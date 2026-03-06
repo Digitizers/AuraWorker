@@ -37,6 +37,15 @@ class Aura_Worker_Updater {
 	public function get_available_updates( $force_refresh = false ) {
 		// Temporarily increase memory for update checks.
 		@ini_set( 'memory_limit', '256M' );
+
+		// Load required admin files for update functions.
+		if ( ! function_exists( 'get_core_updates' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/update.php';
+		}
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
 		if ( $force_refresh ) {
 			wp_version_check();
 			wp_update_plugins();
