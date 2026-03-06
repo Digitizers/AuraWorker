@@ -28,19 +28,25 @@ class Aura_Worker_Updater {
 	/**
 	 * Get available updates for everything.
 	 *
+	 * Uses cached transients by default (lightweight).
+	 * Pass ?refresh=1 to force a fresh check (requires more memory).
+	 *
+	 * @param bool $force_refresh Whether to force fresh update checks.
 	 * @return array Update information.
 	 */
-	public function get_available_updates() {
-		// Force WordPress to check for updates.
-		wp_version_check();
-		wp_update_plugins();
-		wp_update_themes();
+	public function get_available_updates( $force_refresh = false ) {
+		if ( $force_refresh ) {
+			wp_version_check();
+			wp_update_plugins();
+			wp_update_themes();
+		}
 
 		$result = array(
 			'core'         => $this->get_core_updates(),
 			'plugins'      => $this->get_plugin_updates(),
 			'themes'       => $this->get_theme_updates(),
 			'translations' => $this->get_translation_updates(),
+			'cached'       => ! $force_refresh,
 		);
 
 		return $result;

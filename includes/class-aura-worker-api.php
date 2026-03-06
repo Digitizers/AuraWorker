@@ -185,13 +185,15 @@ class Aura_Worker_API {
 	/**
 	 * GET /aura/v1/updates
 	 *
-	 * Returns all available updates.
+	 * Returns all available updates. Uses cached data by default.
+	 * Add ?refresh=1 to force fresh check (may fail on low-memory servers).
 	 *
 	 * @param WP_REST_Request $request The request object.
 	 * @return WP_REST_Response Available updates.
 	 */
 	public function get_updates( $request ) {
-		$updates = $this->updater->get_available_updates();
+		$refresh = (bool) $request->get_param( 'refresh' );
+		$updates = $this->updater->get_available_updates( $refresh );
 		return rest_ensure_response( $updates );
 	}
 
