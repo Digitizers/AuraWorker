@@ -7,7 +7,7 @@
  * Requires at least: 6.2
  * Requires PHP:      7.4
  * Author:            Digitizer
- * Author URI:        https://www.digitizer.co.il
+ * Author URI:        https://www.digitizer.studio
  * License:           GPL v2 or later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       aura-worker
