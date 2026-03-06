@@ -35,6 +35,8 @@ class Aura_Worker_Updater {
 	 * @return array Update information.
 	 */
 	public function get_available_updates( $force_refresh = false ) {
+		// Temporarily increase memory for update checks.
+		@ini_set( 'memory_limit', '256M' );
 		if ( $force_refresh ) {
 			wp_version_check();
 			wp_update_plugins();
@@ -60,7 +62,7 @@ class Aura_Worker_Updater {
 	private function get_core_updates() {
 		$updates = get_core_updates();
 
-		if ( empty( $updates ) || ! is_array( $updates ) ) {
+		if ( empty( $updates ) || ! is_array( $updates ) || is_wp_error( $updates ) ) {
 			return null;
 		}
 
