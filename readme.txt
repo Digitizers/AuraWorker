@@ -38,7 +38,7 @@ Three layers of authentication protect all API endpoints:
 
 == Installation ==
 
-1. Upload the `aura-worker` folder to `/wp-content/plugins/`
+1. Upload the `AuraWP` folder to `/wp-content/plugins/`
 2. Activate the plugin through the Plugins menu
 3. Go to Tools > Aura Worker to find your site token
 4. Add the site token to your Aura dashboard
