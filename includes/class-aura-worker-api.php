@@ -82,7 +82,7 @@ class Aura_Worker_API {
 					'validate_callback' => function( $value ) {
 						return is_string( $value ) && preg_match( '/^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-]+\.php$/', $value );
 					},
-					'description'       => __( 'Plugin file path (e.g., akismet/akismet.php)', 'aura-worker' ),
+					'description'       => __( 'Plugin file path (e.g., akismet/akismet.php)', 'aurawp' ),
 				),
 			),
 		) );
@@ -100,7 +100,7 @@ class Aura_Worker_API {
 					'validate_callback' => function( $value ) {
 						return is_string( $value ) && preg_match( '/^[a-zA-Z0-9_\-]+$/', $value );
 					},
-					'description'       => __( 'Theme stylesheet slug', 'aura-worker' ),
+					'description'       => __( 'Theme stylesheet slug', 'aurawp' ),
 				),
 			),
 		) );
@@ -233,7 +233,7 @@ class Aura_Worker_API {
 		if ( ! isset( $all_plugins[ $plugin_file ] ) ) {
 			return new WP_REST_Response( array(
 				'success' => false,
-				'error'   => __( 'Plugin not found.', 'aura-worker' ),
+				'error'   => __( 'Plugin not found.', 'aurawp' ),
 			), 404 );
 		}
 
@@ -256,7 +256,7 @@ class Aura_Worker_API {
 		if ( ! $theme->exists() ) {
 			return new WP_REST_Response( array(
 				'success' => false,
-				'error'   => __( 'Theme not found.', 'aura-worker' ),
+				'error'   => __( 'Theme not found.', 'aurawp' ),
 			), 404 );
 		}
 

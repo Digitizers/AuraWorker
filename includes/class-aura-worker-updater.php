@@ -174,20 +174,20 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Update failed. The plugin may not have an update available.', 'aura-worker' ),
+				'error'   => __( 'Update failed. The plugin may not have an update available.', 'aurawp' ),
 			);
 		}
 
 		if ( null === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'No update available for this plugin.', 'aura-worker' ),
+				'error'   => __( 'No update available for this plugin.', 'aurawp' ),
 			);
 		}
 
 		return array(
 			'success' => true,
-			'message' => __( 'Plugin updated successfully.', 'aura-worker' ),
+			'message' => __( 'Plugin updated successfully.', 'aurawp' ),
 		);
 	}
 
@@ -214,20 +214,20 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Update failed. The theme may not have an update available.', 'aura-worker' ),
+				'error'   => __( 'Update failed. The theme may not have an update available.', 'aurawp' ),
 			);
 		}
 
 		if ( null === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'No update available for this theme.', 'aura-worker' ),
+				'error'   => __( 'No update available for this theme.', 'aurawp' ),
 			);
 		}
 
 		return array(
 			'success' => true,
-			'message' => __( 'Theme updated successfully.', 'aura-worker' ),
+			'message' => __( 'Theme updated successfully.', 'aurawp' ),
 		);
 	}
 
@@ -244,7 +244,7 @@ class Aura_Worker_Updater {
 		if ( empty( $updates ) || ! is_array( $updates ) || 'latest' === $updates[0]->response ) {
 			return array(
 				'success' => true,
-				'message' => __( 'WordPress is already up to date.', 'aura-worker' ),
+				'message' => __( 'WordPress is already up to date.', 'aurawp' ),
 			);
 		}
 
@@ -263,7 +263,7 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Core update failed (filesystem error).', 'aura-worker' ),
+				'error'   => __( 'Core update failed (filesystem error).', 'aurawp' ),
 			);
 		}
 
@@ -271,7 +271,7 @@ class Aura_Worker_Updater {
 			'success' => true,
 			'message' => sprintf(
 				/* translators: %s: WordPress version */
-				__( 'WordPress updated to %s.', 'aura-worker' ),
+				__( 'WordPress updated to %s.', 'aurawp' ),
 				$update->version
 			),
 		);
@@ -292,7 +292,7 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Translation update failed.', 'aura-worker' ),
+				'error'   => __( 'Translation update failed.', 'aurawp' ),
 			);
 		}
 
@@ -302,7 +302,7 @@ class Aura_Worker_Updater {
 			'success' => true,
 			'message' => sprintf(
 				/* translators: %d: number of translations updated */
-				__( '%d translation(s) updated.', 'aura-worker' ),
+				__( '%d translation(s) updated.', 'aurawp' ),
 				$updated_count
 			),
 		);
@@ -322,7 +322,7 @@ class Aura_Worker_Updater {
 
 		return array(
 			'success'    => true,
-			'message'    => __( 'Database tables updated.', 'aura-worker' ),
+			'message'    => __( 'Database tables updated.', 'aurawp' ),
 			'db_before'  => $db_version_before,
 			'db_after'   => $db_version_after,
 			'changed'    => $db_version_before !== $db_version_after,

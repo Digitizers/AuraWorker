@@ -35,11 +35,31 @@ class Aura_Worker {
 		// Register REST API routes.
 		add_action( 'rest_api_init', array( $this->api, 'register_routes' ) );
 
-		// Add settings page.
+		// Add settings page and privacy policy.
 		if ( is_admin() ) {
 			add_action( 'admin_menu', array( $this, 'add_settings_page' ) );
 			add_action( 'admin_init', array( $this, 'register_settings' ) );
+			add_action( 'admin_init', array( $this, 'add_privacy_policy_content' ) );
 		}
+	}
+
+	/**
+	 * Suggest privacy policy content for the site's Privacy Policy page.
+	 */
+	public function add_privacy_policy_content() {
+		if ( ! function_exists( 'wp_add_privacy_policy_content' ) ) {
+			return;
+		}
+		wp_add_privacy_policy_content(
+			'AuraWP',
+			wp_kses_post( wpautop( __(
+				'This site uses the AuraWP plugin to enable remote management from the Aura dashboard (my-aura.app). ' .
+				'When connected, the Aura dashboard may access site health information including WordPress version, ' .
+				'PHP version, installed plugins and themes, and database metadata. No personal user data is collected ' .
+				'or transmitted by this plugin.',
+				'aurawp'
+			) ) )
+		);
 	}
 
 	/**
@@ -47,10 +67,10 @@ class Aura_Worker {
 	 */
 	public function add_settings_page() {
 		add_options_page(
-			__( 'AuraWP', 'aura-worker' ),
-			__( 'AuraWP', 'aura-worker' ),
+			__( 'AuraWP', 'aurawp' ),
+			__( 'AuraWP', 'aurawp' ),
 			'manage_options',
-			'aura-worker',
+			'aurawp',
 			array( $this, 'render_settings_page' )
 		);
 	}
@@ -79,32 +99,32 @@ class Aura_Worker {
 
 		add_settings_section(
 			'aura_worker_main',
-			__( 'Connection Settings', 'aura-worker' ),
+			__( 'Connection Settings', 'aurawp' ),
 			null,
-			'aura-worker'
+			'aurawp'
 		);
 
 		add_settings_field(
 			'aura_worker_site_token',
-			__( 'Site Token', 'aura-worker' ),
+			__( 'Site Token', 'aurawp' ),
 			array( $this, 'render_token_field' ),
-			'aura-worker',
+			'aurawp',
 			'aura_worker_main'
 		);
 
 		add_settings_field(
 			'aura_worker_allowed_ips',
-			__( 'Allowed IPs', 'aura-worker' ),
+			__( 'Allowed IPs', 'aurawp' ),
 			array( $this, 'render_ips_field' ),
-			'aura-worker',
+			'aurawp',
 			'aura_worker_main'
 		);
 
 		add_settings_field(
 			'aura_worker_allowed_domains',
-			__( 'Allowed Domains', 'aura-worker' ),
+			__( 'Allowed Domains', 'aurawp' ),
 			array( $this, 'render_domains_field' ),
-			'aura-worker',
+			'aurawp',
 			'aura_worker_main'
 		);
 	}
@@ -119,24 +139,24 @@ class Aura_Worker {
 		?>
 		<div class="wrap">
 			<h1><?php echo esc_html( get_admin_page_title() ); ?></h1>
-			<p><?php esc_html_e( 'Configure the connection between this site and your Aura dashboard.', 'aura-worker' ); ?></p>
+			<p><?php esc_html_e( 'Configure the connection between this site and your Aura dashboard.', 'aurawp' ); ?></p>
 
 			<form method="post" action="options.php">
 				<?php
 				settings_fields( 'aura_worker_settings' );
-				do_settings_sections( 'aura-worker' );
+				do_settings_sections( 'aurawp' );
 				submit_button();
 				?>
 			</form>
 
 			<hr>
-			<h2><?php esc_html_e( 'Connection Test', 'aura-worker' ); ?></h2>
+			<h2><?php esc_html_e( 'Connection Test', 'aurawp' ); ?></h2>
 			<p>
-				<?php esc_html_e( 'API Endpoint:', 'aura-worker' ); ?>
+				<?php esc_html_e( 'API Endpoint:', 'aurawp' ); ?>
 				<code><?php echo esc_url( rest_url( 'aura/v1/status' ) ); ?></code>
 			</p>
 			<p>
-				<?php esc_html_e( 'Plugin Version:', 'aura-worker' ); ?>
+				<?php esc_html_e( 'Plugin Version:', 'aurawp' ); ?>
 				<strong><?php echo esc_html( AURA_WORKER_VERSION ); ?></strong>
 			</p>
 		</div>
@@ -153,7 +173,7 @@ class Aura_Worker {
 			   value="<?php echo esc_attr( $token ); ?>"
 			   class="regular-text" readonly>
 		<p class="description">
-			<?php esc_html_e( 'Auto-generated token. Copy this to your Aura dashboard when connecting this site.', 'aura-worker' ); ?>
+			<?php esc_html_e( 'Auto-generated token. Copy this to your Aura dashboard when connecting this site.', 'aurawp' ); ?>
 		</p>
 		<?php
 	}
@@ -166,7 +186,7 @@ class Aura_Worker {
 		?>
 		<textarea name="aura_worker_allowed_ips" rows="3" class="large-text"><?php echo esc_textarea( $ips ); ?></textarea>
 		<p class="description">
-			<?php esc_html_e( 'One IP per line. Leave empty to allow all IPs (less secure). Only these IPs can access the Aura API.', 'aura-worker' ); ?>
+			<?php esc_html_e( 'One IP per line. Leave empty to allow all IPs (less secure). Only these IPs can access the Aura API.', 'aurawp' ); ?>
 		</p>
 		<?php
 	}
@@ -179,7 +199,7 @@ class Aura_Worker {
 		?>
 		<textarea name="aura_worker_allowed_domains" rows="3" class="large-text"><?php echo esc_textarea( $domains ); ?></textarea>
 		<p class="description">
-			<?php esc_html_e( 'One domain per line (e.g., my-aura.app). Leave empty to allow all origins. Checked against the Origin or Referer header of incoming requests.', 'aura-worker' ); ?>
+			<?php esc_html_e( 'One domain per line (e.g., my-aura.app). Leave empty to allow all origins. Checked against the Origin or Referer header of incoming requests.', 'aurawp' ); ?>
 		</p>
 		<?php
 	}

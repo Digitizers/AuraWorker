@@ -65,7 +65,7 @@ class Aura_Worker_Security {
 		if ( ! in_array( $client_ip, $allowed, true ) ) {
 			return new WP_Error(
 				'aura_ip_blocked',
-				__( 'Your IP address is not authorized.', 'aura-worker' ),
+				__( 'Your IP address is not authorized.', 'aurawp' ),
 				array( 'status' => 403 )
 			);
 		}
@@ -105,7 +105,7 @@ class Aura_Worker_Security {
 		if ( empty( $request_host ) || ! in_array( $request_host, $allowed, true ) ) {
 			return new WP_Error(
 				'aura_domain_blocked',
-				__( 'Your request origin domain is not authorized.', 'aura-worker' ),
+				__( 'Your request origin domain is not authorized.', 'aurawp' ),
 				array( 'status' => 403 )
 			);
 		}
@@ -126,7 +126,7 @@ class Aura_Worker_Security {
 		if ( empty( $stored_token ) ) {
 			return new WP_Error(
 				'aura_not_configured',
-				__( 'Aura Worker is not configured. Please set a site token.', 'aura-worker' ),
+				__( 'Aura Worker is not configured. Please set a site token.', 'aurawp' ),
 				array( 'status' => 500 )
 			);
 		}
@@ -134,7 +134,7 @@ class Aura_Worker_Security {
 		if ( empty( $provided_token ) || ! hash_equals( $stored_token, $provided_token ) ) {
 			return new WP_Error(
 				'aura_invalid_token',
-				__( 'Invalid or missing Aura token.', 'aura-worker' ),
+				__( 'Invalid or missing Aura token.', 'aurawp' ),
 				array( 'status' => 401 )
 			);
 		}
@@ -173,7 +173,7 @@ class Aura_Worker_Security {
 		if ( ! current_user_can( 'manage_options' ) ) {
 			return new WP_Error(
 				'aura_insufficient_permissions',
-				__( 'You do not have permission to perform this action.', 'aura-worker' ),
+				__( 'You do not have permission to perform this action.', 'aurawp' ),
 				array( 'status' => 403 )
 			);
 		}
@@ -196,7 +196,7 @@ class Aura_Worker_Security {
 		if ( ! current_user_can( 'manage_options' ) ) {
 			return new WP_Error(
 				'aura_insufficient_permissions',
-				__( 'You do not have permission to view this data.', 'aura-worker' ),
+				__( 'You do not have permission to view this data.', 'aurawp' ),
 				array( 'status' => 403 )
 			);
 		}

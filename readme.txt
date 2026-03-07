@@ -28,6 +28,16 @@ Three layers of authentication protect all API endpoints:
 1. **WordPress Application Password** - Standard WordPress REST API authentication
 2. **Aura Site Token** - Unique token verified via X-Aura-Token header
 3. **IP Whitelist** - Optional IP restriction for additional security
+4. **Domain Whitelist** - Optional origin domain restriction
+
+= External Service =
+
+This plugin connects to the [Aura dashboard](https://my-aura.app/) to enable remote site management.
+When connected, the Aura dashboard sends authenticated REST API requests to your site to check health status and perform updates.
+The plugin itself does not send data outbound — it only responds to authenticated incoming requests.
+
+* [Aura Terms of Service](https://my-aura.app/terms)
+* [Aura Privacy Policy](https://my-aura.app/privacy)
 
 = Requirements =
 
@@ -56,6 +66,11 @@ No. The plugin only loads its REST API endpoints. It has zero impact on frontend
 = What happens if I deactivate the plugin? =
 
 Your Aura dashboard will no longer be able to communicate with this site. No data is lost.
+
+== Screenshots ==
+
+1. AuraWP settings page — configure your site token, IP whitelist, and domain whitelist
+2. Connection test section — verify your API endpoint and plugin version
 
 == Changelog ==
 
