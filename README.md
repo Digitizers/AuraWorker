@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="aura_logotype.png" alt="Aura" width="200" />
+  <img src="assets/aura_logotype.png" alt="Aura" width="200" />
 </p>
 
 <h3 align="center">AuraWP &mdash; WordPress Site Agent</h3>
