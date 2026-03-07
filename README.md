@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/aura_icon.png" alt="Aura" width="160" />
+  <img src="assets/aura_icon.png" alt="Aura" width="200" />
 </p>
 <p align="center">
-  <img src="assets/aura_logotype.png" alt="Aura" width="200" />
+  <img src="assets/aura_logotype.png" alt="Aura" width="160" />
 </p>
 
 <h3 align="center">AuraWP &mdash; WordPress Site Agent</h3>
