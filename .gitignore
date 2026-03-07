@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# WordPress
+wp-config.php
+wp-content/uploads/
+wp-content/upgrade/
+
+# Build artifacts
+*.zip
+node_modules/
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+debug.log
+error_log
