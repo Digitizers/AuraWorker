@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1544" height="500" viewBox="0 0 1544 500">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f172a"/>
+      <stop offset="100%" style="stop-color:#1e293b"/>
+    </linearGradient>
+  </defs>
+  <rect width="1544" height="500" fill="url(#bg)"/>
+  <!-- Subtle grid pattern -->
+  <g opacity="0.05">
+    <line x1="0" y1="100" x2="1544" y2="100" stroke="white" stroke-width="1"/>
+    <line x1="0" y1="200" x2="1544" y2="200" stroke="white" stroke-width="1"/>
+    <line x1="0" y1="300" x2="1544" y2="300" stroke="white" stroke-width="1"/>
+    <line x1="0" y1="400" x2="1544" y2="400" stroke="white" stroke-width="1"/>
+    <line x1="300" y1="0" x2="300" y2="500" stroke="white" stroke-width="1"/>
+    <line x1="600" y1="0" x2="600" y2="500" stroke="white" stroke-width="1"/>
+    <line x1="900" y1="0" x2="900" y2="500" stroke="white" stroke-width="1"/>
+    <line x1="1200" y1="0" x2="1200" y2="500" stroke="white" stroke-width="1"/>
+  </g>
+  <!-- Decorative accent -->
+  <circle cx="1360" cy="120" r="240" fill="#3b82f6" opacity="0.08"/>
+  <circle cx="200" cy="400" r="160" fill="#3b82f6" opacity="0.05"/>
+  <!-- Logo text -->
+  <text x="772" y="220" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="128" font-weight="700" fill="white" text-anchor="middle" letter-spacing="-2">AuraWP</text>
+  <!-- Tagline -->
+  <text x="772" y="310" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="36" fill="#94a3b8" text-anchor="middle" letter-spacing="1">WordPress Site Agent for Aura Infrastructure Hub</text>
+  <!-- Bottom accent line -->
+  <rect x="632" y="350" width="280" height="5" rx="2.5" fill="#3b82f6" opacity="0.6"/>
+</svg>

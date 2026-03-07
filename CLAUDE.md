@@ -13,7 +13,8 @@ This file provides context and conventions for AI assistants working in this rep
 - **Auth:** Three-layer (WordPress Application Password + Aura Site Token + optional IP Whitelist)
 - **REST Namespace:** `aura/v1`
 - **License:** GPLv2 or later
-- **Text Domain:** `aura-worker`
+- **Text Domain:** `aurawp`
+- **WordPress.org Slug:** `aurawp`
 
 ---
 
@@ -26,6 +27,14 @@ AuraWP/
 ├── readme.txt                               # WordPress.org plugin readme
 ├── README.md                                # GitHub readme
 ├── aura_logotype.png                        # Logo asset
+├── LICENSE                                  # GPLv2 license text
+├── assets/                                  # WordPress.org plugin page assets (NOT shipped)
+│   ├── banner-772x250.svg                   # Standard banner
+│   ├── banner-1544x500.svg                  # Retina banner
+│   ├── icon-128x128.svg                     # Standard icon
+│   ├── icon-256x256.svg                     # Retina icon
+│   ├── screenshot-1.html                    # Settings page mockup (export to PNG)
+│   └── screenshot-2.html                    # Connection test mockup (export to PNG)
 └── includes/
     ├── class-aura-worker.php                # Main orchestrator — admin menu, settings, wiring
     ├── class-aura-worker-api.php            # REST API route registration and handlers
@@ -59,9 +68,10 @@ AuraWP/
 
 Every REST request passes through three checks in order:
 
-1. **IP Whitelist** (`check_ip_whitelist`) — If IPs are configured in settings, the client IP must match. Uses proxy headers (`CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`) before `REMOTE_ADDR`.
-2. **Aura Site Token** (`check_aura_token`) — `X-Aura-Token` header must match the stored token. Comparison uses `hash_equals()` for timing safety.
-3. **WordPress Capability** — Read endpoints require `manage_options`, write endpoints require `update_plugins`.
+1. **IP Whitelist** (`check_ip_whitelist`) — If IPs are configured in settings, the client IP must match. Uses `REMOTE_ADDR` only (proxy headers are not trusted).
+2. **Domain Whitelist** (`check_domain_whitelist`) — If domains are configured, the request's `Origin` or `Referer` header must match.
+3. **Aura Site Token** (`check_aura_token`) — `X-Aura-Token` header must match the stored token. Comparison uses `hash_equals()` for timing safety.
+4. **WordPress Capability** — All endpoints require `manage_options`.
 
 ---
 
@@ -76,7 +86,7 @@ All routes are under `/wp-json/aura/v1/`.
 | `GET` | `/status` | Full site health: WP/PHP/MySQL versions, plugins, themes, disk usage, DB info |
 | `GET` | `/updates` | Available updates for core, plugins, themes, translations. Add `?refresh=1` to force fresh check |
 
-### Write Endpoints (require `update_plugins`)
+### Write Endpoints (require `manage_options`)
 
 | Method | Endpoint | Parameters | Description |
 |--------|----------|------------|-------------|
@@ -94,6 +104,7 @@ All routes are under `/wp-json/aura/v1/`.
 |------------|-------------|
 | `aura_worker_site_token` | 32-char alphanumeric token for API auth |
 | `aura_worker_allowed_ips` | Newline-separated IP whitelist (empty = allow all) |
+| `aura_worker_allowed_domains` | Newline-separated domain whitelist (empty = allow all) |
 | `aura_worker_activated` | Activation timestamp |
 | `aura_worker_version` | Plugin version at activation |
 
@@ -109,7 +120,7 @@ All options are cleaned up in `uninstall.php`.
 - Tabs for indentation (not spaces)
 - Yoda conditions are acceptable but not required
 - All files must start with `if ( ! defined( 'ABSPATH' ) ) { exit; }` guard
-- Use WordPress i18n functions (`__()`, `esc_html_e()`) with text domain `aura-worker`
+- Use WordPress i18n functions (`__()`, `esc_html_e()`) with text domain `aurawp`
 
 ### Naming
 
