@@ -102,7 +102,13 @@ class Aura_Worker_Security {
 			$request_host = isset( $parsed['host'] ) ? strtolower( $parsed['host'] ) : '';
 		}
 
-		if ( empty( $request_host ) || ! in_array( $request_host, $allowed, true ) ) {
+		// No Origin/Referer header — this is a server-to-server request (e.g. from the
+		// Aura dashboard). Allow it through; the token check still protects the endpoint.
+		if ( empty( $request_host ) ) {
+			return true;
+		}
+
+		if ( ! in_array( $request_host, $allowed, true ) ) {
 			return new WP_Error(
 				'aura_domain_blocked',
 				__( 'Your request origin domain is not authorized.', 'aurawp' ),
