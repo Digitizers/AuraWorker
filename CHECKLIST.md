@@ -81,11 +81,8 @@ Pre-submission verification for publishing AuraWP v1.2.0 to the WordPress.org pl
 
 ## Remaining To-Do (manual tasks)
 
-- [ ] Export assets to PNG — Convert SVGs to PNG (banners 772x250, 1544x500; icons 128x128, 256x256) and export HTML screenshot mockups to PNG  
-- [ ] Create WordPress.org account with 2FA enabled
 - [ ] Validate readme.txt at wordpress.org/plugins/developers/readme-validator/
 - [ ] Run Plugin Check (PCP) on a local WordPress install
 - [ ] Test fresh install — activate, settings page, token generation, REST endpoints with/without auth
-- [ ] Deploy Aura dashboard — so /terms and /privacy are live at my-aura.app
 - [ ] Build clean ZIP — exclude .git, CLAUDE.md, README.md, CHECKLIST.md, assets/, .DS_Store
 - [ ] Submit at wordpress.org/plugins/developers/add/

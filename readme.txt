@@ -8,7 +8,7 @@ Stable tag: 1.2.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Remote site management agent for Aura dashboard. Secure updates, health monitoring, and maintenance operations via REST API.
+Remote site management agent for Aura dashboard. Secure updates, health monitoring, and maintenance operations.
 
 == Description ==
 
