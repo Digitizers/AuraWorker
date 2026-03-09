@@ -81,7 +81,7 @@ Pre-submission verification for publishing AuraWP v1.2.0 to the WordPress.org pl
 
 ## Remaining To-Do (manual tasks)
 
-- [ ] Validate readme.txt at wordpress.org/plugins/developers/readme-validator/
+- [x] Validate readme.txt at wordpress.org/plugins/developers/readme-validator/
 - [ ] Run Plugin Check (PCP) on a local WordPress install
 - [ ] Test fresh install — activate, settings page, token generation, REST endpoints with/without auth
 - [ ] Build clean ZIP — exclude .git, CLAUDE.md, README.md, CHECKLIST.md, assets/, .DS_Store
