@@ -18,7 +18,7 @@ Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.or
 - [x] All endpoints require `manage_options` capability
 - [x] IP whitelist uses `REMOTE_ADDR` only (no proxy headers)
 - [x] Token comparison uses `hash_equals()`
-- [ ] Plugin activates and deactivates cleanly on WordPress 6.2+
+- [x] Plugin activates and deactivates cleanly on WordPress 6.2+
 - [ ] Plugin works on PHP 7.4, 8.0, 8.1, 8.2, 8.3
 
 ## readme.txt
@@ -31,7 +31,7 @@ Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.or
 - [x] External service disclosure present with links to Terms and Privacy
 - [x] Screenshots section has descriptions
 - [x] Changelog section is populated
-- [ ] Re-validate at: https://wordpress.org/plugins/developers/readme-validator/
+- [x] Re-validate at: https://wordpress.org/plugins/developers/readme-validator/
 
 ## Plugin Check (PCP)
 
@@ -41,7 +41,7 @@ Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.or
 - [x] `@ini_set()` replaced with `wp_raise_memory_limit('admin')`
 - [x] `phpcs:ignore` added for `SHOW TABLES` direct query
 - [x] Renamed from AuraWP/aurawp to AuraWorker/aura-worker (trademark fix)
-- [ ] Re-run PCP — confirm 0 errors, 0 warnings
+- [x] Re-run PCP — confirm 0 errors, 0 warnings
 
 ## External Pages (Aura Dashboard)
 
@@ -55,24 +55,24 @@ Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.or
 - [x] `banner-1544x500.png` — 1544 × 500 px (retina, recommended)
 - [x] `icon-128x128.png` — 128 × 128 px (required)
 - [x] `icon-256x256.png` — 256 × 256 px (retina, recommended)
-- [ ] `screenshot-1.png` — Settings page
-- [ ] `screenshot-2.png` — Connection test section
+- [x] `screenshot-1.png` — Settings page
+- [x] `screenshot-2.png` — Connection test section
 
 ## Build & Test
 
 - [x] Build clean ZIP — GitHub Action attaches `aura-worker.zip` to release automatically
-- [ ] Test fresh install on clean WordPress site
-- [ ] Test activation → settings page → site token generated
-- [ ] Test REST endpoints respond with valid auth
-- [ ] Test REST endpoints reject without auth
-- [ ] Test IP whitelist blocks non-whitelisted IPs
-- [ ] Test domain whitelist blocks non-whitelisted origins
+- [x] Test fresh install on clean WordPress site
+- [x] Test activation → settings page → site token generated
+- [x] Test REST endpoints respond with valid auth
+- [x] Test REST endpoints reject without auth
+- [x] Test IP whitelist blocks non-whitelisted IPs
+- [x] Test domain whitelist blocks non-whitelisted origins
 
 ## WordPress.org Account
 
 - [x] Account created at wordpress.org
 - [x] Two-Factor Authentication enabled
-- [ ] `plugins@wordpress.org` whitelisted in email
+- [x] `plugins@wordpress.org` whitelisted in email
 
 ## Submission
 
