@@ -4,7 +4,7 @@ Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.2.0
+Stable tag: 1.3.0-beta.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -19,7 +19,7 @@ AuraWorker is a lightweight WordPress plugin that enables remote site management
 * **Theme Updates** - Update themes remotely
 * **Core Updates** - Update WordPress core remotely
 * **Translation Updates** - Bulk update all translations
-* **Database Updates** - Run database table upgrades after core updates
+* **Database Updates** - Run WordPress core database upgrades and plugin-specific migrations (Elementor, WooCommerce, Crocoblock)
 
 = Security =
 
@@ -73,6 +73,12 @@ Your Aura dashboard will no longer be able to communicate with this site. No dat
 2. Connection test section — verify your API endpoint and plugin version
 
 == Changelog ==
+
+= 1.3.0-beta.1 =
+* Feature: Plugin-specific database migration support (Elementor, Elementor Pro, WooCommerce, JetEngine/Crocoblock)
+* Feature: New GET /database-status endpoint — returns pending migration status for detected plugins
+* Feature: POST /update/database now accepts optional `plugin` parameter for targeted migrations
+* Feature: `aura_worker_migration_registry` filter for third-party plugin migration registration
 
 = 1.2.0 =
 * Security: Fix IP whitelist bypass via spoofable proxy headers — now uses REMOTE_ADDR only
