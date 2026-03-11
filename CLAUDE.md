@@ -21,26 +21,29 @@ This file provides context and conventions for AI assistants working in this rep
 ## Repository Structure
 
 ```
-AuraWP/
-├── aura-worker.php                          # Plugin entry point, activation/deactivation hooks
-├── uninstall.php                            # Cleanup on uninstall (removes all options)
-├── readme.txt                               # WordPress.org plugin readme
-├── README.md                                # GitHub readme
-├── LICENSE                                  # GPLv2 license text
+AuraWP/                                      # Repo root (development)
+├── CLAUDE.md                                # AI assistant instructions (dev only)
+├── CHECKLIST.md                             # Development checklist (dev only)
+├── README.md                                # GitHub readme (dev only)
+├── LICENSE                                  # GPLv2 license text (dev only)
 ├── assets/                                  # WordPress.org plugin page assets (NOT shipped)
 │   ├── aura_logotype.png                    # Logo asset
 │   ├── banner-772x250.svg                   # Standard banner
 │   ├── banner-1544x500.svg                  # Retina banner
 │   ├── icon-128x128.svg                     # Standard icon
-│   ├── icon-256x256.svg                     # Retina icon
-│   ├── screenshot-1.html                    # Settings page mockup (export to PNG)
-│   └── screenshot-2.html                    # Connection test mockup (export to PNG)
-└── includes/
-    ├── class-aura-worker.php                # Main orchestrator — admin menu, settings, wiring
-    ├── class-aura-worker-api.php            # REST API route registration and handlers
-    ├── class-aura-worker-updater.php        # Update operations (core, plugins, themes, translations, DB)
-    └── class-aura-worker-security.php       # Three-layer authentication and permission callbacks
+│   └── icon-256x256.svg                     # Retina icon
+└── aurawp/                                  # ← Clean plugin folder (zip this for installation)
+    ├── aura-worker.php                      # Plugin entry point, activation/deactivation hooks
+    ├── uninstall.php                        # Cleanup on uninstall (removes all options)
+    ├── readme.txt                           # WordPress.org plugin readme
+    └── includes/
+        ├── class-aura-worker.php            # Main orchestrator — admin menu, settings, wiring
+        ├── class-aura-worker-api.php        # REST API route registration and handlers
+        ├── class-aura-worker-updater.php    # Update operations (core, plugins, themes, translations, DB)
+        └── class-aura-worker-security.php   # Three-layer authentication and permission callbacks
 ```
+
+To create an installable ZIP: `cd` to the repo root and run `zip -r aurawp.zip aurawp/`.
 
 ---
 
@@ -50,10 +53,10 @@ AuraWP/
 
 | Class | File | Role |
 |-------|------|------|
-| `Aura_Worker` | `class-aura-worker.php` | Orchestrator — creates Security and API instances, registers admin menu and settings |
-| `Aura_Worker_API` | `class-aura-worker-api.php` | Registers all REST routes under `aura/v1`, handles request/response logic |
-| `Aura_Worker_Updater` | `class-aura-worker-updater.php` | Wraps WordPress Upgrader classes for core/plugin/theme/translation/DB updates |
-| `Aura_Worker_Security` | `class-aura-worker-security.php` | Implements IP whitelist, site token verification, and capability checks |
+| `Aura_Worker` | `aurawp/includes/class-aura-worker.php` | Orchestrator — creates Security and API instances, registers admin menu and settings |
+| `Aura_Worker_API` | `aurawp/includes/class-aura-worker-api.php` | Registers all REST routes under `aura/v1`, handles request/response logic |
+| `Aura_Worker_Updater` | `aurawp/includes/class-aura-worker-updater.php` | Wraps WordPress Upgrader classes for core/plugin/theme/translation/DB updates |
+| `Aura_Worker_Security` | `aurawp/includes/class-aura-worker-security.php` | Implements IP whitelist, site token verification, and capability checks |
 
 ### Initialization Flow
 
