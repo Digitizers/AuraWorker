@@ -309,11 +309,197 @@ class Aura_Worker_Updater {
 	}
 
 	/**
-	 * Run database upgrade (dbDelta).
+	 * Get the plugin migration registry.
 	 *
+	 * Maps known plugin slugs to their detection, pending-check, and
+	 * migration callables. Third-party plugins can register their own
+	 * entries via the `aura_worker_migration_registry` filter.
+	 *
+	 * @return array Keyed array of migration entries.
+	 */
+	private function get_migration_registry() {
+		if ( ! function_exists( 'is_plugin_active' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		$registry = array(
+			'elementor'     => array(
+				'label'   => 'Elementor',
+				'detect'  => function () {
+					return defined( 'ELEMENTOR_VERSION' ) && is_plugin_active( 'elementor/elementor.php' );
+				},
+				'pending' => function () {
+					if ( ! defined( 'ELEMENTOR_VERSION' ) ) {
+						return false;
+					}
+					$db_ver = get_option( 'elementor_version', '0' );
+					return version_compare( $db_ver, ELEMENTOR_VERSION, '<' );
+				},
+				'run'     => function () {
+					if ( ! class_exists( '\Elementor\Plugin' ) ) {
+						return;
+					}
+					\Elementor\Plugin::instance()->files_manager->clear_cache();
+					if ( isset( \Elementor\Plugin::instance()->upgrade ) ) {
+						\Elementor\Plugin::instance()->upgrade->do_upgrade();
+					}
+					update_option( 'elementor_version', ELEMENTOR_VERSION );
+				},
+			),
+			'elementor-pro' => array(
+				'label'   => 'Elementor Pro',
+				'detect'  => function () {
+					return defined( 'ELEMENTOR_PRO_VERSION' ) && is_plugin_active( 'elementor-pro/elementor-pro.php' );
+				},
+				'pending' => function () {
+					if ( ! defined( 'ELEMENTOR_PRO_VERSION' ) ) {
+						return false;
+					}
+					$db_ver = get_option( 'elementor_pro_version', '0' );
+					return version_compare( $db_ver, ELEMENTOR_PRO_VERSION, '<' );
+				},
+				'run'     => function () {
+					if ( ! class_exists( '\ElementorPro\Plugin' ) ) {
+						return;
+					}
+					if ( isset( \ElementorPro\Plugin::instance()->upgrade ) ) {
+						\ElementorPro\Plugin::instance()->upgrade->do_upgrade();
+					}
+					update_option( 'elementor_pro_version', ELEMENTOR_PRO_VERSION );
+				},
+			),
+			'woocommerce'   => array(
+				'label'   => 'WooCommerce',
+				'detect'  => function () {
+					return defined( 'WC_VERSION' ) && is_plugin_active( 'woocommerce/woocommerce.php' );
+				},
+				'pending' => function () {
+					if ( ! defined( 'WC_VERSION' ) ) {
+						return false;
+					}
+					$db_ver = get_option( 'woocommerce_db_version', '0' );
+					return version_compare( $db_ver, WC_VERSION, '<' );
+				},
+				'run'     => function () {
+					if ( class_exists( 'WC_Install' ) ) {
+						\WC_Install::install();
+					}
+				},
+			),
+			'jet-engine'    => array(
+				'label'   => 'JetEngine (Crocoblock)',
+				'detect'  => function () {
+					return defined( 'JET_ENGINE_VERSION' ) && is_plugin_active( 'jet-engine/jet-engine.php' );
+				},
+				'pending' => function () {
+					if ( ! defined( 'JET_ENGINE_VERSION' ) ) {
+						return false;
+					}
+					$db_ver = get_option( 'jet_engine_db_version', '0' );
+					return version_compare( $db_ver, JET_ENGINE_VERSION, '<' );
+				},
+				'run'     => function () {
+					if ( function_exists( 'jet_engine' ) && isset( jet_engine()->update_db_updater ) ) {
+						jet_engine()->update_db_updater->update_db();
+					}
+				},
+			),
+		);
+
+		/**
+		 * Filter the plugin migration registry.
+		 *
+		 * Allows third-party plugins to register their own database
+		 * migration handlers without modifying AuraWorker core.
+		 *
+		 * @param array $registry Keyed array of migration entries.
+		 */
+		return apply_filters( 'aura_worker_migration_registry', $registry );
+	}
+
+	/**
+	 * Get database migration status for all detected plugins.
+	 *
+	 * Returns which plugins are installed and whether they have
+	 * pending database migrations.
+	 *
+	 * @return array Keyed array of { label, pending } per plugin.
+	 */
+	public function get_database_status() {
+		$registry   = $this->get_migration_registry();
+		$migrations = array();
+
+		foreach ( $registry as $key => $entry ) {
+			if ( call_user_func( $entry['detect'] ) ) {
+				$migrations[ $key ] = array(
+					'label'   => $entry['label'],
+					'pending' => (bool) call_user_func( $entry['pending'] ),
+				);
+			}
+		}
+
+		return $migrations;
+	}
+
+	/**
+	 * Run database upgrade.
+	 *
+	 * When $plugin is null, runs WordPress core dbDelta (wp_upgrade).
+	 * When $plugin is a registry key, runs that plugin's migration.
+	 *
+	 * @param string|null $plugin Optional plugin key from migration registry.
 	 * @return array Result with success status.
 	 */
-	public function update_database() {
+	public function update_database( $plugin = null ) {
+		// Plugin-specific migration.
+		if ( $plugin ) {
+			$registry = $this->get_migration_registry();
+
+			if ( ! isset( $registry[ $plugin ] ) ) {
+				return array(
+					'success' => false,
+					'error'   => __( 'Unknown plugin migration key.', 'aura-worker' ),
+				);
+			}
+
+			$entry = $registry[ $plugin ];
+
+			if ( ! call_user_func( $entry['detect'] ) ) {
+				return array(
+					'success' => false,
+					'error'   => sprintf(
+						/* translators: %s: Plugin label */
+						__( '%s is not installed or active.', 'aura-worker' ),
+						$entry['label']
+					),
+				);
+			}
+
+			try {
+				call_user_func( $entry['run'] );
+			} catch ( \Exception $e ) {
+				return array(
+					'success' => false,
+					'error'   => sprintf(
+						/* translators: %1$s: Plugin label, %2$s: Error message */
+						__( '%1$s migration failed: %2$s', 'aura-worker' ),
+						$entry['label'],
+						$e->getMessage()
+					),
+				);
+			}
+
+			return array(
+				'success' => true,
+				'message' => sprintf(
+					/* translators: %s: Plugin label */
+					__( '%s database migration completed.', 'aura-worker' ),
+					$entry['label']
+				),
+			);
+		}
+
+		// Core WordPress database upgrade (default).
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		$db_version_before = get_option( 'db_version' );

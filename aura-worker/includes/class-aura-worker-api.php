@@ -112,11 +112,26 @@ class Aura_Worker_API {
 			'permission_callback' => array( $this->security, 'check_admin_permission' ),
 		) );
 
-		// Update database tables.
+		// Database migration status (read-only).
+		register_rest_route( self::NAMESPACE, '/database-status', array(
+			'methods'             => 'GET',
+			'callback'            => array( $this, 'get_database_status' ),
+			'permission_callback' => array( $this->security, 'check_read_permission' ),
+		) );
+
+		// Update database tables (core or plugin-specific).
 		register_rest_route( self::NAMESPACE, '/update/database', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'update_database' ),
 			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'plugin' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'Plugin migration key (e.g., elementor, woocommerce). Omit for core wp_upgrade.', 'aura-worker' ),
+				),
+			),
 		) );
 	}
 
@@ -278,13 +293,29 @@ class Aura_Worker_API {
 	}
 
 	/**
+	 * GET /aura/v1/database-status
+	 *
+	 * Returns pending database migration status for detected plugins.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Database migration status.
+	 */
+	public function get_database_status( $request ) {
+		$status = $this->updater->get_database_status();
+		return rest_ensure_response( $status );
+	}
+
+	/**
 	 * POST /aura/v1/update/database
+	 *
+	 * Runs core wp_upgrade or a plugin-specific database migration.
 	 *
 	 * @param WP_REST_Request $request The request object.
 	 * @return WP_REST_Response Update result.
 	 */
 	public function update_database( $request ) {
-		$result = $this->updater->update_database();
+		$plugin = $request->get_param( 'plugin' );
+		$result = $this->updater->update_database( $plugin );
 		$status = $result['success'] ? 200 : 500;
 		return new WP_REST_Response( $result, $status );
 	}
