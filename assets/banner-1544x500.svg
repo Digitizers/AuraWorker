@@ -21,7 +21,7 @@
   <circle cx="1360" cy="120" r="240" fill="#3b82f6" opacity="0.08"/>
   <circle cx="200" cy="400" r="160" fill="#3b82f6" opacity="0.05"/>
   <!-- Logo text -->
-  <text x="772" y="220" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="128" font-weight="700" fill="white" text-anchor="middle" letter-spacing="-2">AuraWP</text>
+  <text x="772" y="220" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="128" font-weight="700" fill="white" text-anchor="middle" letter-spacing="-2">AuraWorker</text>
   <!-- Tagline -->
   <text x="772" y="310" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="36" fill="#94a3b8" text-anchor="middle" letter-spacing="1">WordPress Site Agent for Aura Infrastructure Hub</text>
   <!-- Bottom accent line -->

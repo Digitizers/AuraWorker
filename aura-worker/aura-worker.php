@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name:       AuraWP
+ * Plugin Name:       AuraWorker
  * Plugin URI:        https://my-aura.app
  * Description:       Remote site management agent for Aura dashboard. Enables secure updates, health monitoring, and maintenance operations via REST API.
  * Version:           1.2.0
@@ -10,7 +10,7 @@
  * Author URI:        https://www.digitizer.studio
  * License:           GPL v2 or later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
- * Text Domain:       aurawp
+ * Text Domain:       aura-worker
  */
 
 // Prevent direct access.

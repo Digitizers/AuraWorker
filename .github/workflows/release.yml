@@ -15,9 +15,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Create plugin ZIP
-        run: zip -r aurawp.zip aurawp/
+        run: zip -r aura-worker.zip aura-worker/
 
       - name: Upload ZIP to release
         uses: softprops/action-gh-release@v2
         with:
-          files: aurawp.zip
+          files: aura-worker.zip

@@ -5,7 +5,7 @@
   <img src="assets/aura_logotype.png" alt="Aura" width="160" />
 </p>
 
-<h3 align="center">AuraWP &mdash; WordPress Site Agent</h3>
+<h3 align="center">AuraWorker &mdash; WordPress Site Agent</h3>
 
 <p align="center">
   Lightweight WordPress plugin that connects your sites to the<br/>
@@ -21,11 +21,11 @@
 
 ---
 
-## What is AuraWP?
+## What is AuraWorker?
 
-AuraWP is a remote management agent that runs on your WordPress sites and communicates with the [Aura dashboard](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates, and perform maintenance — all from a single centralized interface.
+AuraWorker is a remote management agent that runs on your WordPress sites and communicates with the [Aura dashboard](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates, and perform maintenance — all from a single centralized interface.
 
-> **Aura** is a full-stack, multi-provider infrastructure dashboard that unifies server, application, DNS, and CDN management across **Cloudways**, **Hostinger VPS**, **Cloudflare**, and **Bunny.net**. AuraWP extends that reach directly into your WordPress installations.
+> **Aura** is a full-stack, multi-provider infrastructure dashboard that unifies server, application, DNS, and CDN management across **Cloudways**, **Hostinger VPS**, **Cloudflare**, and **Bunny.net**. AuraWorker extends that reach directly into your WordPress installations.
 
 ---
 
@@ -42,7 +42,7 @@ AuraWP is a remote management agent that runs on your WordPress sites and commun
 
 ### Zero Frontend Impact
 
-AuraWP only loads its REST API routes. It adds nothing to your site's frontend — no scripts, no styles, no database queries on page load.
+AuraWorker only loads its REST API routes. It adds nothing to your site's frontend — no scripts, no styles, no database queries on page load.
 
 ---
 
@@ -65,14 +65,14 @@ All three layers must pass before any request is processed.
 ### Manual Upload
 
 1. Download the latest release
-2. Upload the `AuraWP` folder to `/wp-content/plugins/`
+2. Upload the `AuraWorker` folder to `/wp-content/plugins/`
 3. Activate the plugin via **Plugins** in your WordPress admin
-4. Navigate to **Tools &rarr; AuraWP** to view your site token
+4. Navigate to **Tools &rarr; AuraWorker** to view your site token
 
 ### Connect to Aura
 
 1. In the Aura dashboard, add your WordPress site as a resource
-2. Enter the site URL and the **Site Token** from the AuraWP settings page
+2. Enter the site URL and the **Site Token** from the AuraWorker settings page
 3. Configure a WordPress **Application Password** for API authentication
 4. (Optional) Add the Aura server's IP to the **IP Whitelist** for extra security
 
@@ -104,7 +104,7 @@ All endpoints are registered under `/wp-json/aura/v1/`.
 ## Architecture
 
 ```
-AuraWP/
+AuraWorker/
 ├── aura-worker.php                          # Plugin entry point
 ├── uninstall.php                            # Cleanup on uninstall
 ├── readme.txt                               # WordPress.org readme
@@ -127,7 +127,7 @@ AuraWP/
       <p><sub>Next.js &middot; TypeScript &middot; Prisma &middot; PostgreSQL</sub></p>
     </td>
     <td width="50%" valign="top">
-      <h4>AuraWP &mdash; WordPress Agent</h4>
+      <h4>AuraWorker &mdash; WordPress Agent</h4>
       <p>This plugin. Installed on each WordPress site to enable remote health monitoring, updates, and maintenance from the Aura dashboard.</p>
       <p><sub>PHP &middot; WordPress REST API</sub></p>
     </td>
@@ -148,7 +148,7 @@ AuraWP/
 ## FAQ
 
 **Does this plugin slow down my site?**
-No. AuraWP only registers REST API endpoints. It has zero impact on frontend performance.
+No. AuraWorker only registers REST API endpoints. It has zero impact on frontend performance.
 
 **What happens if I deactivate the plugin?**
 The Aura dashboard will no longer be able to communicate with the site. No data is lost — reactivate to reconnect.
@@ -177,7 +177,7 @@ Yes. All endpoints require three layers of authentication. No actions can be per
 - Memory optimization for update operations (auto-scales to 256MB)
 - Transient caching for update checks
 - Settings page moved to Tools menu
-- Rebranded from "Aura Worker" to "AuraWP"
+- Rebranded from "AuraWP" to "AuraWorker"
 
 ### 1.0.0
 - Initial release

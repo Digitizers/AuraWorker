@@ -1,4 +1,4 @@
-# CLAUDE.md — AuraWP
+# CLAUDE.md — AuraWorker
 
 This file provides context and conventions for AI assistants working in this repository.
 
@@ -6,22 +6,22 @@ This file provides context and conventions for AI assistants working in this rep
 
 ## Project Overview
 
-**AuraWP** is a WordPress plugin that acts as a remote site management agent for the [Aura dashboard](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates (core, plugins, themes, translations), and perform database maintenance.
+**AuraWorker** is a WordPress plugin that acts as a remote site management agent for the [Aura dashboard](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates (core, plugins, themes, translations), and perform database maintenance.
 
 - **Language:** PHP 7.4+
 - **Platform:** WordPress 6.2+
 - **Auth:** Three-layer (WordPress Application Password + Aura Site Token + optional IP Whitelist)
 - **REST Namespace:** `aura/v1`
 - **License:** GPLv2 or later
-- **Text Domain:** `aurawp`
-- **WordPress.org Slug:** `aurawp`
+- **Text Domain:** `aura-worker`
+- **WordPress.org Slug:** `aura-worker`
 
 ---
 
 ## Repository Structure
 
 ```
-AuraWP/                                      # Repo root (development)
+AuraWorker/                                      # Repo root (development)
 ├── CLAUDE.md                                # AI assistant instructions (dev only)
 ├── CHECKLIST.md                             # Development checklist (dev only)
 ├── README.md                                # GitHub readme (dev only)
@@ -32,7 +32,7 @@ AuraWP/                                      # Repo root (development)
 │   ├── banner-1544x500.svg                  # Retina banner
 │   ├── icon-128x128.svg                     # Standard icon
 │   └── icon-256x256.svg                     # Retina icon
-└── aurawp/                                  # ← Clean plugin folder (zip this for installation)
+└── aura-worker/                                  # ← Clean plugin folder (zip this for installation)
     ├── aura-worker.php                      # Plugin entry point, activation/deactivation hooks
     ├── uninstall.php                        # Cleanup on uninstall (removes all options)
     ├── readme.txt                           # WordPress.org plugin readme
@@ -43,7 +43,7 @@ AuraWP/                                      # Repo root (development)
         └── class-aura-worker-security.php   # Three-layer authentication and permission callbacks
 ```
 
-To create an installable ZIP: `cd` to the repo root and run `zip -r aurawp.zip aurawp/`.
+To create an installable ZIP: `cd` to the repo root and run `zip -r aura-worker.zip aura-worker/`.
 
 ---
 
@@ -53,10 +53,10 @@ To create an installable ZIP: `cd` to the repo root and run `zip -r aurawp.zip a
 
 | Class | File | Role |
 |-------|------|------|
-| `Aura_Worker` | `aurawp/includes/class-aura-worker.php` | Orchestrator — creates Security and API instances, registers admin menu and settings |
-| `Aura_Worker_API` | `aurawp/includes/class-aura-worker-api.php` | Registers all REST routes under `aura/v1`, handles request/response logic |
-| `Aura_Worker_Updater` | `aurawp/includes/class-aura-worker-updater.php` | Wraps WordPress Upgrader classes for core/plugin/theme/translation/DB updates |
-| `Aura_Worker_Security` | `aurawp/includes/class-aura-worker-security.php` | Implements IP whitelist, site token verification, and capability checks |
+| `Aura_Worker` | `aura-worker/includes/class-aura-worker.php` | Orchestrator — creates Security and API instances, registers admin menu and settings |
+| `Aura_Worker_API` | `aura-worker/includes/class-aura-worker-api.php` | Registers all REST routes under `aura/v1`, handles request/response logic |
+| `Aura_Worker_Updater` | `aura-worker/includes/class-aura-worker-updater.php` | Wraps WordPress Upgrader classes for core/plugin/theme/translation/DB updates |
+| `Aura_Worker_Security` | `aura-worker/includes/class-aura-worker-security.php` | Implements IP whitelist, site token verification, and capability checks |
 
 ### Initialization Flow
 
@@ -123,7 +123,7 @@ All options are cleaned up in `uninstall.php`.
 - Tabs for indentation (not spaces)
 - Yoda conditions are acceptable but not required
 - All files must start with `if ( ! defined( 'ABSPATH' ) ) { exit; }` guard
-- Use WordPress i18n functions (`__()`, `esc_html_e()`) with text domain `aurawp`
+- Use WordPress i18n functions (`__()`, `esc_html_e()`) with text domain `aura-worker`
 
 ### Naming
 
@@ -185,11 +185,11 @@ There are currently no automated tests. When adding tests:
 
 ## Relationship to Aura
 
-AuraWP is the WordPress-side companion to the [Aura Infrastructure Hub](https://my-aura.app) (Next.js dashboard). Aura manages cloud resources across Cloudways, Hostinger VPS, Cloudflare, and Bunny.net. AuraWP extends that reach into individual WordPress installations, allowing Aura to monitor and update sites remotely.
+AuraWorker is the WordPress-side companion to the [Aura Infrastructure Hub](https://my-aura.app) (Next.js dashboard). Aura manages cloud resources across Cloudways, Hostinger VPS, Cloudflare, and Bunny.net. AuraWorker extends that reach into individual WordPress installations, allowing Aura to monitor and update sites remotely.
 
 The communication flow is:
 ```
-Aura Dashboard → HTTP REST → WordPress (AuraWP plugin)
+Aura Dashboard → HTTP REST → WordPress (AuraWorker plugin)
                   ↑
           Application Password + X-Aura-Token header
 ```
