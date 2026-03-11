@@ -1,8 +1,7 @@
 <?php
 /**
  * Plugin Name:       AuraWP
- * Plugin URI:        https://my-aura.app/wordpress
- * Update URI:        https://my-aura.app/
+ * Plugin URI:        https://my-aura.app
  * Description:       Remote site management agent for Aura dashboard. Enables secure updates, health monitoring, and maintenance operations via REST API.
  * Version:           1.2.0
  * Requires at least: 6.2
@@ -12,7 +11,6 @@
  * License:           GPL v2 or later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       aurawp
- * Domain Path:       /languages
  */
 
 // Prevent direct access.

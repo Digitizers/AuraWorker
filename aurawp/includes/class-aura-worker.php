@@ -52,13 +52,7 @@ class Aura_Worker {
 		}
 		wp_add_privacy_policy_content(
 			'AuraWP',
-			wp_kses_post( wpautop( __(
-				'This site uses the AuraWP plugin to enable remote management from the Aura dashboard (my-aura.app). ' .
-				'When connected, the Aura dashboard may access site health information including WordPress version, ' .
-				'PHP version, installed plugins and themes, and database metadata. No personal user data is collected ' .
-				'or transmitted by this plugin.',
-				'aurawp'
-			) ) )
+			wp_kses_post( wpautop( __( 'This site uses the AuraWP plugin to enable remote management from the Aura dashboard (my-aura.app). When connected, the Aura dashboard may access site health information including WordPress version, PHP version, installed plugins and themes, and database metadata. No personal user data is collected or transmitted by this plugin.', 'aurawp' ) ) )
 		);
 	}
 

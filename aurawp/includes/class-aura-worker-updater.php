@@ -36,7 +36,7 @@ class Aura_Worker_Updater {
 	 */
 	public function get_available_updates( $force_refresh = false ) {
 		// Temporarily increase memory for update checks.
-		@ini_set( 'memory_limit', '256M' );
+		wp_raise_memory_limit( 'admin' );
 
 		// Load required admin files for update functions.
 		if ( ! function_exists( 'get_core_updates' ) ) {
