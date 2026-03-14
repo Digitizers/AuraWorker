@@ -394,20 +394,29 @@ class Aura_Worker_Updater {
 					$db_ver = get_option( 'elementor_version', '0' );
 					return version_compare( $db_ver, ELEMENTOR_VERSION, '<' );
 				},
-				'async'   => true,
 				'run'     => function () {
 					if ( ! class_exists( '\Elementor\Plugin' ) ) {
 						return;
 					}
 					\Elementor\Plugin::instance()->files_manager->clear_cache();
-					// Schedule the upgrade to run via WP-Cron instead of inline.
-					// Elementor's do_upgrade() uses loopback HTTP requests for
-					// batched processing which blocks/hangs in REST API context.
-					if ( ! wp_next_scheduled( 'aura_worker_elementor_upgrade' ) ) {
-						wp_schedule_single_event( time(), 'aura_worker_elementor_upgrade' );
-						// Trigger cron to start processing immediately.
-						spawn_cron();
+
+					$upgrade = \Elementor\Plugin::instance()->upgrade ?? null;
+					if ( ! $upgrade ) {
+						return;
 					}
+
+					// Run upgrade callbacks directly instead of using
+					// do_upgrade() which dispatches a background runner via
+					// loopback HTTP — that blocks in REST API context and
+					// fails when DISABLE_WP_CRON is set.
+					$callbacks = $upgrade->get_upgrade_callbacks();
+					foreach ( $callbacks as $callback ) {
+						if ( is_callable( $callback ) ) {
+							call_user_func( $callback, $upgrade );
+						}
+					}
+
+					$upgrade->on_runner_complete( true );
 				},
 			),
 			'elementor-pro' => array(
@@ -422,16 +431,24 @@ class Aura_Worker_Updater {
 					$db_ver = get_option( 'elementor_pro_version', '0' );
 					return version_compare( $db_ver, ELEMENTOR_PRO_VERSION, '<' );
 				},
-				'async'   => true,
 				'run'     => function () {
 					if ( ! class_exists( '\ElementorPro\Plugin' ) ) {
 						return;
 					}
-					// Schedule via WP-Cron — same reason as Elementor core.
-					if ( ! wp_next_scheduled( 'aura_worker_elementor_pro_upgrade' ) ) {
-						wp_schedule_single_event( time(), 'aura_worker_elementor_pro_upgrade' );
-						spawn_cron();
+
+					$upgrade = \ElementorPro\Plugin::instance()->upgrade ?? null;
+					if ( ! $upgrade ) {
+						return;
 					}
+
+					$callbacks = $upgrade->get_upgrade_callbacks();
+					foreach ( $callbacks as $callback ) {
+						if ( is_callable( $callback ) ) {
+							call_user_func( $callback, $upgrade );
+						}
+					}
+
+					$upgrade->on_runner_complete( true );
 				},
 			),
 			'woocommerce'   => array(
