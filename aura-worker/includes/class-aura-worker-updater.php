@@ -451,6 +451,11 @@ class Aura_Worker_Updater {
 	 * @return array Result with success status.
 	 */
 	public function update_database( $plugin = null ) {
+		// Extend execution time for potentially long migrations.
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 120 );
+		}
+
 		// Plugin-specific migration.
 		if ( $plugin ) {
 			$registry = $this->get_migration_registry();
@@ -477,7 +482,7 @@ class Aura_Worker_Updater {
 
 			try {
 				call_user_func( $entry['run'] );
-			} catch ( \Exception $e ) {
+			} catch ( \Throwable $e ) {
 				return array(
 					'success' => false,
 					'error'   => sprintf(
