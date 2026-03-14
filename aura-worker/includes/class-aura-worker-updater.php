@@ -152,6 +152,65 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * Self-update AuraWorker from a zip URL (e.g. GitHub release asset).
+	 *
+	 * Downloads the zip, overwrites the current plugin files, and reactivates.
+	 *
+	 * @param string $zip_url URL to the plugin zip file.
+	 * @return array Result with success status, message, and version info.
+	 */
+	public function self_update( $zip_url ) {
+		$this->load_upgrade_dependencies();
+
+		$old_version = AURA_WORKER_VERSION;
+		$plugin_file = 'aura-worker/aura-worker.php';
+
+		$skin     = new Automatic_Upgrader_Skin();
+		$upgrader = new Plugin_Upgrader( $skin );
+
+		// Override the upgrader to install from URL, overwriting existing.
+		$result = $upgrader->install( $zip_url, array( 'overwrite_package' => true ) );
+
+		if ( is_wp_error( $result ) ) {
+			return array(
+				'success' => false,
+				'error'   => $result->get_error_message(),
+			);
+		}
+
+		if ( false === $result ) {
+			$messages = $skin->get_upgrade_messages();
+			$last_msg = ! empty( $messages ) ? end( $messages ) : '';
+			return array(
+				'success' => false,
+				'error'   => __( 'Self-update failed — filesystem error.', 'aura-worker' ),
+				'detail'  => $last_msg,
+			);
+		}
+
+		// Ensure the plugin is activated after overwrite.
+		if ( ! is_plugin_active( $plugin_file ) ) {
+			activate_plugin( $plugin_file );
+		}
+
+		// Read new version from the updated file header.
+		$new_data    = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin_file, false, false );
+		$new_version = $new_data['Version'] ?? 'unknown';
+
+		return array(
+			'success'      => true,
+			'message'      => sprintf(
+				/* translators: %1$s: old version, %2$s: new version */
+				__( 'AuraWorker updated from %1$s to %2$s.', 'aura-worker' ),
+				$old_version,
+				$new_version
+			),
+			'old_version'  => $old_version,
+			'new_version'  => $new_version,
+		);
+	}
+
+	/**
 	 * Update a specific plugin.
 	 *
 	 * @param string $plugin_file Plugin file path (e.g., "akismet/akismet.php").

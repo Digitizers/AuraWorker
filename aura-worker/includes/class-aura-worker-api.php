@@ -119,6 +119,25 @@ class Aura_Worker_API {
 			'permission_callback' => array( $this->security, 'check_read_permission' ),
 		) );
 
+		// Self-update AuraWorker from a zip URL.
+		register_rest_route( self::NAMESPACE, '/self-update', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'self_update' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'zip_url' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'esc_url_raw',
+					'validate_callback' => function( $value ) {
+						return filter_var( $value, FILTER_VALIDATE_URL )
+							&& preg_match( '#^https://github\.com/Digitizers/AuraWorker/releases/download/.+\.zip$#', $value );
+					},
+					'description'       => __( 'GitHub release zip URL for AuraWorker.', 'aura-worker' ),
+				),
+			),
+		) );
+
 		// Update database tables (core or plugin-specific).
 		register_rest_route( self::NAMESPACE, '/update/database', array(
 			'methods'             => 'POST',
@@ -303,6 +322,21 @@ class Aura_Worker_API {
 	public function get_database_status( $request ) {
 		$status = $this->updater->get_database_status();
 		return rest_ensure_response( $status );
+	}
+
+	/**
+	 * POST /aura/v1/self-update
+	 *
+	 * Updates the AuraWorker plugin from a GitHub release zip URL.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Update result with version info.
+	 */
+	public function self_update( $request ) {
+		$zip_url = $request->get_param( 'zip_url' );
+		$result  = $this->updater->self_update( $zip_url );
+		$status  = $result['success'] ? 200 : 500;
+		return new WP_REST_Response( $result, $status );
 	}
 
 	/**
