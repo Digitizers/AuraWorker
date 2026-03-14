@@ -3,7 +3,7 @@
  * Plugin Name:       AuraWorker
  * Plugin URI:        https://my-aura.app
  * Description:       Remote site management agent for Aura dashboard. Enables secure updates, health monitoring, and maintenance operations via REST API.
- * Version:           1.3.0-beta.4
+ * Version:           1.3.0-beta.5
  * Requires at least: 6.2
  * Requires PHP:      7.4
  * Author:            Digitizer
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'AURA_WORKER_VERSION', '1.3.0-beta.4' );
+define( 'AURA_WORKER_VERSION', '1.3.0-beta.5' );
 define( 'AURA_WORKER_FILE', __FILE__ );
 define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -36,6 +36,18 @@ function aura_worker_init() {
 	$plugin->init();
 }
 add_action( 'plugins_loaded', 'aura_worker_init' );
+
+// WP-Cron hooks for deferred Elementor database migrations.
+add_action( 'aura_worker_elementor_upgrade', function () {
+	if ( class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::instance()->upgrade ) ) {
+		\Elementor\Plugin::instance()->upgrade->do_upgrade();
+	}
+} );
+add_action( 'aura_worker_elementor_pro_upgrade', function () {
+	if ( class_exists( '\ElementorPro\Plugin' ) && isset( \ElementorPro\Plugin::instance()->upgrade ) ) {
+		\ElementorPro\Plugin::instance()->upgrade->do_upgrade();
+	}
+} );
 
 /**
  * Activation hook.

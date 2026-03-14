@@ -4,7 +4,7 @@ Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.3.0-beta.4
+Stable tag: 1.3.0-beta.5
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -73,6 +73,9 @@ Your Aura dashboard will no longer be able to communicate with this site. No dat
 2. Connection test section — verify your API endpoint and plugin version
 
 == Changelog ==
+
+= 1.3.0-beta.5 =
+* Fix: Elementor migrations now deferred to WP-Cron instead of running inline — prevents REST API timeout from loopback HTTP blocking
 
 = 1.3.0-beta.4 =
 * Feature: Self-update endpoint (POST /self-update) — update AuraWorker from a GitHub release zip URL

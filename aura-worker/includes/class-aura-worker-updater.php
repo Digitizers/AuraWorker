@@ -400,11 +400,14 @@ class Aura_Worker_Updater {
 						return;
 					}
 					\Elementor\Plugin::instance()->files_manager->clear_cache();
-					if ( isset( \Elementor\Plugin::instance()->upgrade ) ) {
-						\Elementor\Plugin::instance()->upgrade->do_upgrade();
+					// Schedule the upgrade to run via WP-Cron instead of inline.
+					// Elementor's do_upgrade() uses loopback HTTP requests for
+					// batched processing which blocks/hangs in REST API context.
+					if ( ! wp_next_scheduled( 'aura_worker_elementor_upgrade' ) ) {
+						wp_schedule_single_event( time(), 'aura_worker_elementor_upgrade' );
+						// Trigger cron to start processing immediately.
+						spawn_cron();
 					}
-					// Do NOT set elementor_version here — Elementor's
-					// on_runner_complete() handles it after background tasks finish.
 				},
 			),
 			'elementor-pro' => array(
@@ -424,11 +427,11 @@ class Aura_Worker_Updater {
 					if ( ! class_exists( '\ElementorPro\Plugin' ) ) {
 						return;
 					}
-					if ( isset( \ElementorPro\Plugin::instance()->upgrade ) ) {
-						\ElementorPro\Plugin::instance()->upgrade->do_upgrade();
+					// Schedule via WP-Cron — same reason as Elementor core.
+					if ( ! wp_next_scheduled( 'aura_worker_elementor_pro_upgrade' ) ) {
+						wp_schedule_single_event( time(), 'aura_worker_elementor_pro_upgrade' );
+						spawn_cron();
 					}
-					// Do NOT set elementor_pro_version here — Elementor Pro's
-					// on_runner_complete() handles it after background tasks finish.
 				},
 			),
 			'woocommerce'   => array(
