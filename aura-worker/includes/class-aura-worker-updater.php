@@ -335,6 +335,7 @@ class Aura_Worker_Updater {
 					$db_ver = get_option( 'elementor_version', '0' );
 					return version_compare( $db_ver, ELEMENTOR_VERSION, '<' );
 				},
+				'async'   => true,
 				'run'     => function () {
 					if ( ! class_exists( '\Elementor\Plugin' ) ) {
 						return;
@@ -343,7 +344,8 @@ class Aura_Worker_Updater {
 					if ( isset( \Elementor\Plugin::instance()->upgrade ) ) {
 						\Elementor\Plugin::instance()->upgrade->do_upgrade();
 					}
-					update_option( 'elementor_version', ELEMENTOR_VERSION );
+					// Do NOT set elementor_version here — Elementor's
+					// on_runner_complete() handles it after background tasks finish.
 				},
 			),
 			'elementor-pro' => array(
@@ -358,6 +360,7 @@ class Aura_Worker_Updater {
 					$db_ver = get_option( 'elementor_pro_version', '0' );
 					return version_compare( $db_ver, ELEMENTOR_PRO_VERSION, '<' );
 				},
+				'async'   => true,
 				'run'     => function () {
 					if ( ! class_exists( '\ElementorPro\Plugin' ) ) {
 						return;
@@ -365,7 +368,8 @@ class Aura_Worker_Updater {
 					if ( isset( \ElementorPro\Plugin::instance()->upgrade ) ) {
 						\ElementorPro\Plugin::instance()->upgrade->do_upgrade();
 					}
-					update_option( 'elementor_pro_version', ELEMENTOR_PRO_VERSION );
+					// Do NOT set elementor_pro_version here — Elementor Pro's
+					// on_runner_complete() handles it after background tasks finish.
 				},
 			),
 			'woocommerce'   => array(
@@ -480,6 +484,8 @@ class Aura_Worker_Updater {
 				);
 			}
 
+			$is_async = ! empty( $entry['async'] );
+
 			try {
 				call_user_func( $entry['run'] );
 			} catch ( \Throwable $e ) {
@@ -490,6 +496,18 @@ class Aura_Worker_Updater {
 						__( '%1$s migration failed: %2$s', 'aura-worker' ),
 						$entry['label'],
 						$e->getMessage()
+					),
+				);
+			}
+
+			if ( $is_async ) {
+				return array(
+					'success' => true,
+					'async'   => true,
+					'message' => sprintf(
+						/* translators: %s: Plugin label */
+						__( '%s database migration triggered. It will complete in the background — poll database-status to check progress.', 'aura-worker' ),
+						$entry['label']
 					),
 				);
 			}
