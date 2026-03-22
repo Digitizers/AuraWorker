@@ -163,7 +163,7 @@ class Aura_Worker_Updater {
 		$this->load_upgrade_dependencies();
 
 		$old_version = AURA_WORKER_VERSION;
-		$plugin_file = 'aura-worker/aura-worker.php';
+		$plugin_file = 'digitizer-site-worker/digitizer-site-worker.php';
 
 		$skin     = new Automatic_Upgrader_Skin();
 		$upgrader = new Plugin_Upgrader( $skin );
@@ -183,7 +183,7 @@ class Aura_Worker_Updater {
 			$last_msg = ! empty( $messages ) ? end( $messages ) : '';
 			return array(
 				'success' => false,
-				'error'   => __( 'Self-update failed — filesystem error.', 'aura-worker' ),
+				'error'   => __( 'Self-update failed — filesystem error.', 'digitizer-site-worker' ),
 				'detail'  => $last_msg,
 			);
 		}
@@ -201,7 +201,7 @@ class Aura_Worker_Updater {
 			'success'      => true,
 			'message'      => sprintf(
 				/* translators: %1$s: old version, %2$s: new version */
-				__( 'AuraWorker updated from %1$s to %2$s.', 'aura-worker' ),
+				__( 'AuraWorker updated from %1$s to %2$s.', 'digitizer-site-worker' ),
 				$old_version,
 				$new_version
 			),
@@ -233,20 +233,20 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Update failed. The plugin may not have an update available.', 'aura-worker' ),
+				'error'   => __( 'Update failed. The plugin may not have an update available.', 'digitizer-site-worker' ),
 			);
 		}
 
 		if ( null === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'No update available for this plugin.', 'aura-worker' ),
+				'error'   => __( 'No update available for this plugin.', 'digitizer-site-worker' ),
 			);
 		}
 
 		return array(
 			'success' => true,
-			'message' => __( 'Plugin updated successfully.', 'aura-worker' ),
+			'message' => __( 'Plugin updated successfully.', 'digitizer-site-worker' ),
 		);
 	}
 
@@ -273,20 +273,20 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Update failed. The theme may not have an update available.', 'aura-worker' ),
+				'error'   => __( 'Update failed. The theme may not have an update available.', 'digitizer-site-worker' ),
 			);
 		}
 
 		if ( null === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'No update available for this theme.', 'aura-worker' ),
+				'error'   => __( 'No update available for this theme.', 'digitizer-site-worker' ),
 			);
 		}
 
 		return array(
 			'success' => true,
-			'message' => __( 'Theme updated successfully.', 'aura-worker' ),
+			'message' => __( 'Theme updated successfully.', 'digitizer-site-worker' ),
 		);
 	}
 
@@ -303,7 +303,7 @@ class Aura_Worker_Updater {
 		if ( empty( $updates ) || ! is_array( $updates ) || 'latest' === $updates[0]->response ) {
 			return array(
 				'success' => true,
-				'message' => __( 'WordPress is already up to date.', 'aura-worker' ),
+				'message' => __( 'WordPress is already up to date.', 'digitizer-site-worker' ),
 			);
 		}
 
@@ -322,7 +322,7 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Core update failed (filesystem error).', 'aura-worker' ),
+				'error'   => __( 'Core update failed (filesystem error).', 'digitizer-site-worker' ),
 			);
 		}
 
@@ -330,7 +330,7 @@ class Aura_Worker_Updater {
 			'success' => true,
 			'message' => sprintf(
 				/* translators: %s: WordPress version */
-				__( 'WordPress updated to %s.', 'aura-worker' ),
+				__( 'WordPress updated to %s.', 'digitizer-site-worker' ),
 				$update->version
 			),
 		);
@@ -351,7 +351,7 @@ class Aura_Worker_Updater {
 		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => __( 'Translation update failed.', 'aura-worker' ),
+				'error'   => __( 'Translation update failed.', 'digitizer-site-worker' ),
 			);
 		}
 
@@ -361,7 +361,7 @@ class Aura_Worker_Updater {
 			'success' => true,
 			'message' => sprintf(
 				/* translators: %d: number of translations updated */
-				__( '%d translation(s) updated.', 'aura-worker' ),
+				__( '%d translation(s) updated.', 'digitizer-site-worker' ),
 				$updated_count
 			),
 		);
@@ -546,7 +546,7 @@ class Aura_Worker_Updater {
 			if ( ! isset( $registry[ $plugin ] ) ) {
 				return array(
 					'success' => false,
-					'error'   => __( 'Unknown plugin migration key.', 'aura-worker' ),
+					'error'   => __( 'Unknown plugin migration key.', 'digitizer-site-worker' ),
 				);
 			}
 
@@ -557,7 +557,7 @@ class Aura_Worker_Updater {
 					'success' => false,
 					'error'   => sprintf(
 						/* translators: %s: Plugin label */
-						__( '%s is not installed or active.', 'aura-worker' ),
+						__( '%s is not installed or active.', 'digitizer-site-worker' ),
 						$entry['label']
 					),
 				);
@@ -572,7 +572,7 @@ class Aura_Worker_Updater {
 					'success' => false,
 					'error'   => sprintf(
 						/* translators: %1$s: Plugin label, %2$s: Error message */
-						__( '%1$s migration failed: %2$s', 'aura-worker' ),
+						__( '%1$s migration failed: %2$s', 'digitizer-site-worker' ),
 						$entry['label'],
 						$e->getMessage()
 					),
@@ -585,7 +585,7 @@ class Aura_Worker_Updater {
 					'async'   => true,
 					'message' => sprintf(
 						/* translators: %s: Plugin label */
-						__( '%s database migration triggered. It will complete in the background — poll database-status to check progress.', 'aura-worker' ),
+						__( '%s database migration triggered. It will complete in the background — poll database-status to check progress.', 'digitizer-site-worker' ),
 						$entry['label']
 					),
 				);
@@ -595,7 +595,7 @@ class Aura_Worker_Updater {
 				'success' => true,
 				'message' => sprintf(
 					/* translators: %s: Plugin label */
-					__( '%s database migration completed.', 'aura-worker' ),
+					__( '%s database migration completed.', 'digitizer-site-worker' ),
 					$entry['label']
 				),
 			);
@@ -610,7 +610,7 @@ class Aura_Worker_Updater {
 
 		return array(
 			'success'    => true,
-			'message'    => __( 'Database tables updated.', 'aura-worker' ),
+			'message'    => __( 'Database tables updated.', 'digitizer-site-worker' ),
 			'db_before'  => $db_version_before,
 			'db_after'   => $db_version_after,
 			'changed'    => $db_version_before !== $db_version_after,
