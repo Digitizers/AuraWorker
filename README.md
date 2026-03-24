@@ -21,7 +21,7 @@
 
 ---
 
-## What is AuraWorker?
+## What is Digitizer Site Worker?
 
 Digitizer Site Worker is a remote management agent that runs on your WordPress sites and communicates with the [Aura Infrastructure Hub](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates, and perform maintenance — all from a single centralized interface.
 
@@ -78,7 +78,7 @@ wp plugin install https://github.com/Digitizers/AuraWorker/releases/latest/downl
 ### Connect to Aura
 
 1. In the Aura dashboard, add your WordPress site as a resource
-2. Enter the site URL and the **Site Token** from the AuraWorker settings page
+2. Enter the site URL and the **Site Token** from the Digitizer Site Worker settings page
 3. Configure a WordPress **Application Password** for API authentication
 4. (Optional) Add the Aura server's IP to the **IP Whitelist** for extra security
 
@@ -116,7 +116,7 @@ Pending approval on WordPress.org as `digitizer-site-worker`.
 ## Architecture
 
 ```
-AuraWorker/
+digitizer-site-worker/
 ├── digitizer-site-worker.php                # Plugin entry point
 ├── uninstall.php                            # Cleanup on uninstall
 ├── readme.txt                               # WordPress.org readme
@@ -160,7 +160,7 @@ AuraWorker/
 ## FAQ
 
 **Does this plugin slow down my site?**
-No. AuraWorker only registers REST API endpoints. It has zero impact on frontend performance.
+No. Digitizer Site Worker only registers REST API endpoints. It has zero impact on frontend performance.
 
 **What happens if I deactivate the plugin?**
 The Aura dashboard will no longer be able to communicate with the site. No data is lost — reactivate to reconnect.
@@ -189,7 +189,7 @@ Yes. All endpoints require three layers of authentication. No actions can be per
 - Memory optimization for update operations (auto-scales to 256MB)
 - Transient caching for update checks
 - Settings page moved to Tools menu
-- Rebranded from "AuraWP" to "AuraWorker"
+- Rebranded from "AuraWP" to "AuraWorker" to "Digitizer Site Worker for Aura"
 
 ### 1.0.0
 - Initial release
@@ -207,3 +207,11 @@ GPLv2 or later — [License](https://www.gnu.org/licenses/gpl-2.0.html)
 ---
 
 Built with care by [Digitizer](https://www.digitizer.studio) for the [Aura](https://my-aura.app) ecosystem
+
+### 1.3.0
+
+- Rebranded from "AuraWorker" to "Digitizer Site Worker for Aura"
+- New slug: `digitizer-site-worker`
+- Updated text domain, directory name, and all references
+- Pending WordPress.org approval
+- GitHub Release: [v1.3.0](https://github.com/Digitizers/AuraWorker/releases/tag/v1.3.0)

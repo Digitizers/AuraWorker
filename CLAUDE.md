@@ -21,7 +21,7 @@ This file provides context and conventions for AI assistants working in this rep
 ## Repository Structure
 
 ```
-AuraWorker/                                      # Repo root (development)
+digitizer-site-worker/                                      # Repo root (development)
 ├── CLAUDE.md                                # AI assistant instructions (dev only)
 ├── CHECKLIST.md                             # Development checklist (dev only)
 ├── README.md                                # GitHub readme (dev only)
@@ -43,7 +43,7 @@ AuraWorker/                                      # Repo root (development)
         └── class-aura-worker-security.php   # Three-layer authentication and permission callbacks
 ```
 
-To create an installable ZIP: `cd` to the repo root and run `zip -r aura-worker.zip aura-worker/`.
+To create an installable ZIP: `cd` to the repo root and run `zip -r digitizer-site-worker.zip digitizer-site-worker/`.
 
 ---
 
