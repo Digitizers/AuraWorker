@@ -1,17 +1,17 @@
-# AuraWorker — WordPress.org Submission Checklist
+# Digitizer Site Worker for Aura — WordPress.org Submission Checklist
 
-Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.org plugin directory.
+Pre-submission verification for publishing Digitizer Site Worker for Aura v1.3.0 to the WordPress.org plugin directory.
 
 ---
 
 ## Code Verification
 
-- [x] Text domain is `aura-worker` in all `__()`, `_e()`, `esc_html__()`, `esc_html_e()` calls
-- [x] Text domain in plugin header matches: `Text Domain: aura-worker`
+- [x] Text domain is `digitizer-site-worker` in all `__()`, `_e()`, `esc_html__()`, `esc_html_e()` calls
+- [x] Text domain in plugin header matches: `Text Domain: digitizer-site-worker`
 - [x] No remaining references to old text domain `aurawp` in PHP strings
-- [x] Version alignment: plugin header `Version: 1.2.0` = `AURA_WORKER_VERSION` constant = `Stable tag: 1.2.0` in readme.txt
+- [x] Version alignment: plugin header `Version: 1.3.0` = `DIGITIZER_SITE_WORKER_VERSION` constant = `Stable tag: 1.3.0` in readme.txt
 - [x] All files have `if ( ! defined( 'ABSPATH' ) ) { exit; }` guard
-- [x] `uninstall.php` cleans up all `aura_worker_*` options
+- [x] `uninstall.php` cleans up all `digitizer_site_worker_*` options
 - [x] `wp_add_privacy_policy_content()` is hooked and working
 - [x] No `flush_rewrite_rules()` calls present
 - [x] All SQL uses `$wpdb->prepare()`
@@ -40,7 +40,7 @@ Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.or
 - [x] `Domain Path` header removed (no languages directory)
 - [x] `@ini_set()` replaced with `wp_raise_memory_limit('admin')`
 - [x] `phpcs:ignore` added for `SHOW TABLES` direct query
-- [x] Renamed from AuraWP/aurawp to AuraWorker/aura-worker (trademark fix)
+- [x] Renamed from AuraWorker/aura-worker to Digitizer Site Worker/digitizer-site-worker (branding fix)
 - [x] Re-run PCP — confirm 0 errors, 0 warnings
 
 ## External Pages (Aura Dashboard)
@@ -60,7 +60,7 @@ Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.or
 
 ## Build & Test
 
-- [x] Build clean ZIP — GitHub Action attaches `aura-worker.zip` to release automatically
+- [x] Build clean ZIP — GitHub Action attaches `digitizer-site-worker-v1.3.0.zip` to release automatically
 - [x] Test fresh install on clean WordPress site
 - [x] Test activation → settings page → site token generated
 - [x] Test REST endpoints respond with valid auth
@@ -82,8 +82,8 @@ Pre-submission verification for publishing AuraWorker v1.2.0 to the WordPress.or
 
 ## Post-Approval (SVN)
 
-- [ ] Check out SVN repo: `svn co https://plugins.svn.wordpress.org/aura-worker`
+- [ ] Check out SVN repo: `svn co https://plugins.svn.wordpress.org/digitizer-site-worker`
 - [ ] Copy plugin files to `trunk/` (flat structure, no dev files)
 - [ ] Copy asset PNGs to `assets/` with `svn:mime-type image/png`
-- [ ] Initial commit: `svn ci -m "Initial release v1.2.0"`
-- [ ] Tag release: `svn cp trunk tags/1.2.0 && svn ci -m "Tagging v1.2.0"`
+- [ ] Initial commit: `svn ci -m "Initial release v1.3.0"`
+- [ ] Tag release: `svn cp trunk tags/1.3.0 && svn ci -m "Tagging v1.3.0"`

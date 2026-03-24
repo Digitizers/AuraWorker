@@ -5,7 +5,7 @@
   <img src="assets/aura_logotype.png" alt="Aura" width="160" />
 </p>
 
-<h3 align="center">AuraWorker &mdash; WordPress Site Agent</h3>
+<h3 align="center">Digitizer Site Worker for Aura</h3>
 
 <p align="center">
   Lightweight WordPress plugin that connects your sites to the<br/>
@@ -16,16 +16,16 @@
   <img src="https://img.shields.io/badge/WordPress-6.2%2B-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
   <img src="https://img.shields.io/badge/License-GPLv2-blue" alt="License" />
-  <img src="https://img.shields.io/badge/Version-1.2.0-green" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-1.3.0-green" alt="Version" />
 </p>
 
 ---
 
 ## What is AuraWorker?
 
-AuraWorker is a remote management agent that runs on your WordPress sites and communicates with the [Aura dashboard](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates, and perform maintenance — all from a single centralized interface.
+Digitizer Site Worker is a remote management agent that runs on your WordPress sites and communicates with the [Aura Infrastructure Hub](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates, and perform maintenance — all from a single centralized interface.
 
-> **Aura** is a full-stack, multi-provider infrastructure dashboard that unifies server, application, DNS, and CDN management across **Cloudways**, **Hostinger VPS**, **Cloudflare**, and **Bunny.net**. AuraWorker extends that reach directly into your WordPress installations.
+> **Aura** is a full-stack, multi-provider infrastructure dashboard that unifies server, application, DNS, and CDN management across **Cloudways**, **Hostinger VPS**, **Cloudflare**, and **Bunny.net**. The plugin extends that reach directly into your WordPress installations.
 
 ---
 
@@ -42,7 +42,7 @@ AuraWorker is a remote management agent that runs on your WordPress sites and co
 
 ### Zero Frontend Impact
 
-AuraWorker only loads its REST API routes. It adds nothing to your site's frontend — no scripts, no styles, no database queries on page load.
+Digitizer Site Worker only loads its REST API routes. It adds nothing to your site's frontend — no scripts, no styles, no database queries on page load.
 
 ---
 
@@ -62,12 +62,18 @@ All three layers must pass before any request is processed.
 
 ## Installation
 
+### WP CLI
+
+```bash
+wp plugin install https://github.com/Digitizers/AuraWorker/releases/latest/download/digitizer-site-worker-v1.3.0.zip --activate
+```
+
 ### Manual Upload
 
-1. Download the latest release
-2. Upload the `AuraWorker` folder to `/wp-content/plugins/`
+1. Download the latest release (`digitizer-site-worker-v1.3.0.zip`)
+2. Upload the `digitizer-site-worker` folder to `/wp-content/plugins/`
 3. Activate the plugin via **Plugins** in your WordPress admin
-4. Navigate to **Tools &rarr; AuraWorker** to view your site token
+4. Navigate to **Tools &rarr; Digitizer Site Worker** to view your site token
 
 ### Connect to Aura
 
@@ -101,11 +107,17 @@ All endpoints are registered under `/wp-json/aura/v1/`.
 
 ---
 
+## Pending WordPress.org Approval
+
+Pending approval on WordPress.org as `digitizer-site-worker`.
+
+---
+
 ## Architecture
 
 ```
 AuraWorker/
-├── aura-worker.php                          # Plugin entry point
+├── digitizer-site-worker.php                # Plugin entry point
 ├── uninstall.php                            # Cleanup on uninstall
 ├── readme.txt                               # WordPress.org readme
 └── includes/
@@ -127,7 +139,7 @@ AuraWorker/
       <p><sub>Next.js &middot; TypeScript &middot; Prisma &middot; PostgreSQL</sub></p>
     </td>
     <td width="50%" valign="top">
-      <h4>AuraWorker &mdash; WordPress Agent</h4>
+      <h4>Digitizer Site Worker &mdash; WordPress Agent</h4>
       <p>This plugin. Installed on each WordPress site to enable remote health monitoring, updates, and maintenance from the Aura dashboard.</p>
       <p><sub>PHP &middot; WordPress REST API</sub></p>
     </td>

@@ -1,4 +1,4 @@
-# CLAUDE.md — AuraWorker
+# CLAUDE.md — Digitizer Site Worker for Aura
 
 This file provides context and conventions for AI assistants working in this repository.
 
@@ -6,15 +6,15 @@ This file provides context and conventions for AI assistants working in this rep
 
 ## Project Overview
 
-**AuraWorker** is a WordPress plugin that acts as a remote site management agent for the [Aura dashboard](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates (core, plugins, themes, translations), and perform database maintenance.
+**Digitizer Site Worker for Aura** is a WordPress plugin that acts as a remote site management agent for the [Aura Infrastructure Hub](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates (core, plugins, themes, translations), and perform database maintenance.
 
 - **Language:** PHP 7.4+
 - **Platform:** WordPress 6.2+
 - **Auth:** Three-layer (WordPress Application Password + Aura Site Token + optional IP Whitelist)
 - **REST Namespace:** `aura/v1`
 - **License:** GPLv2 or later
-- **Text Domain:** `aura-worker`
-- **WordPress.org Slug:** `aura-worker`
+- **Text Domain:** `digitizer-site-worker`
+- **WordPress.org Slug:** `digitizer-site-worker`
 
 ---
 
@@ -32,8 +32,8 @@ AuraWorker/                                      # Repo root (development)
 │   ├── banner-1544x500.svg                  # Retina banner
 │   ├── icon-128x128.svg                     # Standard icon
 │   └── icon-256x256.svg                     # Retina icon
-└── aura-worker/                                  # ← Clean plugin folder (zip this for installation)
-    ├── aura-worker.php                      # Plugin entry point, activation/deactivation hooks
+└── digitizer-site-worker/                                  # ← Clean plugin folder (zip this for installation)
+    ├── digitizer-site-worker.php                      # Plugin entry point, activation/deactivation hooks
     ├── uninstall.php                        # Cleanup on uninstall (removes all options)
     ├── readme.txt                           # WordPress.org plugin readme
     └── includes/
@@ -53,17 +53,17 @@ To create an installable ZIP: `cd` to the repo root and run `zip -r aura-worker.
 
 | Class | File | Role |
 |-------|------|------|
-| `Aura_Worker` | `aura-worker/includes/class-aura-worker.php` | Orchestrator — creates Security and API instances, registers admin menu and settings |
-| `Aura_Worker_API` | `aura-worker/includes/class-aura-worker-api.php` | Registers all REST routes under `aura/v1`, handles request/response logic |
-| `Aura_Worker_Updater` | `aura-worker/includes/class-aura-worker-updater.php` | Wraps WordPress Upgrader classes for core/plugin/theme/translation/DB updates |
-| `Aura_Worker_Security` | `aura-worker/includes/class-aura-worker-security.php` | Implements IP whitelist, site token verification, and capability checks |
+| `Digitizer_Site_Worker` | `digitizer-site-worker/includes/class-digitizer-site-worker.php` | Orchestrator — creates Security and API instances, registers admin menu and settings |
+| `Digitizer_Site_Worker_API` | `digitizer-site-worker/includes/class-digitizer-site-worker-api.php` | Registers all REST routes under `aura/v1`, handles request/response logic |
+| `Digitizer_Site_Worker_Updater` | `digitizer-site-worker/includes/class-digitizer-site-worker-updater.php` | Wraps WordPress Upgrader classes for core/plugin/theme/translation/DB updates |
+| `Digitizer_Site_Worker_Security` | `digitizer-site-worker/includes/class-digitizer-site-worker-security.php` | Implements IP whitelist, site token verification, and capability checks |
 
 ### Initialization Flow
 
-1. `aura-worker.php` defines constants and loads all class files
-2. `aura_worker_init()` runs on `plugins_loaded` — creates `Aura_Worker` and calls `init()`
-3. `init()` creates `Aura_Worker_Security`, passes it to `Aura_Worker_API`
-4. `Aura_Worker_API` internally creates its own `Aura_Worker_Updater` instance
+1. `digitizer-site-worker.php` defines constants and loads all class files
+2. `digitizer_site_worker_init()` runs on `plugins_loaded` — creates `Digitizer_Site_Worker` and calls `init()`
+3. `init()` creates `Digitizer_Site_Worker_Security`, passes it to `Digitizer_Site_Worker_API`
+4. `Digitizer_Site_Worker_API` internally creates its own `Digitizer_Site_Worker_Updater` instance
 5. REST routes are registered on `rest_api_init`
 6. Admin settings page is registered on `admin_menu` / `admin_init` (admin only)
 
@@ -105,11 +105,11 @@ All routes are under `/wp-json/aura/v1/`.
 
 | Option Key | Description |
 |------------|-------------|
-| `aura_worker_site_token` | 32-char alphanumeric token for API auth |
-| `aura_worker_allowed_ips` | Newline-separated IP whitelist (empty = allow all) |
-| `aura_worker_allowed_domains` | Newline-separated domain whitelist (empty = allow all) |
-| `aura_worker_activated` | Activation timestamp |
-| `aura_worker_version` | Plugin version at activation |
+| `digitizer_site_worker_site_token` | 32-char alphanumeric token for API auth |
+| `digitizer_site_worker_allowed_ips` | Newline-separated IP whitelist (empty = allow all) |
+| `digitizer_site_worker_allowed_domains` | Newline-separated domain whitelist (empty = allow all) |
+| `digitizer_site_worker_activated` | Activation timestamp |
+| `digitizer_site_worker_version` | Plugin version at activation |
 
 All options are cleaned up in `uninstall.php`.
 
@@ -123,17 +123,17 @@ All options are cleaned up in `uninstall.php`.
 - Tabs for indentation (not spaces)
 - Yoda conditions are acceptable but not required
 - All files must start with `if ( ! defined( 'ABSPATH' ) ) { exit; }` guard
-- Use WordPress i18n functions (`__()`, `esc_html_e()`) with text domain `aura-worker`
+- Use WordPress i18n functions (`__()`, `esc_html_e()`) with text domain `digitizer-site-worker`
 
 ### Naming
 
 | Kind | Convention | Example |
 |------|-----------|---------|
-| Classes | `Aura_Worker_*` prefix | `Aura_Worker_Security` |
-| Files | `class-aura-worker-*.php` | `class-aura-worker-api.php` |
-| Functions (global) | `aura_worker_*` prefix | `aura_worker_activate` |
-| Options | `aura_worker_*` prefix | `aura_worker_site_token` |
-| Constants | `AURA_WORKER_*` | `AURA_WORKER_VERSION` |
+| Classes | `Digitizer_Site_Worker_*` prefix | `Digitizer_Site_Worker_Security` |
+| Files | `class-digitizer-site-worker-*.php` | `class-digitizer-site-worker-api.php` |
+| Functions (global) | `digitizer_site_worker_*` prefix | `digitizer_site_worker_activate` |
+| Options | `digitizer_site_worker_*` prefix | `digitizer_site_worker_site_token` |
+| Constants | `DIGITIZER_SITE_WORKER_*` | `DIGITIZER_SITE_WORKER_VERSION` |
 | REST namespace | `aura/v1` | — |
 | Settings group | `aura_worker_settings` | — |
 
@@ -185,11 +185,11 @@ There are currently no automated tests. When adding tests:
 
 ## Relationship to Aura
 
-AuraWorker is the WordPress-side companion to the [Aura Infrastructure Hub](https://my-aura.app) (Next.js dashboard). Aura manages cloud resources across Cloudways, Hostinger VPS, Cloudflare, and Bunny.net. AuraWorker extends that reach into individual WordPress installations, allowing Aura to monitor and update sites remotely.
+Digitizer Site Worker for Aura is the WordPress-side companion to the [Aura Infrastructure Hub](https://my-aura.app) (Next.js dashboard). Aura manages cloud resources across Cloudways, Hostinger VPS, Cloudflare, and Bunny.net. Digitizer Site Worker for Aura extends that reach into individual WordPress installations, allowing Aura to monitor and update sites remotely.
 
 The communication flow is:
 ```
-Aura Dashboard → HTTP REST → WordPress (AuraWorker plugin)
+Aura Dashboard → HTTP REST → WordPress (Digitizer Site Worker for Aura plugin)
                   ↑
           Application Password + X-Aura-Token header
 ```
