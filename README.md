@@ -172,6 +172,14 @@ Yes. All endpoints require three layers of authentication. No actions can be per
 
 ## Changelog
 
+### 1.3.0
+
+- Rebranded from "AuraWorker" to "Digitizer Site Worker for Aura"
+- New slug: `digitizer-site-worker`
+- Updated text domain, directory name, and all references
+- Pending WordPress.org approval
+- GitHub Release: [v1.3.0](https://github.com/Digitizers/AuraWorker/releases/tag/v1.3.0)
+
 ### 1.2.0
 - Security: Fix IP whitelist bypass — now uses only `REMOTE_ADDR`
 - Security: Standardize capability checks to `manage_options` for all endpoints
@@ -207,11 +215,3 @@ GPLv2 or later — [License](https://www.gnu.org/licenses/gpl-2.0.html)
 ---
 
 Built with care by [Digitizer](https://www.digitizer.studio) for the [Aura](https://my-aura.app) ecosystem
-
-### 1.3.0
-
-- Rebranded from "AuraWorker" to "Digitizer Site Worker for Aura"
-- New slug: `digitizer-site-worker`
-- Updated text domain, directory name, and all references
-- Pending WordPress.org approval
-- GitHub Release: [v1.3.0](https://github.com/Digitizers/AuraWorker/releases/tag/v1.3.0)
