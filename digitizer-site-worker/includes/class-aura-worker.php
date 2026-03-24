@@ -51,8 +51,8 @@ class Aura_Worker {
 			return;
 		}
 		wp_add_privacy_policy_content(
-			'AuraWorker',
-			wp_kses_post( wpautop( __( 'This site uses the AuraWorker plugin to enable remote management from the Aura dashboard (my-aura.app). When connected, the Aura dashboard may access site health information including WordPress version, PHP version, installed plugins and themes, and database metadata. No personal user data is collected or transmitted by this plugin.', 'aura-worker' ) ) )
+			'Digitizer Site Worker',
+			wp_kses_post( wpautop( __( 'This site uses the AuraWorker plugin to enable remote management from the Aura dashboard (my-aura.app). When connected, the Aura dashboard may access site health information including WordPress version, PHP version, installed plugins and themes, and database metadata. No personal user data is collected or transmitted by this plugin.', 'digitizer-site-worker' ) ) )
 		);
 	}
 
@@ -61,10 +61,10 @@ class Aura_Worker {
 	 */
 	public function add_settings_page() {
 		add_options_page(
-			__( 'AuraWorker', 'aura-worker' ),
-			__( 'AuraWorker', 'aura-worker' ),
+			__( 'Digitizer Site Worker', 'digitizer-site-worker' ),
+			__( 'Digitizer Site Worker', 'digitizer-site-worker' ),
 			'manage_options',
-			'aura-worker',
+			'digitizer-site-worker',
 			array( $this, 'render_settings_page' )
 		);
 	}
@@ -93,32 +93,32 @@ class Aura_Worker {
 
 		add_settings_section(
 			'aura_worker_main',
-			__( 'Connection Settings', 'aura-worker' ),
+			__( 'Connection Settings', 'digitizer-site-worker' ),
 			null,
-			'aura-worker'
+			'digitizer-site-worker'
 		);
 
 		add_settings_field(
 			'aura_worker_site_token',
-			__( 'Site Token', 'aura-worker' ),
+			__( 'Site Token', 'digitizer-site-worker' ),
 			array( $this, 'render_token_field' ),
-			'aura-worker',
+			'digitizer-site-worker',
 			'aura_worker_main'
 		);
 
 		add_settings_field(
 			'aura_worker_allowed_ips',
-			__( 'Allowed IPs', 'aura-worker' ),
+			__( 'Allowed IPs', 'digitizer-site-worker' ),
 			array( $this, 'render_ips_field' ),
-			'aura-worker',
+			'digitizer-site-worker',
 			'aura_worker_main'
 		);
 
 		add_settings_field(
 			'aura_worker_allowed_domains',
-			__( 'Allowed Domains', 'aura-worker' ),
+			__( 'Allowed Domains', 'digitizer-site-worker' ),
 			array( $this, 'render_domains_field' ),
-			'aura-worker',
+			'digitizer-site-worker',
 			'aura_worker_main'
 		);
 	}
@@ -133,24 +133,24 @@ class Aura_Worker {
 		?>
 		<div class="wrap">
 			<h1><?php echo esc_html( get_admin_page_title() ); ?></h1>
-			<p><?php esc_html_e( 'Configure the connection between this site and your Aura dashboard.', 'aura-worker' ); ?></p>
+			<p><?php esc_html_e( 'Configure the connection between this site and your Aura dashboard.', 'digitizer-site-worker' ); ?></p>
 
 			<form method="post" action="options.php">
 				<?php
 				settings_fields( 'aura_worker_settings' );
-				do_settings_sections( 'aura-worker' );
+				do_settings_sections( 'digitizer-site-worker' );
 				submit_button();
 				?>
 			</form>
 
 			<hr>
-			<h2><?php esc_html_e( 'Connection Test', 'aura-worker' ); ?></h2>
+			<h2><?php esc_html_e( 'Connection Test', 'digitizer-site-worker' ); ?></h2>
 			<p>
-				<?php esc_html_e( 'API Endpoint:', 'aura-worker' ); ?>
+				<?php esc_html_e( 'API Endpoint:', 'digitizer-site-worker' ); ?>
 				<code><?php echo esc_url( rest_url( 'aura/v1/status' ) ); ?></code>
 			</p>
 			<p>
-				<?php esc_html_e( 'Plugin Version:', 'aura-worker' ); ?>
+				<?php esc_html_e( 'Plugin Version:', 'digitizer-site-worker' ); ?>
 				<strong><?php echo esc_html( AURA_WORKER_VERSION ); ?></strong>
 			</p>
 		</div>
@@ -167,7 +167,7 @@ class Aura_Worker {
 			   value="<?php echo esc_attr( $token ); ?>"
 			   class="regular-text" readonly>
 		<p class="description">
-			<?php esc_html_e( 'Auto-generated token. Copy this to your Aura dashboard when connecting this site.', 'aura-worker' ); ?>
+			<?php esc_html_e( 'Auto-generated token. Copy this to your Aura dashboard when connecting this site.', 'digitizer-site-worker' ); ?>
 		</p>
 		<?php
 	}
@@ -180,7 +180,7 @@ class Aura_Worker {
 		?>
 		<textarea name="aura_worker_allowed_ips" rows="3" class="large-text"><?php echo esc_textarea( $ips ); ?></textarea>
 		<p class="description">
-			<?php esc_html_e( 'One IP per line. Leave empty to allow all IPs (less secure). Only these IPs can access the Aura API.', 'aura-worker' ); ?>
+			<?php esc_html_e( 'One IP per line. Leave empty to allow all IPs (less secure). Only these IPs can access the Aura API.', 'digitizer-site-worker' ); ?>
 		</p>
 		<?php
 	}
@@ -193,7 +193,7 @@ class Aura_Worker {
 		?>
 		<textarea name="aura_worker_allowed_domains" rows="3" class="large-text"><?php echo esc_textarea( $domains ); ?></textarea>
 		<p class="description">
-			<?php esc_html_e( 'One domain per line (e.g., my-aura.app). Leave empty to allow all origins. Checked against the Origin or Referer header of incoming requests.', 'aura-worker' ); ?>
+			<?php esc_html_e( 'One domain per line (e.g., my-aura.app). Leave empty to allow all origins. Checked against the Origin or Referer header of incoming requests.', 'digitizer-site-worker' ); ?>
 		</p>
 		<?php
 	}

@@ -82,7 +82,7 @@ class Aura_Worker_API {
 					'validate_callback' => function( $value ) {
 						return is_string( $value ) && preg_match( '/^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-]+\.php$/', $value );
 					},
-					'description'       => __( 'Plugin file path (e.g., akismet/akismet.php)', 'aura-worker' ),
+					'description'       => __( 'Plugin file path (e.g., akismet/akismet.php)', 'digitizer-site-worker' ),
 				),
 			),
 		) );
@@ -100,7 +100,7 @@ class Aura_Worker_API {
 					'validate_callback' => function( $value ) {
 						return is_string( $value ) && preg_match( '/^[a-zA-Z0-9_\-]+$/', $value );
 					},
-					'description'       => __( 'Theme stylesheet slug', 'aura-worker' ),
+					'description'       => __( 'Theme stylesheet slug', 'digitizer-site-worker' ),
 				),
 			),
 		) );
@@ -133,7 +133,7 @@ class Aura_Worker_API {
 						return filter_var( $value, FILTER_VALIDATE_URL )
 							&& preg_match( '#^https://github\.com/Digitizers/AuraWorker/releases/download/.+\.zip$#', $value );
 					},
-					'description'       => __( 'GitHub release zip URL for AuraWorker.', 'aura-worker' ),
+					'description'       => __( 'GitHub release zip URL for AuraWorker.', 'digitizer-site-worker' ),
 				),
 			),
 		) );
@@ -148,7 +148,7 @@ class Aura_Worker_API {
 					'required'          => false,
 					'type'              => 'string',
 					'sanitize_callback' => 'sanitize_text_field',
-					'description'       => __( 'Plugin migration key (e.g., elementor, woocommerce). Omit for core wp_upgrade.', 'aura-worker' ),
+					'description'       => __( 'Plugin migration key (e.g., elementor, woocommerce). Omit for core wp_upgrade.', 'digitizer-site-worker' ),
 				),
 			),
 		) );
@@ -267,7 +267,7 @@ class Aura_Worker_API {
 		if ( ! isset( $all_plugins[ $plugin_file ] ) ) {
 			return new WP_REST_Response( array(
 				'success' => false,
-				'error'   => __( 'Plugin not found.', 'aura-worker' ),
+				'error'   => __( 'Plugin not found.', 'digitizer-site-worker' ),
 			), 404 );
 		}
 
@@ -290,7 +290,7 @@ class Aura_Worker_API {
 		if ( ! $theme->exists() ) {
 			return new WP_REST_Response( array(
 				'success' => false,
-				'error'   => __( 'Theme not found.', 'aura-worker' ),
+				'error'   => __( 'Theme not found.', 'digitizer-site-worker' ),
 			), 404 );
 		}
 

@@ -1,10 +1,10 @@
-=== AuraWorker ===
+=== Digitizer Site Worker for Aura ===
 Contributors: benkalsky
 Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.3.0-beta.6
+Stable tag: 1.3.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -12,7 +12,7 @@ Remote site management agent for Aura dashboard. Secure updates, health monitori
 
 == Description ==
 
-AuraWorker is a lightweight WordPress plugin that enables remote site management through the Aura dashboard. It provides secure REST API endpoints for:
+Digitizer Site Worker for Aura is a lightweight WordPress plugin that enables remote site management through the Aura dashboard. It provides secure REST API endpoints for:
 
 * **Site Health Status** - WordPress version, PHP version, plugins, themes, database info, disk usage
 * **Plugin Updates** - Update individual plugins remotely
@@ -48,9 +48,9 @@ The plugin itself does not send data outbound — it only responds to authentica
 
 == Installation ==
 
-1. Upload the `AuraWorker` folder to `/wp-content/plugins/`
+1. Upload the `digitizer-site-worker` folder to `/wp-content/plugins/`
 2. Activate the plugin through the Plugins menu
-3. Go to Tools > AuraWorker to find your site token
+3. Go to Tools > Digitizer Site Worker to find your site token
 4. Add the site token to your Aura dashboard
 
 == Frequently Asked Questions ==
@@ -69,7 +69,7 @@ Your Aura dashboard will no longer be able to communicate with this site. No dat
 
 == Screenshots ==
 
-1. AuraWorker settings page — configure your site token, IP whitelist, and domain whitelist
+1. Digitizer Site Worker settings page — configure your site token, IP whitelist, and domain whitelist
 2. Connection test section — verify your API endpoint and plugin version
 
 == Changelog ==
