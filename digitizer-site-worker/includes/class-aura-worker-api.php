@@ -66,14 +66,14 @@ class Aura_Worker_API {
 		register_rest_route( self::NAMESPACE, '/update/core', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'update_core' ),
-			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'permission_callback' => array( $this->security, 'check_update_core_permission' ),
 		) );
 
 		// Update a plugin.
 		register_rest_route( self::NAMESPACE, '/update/plugin', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'update_plugin' ),
-			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'permission_callback' => array( $this->security, 'check_update_plugins_permission' ),
 			'args'                => array(
 				'plugin' => array(
 					'required'          => true,
@@ -91,7 +91,7 @@ class Aura_Worker_API {
 		register_rest_route( self::NAMESPACE, '/update/theme', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'update_theme' ),
-			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'permission_callback' => array( $this->security, 'check_update_themes_permission' ),
 			'args'                => array(
 				'theme' => array(
 					'required'          => true,
@@ -109,7 +109,7 @@ class Aura_Worker_API {
 		register_rest_route( self::NAMESPACE, '/update/translations', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'update_translations' ),
-			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'permission_callback' => array( $this->security, 'check_update_core_permission' ),
 		) );
 
 		// Database migration status (read-only).
@@ -123,7 +123,7 @@ class Aura_Worker_API {
 		register_rest_route( self::NAMESPACE, '/self-update', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'self_update' ),
-			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'permission_callback' => array( $this->security, 'check_update_plugins_permission' ),
 			'args'                => array(
 				'zip_url' => array(
 					'required'          => true,
@@ -142,7 +142,7 @@ class Aura_Worker_API {
 		register_rest_route( self::NAMESPACE, '/update/database', array(
 			'methods'             => 'POST',
 			'callback'            => array( $this, 'update_database' ),
-			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'permission_callback' => array( $this->security, 'check_update_core_permission' ),
 			'args'                => array(
 				'plugin' => array(
 					'required'          => false,

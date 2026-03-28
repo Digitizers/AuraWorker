@@ -188,6 +188,75 @@ class Aura_Worker_Security {
 	}
 
 	/**
+	 * Permission callback for plugin update routes.
+	 *
+	 * @param WP_REST_Request $request The incoming request.
+	 * @return bool|WP_Error True if authorized.
+	 */
+	public function check_update_plugins_permission( $request ) {
+		$valid = $this->validate_request( $request );
+		if ( is_wp_error( $valid ) ) {
+			return $valid;
+		}
+
+		if ( ! current_user_can( 'update_plugins' ) ) {
+			return new WP_Error(
+				'aura_insufficient_permissions',
+				__( 'You do not have permission to update plugins.', 'digitizer-site-worker' ),
+				array( 'status' => 403 )
+			);
+		}
+
+		return true;
+	}
+
+	/**
+	 * Permission callback for core update routes.
+	 *
+	 * @param WP_REST_Request $request The incoming request.
+	 * @return bool|WP_Error True if authorized.
+	 */
+	public function check_update_core_permission( $request ) {
+		$valid = $this->validate_request( $request );
+		if ( is_wp_error( $valid ) ) {
+			return $valid;
+		}
+
+		if ( ! current_user_can( 'update_core' ) ) {
+			return new WP_Error(
+				'aura_insufficient_permissions',
+				__( 'You do not have permission to update WordPress core.', 'digitizer-site-worker' ),
+				array( 'status' => 403 )
+			);
+		}
+
+		return true;
+	}
+
+	/**
+	 * Permission callback for theme update routes.
+	 *
+	 * @param WP_REST_Request $request The incoming request.
+	 * @return bool|WP_Error True if authorized.
+	 */
+	public function check_update_themes_permission( $request ) {
+		$valid = $this->validate_request( $request );
+		if ( is_wp_error( $valid ) ) {
+			return $valid;
+		}
+
+		if ( ! current_user_can( 'update_themes' ) ) {
+			return new WP_Error(
+				'aura_insufficient_permissions',
+				__( 'You do not have permission to update themes.', 'digitizer-site-worker' ),
+				array( 'status' => 403 )
+			);
+		}
+
+		return true;
+	}
+
+	/**
 	 * Permission callback for read-only routes.
 	 *
 	 * @param WP_REST_Request $request The incoming request.

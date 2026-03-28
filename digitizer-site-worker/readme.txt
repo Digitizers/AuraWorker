@@ -4,7 +4,7 @@ Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.3.0
+Stable tag: 1.3.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -73,6 +73,16 @@ Your Aura dashboard will no longer be able to communicate with this site. No dat
 2. Connection test section — verify your API endpoint and plugin version
 
 == Changelog ==
+
+= 1.3.1 =
+* Security: Use specific WordPress capabilities for REST API permission callbacks
+  - update/plugin → update_plugins
+  - update/core → update_core
+  - update/theme → update_themes
+  - update/translations → update_core
+  - update/database → update_core
+  - self-update → update_plugins
+* Addresses WordPress.org plugin review feedback (Review ID: R digitizer-site-worker/benkalsky/22Mar26)
 
 = 1.3.0-beta.6 =
 * Fix: Run Elementor upgrade callbacks directly and synchronously, bypassing the background runner that relies on loopback HTTP/WP-Cron — works reliably regardless of DISABLE_WP_CRON setting
