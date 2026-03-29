@@ -193,6 +193,12 @@ class Aura_Worker_Updater {
 			activate_plugin( $plugin_file );
 		}
 
+		// Clear plugin cache so WordPress reads the fresh file header.
+		wp_clean_plugins_cache( true );
+		if ( function_exists( 'wp_cache_flush' ) ) {
+			wp_cache_flush();
+		}
+
 		// Read new version from the updated file header.
 		$new_data    = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin_file, false, false );
 		$new_version = $new_data['Version'] ?? 'unknown';

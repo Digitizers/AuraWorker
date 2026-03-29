@@ -4,7 +4,7 @@ Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.3.1
+Stable tag: 1.3.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -73,6 +73,10 @@ Your Aura dashboard will no longer be able to communicate with this site. No dat
 2. Connection test section — verify your API endpoint and plugin version
 
 == Changelog ==
+
+= 1.3.2 =
+* Fix: Clear plugin cache after self-update to ensure correct version is reported
+* Uses wp_clean_plugins_cache() + wp_cache_flush() before reading new version
 
 = 1.3.1 =
 * Security: Use specific WordPress capabilities for REST API permission callbacks
