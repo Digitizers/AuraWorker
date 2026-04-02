@@ -1,6 +1,9 @@
 <p align="center">
   <img src="assets/aura_icon.png" alt="Aura" width="160" />
 </p>
+<p align="center">
+  <img src="assets/aura_logotype.png" alt="Aura" width="140" />
+</p>
 
 <h3 align="center">Digitizer Site Worker for Aura</h3>
 
