@@ -4,7 +4,7 @@ Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.3.3
+Stable tag: 1.3.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -75,6 +75,10 @@ Your Aura dashboard will no longer be able to communicate with this site. No dat
 4. Activity log — monitor remote update and maintenance operations.
 
 == Changelog ==
+
+= 1.3.4 =
+* Branding update: New banners and icons
+* Improved screenshots and documentation
 
 = 1.3.3 =
 * Initial release to WordPress.org
