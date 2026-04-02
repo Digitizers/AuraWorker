@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/aura-symbol-v2.png" alt="Aura" width="160" />
+  <img src="assets/aura_icon.png" alt="Aura" width="160" />
 </p>
 
 <h3 align="center">Digitizer Site Worker for Aura</h3>
