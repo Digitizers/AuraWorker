@@ -1,0 +1,13 @@
+/.git
+/.github
+/.wordpress-org
+/assets
+/docs
+*.zip
+*.md
+!readme.txt
+.distignore
+.gitignore
+CHECKLIST.md
+CLAUDE.md
+RELEASE-NOTES.md

@@ -2,7 +2,7 @@
 Contributors: benkalsky
 Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
-Tested up to: 6.9
+Tested up to: 7.0
 Requires PHP: 7.4
 Stable tag: 1.3.2
 License: GPLv2 or later
@@ -69,8 +69,10 @@ Your Aura dashboard will no longer be able to communicate with this site. No dat
 
 == Screenshots ==
 
-1. Digitizer Site Worker settings page — configure your site token, IP whitelist, and domain whitelist
-2. Connection test section — verify your API endpoint and plugin version
+1. Digitizer Site Worker settings page — configure your site token, IP whitelist, and domain whitelist.
+2. Connection test section — verify your API endpoint and plugin version.
+3. Security settings — manage IP and domain whitelists for enhanced protection.
+4. Activity log — monitor remote update and maintenance operations.
 
 == Changelog ==
 
