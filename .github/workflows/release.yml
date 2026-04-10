@@ -15,9 +15,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Create plugin ZIP
-        run: zip -r aura-worker.zip aura-worker/
+        run: zip -r digitizer-site-worker.zip digitizer-site-worker/
 
       - name: Upload ZIP to release
         uses: softprops/action-gh-release@v2
         with:
-          files: aura-worker.zip
+          files: digitizer-site-worker.zip
