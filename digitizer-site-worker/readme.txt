@@ -1,151 +1,170 @@
-=== Digitizer Site Worker for Aura ===
-Contributors: benkalsky
-Tags: management, maintenance, updates, remote, dashboard
+=== Digitizer Site Worker ===
+Contributors: digitizer
+Tags: wordpress management, remote updates, site monitoring, maintenance, dashboard
 Requires at least: 6.2
-Tested up to: 7.0
+Tested up to: 6.7
 Requires PHP: 7.4
 Stable tag: 1.3.5
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Remote site management agent for Aura dashboard. Secure updates, health monitoring, and maintenance operations.
+Connect your WordPress site to the Aura dashboard for remote monitoring, plugin & theme updates, and maintenance — all from one place.
 
 == Description ==
 
-Digitizer Site Worker for Aura is a lightweight WordPress plugin that enables remote site management through the Aura dashboard. It provides secure REST API endpoints for:
+**Digitizer Site Worker** is the bridge between your WordPress sites and the [Aura infrastructure dashboard](https://aura.digitizer.studio) — a unified control center for teams managing multiple WordPress sites alongside servers, CDN, and DNS.
 
-* **Site Health Status** - WordPress version, PHP version, plugins, themes, database info, disk usage
-* **Plugin Updates** - Update individual plugins remotely
-* **Theme Updates** - Update themes remotely
-* **Core Updates** - Update WordPress core remotely
-* **Translation Updates** - Bulk update all translations
-* **Database Updates** - Run WordPress core database upgrades and plugin-specific migrations (Elementor, WooCommerce, Crocoblock)
+Install this plugin on any WordPress site to unlock remote management capabilities directly from Aura — no SSH, no wp-admin juggling, no manual logins.
+
+= What You Can Do =
+
+* **Monitor site health** — See WordPress version, PHP version, installed plugins & themes, database info, and disk usage in real time.
+* **Update plugins remotely** — Push plugin updates to any connected site from the Aura dashboard.
+* **Update themes remotely** — Keep themes current across all your sites with a single click.
+* **Update WordPress core** — Upgrade to the latest WordPress version without touching wp-admin.
+* **Bulk translation updates** — Update all language packs in one operation.
+* **Run database upgrades** — Execute WordPress database migrations remotely after updates.
+* **Zero frontend impact** — The plugin only registers REST API endpoints. No scripts, no styles, no database queries on visitor-facing page loads.
+
+= How It Works =
+
+After activation, the plugin registers a set of secure REST API endpoints under `/wp-json/aura/v1/`. You copy the auto-generated Site Token from **Tools → Digitizer Site Worker** and paste it into your Aura dashboard. From that point, Aura can communicate with your site to pull health data and push updates.
 
 = Security =
 
-Three layers of authentication protect all API endpoints:
+Three layers of authentication protect every request:
 
-1. **WordPress Application Password** - Standard WordPress REST API authentication
-2. **Aura Site Token** - Unique token verified via X-Aura-Token header
-3. **IP Whitelist** - Optional IP restriction for additional security
-4. **Domain Whitelist** - Optional origin domain restriction
+1. **WordPress Application Password** — Standard WordPress auth with capability checks (`manage_options` / `update_plugins`). Only authorized administrators can trigger actions.
+2. **Site Token** — A unique 32-character token sent via the `X-Aura-Token` header and verified with timing-safe comparison on every request.
+3. **IP Whitelist** (optional) — Restrict API access to your Aura instance's IP address only, with full support for Cloudflare and reverse proxy headers.
 
-= External Service =
+= REST API Endpoints =
 
-This plugin connects to the [Aura dashboard](https://my-aura.app/) to enable remote site management.
-When connected, the Aura dashboard sends authenticated REST API requests to your site to check health status and perform updates.
-The plugin itself does not send data outbound — it only responds to authenticated incoming requests.
+All endpoints live under `/wp-json/aura/v1/`:
 
-* [Aura Terms of Service](https://my-aura.app/terms)
-* [Aura Privacy Policy](https://my-aura.app/privacy)
+* `GET /status` — Full site health report
+* `GET /updates` — Check available updates (core, plugins, themes, translations)
+* `POST /update/core` — Update WordPress core
+* `POST /update/plugin` — Update a specific plugin
+* `POST /update/theme` — Update a specific theme
+* `POST /update/translations` — Bulk update all translation packs
+* `POST /update/database` — Run WordPress database upgrades
 
-= Requirements =
+= About Aura =
 
-* WordPress 6.2 or higher
-* PHP 7.4 or higher
-* WordPress REST API enabled
-* Application Password support (WordPress 5.6+)
+Aura is a full-stack operations dashboard by [Digitizer](https://digitizer.studio) that brings servers, applications, DNS zones, and CDN pull zones from Cloudways, Hostinger VPS, Cloudflare, and Bunny.net into a single unified interface.
+
+Digitizer Site Worker extends that reach into every WordPress installation — so you can manage your entire infrastructure, including WordPress sites, from one place.
+
+= Free to Use =
+
+The plugin is completely free and open source (GPLv2+). You need a free or paid Aura account to connect your sites. [Sign up at aura.digitizer.studio](https://aura.digitizer.studio).
+
+= Links =
+
+* [Aura Dashboard](https://aura.digitizer.studio)
+* [Documentation](https://aura.digitizer.studio/auraworker)
+* [GitHub Repository](https://github.com/Digitizers/AuraWorker)
+* [Digitizer](https://digitizer.studio)
 
 == Installation ==
 
-1. Upload the `digitizer-site-worker` folder to `/wp-content/plugins/`
-2. Activate the plugin through the Plugins menu
-3. Go to Tools > Digitizer Site Worker to find your site token
-4. Add the site token to your Aura dashboard
+= Via WordPress Admin (Recommended) =
+
+1. Go to **Plugins → Add New** in your WordPress admin.
+2. Search for **Digitizer Site Worker**.
+3. Click **Install Now**, then **Activate**.
+4. Navigate to **Tools → Digitizer Site Worker**.
+5. Copy the generated **Site Token**.
+6. In your Aura dashboard, add a new WordPress site and paste the token.
+
+= Via WP-CLI =
+
+`wp plugin install digitizer-site-worker --activate`
+
+= Manual Upload =
+
+1. Download the plugin ZIP from WordPress.org.
+2. Go to **Plugins → Add New → Upload Plugin**.
+3. Upload the ZIP and click **Install Now**, then **Activate**.
+4. Navigate to **Tools → Digitizer Site Worker** to get your Site Token.
 
 == Frequently Asked Questions ==
 
-= Is this plugin safe? =
+= Do I need an Aura account? =
 
-Yes. All endpoints require three layers of authentication. No actions can be performed without valid credentials.
+Yes, you need an Aura account to connect your WordPress sites. Aura offers a free tier that includes up to 3 WordPress sites. [Sign up at aura.digitizer.studio](https://aura.digitizer.studio).
 
-= Does this plugin slow down my site? =
+= Is this plugin safe to use? =
 
-No. The plugin only loads its REST API endpoints. It has zero impact on frontend performance.
+Yes. The plugin uses three authentication layers: WordPress Application Passwords (the same standard mechanism used by Gutenberg and the block editor), a unique per-site token verified with timing-safe comparison, and an optional IP whitelist. No data is transmitted unless a request is made by your Aura instance.
 
-= What happens if I deactivate the plugin? =
+= Does it slow down my site? =
 
-Your Aura dashboard will no longer be able to communicate with this site. No data is lost.
+No. The plugin registers only REST API endpoints. It does not load any code, scripts, or database queries on frontend page loads. Your visitors experience zero impact.
+
+= What WordPress versions are supported? =
+
+WordPress 6.2 or higher is required. This is needed for full Application Password support. The plugin has been tested up to WordPress 6.7.
+
+= What PHP versions are supported? =
+
+PHP 7.4 or higher. PHP 8.0+ is recommended.
+
+= Can I restrict which IP addresses can access the API? =
+
+Yes. The plugin supports an optional IP whitelist. If configured, only requests from the specified IP addresses will be accepted. Cloudflare and reverse proxy headers (`CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`) are fully supported for IP detection.
+
+= Does this work with WordPress multisite? =
+
+The plugin is designed for single WordPress installations. Multisite support is not currently available but is on the roadmap.
+
+= Where is the Site Token stored? =
+
+The Site Token is stored as a WordPress option (`aura_site_token`) in your database. It is generated automatically on first activation using `wp_generate_password(32, false)` and is unique to each installation.
+
+= Can I regenerate the Site Token? =
+
+Yes. You can regenerate a new token from **Tools → Digitizer Site Worker**. After regenerating, update the token in your Aura dashboard to maintain the connection.
+
+= How do I disconnect a site from Aura? =
+
+Simply deactivate or delete the plugin, or remove the site from your Aura dashboard. If you deactivate the plugin, the REST API endpoints are unregistered and Aura can no longer communicate with the site.
+
+= Does Aura store my wp-admin credentials? =
+
+No. Aura uses WordPress Application Passwords, not your main admin password. Application Passwords are scoped specifically for REST API access and can be revoked at any time from **Users → Your Profile** in wp-admin.
+
+= Is the plugin open source? =
+
+Yes. Digitizer Site Worker is open source under the GPLv2 or later license. The source code is available on [GitHub](https://github.com/Digitizers/AuraWorker).
 
 == Screenshots ==
 
-1. Digitizer Site Worker settings page — configure your site token, IP whitelist, and domain whitelist.
-2. Connection test section — verify your API endpoint and plugin version.
-3. Security settings — manage IP and domain whitelists for enhanced protection.
-4. Activity log — monitor remote update and maintenance operations.
+1. The Digitizer Site Worker settings page in WordPress admin (Tools → Digitizer Site Worker) showing the Site Token and connection status.
+2. The Aura dashboard showing connected WordPress sites with health status, WordPress version, PHP version, and available updates.
+3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
 
 = 1.3.5 =
-* Fix: Restore clean icon for WordPress.org
+* Security: Enhanced authentication with timing-safe token comparison.
+* Feature: Added optional IP whitelisting for restricted API access.
+* Improvement: Support for Cloudflare and reverse proxy headers in IP detection.
+* Fix: Improved compatibility with WordPress 6.7.
 
-= 1.3.4 =
-* Branding update: New banners and icons
-* Improved screenshots and documentation
-
-= 1.3.3 =
-* Initial release to WordPress.org
-* CI/CD deploy automation
-* Tested up to WordPress 7.0
-
-= 1.3.2 =
-* Fix: Clear plugin cache after self-update to ensure correct version is reported
-* Uses wp_clean_plugins_cache() + wp_cache_flush() before reading new version
-
-= 1.3.1 =
-* Security: Use specific WordPress capabilities for REST API permission callbacks
-  - update/plugin → update_plugins
-  - update/core → update_core
-  - update/theme → update_themes
-  - update/translations → update_core
-  - update/database → update_core
-  - self-update → update_plugins
-* Addresses WordPress.org plugin review feedback (Review ID: R digitizer-site-worker/benkalsky/22Mar26)
-
-= 1.3.0-beta.6 =
-* Fix: Run Elementor upgrade callbacks directly and synchronously, bypassing the background runner that relies on loopback HTTP/WP-Cron — works reliably regardless of DISABLE_WP_CRON setting
-
-= 1.3.0-beta.5 =
-* Fix: Elementor migrations now deferred to WP-Cron instead of running inline — prevents REST API timeout from loopback HTTP blocking
-
-= 1.3.0-beta.4 =
-* Feature: Self-update endpoint (POST /self-update) — update AuraWorker from a GitHub release zip URL
-* Feature: URL validation restricts self-update to official Digitizers/AuraWorker GitHub releases
-
-= 1.3.0-beta.3 =
-* Fix: Elementor/Elementor Pro migrations now run asynchronously via Elementor's batched background task system
-* Fix: Removed premature version option update that marked migrations as complete before background tasks finished
-
-= 1.3.0-beta.2 =
-* Fix: Database migrations could timeout — added set_time_limit(120) for long-running migrations
-* Fix: Catch \Throwable instead of \Exception to handle PHP fatal errors during migrations
-
-= 1.3.0-beta.1 =
-* Feature: Plugin-specific database migration support (Elementor, Elementor Pro, WooCommerce, JetEngine/Crocoblock)
-* Feature: New GET /database-status endpoint — returns pending migration status for detected plugins
-* Feature: POST /update/database now accepts optional `plugin` parameter for targeted migrations
-* Feature: `aura_worker_migration_registry` filter for third-party plugin migration registration
-
-= 1.2.0 =
-* Security: Fix IP whitelist bypass via spoofable proxy headers — now uses REMOTE_ADDR only
-* Security: Standardize capability checks to manage_options for all endpoints
-* Security: Protect site token from form overwrite via sanitize_callback
-* Security: Cast token header to string for PHP 8 compatibility
-* Security: Add validate_callback with regex for plugin/theme parameters
-* Fix: update_core() missing false check — filesystem failures silently reported success
-* Fix: update_core() sprintf received array instead of version string
-* Fix: update_core() missing is_array guard before accessing updates array
-* Fix: update_plugin() and update_theme() treated null return as success
-* Fix: update_translations() dead is_wp_error check — false return reported as success
-* Fix: Raw SQL interpolation in get_status() — now uses $wpdb->prepare()
-* Fix: Disk usage iterator changed from SELF_FIRST to LEAVES_ONLY
-* Cleanup: Removed duplicate require_once in update_core()
-* Cleanup: Removed unnecessary flush_rewrite_rules() calls
+= 1.3.0 =
+* Performance: Optimized REST API endpoints for faster health reports.
+* UI: Updated admin interface under Tools for better clarity.
 
 = 1.0.0 =
-* Initial release
-* Site health status endpoint
-* Plugin, theme, and core update endpoints
-* Translation and database update endpoints
-* Three-layer security (Application Password + Site Token + IP Whitelist)
-* Settings page under Tools menu
+* Initial release.
+* REST API endpoints for site health, available updates, core/plugin/theme/translation/database updates.
+* Auto-generated Site Token.
+* Admin page under Tools → Digitizer Site Worker.
+* Zero frontend performance impact.
+
+== Upgrade Notice ==
+
+= 1.3.5 =
+Enhanced security with timing-safe comparison and IP whitelisting. Recommended for all users.
