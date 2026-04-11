@@ -167,6 +167,27 @@ class Aura_Worker_API {
 			'permission_callback' => array( $this->security, 'check_read_permission' ),
 		) );
 
+		// v2: Plugin rollback.
+		register_rest_route( self::NAMESPACE_V2, '/rollback/(?P<plugin>[a-z0-9\-]+)', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'rollback_plugin' ),
+			'permission_callback' => array( $this->security, 'check_update_plugins_permission' ),
+			'args'                => array(
+				'plugin' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'Plugin folder slug to roll back.', 'digitizer-site-worker' ),
+				),
+				'backup_path' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'Absolute path to a specific backup zip. Omit to use the most recent backup.', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
 	}
 
 	/**
@@ -381,6 +402,38 @@ class Aura_Worker_API {
 		$health = new Aura_Worker_Health();
 		$result = $health->run_health_check();
 		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * POST /aura/v2/rollback/{plugin}
+	 *
+	 * Backs up (if needed) and restores a plugin from a backup zip.
+	 * If no backup_path is supplied, the most recent backup for the plugin is used.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Rollback result.
+	 */
+	public function rollback_plugin( $request ) {
+		$plugin_slug = $request->get_param( 'plugin' );
+		$backup_path = $request->get_param( 'backup_path' );
+
+		$rollback = new Aura_Worker_Rollback();
+
+		// If no specific backup path given, use the most recent backup.
+		if ( empty( $backup_path ) ) {
+			$backups = $rollback->list_backups( $plugin_slug );
+			if ( empty( $backups ) ) {
+				return new WP_REST_Response( array(
+					'success' => false,
+					'error'   => __( 'No backups found for this plugin.', 'digitizer-site-worker' ),
+				), 404 );
+			}
+			$backup_path = $backups[0]['path'];
+		}
+
+		$result = $rollback->restore_plugin( $plugin_slug, $backup_path );
+		$status = $result['success'] ? 200 : 500;
+		return new WP_REST_Response( $result, $status );
 	}
 
 	/**
