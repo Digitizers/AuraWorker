@@ -19,6 +19,13 @@ class Aura_Worker {
 	private $api;
 
 	/**
+	 * MCP router instance.
+	 *
+	 * @var Aura_Worker_MCP
+	 */
+	private $mcp;
+
+	/**
 	 * Security handler instance.
 	 *
 	 * @var Aura_Worker_Security
@@ -31,9 +38,11 @@ class Aura_Worker {
 	public function init() {
 		$this->security = new Aura_Worker_Security();
 		$this->api      = new Aura_Worker_API( $this->security );
+		$this->mcp      = new Aura_Worker_MCP( $this->security );
 
 		// Register REST API routes.
 		add_action( 'rest_api_init', array( $this->api, 'register_routes' ) );
+		add_action( 'rest_api_init', array( $this->mcp, 'register_routes' ) );
 
 		// Add settings page and privacy policy.
 		if ( is_admin() ) {
