@@ -55,6 +55,33 @@ class Aura_Worker_API {
 	 * Register REST API routes.
 	 */
 	public function register_routes() {
+		// Magic link: receive site token from Aura dashboard (public — validated by transient).
+		register_rest_route( self::NAMESPACE, '/connect', array(
+			'methods'             => 'POST',
+			'callback'            => array( new Aura_Worker_Magic_Link(), 'handle_connect' ),
+			'permission_callback' => '__return_true',
+			'args'                => array(
+				'magic_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'One-time magic link ID generated during the connect flow.', 'digitizer-site-worker' ),
+				),
+				'aura_token' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'Site token issued by the Aura dashboard.', 'digitizer-site-worker' ),
+				),
+				'dashboard_url' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'esc_url_raw',
+					'description'       => __( 'Base URL of the Aura dashboard that issued the token.', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
 		// Status & health check (read-only).
 		register_rest_route( self::NAMESPACE, '/status', array(
 			'methods'             => 'GET',

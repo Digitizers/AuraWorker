@@ -31,6 +31,7 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-health.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-rollback.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-backup.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-mcp.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';
 
 /**
  * Initialize the plugin.

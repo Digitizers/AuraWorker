@@ -26,6 +26,13 @@ class Aura_Worker {
 	private $mcp;
 
 	/**
+	 * Magic link onboarding handler instance.
+	 *
+	 * @var Aura_Worker_Magic_Link
+	 */
+	private $magic_link;
+
+	/**
 	 * Security handler instance.
 	 *
 	 * @var Aura_Worker_Security
@@ -36,9 +43,10 @@ class Aura_Worker {
 	 * Initialize the plugin components.
 	 */
 	public function init() {
-		$this->security = new Aura_Worker_Security();
-		$this->api      = new Aura_Worker_API( $this->security );
-		$this->mcp      = new Aura_Worker_MCP( $this->security );
+		$this->security    = new Aura_Worker_Security();
+		$this->api         = new Aura_Worker_API( $this->security );
+		$this->mcp         = new Aura_Worker_MCP( $this->security );
+		$this->magic_link  = new Aura_Worker_Magic_Link();
 
 		// Register REST API routes.
 		add_action( 'rest_api_init', array( $this->api, 'register_routes' ) );
@@ -151,6 +159,8 @@ class Aura_Worker {
 				submit_button();
 				?>
 			</form>
+
+			<?php $this->magic_link->render_connect_section(); ?>
 
 			<hr>
 			<h2><?php esc_html_e( 'Connection Test', 'digitizer-site-worker' ); ?></h2>
