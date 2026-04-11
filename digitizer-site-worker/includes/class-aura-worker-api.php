@@ -14,11 +14,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Aura_Worker_API {
 
 	/**
-	 * REST API namespace.
+	 * REST API namespace (v1).
 	 *
 	 * @var string
 	 */
 	const NAMESPACE = 'aura/v1';
+
+	/**
+	 * REST API namespace (v2).
+	 *
+	 * @var string
+	 */
+	const NAMESPACE_V2 = 'aura/v2';
 
 	/**
 	 * Security handler.
@@ -152,6 +159,14 @@ class Aura_Worker_API {
 				),
 			),
 		) );
+
+		// v2: Health check (HTTP, PHP errors, WSOD, DB).
+		register_rest_route( self::NAMESPACE_V2, '/health', array(
+			'methods'             => 'GET',
+			'callback'            => array( $this, 'get_health' ),
+			'permission_callback' => array( $this->security, 'check_read_permission' ),
+		) );
+
 	}
 
 	/**
@@ -352,6 +367,20 @@ class Aura_Worker_API {
 		$result = $this->updater->update_database( $plugin );
 		$status = $result['success'] ? 200 : 500;
 		return new WP_REST_Response( $result, $status );
+	}
+
+	/**
+	 * GET /aura/v2/health
+	 *
+	 * Runs HTTP, PHP error log, white-screen, and database checks.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Health check results.
+	 */
+	public function get_health( $request ) {
+		$health = new Aura_Worker_Health();
+		$result = $health->run_health_check();
+		return rest_ensure_response( $result );
 	}
 
 	/**
