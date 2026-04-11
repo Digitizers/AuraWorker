@@ -160,6 +160,35 @@ class Aura_Worker_API {
 			),
 		) );
 
+		// v2: Chunked batch plugin update with health-check auto-rollback.
+		register_rest_route( self::NAMESPACE_V2, '/update/batch', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'batch_update_plugins' ),
+			'permission_callback' => array( $this->security, 'check_update_plugins_permission' ),
+			'args'                => array(
+				'plugins' => array(
+					'required'    => true,
+					'type'        => 'array',
+					'items'       => array( 'type' => 'string' ),
+					'description' => __( 'Array of plugin file paths (e.g. ["akismet/akismet.php"]).', 'digitizer-site-worker' ),
+				),
+				'chunk_size' => array(
+					'required'          => false,
+					'type'              => 'integer',
+					'default'           => 5,
+					'minimum'           => 1,
+					'sanitize_callback' => 'absint',
+					'description'       => __( 'Number of plugins to process per chunk (default 5).', 'digitizer-site-worker' ),
+				),
+				'create_backup' => array(
+					'required'    => false,
+					'type'        => 'boolean',
+					'default'     => true,
+					'description' => __( 'Whether to backup each plugin before updating (default true).', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
 		// v2: Health check (HTTP, PHP errors, WSOD, DB).
 		register_rest_route( self::NAMESPACE_V2, '/health', array(
 			'methods'             => 'GET',
@@ -388,6 +417,43 @@ class Aura_Worker_API {
 		$result = $this->updater->update_database( $plugin );
 		$status = $result['success'] ? 200 : 500;
 		return new WP_REST_Response( $result, $status );
+	}
+
+	/**
+	 * POST /aura/v2/update/batch
+	 *
+	 * Processes plugins in chunks, backing up and health-checking each one.
+	 * Automatically rolls back if the health check fails after an update.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Batch update summary and per-plugin results.
+	 */
+	public function batch_update_plugins( $request ) {
+		$plugins       = $request->get_param( 'plugins' );
+		$chunk_size    = $request->get_param( 'chunk_size' ) ?? 5;
+		$create_backup = $request->get_param( 'create_backup' ) ?? true;
+
+		if ( empty( $plugins ) || ! is_array( $plugins ) ) {
+			return new WP_REST_Response( array(
+				'success' => false,
+				'error'   => __( 'No plugins provided.', 'digitizer-site-worker' ),
+			), 400 );
+		}
+
+		// Sanitize plugin file paths.
+		$plugins = array_filter( array_map( 'sanitize_text_field', $plugins ), function( $p ) {
+			return preg_match( '/^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-]+\.php$/', $p );
+		} );
+
+		if ( empty( $plugins ) ) {
+			return new WP_REST_Response( array(
+				'success' => false,
+				'error'   => __( 'No valid plugin file paths provided.', 'digitizer-site-worker' ),
+			), 400 );
+		}
+
+		$result = $this->updater->batch_update_plugins( array_values( $plugins ), (int) $chunk_size, (bool) $create_backup );
+		return new WP_REST_Response( array_merge( array( 'success' => true ), $result ), 200 );
 	}
 
 	/**
