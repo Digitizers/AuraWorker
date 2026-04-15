@@ -374,6 +374,141 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * Update a single plugin using Plugin_Upgrader.
+	 *
+	 * @param string $plugin_file Plugin file path (e.g., "akismet/akismet.php").
+	 * @return array { success: bool, error?: string }
+	 */
+	private function update_single_plugin( $plugin_file ) {
+		$this->load_upgrade_dependencies();
+
+		$skin     = new Automatic_Upgrader_Skin();
+		$upgrader = new Plugin_Upgrader( $skin );
+		$result   = $upgrader->upgrade( $plugin_file );
+
+		if ( is_wp_error( $result ) ) {
+			return array( 'success' => false, 'error' => $result->get_error_message() );
+		}
+
+		if ( false === $result || null === $result ) {
+			return array( 'success' => false, 'error' => __( 'Update failed or no update available.', 'digitizer-site-worker' ) );
+		}
+
+		return array( 'success' => true );
+	}
+
+	/**
+	 * Update plugins in chunks with optional backup and health-check auto-rollback.
+	 *
+	 * For each plugin:
+	 *   1. Backup (if $create_backup is true) using Aura_Worker_Rollback.
+	 *   2. Update using Plugin_Upgrader.
+	 *   3. Health check using Aura_Worker_Health.
+	 *   4. If health check fails → auto-rollback from backup.
+	 *   5. Record result (updated / failed / rolled_back / skipped).
+	 *
+	 * Between chunks: wp_cache_flush() and gc_collect_cycles().
+	 * After all chunks: cleanup old backups.
+	 *
+	 * @param array $plugins       List of plugin file paths (e.g. ["akismet/akismet.php"]).
+	 * @param int   $chunk_size    Number of plugins to process per chunk (default 5).
+	 * @param bool  $create_backup Whether to create a backup before each update (default true).
+	 * @return array { results: array, summary: array }
+	 */
+	public function batch_update_plugins( $plugins, $chunk_size = 5, $create_backup = true ) {
+		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-health.php';
+		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-rollback.php';
+
+		$results  = array();
+		$rollback = new Aura_Worker_Rollback();
+		$health   = new Aura_Worker_Health();
+		$chunks   = array_chunk( $plugins, max( 1, (int) $chunk_size ) );
+
+		foreach ( $chunks as $chunk ) {
+			foreach ( $chunk as $plugin_file ) {
+				$slug        = dirname( $plugin_file );
+				$backup_path = null;
+				$entry       = array(
+					'plugin'  => $plugin_file,
+					'status'  => 'skipped',
+					'detail'  => '',
+				);
+
+				// 1. Backup.
+				if ( $create_backup ) {
+					$backup_result = $rollback->backup_plugin( $slug );
+					if ( $backup_result['success'] ) {
+						$backup_path = $backup_result['backup_path'];
+					} else {
+						$entry['status'] = 'failed';
+						$entry['detail'] = 'Backup failed: ' . $backup_result['error'];
+						$results[]       = $entry;
+						continue;
+					}
+				}
+
+				// 2. Update.
+				$update_result = $this->update_single_plugin( $plugin_file );
+				if ( ! $update_result['success'] ) {
+					$entry['status'] = 'failed';
+					$entry['detail'] = $update_result['error'];
+					$results[]       = $entry;
+					continue;
+				}
+
+				// 3. Health check.
+				$health_result = $health->run_health_check();
+				if ( ! $health_result['healthy'] ) {
+					// 4. Auto-rollback.
+					if ( $backup_path ) {
+						$restore_result  = $rollback->restore_plugin( $slug, $backup_path );
+						$entry['status'] = 'rolled_back';
+						$entry['detail'] = 'Health check failed; rollback ' . ( $restore_result['success'] ? 'succeeded' : 'failed: ' . $restore_result['error'] );
+					} else {
+						$entry['status'] = 'failed';
+						$entry['detail'] = 'Health check failed; no backup available for rollback';
+					}
+					$results[] = $entry;
+					continue;
+				}
+
+				// 5. Success.
+				$entry['status'] = 'updated';
+				$entry['detail'] = 'Update and health check passed';
+				$results[]       = $entry;
+			}
+
+			// Between chunks: flush caches and run garbage collection.
+			wp_cache_flush();
+			if ( function_exists( 'gc_collect_cycles' ) ) {
+				gc_collect_cycles();
+			}
+		}
+
+		// Cleanup old backups after all chunks.
+		$rollback->cleanup_old_backups();
+
+		// Build summary.
+		$summary = array(
+			'total'       => count( $plugins ),
+			'updated'     => 0,
+			'failed'      => 0,
+			'rolled_back' => 0,
+			'skipped'     => 0,
+		);
+		foreach ( $results as $r ) {
+			if ( isset( $summary[ $r['status'] ] ) ) {
+				$summary[ $r['status'] ]++;
+			}
+		}
+
+		return array(
+			'results' => $results,
+			'summary' => $summary,
+		);
+	}
+
+	/**
 	 * Get the plugin migration registry.
 	 *
 	 * Maps known plugin slugs to their detection, pending-check, and
@@ -541,9 +676,8 @@ class Aura_Worker_Updater {
 	 */
 	public function update_database( $plugin = null ) {
 		// Extend execution time for potentially long migrations.
-		// phpcs:ignore Squiz.PHP.DiscouragedFunctions.Discouraged -- Required for long-running DB migrations.
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 120 );
+			@set_time_limit( 120 ); // phpcs:ignore Squiz.PHP.DiscouragedFunctions.Discouraged,WordPress.PHP.NoSilencedErrors.Discouraged -- Required for long-running DB migrations.
 		}
 
 		// Plugin-specific migration.

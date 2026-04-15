@@ -14,11 +14,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Aura_Worker_API {
 
 	/**
-	 * REST API namespace.
+	 * REST API namespace (v1).
 	 *
 	 * @var string
 	 */
 	const NAMESPACE = 'aura/v1';
+
+	/**
+	 * REST API namespace (v2).
+	 *
+	 * @var string
+	 */
+	const NAMESPACE_V2 = 'aura/v2';
 
 	/**
 	 * Security handler.
@@ -48,6 +55,33 @@ class Aura_Worker_API {
 	 * Register REST API routes.
 	 */
 	public function register_routes() {
+		// Magic link: receive site token from Aura dashboard (public — validated by transient).
+		register_rest_route( self::NAMESPACE, '/connect', array(
+			'methods'             => 'POST',
+			'callback'            => array( new Aura_Worker_Magic_Link(), 'handle_connect' ),
+			'permission_callback' => '__return_true',
+			'args'                => array(
+				'magic_id' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'One-time magic link ID generated during the connect flow.', 'digitizer-site-worker' ),
+				),
+				'aura_token' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'Site token issued by the Aura dashboard.', 'digitizer-site-worker' ),
+				),
+				'dashboard_url' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'esc_url_raw',
+					'description'       => __( 'Base URL of the Aura dashboard that issued the token.', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
 		// Status & health check (read-only).
 		register_rest_route( self::NAMESPACE, '/status', array(
 			'methods'             => 'GET',
@@ -152,6 +186,64 @@ class Aura_Worker_API {
 				),
 			),
 		) );
+
+		// v2: Chunked batch plugin update with health-check auto-rollback.
+		register_rest_route( self::NAMESPACE_V2, '/update/batch', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'batch_update_plugins' ),
+			'permission_callback' => array( $this->security, 'check_update_plugins_permission' ),
+			'args'                => array(
+				'plugins' => array(
+					'required'    => true,
+					'type'        => 'array',
+					'items'       => array( 'type' => 'string' ),
+					'description' => __( 'Array of plugin file paths (e.g. ["akismet/akismet.php"]).', 'digitizer-site-worker' ),
+				),
+				'chunk_size' => array(
+					'required'          => false,
+					'type'              => 'integer',
+					'default'           => 5,
+					'minimum'           => 1,
+					'sanitize_callback' => 'absint',
+					'description'       => __( 'Number of plugins to process per chunk (default 5).', 'digitizer-site-worker' ),
+				),
+				'create_backup' => array(
+					'required'    => false,
+					'type'        => 'boolean',
+					'default'     => true,
+					'description' => __( 'Whether to backup each plugin before updating (default true).', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
+		// v2: Health check (HTTP, PHP errors, WSOD, DB).
+		register_rest_route( self::NAMESPACE_V2, '/health', array(
+			'methods'             => 'GET',
+			'callback'            => array( $this, 'get_health' ),
+			'permission_callback' => array( $this->security, 'check_read_permission' ),
+		) );
+
+		// v2: Plugin rollback.
+		register_rest_route( self::NAMESPACE_V2, '/rollback/(?P<plugin>[a-z0-9\-]+)', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'rollback_plugin' ),
+			'permission_callback' => array( $this->security, 'check_update_plugins_permission' ),
+			'args'                => array(
+				'plugin' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'Plugin folder slug to roll back.', 'digitizer-site-worker' ),
+				),
+				'backup_path' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( 'Absolute path to a specific backup zip. Omit to use the most recent backup.', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
 	}
 
 	/**
@@ -350,6 +442,89 @@ class Aura_Worker_API {
 	public function update_database( $request ) {
 		$plugin = $request->get_param( 'plugin' );
 		$result = $this->updater->update_database( $plugin );
+		$status = $result['success'] ? 200 : 500;
+		return new WP_REST_Response( $result, $status );
+	}
+
+	/**
+	 * POST /aura/v2/update/batch
+	 *
+	 * Processes plugins in chunks, backing up and health-checking each one.
+	 * Automatically rolls back if the health check fails after an update.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Batch update summary and per-plugin results.
+	 */
+	public function batch_update_plugins( $request ) {
+		$plugins       = $request->get_param( 'plugins' );
+		$chunk_size    = $request->get_param( 'chunk_size' ) ?? 5;
+		$create_backup = $request->get_param( 'create_backup' ) ?? true;
+
+		if ( empty( $plugins ) || ! is_array( $plugins ) ) {
+			return new WP_REST_Response( array(
+				'success' => false,
+				'error'   => __( 'No plugins provided.', 'digitizer-site-worker' ),
+			), 400 );
+		}
+
+		// Sanitize plugin file paths.
+		$plugins = array_filter( array_map( 'sanitize_text_field', $plugins ), function( $p ) {
+			return preg_match( '/^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-]+\.php$/', $p );
+		} );
+
+		if ( empty( $plugins ) ) {
+			return new WP_REST_Response( array(
+				'success' => false,
+				'error'   => __( 'No valid plugin file paths provided.', 'digitizer-site-worker' ),
+			), 400 );
+		}
+
+		$result = $this->updater->batch_update_plugins( array_values( $plugins ), (int) $chunk_size, (bool) $create_backup );
+		return new WP_REST_Response( array_merge( array( 'success' => true ), $result ), 200 );
+	}
+
+	/**
+	 * GET /aura/v2/health
+	 *
+	 * Runs HTTP, PHP error log, white-screen, and database checks.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Health check results.
+	 */
+	public function get_health( $request ) {
+		$health = new Aura_Worker_Health();
+		$result = $health->run_health_check();
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * POST /aura/v2/rollback/{plugin}
+	 *
+	 * Backs up (if needed) and restores a plugin from a backup zip.
+	 * If no backup_path is supplied, the most recent backup for the plugin is used.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response Rollback result.
+	 */
+	public function rollback_plugin( $request ) {
+		$plugin_slug = $request->get_param( 'plugin' );
+		$backup_path = $request->get_param( 'backup_path' );
+
+		$rollback = new Aura_Worker_Rollback();
+
+		// If no specific backup path given, use the most recent backup.
+		if ( empty( $backup_path ) ) {
+			$backups = $rollback->list_backups( $plugin_slug );
+			if ( empty( $backups ) ) {
+				return new WP_REST_Response( array(
+					'success' => false,
+					'error'   => __( 'No backups found for this plugin.', 'digitizer-site-worker' ),
+				), 404 );
+			}
+			$backup_path = $backups[0]['path'];
+		}
+
+		$result = $rollback->restore_plugin( $plugin_slug, $backup_path );
 		$status = $result['success'] ? 200 : 500;
 		return new WP_REST_Response( $result, $status );
 	}

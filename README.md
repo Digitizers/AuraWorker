@@ -15,9 +15,10 @@
   <a href="https://wordpress.org/plugins/digitizer-site-worker/">
     <img src="https://img.shields.io/badge/WordPress.org-Plugin-blue?logo=wordpress" alt="WordPress.org" />
   </a>
-  <img src="https://img.shields.io/badge/WordPress-6.2%2B-21759b?logo=wordpress" alt="WordPress" />
+  <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%936.9-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Version-1.3.4-green" alt="Version" />
+  <img src="https://img.shields.io/badge/Stable-1.3.5-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Beta-2.0.0--beta.2-orange" alt="Beta" />
 </p>
 
 ---
@@ -34,6 +35,10 @@ Digitizer Site Worker is the official remote management agent for the [Aura Infr
 |------------|-------------|
 | **Site Health** | Real-time monitoring of WordPress & PHP versions, plugins, themes, and server health. |
 | **One-Click Updates** | Update WordPress core, plugins, and themes remotely from the Aura dashboard. |
+| **Safe Update Engine** *(v2)* | Chunked batch updates with health checks and automatic rollback on failure. |
+| **Per-Plugin Rollback** *(v2)* | Zip backups in `wp-content/aura-backups/` with one-shot restore. |
+| **MCP Tools Layer** *(v2)* | `/aura/mcp/` REST namespace exposing AI-agent-friendly tools with JSON schemas. |
+| **Magic Link Onboarding** *(v2)* | One-click connection from wp-admin to the Aura dashboard — no token copy/paste. |
 | **Maintenance** | Run database upgrades and translation updates across all sites. |
 | **Enterprise Security** | Protected by three layers of authentication (WordPress Passwords, Site Tokens, IP Whitelist). |
 | **Developer API** | Fully exposed via secure REST API endpoints. |
@@ -56,6 +61,16 @@ Digitizer Site Worker is built for performance. It only registers REST API route
 wp plugin install digitizer-site-worker --activate
 ```
 
+### Beta channel (v2.0.0)
+
+The v2 update engine and MCP tools are currently in beta. To install:
+
+```bash
+wp plugin install https://github.com/Digitizers/AuraWorker/releases/download/v2.0.0-beta.2/digitizer-site-worker-2.0.0-beta.2.zip --activate
+```
+
+Or download the zip from the [latest pre-release](https://github.com/Digitizers/AuraWorker/releases) and upload via **Plugins → Add New → Upload Plugin**.
+
 ---
 
 ## Security
@@ -70,7 +85,7 @@ Three layers of authentication protect every request:
 
 ## REST API
 
-All endpoints live under `/wp-json/aura/v1/`.
+### v1 namespace — `/wp-json/aura/v1/`
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -81,10 +96,41 @@ All endpoints live under `/wp-json/aura/v1/`.
 | `POST` | `/update/theme` | Update a specific theme |
 | `POST` | `/update/translations` | Bulk update translation packs |
 | `POST` | `/update/database` | Run WordPress database upgrades |
+| `POST` | `/connect` | Magic-link token exchange (public, 10-min expiring) |
+
+### v2 namespace — `/wp-json/aura/v2/` *(2.0.0 beta)*
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | HTTP, PHP fatals, white-screen, and DB connectivity checks |
+| `POST` | `/update/batch` | Chunked batch updates with auto-rollback on health failure |
+| `POST` | `/rollback/{plugin}` | Restore a plugin from its most recent zip backup |
+
+### MCP namespace — `/wp-json/aura/mcp/` *(2.0.0 beta)*
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/tools/list` | Enumerate available tools with JSON schemas |
+| `POST` | `/tools/execute` | Execute a tool with validated parameters |
+| `GET` | `/context` | Full site context for AI decision-making |
+
+Built-in MCP tools: `get_site_context`, `update_plugin_safely`, `cleanup_orphaned_assets`, `check_vulnerabilities`.
 
 ---
 
 ## Changelog
+
+### 2.0.0-beta.2 *(pre-release)*
+- WordPress.org Plugin Check compliance: `WP_Filesystem` for directory deletion, `gmdate()`, `wp_delete_file()`, justified ignores for tail-only log reads.
+- `readme.txt` synced to plugin header (title, Stable tag 2.0.0, Tested up to 6.9).
+
+### 2.0.0-beta.1 *(pre-release)*
+- **v2 Update Engine:** health checks, per-plugin rollback, chunked batch updates, auto-rollback on failure.
+- **MCP Tools Layer:** `/aura/mcp/` namespace with `tools/list`, `tools/execute`, `context`, plus four built-in tools.
+- **Magic Link Onboarding:** one-click connection from wp-admin to the Aura dashboard.
+
+### 1.3.5
+- Security: timing-safe token comparison, optional IP whitelisting, Cloudflare/reverse-proxy header support.
 
 ### 1.3.4
 - **Branding Update:** New official icons and banners for WordPress.org.
