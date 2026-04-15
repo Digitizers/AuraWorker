@@ -7,6 +7,8 @@ jobs:
   deploy:
     name: Deploy to WordPress.org
     runs-on: ubuntu-latest
+    # Skip pre-releases (beta, rc, alpha) — only stable releases ship to WP.org SVN.
+    if: github.event.release.prerelease == false
     steps:
       - uses: actions/checkout@v4
 
