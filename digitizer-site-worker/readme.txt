@@ -1,10 +1,10 @@
 === Digitizer Site Worker for Aura ===
-Contributors: digitizer
+Contributors: benkalsky
 Tags: wordpress management, remote updates, site monitoring, maintenance, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 2.0.0
+Stable tag: 1.3.5
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -12,7 +12,7 @@ Connect your WordPress site to the Aura dashboard for remote monitoring, plugin 
 
 == Description ==
 
-**Digitizer Site Worker** is the bridge between your WordPress sites and the [Aura infrastructure dashboard](https://aura.digitizer.studio) — a unified control center for teams managing multiple WordPress sites alongside servers, CDN, and DNS.
+**Digitizer Site Worker** is the bridge between your WordPress sites and the [Aura infrastructure dashboard](https://my-aura.app) — a unified control center for teams managing multiple WordPress sites alongside servers, CDN, and DNS.
 
 Install this plugin on any WordPress site to unlock remote management capabilities directly from Aura — no SSH, no wp-admin juggling, no manual logins.
 
@@ -58,12 +58,12 @@ Digitizer Site Worker extends that reach into every WordPress installation — s
 
 = Free to Use =
 
-The plugin is completely free and open source (GPLv2+). You need a free or paid Aura account to connect your sites. [Sign up at aura.digitizer.studio](https://aura.digitizer.studio).
+The plugin is completely free and open source (GPLv2+). You need a free or paid Aura account to connect your sites. [Sign up at my-aura.app](https://my-aura.app).
 
 = Links =
 
-* [Aura Dashboard](https://aura.digitizer.studio)
-* [Documentation](https://aura.digitizer.studio/auraworker)
+* [Aura Dashboard](https://my-aura.app)
+* [Documentation](https://my-aura.app/auraworker)
 * [GitHub Repository](https://github.com/Digitizers/AuraWorker)
 * [Digitizer](https://digitizer.studio)
 
@@ -93,7 +93,7 @@ The plugin is completely free and open source (GPLv2+). You need a free or paid 
 
 = Do I need an Aura account? =
 
-Yes, you need an Aura account to connect your WordPress sites. Aura offers a free tier that includes up to 3 WordPress sites. [Sign up at aura.digitizer.studio](https://aura.digitizer.studio).
+Yes, you need an Aura account to connect your WordPress sites. Aura offers a free tier that includes up to 3 WordPress sites. [Sign up at my-aura.app](https://my-aura.app).
 
 = Is this plugin safe to use? =
 
