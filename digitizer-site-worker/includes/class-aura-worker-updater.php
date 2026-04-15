@@ -676,9 +676,8 @@ class Aura_Worker_Updater {
 	 */
 	public function update_database( $plugin = null ) {
 		// Extend execution time for potentially long migrations.
-		// phpcs:ignore Squiz.PHP.DiscouragedFunctions.Discouraged -- Required for long-running DB migrations.
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 120 );
+			@set_time_limit( 120 ); // phpcs:ignore Squiz.PHP.DiscouragedFunctions.Discouraged,WordPress.PHP.NoSilencedErrors.Discouraged -- Required for long-running DB migrations.
 		}
 
 		// Plugin-specific migration.

@@ -1,10 +1,10 @@
-=== Digitizer Site Worker ===
+=== Digitizer Site Worker for Aura ===
 Contributors: digitizer
 Tags: wordpress management, remote updates, site monitoring, maintenance, dashboard
 Requires at least: 6.2
-Tested up to: 6.7
+Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.3.5
+Stable tag: 2.0.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -105,7 +105,7 @@ No. The plugin registers only REST API endpoints. It does not load any code, scr
 
 = What WordPress versions are supported? =
 
-WordPress 6.2 or higher is required. This is needed for full Application Password support. The plugin has been tested up to WordPress 6.7.
+WordPress 6.2 or higher is required. This is needed for full Application Password support. The plugin has been tested up to WordPress 6.9.
 
 = What PHP versions are supported? =
 
@@ -146,6 +146,11 @@ Yes. Digitizer Site Worker is open source under the GPLv2 or later license. The 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.0.0 =
+* Feature: Site health checks, rollback/backup of plugins, magic-link admin access, MCP tools.
+* Improvement: Tested with WordPress 6.9.
+* Compliance: WordPress.org Plugin Check fixes (WP_Filesystem usage, gmdate, wp_delete_file).
 
 = 1.3.5 =
 * Security: Enhanced authentication with timing-safe token comparison.

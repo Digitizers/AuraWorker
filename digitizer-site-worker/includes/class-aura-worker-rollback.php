@@ -42,7 +42,7 @@ class Aura_Worker_Rollback {
 			return array( 'success' => false, 'error' => "Plugin directory not found: $plugin_slug" );
 		}
 
-		$timestamp   = date( 'Y-m-d_H-i-s' );
+		$timestamp   = gmdate( 'Y-m-d_H-i-s' );
 		$backup_path = $this->backup_dir . $plugin_slug . '_' . $timestamp . '.zip';
 
 		$zip = new ZipArchive();
@@ -131,7 +131,7 @@ class Aura_Worker_Rollback {
 		}
 		foreach ( $by_plugin as $plugin_backups ) {
 			foreach ( array_slice( $plugin_backups, $keep_per_plugin ) as $old ) {
-				@unlink( $old['path'] ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				wp_delete_file( $old['path'] );
 			}
 		}
 	}
@@ -160,13 +160,11 @@ class Aura_Worker_Rollback {
 	 * @param string $dir Absolute path to the directory to remove.
 	 */
 	private function delete_directory( $dir ) {
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
-			RecursiveIteratorIterator::CHILD_FIRST
-		);
-		foreach ( $iterator as $file ) {
-			$file->isDir() ? rmdir( $file->getRealPath() ) : unlink( $file->getRealPath() );
+		global $wp_filesystem;
+		if ( ! function_exists( 'WP_Filesystem' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/file.php';
 		}
-		rmdir( $dir );
+		WP_Filesystem();
+		$wp_filesystem->delete( $dir, true, 'd' );
 	}
 }

@@ -65,12 +65,13 @@ class Aura_Worker_Health {
 			return array( 'status' => 'pass', 'detail' => 'No error log found' );
 		}
 		$size = filesize( $log_file );
-		$fp   = fopen( $log_file, 'r' );
+		// Reading only the last 5KB of a potentially huge log file; WP_Filesystem has no streaming seek.
+		$fp = fopen( $log_file, 'r' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
 		if ( $size > 5120 ) {
 			fseek( $fp, -5120, SEEK_END );
 		}
-		$tail = fread( $fp, 5120 );
-		fclose( $fp );
+		$tail = fread( $fp, 5120 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 
 		if ( preg_match_all( '/\[.*?\]\s*(PHP Fatal error|PHP Parse error)/i', $tail, $matches ) ) {
 			return array( 'status' => 'fail', 'detail' => count( $matches[0] ) . ' fatal errors in recent log' );
