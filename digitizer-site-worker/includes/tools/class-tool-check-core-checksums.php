@@ -100,6 +100,9 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 		$truncated  = false;
 		$cap        = '';
 
+		$reported_ancestors        = array();
+		$this->ancestor_link_cache = array();
+
 		foreach ( $manifest as $rel_file => $expected_md5 ) {
 			if ( $checked >= static::MAX_FILES ) {
 				$truncated = true;
@@ -116,6 +119,22 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 
 			$path = $base . $rel_file;
 			$checked++;
+
+			// Ancestor discipline: if any directory on the path (wp-includes
+			// itself, or an intermediate dir) is a symlink, hashing the file
+			// would follow it and read OUTSIDE the tree — the symlinked
+			// ancestor is the finding.
+			$linked_ancestor = $this->linked_ancestor( $base, $rel_file );
+			if ( '' !== $linked_ancestor ) {
+				if ( ! isset( $reported_ancestors[ $linked_ancestor ] ) ) {
+					$reported_ancestors[ $linked_ancestor ] = true;
+					$special[]                              = array(
+						'file' => $linked_ancestor,
+						'kind' => 'symlink',
+					);
+				}
+				continue;
+			}
 
 			// lstat discipline: never hash (or follow) anything that is not a
 			// regular file — a symlink/FIFO/device AT a core path is itself a
@@ -230,6 +249,33 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 	protected function base_path() {
 		$base = apply_filters( 'aura_worker_core_checksums_base', ABSPATH );
 		return rtrim( (string) $base, '/' ) . '/';
+	}
+
+	/** @var array<string,bool> Per-run cache of directory-is-symlink checks. */
+	private $ancestor_link_cache = array();
+
+	/**
+	 * Returns the first symlinked ancestor directory of a relative file path,
+	 * or '' when the whole chain is real directories.
+	 *
+	 * @param string $base     Trailing-slashed base path.
+	 * @param string $rel_file Relative file path.
+	 * @return string Relative directory that is a symlink, or ''.
+	 */
+	private function linked_ancestor( $base, $rel_file ) {
+		$parts = explode( '/', $rel_file );
+		array_pop( $parts ); // The file itself is classified separately.
+		$prefix = '';
+		foreach ( $parts as $part ) {
+			$prefix = ( '' === $prefix ) ? $part : $prefix . '/' . $part;
+			if ( ! isset( $this->ancestor_link_cache[ $prefix ] ) ) {
+				$this->ancestor_link_cache[ $prefix ] = is_link( $base . $prefix );
+			}
+			if ( $this->ancestor_link_cache[ $prefix ] ) {
+				return $prefix;
+			}
+		}
+		return '';
 	}
 
 	/**

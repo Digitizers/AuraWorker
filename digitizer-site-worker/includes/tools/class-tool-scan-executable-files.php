@@ -144,11 +144,15 @@ class Aura_Tool_Scan_Executable_Files extends Aura_Tool_Base {
 				$path = $base . '/' . $rel;
 
 				if ( is_link( $path ) ) {
+					// lstat metadata only: filemtime() would resolve the target,
+					// and a target on a slow/unavailable mount can stall the scan
+					// — the no-follow promise covers metadata too.
+					$lstat      = @lstat( $path );
 					$findings[] = array(
 						'file'   => $rel,
 						'kind'   => 'symlink',
 						'size'   => 0,
-						'mtime'  => (int) @filemtime( $path ),
+						'mtime'  => is_array( $lstat ) && isset( $lstat['mtime'] ) ? (int) $lstat['mtime'] : 0,
 						'target' => (string) @readlink( $path ),
 					);
 					continue; // Never follow.

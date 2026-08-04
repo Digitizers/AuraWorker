@@ -135,6 +135,40 @@ final class SecurityAuditToolsTest extends TestCase {
 		$this->assertNotContains( 'wp-includes/version.php', array_column( $result['modified'], 'file' ) );
 	}
 
+	public function test_checksums_symlinked_ancestor_dir_reported_not_followed(): void {
+		[ $base, $manifest ] = $this->core_fixture();
+
+		// Replace wp-includes with a symlink to a look-alike tree: hashing
+		// through it would read OUTSIDE the intended core tree.
+		$outside = $this->make_tmp_dir();
+		file_put_contents( $outside . '/version.php', "<?php // outside\n" );
+		$this->rrmdir( $base . '/wp-includes' );
+		symlink( $outside, $base . '/wp-includes' );
+
+		$result = $this->checksums_tool( $base, $manifest )->execute( array() );
+
+		$kinds = array_column( $result['special'], 'kind', 'file' );
+		$this->assertSame( 'symlink', $kinds['wp-includes'] ?? null, 'A symlinked ancestor directory is the finding.' );
+		$this->assertNotContains( 'wp-includes/version.php', array_column( $result['modified'], 'file' ), 'Files under a symlinked ancestor are never hashed.' );
+	}
+
+	public function test_admin_audit_site_admins_size_query_scoped_to_network(): void {
+		$GLOBALS['_is_multisite'] = true;
+		$GLOBALS['_db_var_queue'] = array( 60 );
+		$GLOBALS['_site_options']['site_admins'] = array( 'boss' );
+		$GLOBALS['_admins'] = array();
+
+		( new Aura_Tool_Audit_Admin_Accounts() )->execute( array() );
+
+		$queries = array_filter(
+			$GLOBALS['_db_prepared'],
+			static fn( $q ) => in_array( 'site_admins', $q['args'], true )
+		);
+		$this->assertNotEmpty( $queries );
+		$q = array_values( $queries )[0];
+		$this->assertStringContainsString( 'site_id = %d', $q['query'], 'Size pre-check must be scoped to the current network.' );
+	}
+
 	public function test_checksums_manifest_unavailable_fails_closed(): void {
 		[ $base ] = $this->core_fixture();
 

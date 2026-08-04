@@ -143,9 +143,16 @@ class Aura_Tool_Audit_Admin_Accounts extends Aura_Tool_Base {
 		$size = 0;
 		if ( isset( $wpdb ) && method_exists( $wpdb, 'get_var' ) ) {
 			$meta_table = isset( $wpdb->sitemeta ) ? $wpdb->sitemeta : $wpdb->prefix . 'sitemeta';
+			// Scope to the CURRENT network: on multi-network installs sitemeta
+			// holds one site_admins row per site_id, and an arbitrary row's
+			// size says nothing about the row get_site_option() will read.
+			$network_id = function_exists( 'get_current_network_id' )
+				? (int) get_current_network_id()
+				: ( isset( $wpdb->siteid ) ? (int) $wpdb->siteid : 1 );
 			$size       = (int) $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT LENGTH(meta_value) FROM {$meta_table} WHERE meta_key = %s LIMIT 1", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					"SELECT LENGTH(meta_value) FROM {$meta_table} WHERE site_id = %d AND meta_key = %s LIMIT 1", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					$network_id,
 					'site_admins'
 				)
 			);
