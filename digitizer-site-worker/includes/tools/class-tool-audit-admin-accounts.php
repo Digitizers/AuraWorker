@@ -79,15 +79,32 @@ class Aura_Tool_Audit_Admin_Accounts extends Aura_Tool_Base {
 			}
 		}
 
-		// Per-site privileged users: administrators plus anyone holding core
-		// admin capabilities outside the administrator role.
-		$users = get_users(
+		// Per-site privileged users: the UNION of role=administrator and
+		// capability=manage_options. Either alone has a hole — a customized
+		// administrator role stripped of manage_options (but keeping other
+		// privileged caps) escapes the capability query, and a non-admin role
+		// granted manage_options escapes the role query. Deduped by user ID.
+		$by_role = get_users(
+			array(
+				'role'   => 'administrator',
+				'number' => static::MAX_ACCOUNTS + 1,
+				'fields' => 'all',
+			)
+		);
+		$by_cap  = get_users(
 			array(
 				'capability' => 'manage_options',
 				'number'     => static::MAX_ACCOUNTS + 1,
 				'fields'     => 'all',
 			)
 		);
+
+		$users = array();
+		foreach ( array_merge( (array) $by_role, (array) $by_cap ) as $candidate ) {
+			if ( is_object( $candidate ) && isset( $candidate->ID ) && ! isset( $users[ (int) $candidate->ID ] ) ) {
+				$users[ (int) $candidate->ID ] = $candidate;
+			}
+		}
 
 		$now = time();
 		foreach ( (array) $users as $user ) {
