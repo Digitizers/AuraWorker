@@ -79,30 +79,35 @@ class Aura_Tool_Audit_Admin_Accounts extends Aura_Tool_Base {
 			}
 		}
 
-		// Per-site privileged users: the UNION of role=administrator and
-		// capability=manage_options. Either alone has a hole — a customized
-		// administrator role stripped of manage_options (but keeping other
-		// privileged caps) escapes the capability query, and a non-admin role
-		// granted manage_options escapes the role query. Deduped by user ID.
-		$by_role = get_users(
+		// Per-site privileged users: the UNION of role=administrator and each
+		// mutation-grade capability. Any single query has a hole — a customized
+		// administrator role stripped of manage_options escapes the capability
+		// queries, and custom roles can hold update_core/update_plugins/
+		// edit_users etc. WITHOUT manage_options. Deduped by user ID.
+		$batches   = array();
+		$batches[] = get_users(
 			array(
 				'role'   => 'administrator',
 				'number' => static::MAX_ACCOUNTS + 1,
 				'fields' => 'all',
 			)
 		);
-		$by_cap  = get_users(
-			array(
-				'capability' => 'manage_options',
-				'number'     => static::MAX_ACCOUNTS + 1,
-				'fields'     => 'all',
-			)
-		);
+		foreach ( array( 'manage_options', 'update_core', 'update_plugins', 'update_themes', 'install_plugins', 'edit_users', 'edit_plugins' ) as $capability ) {
+			$batches[] = get_users(
+				array(
+					'capability' => $capability,
+					'number'     => static::MAX_ACCOUNTS + 1,
+					'fields'     => 'all',
+				)
+			);
+		}
 
 		$users = array();
-		foreach ( array_merge( (array) $by_role, (array) $by_cap ) as $candidate ) {
-			if ( is_object( $candidate ) && isset( $candidate->ID ) && ! isset( $users[ (int) $candidate->ID ] ) ) {
-				$users[ (int) $candidate->ID ] = $candidate;
+		foreach ( $batches as $batch ) {
+			foreach ( (array) $batch as $candidate ) {
+				if ( is_object( $candidate ) && isset( $candidate->ID ) && ! isset( $users[ (int) $candidate->ID ] ) ) {
+					$users[ (int) $candidate->ID ] = $candidate;
+				}
 			}
 		}
 

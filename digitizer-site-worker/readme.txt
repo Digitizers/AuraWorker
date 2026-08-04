@@ -68,7 +68,7 @@ MCP tools under `/wp-json/aura/mcp/`:
 
 = AI Agent Tools (MCP) =
 
-SiteAgent ships **21 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
+SiteAgent ships **25 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
 
 Read tools:
 
