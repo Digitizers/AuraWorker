@@ -92,7 +92,7 @@ class Aura_Tool_Audit_Admin_Accounts extends Aura_Tool_Base {
 				'fields' => 'all',
 			)
 		);
-		foreach ( array( 'manage_options', 'update_core', 'update_plugins', 'update_themes', 'install_plugins', 'edit_users', 'edit_plugins' ) as $capability ) {
+		foreach ( array( 'manage_options', 'update_core', 'update_plugins', 'update_themes', 'install_plugins', 'install_themes', 'activate_plugins', 'switch_themes', 'edit_users', 'delete_users', 'promote_users', 'edit_plugins', 'edit_themes', 'edit_files', 'unfiltered_html' ) as $capability ) {
 			$batches[] = get_users(
 				array(
 					'capability' => $capability,
