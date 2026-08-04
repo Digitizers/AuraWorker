@@ -59,25 +59,30 @@ class Aura_Tool_Scan_Executable_Files extends Aura_Tool_Base {
 	public function execute( $params ) {
 		$dirs = $this->scan_dirs();
 
-		$findings  = array();
-		$entries   = 0;
-		$truncated = false;
-		$cap       = '';
+		$findings   = array();
+		$entries    = 0;
+		$truncated  = false;
+		$cap        = '';
+		$unreadable = array();
 
 		foreach ( $dirs as $dir ) {
 			if ( $truncated ) {
 				break;
 			}
-			$this->walk( $dir, '', $findings, $entries, $truncated, $cap );
+			$this->walk( $dir, '', $findings, $entries, $truncated, $cap, $unreadable );
 		}
 
 		return array(
 			'findings' => $findings,
 			'coverage' => array(
-				'total_seen' => $entries,
-				'returned'   => count( $findings ),
-				'truncated'  => $truncated,
-				'cap'        => $truncated ? $cap : '',
+				'total_seen'      => $entries,
+				'returned'        => count( $findings ),
+				'truncated'       => $truncated,
+				'cap'             => $truncated ? $cap : '',
+				// Directories that could not be opened (permissions/IO): the
+				// scan there is UNKNOWN, not clean — silence would make an
+				// unreadable uploads root look like a clean result.
+				'unreadable_dirs' => $unreadable,
 			),
 		);
 	}
@@ -112,7 +117,7 @@ class Aura_Tool_Scan_Executable_Files extends Aura_Tool_Base {
 	 * @param bool   $truncated Truncation flag (by reference).
 	 * @param string $cap       Tripped-cap label (by reference).
 	 */
-	private function walk( $base, $rel_dir, &$findings, &$entries, &$truncated, &$cap ) {
+	private function walk( $base, $rel_dir, &$findings, &$entries, &$truncated, &$cap, &$unreadable ) {
 		$base  = rtrim( (string) $base, '/' );
 		$stack = array( $rel_dir );
 
@@ -121,6 +126,7 @@ class Aura_Tool_Scan_Executable_Files extends Aura_Tool_Base {
 			$abs    = '' === $dir ? $base : $base . '/' . $dir;
 			$handle = @opendir( $abs );
 			if ( false === $handle ) {
+				$unreadable[] = '' === $dir ? $base : $dir;
 				continue;
 			}
 			while ( false !== ( $entry = readdir( $handle ) ) ) {

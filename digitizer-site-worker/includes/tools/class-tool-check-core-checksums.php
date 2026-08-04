@@ -100,6 +100,17 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 		$truncated  = false;
 		$cap        = '';
 
+		// In-scope expectation computed up front (cheap — the manifest is
+		// already in memory): stays the FULL in-scope count even when the
+		// scan truncates, so expected>checked correctly signals what was
+		// left unverified.
+		$in_scope = 0;
+		foreach ( $manifest as $rel_file => $unused ) {
+			if ( 0 !== strpos( (string) $rel_file, 'wp-content/' ) ) {
+				$in_scope++;
+			}
+		}
+
 		$reported_ancestors        = array();
 		$this->ancestor_link_cache = array();
 
@@ -179,7 +190,10 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 			'special'    => $special,
 			'root_extra' => $root_extra,
 			'coverage'   => array(
-				'files_expected' => count( $manifest ),
+				// In-scope only: the manifest's wp-content entries are skipped
+				// by design, and counting them would make a COMPLETE scan look
+				// partial (expected > checked with truncated=false).
+				'files_expected' => $in_scope,
 				'files_checked'  => $checked,
 				'truncated'      => $truncated,
 				'cap'            => $truncated ? $cap : '',
