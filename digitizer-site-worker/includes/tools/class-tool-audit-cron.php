@@ -82,7 +82,7 @@ class Aura_Tool_Audit_Cron extends Aura_Tool_Base {
 				if ( ! is_array( $instances ) ) {
 					continue;
 				}
-				foreach ( $instances as $instance ) {
+				foreach ( $instances as $instance_key => $instance ) {
 					$total_seen++;
 					if ( count( $events ) >= static::MAX_EVENTS ) {
 						$truncated = true;
@@ -97,19 +97,18 @@ class Aura_Tool_Audit_Cron extends Aura_Tool_Base {
 						$interval = (int) $schedules[ $schedule ]['interval'];
 					}
 
-					$args = isset( $instance['args'] ) ? $instance['args'] : array();
-					// serialize(), not wp_json_encode(): JSON collapses
-					// unencodable strings and objects with non-public state to
-					// indistinguishable output, so distinct arg sets could share
-					// a digest. PHP serialization is total over cron-storable
-					// values (they came out of unserialize() to begin with).
+					// The cron array KEY is WordPress's own md5(serialize(args))
+					// for this instance — reuse it instead of re-serializing:
+					// serialize() on an object argument would invoke its
+					// __serialize()/__sleep() userland hooks, which a read-only
+					// audit must never execute.
 
 					$events[] = array(
 						'hook'                       => (string) $hook,
 						'schedule'                   => $schedule ? $schedule : 'single',
 						'interval'                   => $interval,
 						'next_run'                   => (int) $timestamp,
-						'args_digest'                => md5( serialize( $args ) ), // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+						'args_digest'                => (string) $instance_key,
 						'interval_lt_60s'            => ( $interval > 0 && $interval < 60 ),
 						// Fact, not verdict: plugins may register callbacks only
 						// during an actual cron request, and hook names carry no

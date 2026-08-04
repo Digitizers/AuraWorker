@@ -242,8 +242,13 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 		$response = wp_remote_get(
 			$url,
 			array(
-				'timeout'   => 15,
-				'sslverify' => true,
+				'timeout'     => 15,
+				'sslverify'   => true,
+				// No redirects: a redirect to an http:// destination would
+				// silently reopen the plaintext-downgrade hole HTTPS-only
+				// fetching exists to close. api.wordpress.org serves this
+				// endpoint directly; anything else is manifest_unavailable.
+				'redirection' => 0,
 			)
 		);
 
