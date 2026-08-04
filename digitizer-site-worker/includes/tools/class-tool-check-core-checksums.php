@@ -177,11 +177,12 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 		$unexpected = array();
 		$root_extra = array();
 		$entries    = 0;
+		$unreadable = array();
 
 		foreach ( array( 'wp-admin', 'wp-includes' ) as $dir ) {
-			$this->walk_unexpected( $base, $dir, $manifest, $unexpected, $special, $entries, $truncated, $cap );
+			$this->walk_unexpected( $base, $dir, $manifest, $unexpected, $special, $entries, $truncated, $cap, $unreadable );
 		}
-		$this->scan_root( $base, $manifest, $unexpected, $root_extra, $entries, $truncated, $cap );
+		$this->scan_root( $base, $manifest, $unexpected, $root_extra, $entries, $truncated, $cap, $unreadable );
 
 		return array(
 			'modified'   => $modified,
@@ -197,6 +198,9 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 				'files_checked'  => $checked,
 				'truncated'      => $truncated,
 				'cap'            => $truncated ? $cap : '',
+				// Directories that could not be enumerated: their contents are
+				// UNVERIFIED, not clean.
+				'unreadable_dirs' => $unreadable,
 			),
 		);
 	}
@@ -328,9 +332,12 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 	 * @param bool   $truncated  Truncation flag (by reference).
 	 * @param string $cap        Tripped-cap label (by reference).
 	 */
-	private function walk_unexpected( $base, $dir, $manifest, &$unexpected, &$special, &$entries, &$truncated, &$cap ) {
+	private function walk_unexpected( $base, $dir, $manifest, &$unexpected, &$special, &$entries, &$truncated, &$cap, &$unreadable ) {
 		$abs = $base . $dir;
-		if ( ! is_dir( $abs ) || is_link( $abs ) ) {
+		if ( is_link( $abs ) ) {
+			return; // Reported by the ancestor guard.
+		}
+		if ( ! is_dir( $abs ) ) {
 			return;
 		}
 
@@ -339,6 +346,7 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 			$rel_dir = array_pop( $stack );
 			$handle  = @opendir( $base . $rel_dir );
 			if ( false === $handle ) {
+				$unreadable[] = $rel_dir;
 				continue;
 			}
 			while ( false !== ( $entry = readdir( $handle ) ) ) {
@@ -388,9 +396,10 @@ class Aura_Tool_Check_Core_Checksums extends Aura_Tool_Base {
 	 * @param bool   $truncated  Truncation flag (by reference).
 	 * @param string $cap        Tripped-cap label (by reference).
 	 */
-	private function scan_root( $base, $manifest, &$unexpected, &$root_extra, &$entries, &$truncated, &$cap ) {
+	private function scan_root( $base, $manifest, &$unexpected, &$root_extra, &$entries, &$truncated, &$cap, &$unreadable ) {
 		$handle = @opendir( $base );
 		if ( false === $handle ) {
+			$unreadable[] = '.';
 			return;
 		}
 		while ( false !== ( $entry = readdir( $handle ) ) ) {

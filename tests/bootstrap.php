@@ -911,7 +911,7 @@ if ( ! function_exists( 'get_locale' ) ) {
 
 if ( ! function_exists( 'add_query_arg' ) ) {
 	function add_query_arg( array $args, string $url ): string {
-		return $url . ( str_contains( $url, '?' ) ? '&' : '?' ) . http_build_query( $args );
+		return $url . ( false !== strpos( $url, '?' ) ? '&' : '?' ) . http_build_query( $args );
 	}
 }
 
