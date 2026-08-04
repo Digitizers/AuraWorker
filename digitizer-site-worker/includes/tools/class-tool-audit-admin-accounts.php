@@ -92,7 +92,7 @@ class Aura_Tool_Audit_Admin_Accounts extends Aura_Tool_Base {
 				'fields' => 'all',
 			)
 		);
-		foreach ( array( 'manage_options', 'update_core', 'update_plugins', 'update_themes', 'install_plugins', 'install_themes', 'activate_plugins', 'switch_themes', 'edit_users', 'delete_users', 'promote_users', 'edit_plugins', 'edit_themes', 'edit_files', 'unfiltered_html' ) as $capability ) {
+		foreach ( array( 'manage_options', 'update_core', 'update_plugins', 'update_themes', 'install_plugins', 'install_themes', 'activate_plugins', 'switch_themes', 'edit_users', 'delete_users', 'promote_users', 'edit_plugins', 'edit_themes', 'edit_files', 'unfiltered_html', 'delete_plugins', 'delete_themes' ) as $capability ) {
 			$batches[] = get_users(
 				array(
 					'capability' => $capability,
@@ -132,7 +132,10 @@ class Aura_Tool_Audit_Admin_Accounts extends Aura_Tool_Base {
 				'is_admin'                => $is_admin,
 				'capability_outside_role' => ! $is_admin,
 				'user_registered'         => $registered,
-				'recently_created'        => ( false !== $reg_ts ) && ( ( $now - $reg_ts ) < static::RECENT_DAYS * DAY_IN_SECONDS ),
+				'recently_created'        => ( false !== $reg_ts ) && ( $now - $reg_ts ) >= 0 && ( ( $now - $reg_ts ) < static::RECENT_DAYS * DAY_IN_SECONDS ),
+				// A future registration date can't be 'recent' — it is its own
+				// anomaly (imported/migrated/tampered account).
+				'registered_in_future'    => ( false !== $reg_ts ) && $reg_ts > $now,
 				'network_super_admin'     => in_array( (string) $user->user_login, $super_logins, true ),
 				'app_passwords'           => $this->app_password_count( (int) $user->ID ),
 			);
