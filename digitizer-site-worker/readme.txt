@@ -26,7 +26,7 @@ Install this plugin on any WordPress site to connect it to Aura — no SSH, no w
 * **Per-plugin rollback** — Every update is zip-snapshotted first; restore any plugin to its last good state on demand.
 * **Bulk translation & database upgrades** — Update all language packs and run WordPress database migrations remotely.
 * **One-click connect (magic link)** — Connect a site to Aura straight from wp-admin — no manual token copy/paste.
-* **AI-agent ready (21 MCP tools)** — Exposes machine-readable, JSON-schema tools for AI-driven management, including SEO/accessibility/performance/broken-link auditors, on-site SEO-meta read/write (Rank Math, Yoast, SEOPress), and Gutenberg block read/edit. Read tools run on demand; mutating tools are approval-gated through Aura, and every call is audited.
+* **AI-agent ready (25 MCP tools)** — Exposes machine-readable, JSON-schema tools for AI-driven management, including SEO/accessibility/performance/broken-link auditors, on-site SEO-meta read/write (Rank Math, Yoast, SEOPress), and Gutenberg block read/edit. Read tools run on demand; mutating tools are approval-gated through Aura, and every call is audited.
 * **Zero frontend impact** — The plugin only registers REST API endpoints. No scripts, no styles, no database queries on visitor-facing page loads.
 
 = How It Works =
@@ -68,7 +68,7 @@ MCP tools under `/wp-json/aura/mcp/`:
 
 = AI Agent Tools (MCP) =
 
-SiteAgent ships **21 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
+SiteAgent ships **25 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
 
 Read tools:
 
@@ -82,7 +82,11 @@ Read tools:
 * `list_users` — Users with roles and post counts, administrators flagged (never returns secrets)
 * `check_health` — Live health gate: HTTP status, PHP fatals, white-screen, database connectivity
 * `scan_error_log` — Tails and severity-groups the error log, surfacing recent fatals
-* `check_vulnerabilities` — Plugins/themes checked against the WordPress.org vulnerability database
+* `check_vulnerabilities` — Plugin update-currency check against WordPress.org (a version check, not a vulnerability/CVE feed; covers wp.org-hosted plugins)
+* `check_core_checksums` — Core-file integrity against the official WordPress.org checksum manifest (modified/missing/unexpected files, fetched over HTTPS only)
+* `scan_executable_files` — Uploads-directory observations: PHP/executable files, .htaccess overrides, and symlinks (reported, never followed)
+* `audit_admin_accounts` — Privileged-account facts: administrators with recency, admin capabilities outside the role, application-password counts, multisite super admins
+* `audit_cron` — Bounded WP-Cron inventory with sub-60-second-schedule and unresolved-callback fact-flags
 * `get_seo_meta` — Read a post/page's SEO title, description, and focus keyword from the active SEO plugin (Rank Math, Yoast, or SEOPress)
 * `list_page_blocks` — Read a page's Gutenberg block structure (block names, attributes, nesting)
 

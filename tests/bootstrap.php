@@ -45,6 +45,9 @@ if ( ! defined( 'FS_CHMOD_FILE' ) ) {
 if ( ! defined( 'ARRAY_A' ) ) {
 	define( 'ARRAY_A', 'ARRAY_A' );
 }
+if ( ! defined( 'DAY_IN_SECONDS' ) ) {
+	define( 'DAY_IN_SECONDS', 86400 );
+}
 if ( ! defined( 'MINUTE_IN_SECONDS' ) ) {
 	define( 'MINUTE_IN_SECONDS', 60 );
 }
@@ -851,6 +854,106 @@ foreach ( glob( SA_PLUGIN_DIR . '/includes/tools/class-tool-*.php' ) as $tool_fi
 /**
  * Reset all mutable stub state. Call from each test's setUp().
  */
+// ---------------------------------------------------------------------------
+// K5 security-audit tool stubs
+// ---------------------------------------------------------------------------
+
+if ( ! function_exists( 'is_multisite' ) ) {
+	function is_multisite(): bool {
+		return (bool) ( $GLOBALS['_is_multisite'] ?? false );
+	}
+}
+
+if ( ! function_exists( 'get_site_option' ) ) {
+	function get_site_option( string $option, $default = false ) {
+		return $GLOBALS['_site_options'][ $option ] ?? $default;
+	}
+}
+
+if ( ! function_exists( 'get_user_meta' ) ) {
+	function get_user_meta( int $user_id, string $key = '', bool $single = false ) {
+		if ( isset( $GLOBALS['_user_meta'][ $user_id ][ $key ] ) ) {
+			return $GLOBALS['_user_meta'][ $user_id ][ $key ];
+		}
+		return $single ? '' : array();
+	}
+}
+
+if ( ! function_exists( '_get_cron_array' ) ) {
+	function _get_cron_array() {
+		return $GLOBALS['_cron_array'] ?? array();
+	}
+}
+
+if ( ! function_exists( 'wp_get_schedules' ) ) {
+	function wp_get_schedules(): array {
+		return $GLOBALS['_cron_schedules'] ?? array(
+			'hourly' => array( 'interval' => 3600, 'display' => 'Hourly' ),
+			'daily'  => array( 'interval' => 86400, 'display' => 'Daily' ),
+		);
+	}
+}
+
+if ( ! function_exists( 'wp_get_upload_dir' ) ) {
+	function wp_get_upload_dir(): array {
+		return array(
+			'basedir' => $GLOBALS['_upload_basedir'] ?? sys_get_temp_dir() . '/sa-test-uploads-none',
+			'baseurl' => 'http://example.com/wp-content/uploads',
+		);
+	}
+}
+
+if ( ! function_exists( 'get_locale' ) ) {
+	function get_locale(): string {
+		return 'en_US';
+	}
+}
+
+if ( ! function_exists( 'add_query_arg' ) ) {
+	function add_query_arg( array $args, string $url ): string {
+		return $url . ( false !== strpos( $url, '?' ) ? '&' : '?' ) . http_build_query( $args );
+	}
+}
+
+if ( ! function_exists( 'rawurlencode_deep' ) ) {
+	// no-op helper space reserved
+}
+
+if ( ! function_exists( 'wp_remote_get' ) ) {
+	/**
+	 * Recording HTTP stub: returns $GLOBALS['_http_response'] (or a WP_Error
+	 * when $GLOBALS['_http_error'] is set) and records the request.
+	 */
+	function wp_remote_get( string $url, array $args = array() ) {
+		$GLOBALS['_wp_http_calls'][] = array(
+			'url'  => $url,
+			'args' => $args,
+		);
+		if ( ! empty( $GLOBALS['_http_error'] ) ) {
+			return new WP_Error( 'http_request_failed', 'stubbed failure' );
+		}
+		return $GLOBALS['_http_response'] ?? array(
+			'response' => array( 'code' => 200 ),
+			'body'     => '',
+		);
+	}
+}
+
+if ( ! function_exists( 'wp_remote_retrieve_response_code' ) ) {
+	function wp_remote_retrieve_response_code( $response ) {
+		if ( is_array( $response ) && isset( $response['response']['code'] ) ) {
+			return (int) $response['response']['code'];
+		}
+		return 0;
+	}
+}
+
+if ( ! function_exists( 'wp_remote_retrieve_body' ) ) {
+	function wp_remote_retrieve_body( $response ): string {
+		return is_array( $response ) && isset( $response['body'] ) ? (string) $response['body'] : '';
+	}
+}
+
 function sa_reset_state(): void {
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();
@@ -887,6 +990,13 @@ function sa_reset_state(): void {
 	$GLOBALS['_ability_categories'] = array();
 	$GLOBALS['_scheduled']    = array();
 	$GLOBALS['_sa_state']     = array();
+	$GLOBALS['_is_multisite']   = false;
+	$GLOBALS['_site_options']   = array();
+	$GLOBALS['_user_meta']      = array();
+	$GLOBALS['_cron_array']     = array();
+	$GLOBALS['_cron_schedules'] = null;
+	$GLOBALS['_http_response']  = null;
+	$GLOBALS['_http_error']     = false;
 	if ( isset( $GLOBALS['wpdb'] ) ) {
 		$GLOBALS['wpdb']->last_error = '';
 		$GLOBALS['wpdb']->last_query = '';

@@ -114,7 +114,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `POST` | `/tools/execute` | Execute a tool with validated parameters |
 | `GET` | `/context` | Full site context for AI decision-making |
 
-**Built-in MCP tools (21):**
+**Built-in MCP tools (25):**
 
 | Tool | Kind | Purpose |
 |------|------|---------|
@@ -130,7 +130,11 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `list_users` | read | users + roles + post counts, admins flagged (never returns secrets) |
 | `check_health` | read | live health gate — HTTP, PHP fatals, white-screen, DB |
 | `scan_error_log` | read | tail + severity-group the error log, surface recent fatals |
-| `check_vulnerabilities` | read | plugins/themes vs the WordPress.org vulnerability DB |
+| `check_vulnerabilities` | read | plugin update-currency vs WordPress.org (version check — not a vulnerability/CVE feed; wp.org-hosted plugins only) |
+| `check_core_checksums` | read | core-file integrity vs the official wp.org checksum manifest (HTTPS-only) — modified/missing/unexpected files incl. root implants |
+| `scan_executable_files` | read | uploads-tree observations: PHP/executables, .htaccess overrides, symlinks (reported, never followed) |
+| `audit_admin_accounts` | read | privileged-account facts: admins + recency, caps outside role, app-password counts, multisite super admins |
+| `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |
@@ -140,7 +144,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `update_page_block` | write | update a Gutenberg block's content/attributes (snapshot-first, reversible) |
 | `create_page_from_blocks` | write | create a new page from a Gutenberg block spec (draft-first) |
 
-These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand, write tools are gated behind human approval, every call is audited. Tool names are classified by verb so the gateway applies the right risk policy automatically.
+These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand, write tools are gated behind human approval, every call is audited. Every tool declares explicit risk annotations (`read_only`, `destructive`, `requires_approval`); the gateway's verb-based classifier is only the fallback for tools that haven't declared them.
 
 ---
 
