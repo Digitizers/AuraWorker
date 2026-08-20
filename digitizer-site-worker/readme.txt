@@ -244,10 +244,13 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   discovers abilities from the whole site, not from the plugin that registered
   them, so anything mutating behind one is outside this plugin's approval and
   audit path. The tool reports what is reachable; it does not change it.
-* All five report bounded coverage (`total_seen`, `returned`, `truncated`, `cap`)
-  and stop at their caps rather than growing without limit on a large site. An
-  empty result under `truncated: true` means "nothing found before the cap" — it
-  is never reported as "clean".
+* All five report bounded coverage — `truncated` and `cap`, alongside a pair of
+  counts naming what was in scope and what was reached (`total_seen` /
+  `returned`, or `files_expected` / `files_checked` for `check_core_checksums`,
+  which counts files rather than rows). They stop at their caps rather than
+  growing without limit on a large site, and an empty result under
+  `truncated: true` means "nothing found before the cap" — it is never reported
+  as "clean".
 * Compatibility: declared tested up to WordPress 7.1.
 
 = 2.8.2 =

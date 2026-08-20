@@ -15,9 +15,9 @@
   <a href="https://wordpress.org/plugins/digitizer-site-worker/">
     <img src="https://img.shields.io/badge/WordPress.org-Plugin-blue?logo=wordpress" alt="WordPress.org" />
   </a>
-  <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.0-21759b?logo=wordpress" alt="WordPress" />
+  <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.7.1-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.9.0-green" alt="Stable" />
 </p>
 
 ---
@@ -114,7 +114,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `POST` | `/tools/execute` | Execute a tool with validated parameters |
 | `GET` | `/context` | Full site context for AI decision-making |
 
-**Built-in MCP tools (25):**
+**Built-in MCP tools (26):**
 
 | Tool | Kind | Purpose |
 |------|------|---------|
@@ -135,6 +135,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `scan_executable_files` | read | uploads-tree observations: PHP/executables, .htaccess overrides, symlinks (reported, never followed) |
 | `audit_admin_accounts` | read | privileged-account facts: admins + recency, caps outside role, app-password counts, multisite super admins |
 | `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
+| `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many site abilities they can reach — a second server discovers abilities site-wide, not per-plugin, so mutating ones behind it sit outside SiteAgent's approval path |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |
