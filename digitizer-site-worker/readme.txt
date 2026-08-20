@@ -441,9 +441,9 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 
 = 2.9.0 =
 Adds five read-only audit tools, including one that reports which other MCP
-servers on the site can reach your abilities — worth running if anything else
-here exposes an AI assistant. Nothing existing changes behaviour; no action
-required.
+servers are registered on the site and how many of your abilities are
+discoverable to one — worth running if anything else here exposes an AI
+assistant. Nothing existing changes behaviour; no action required.
 
 = 2.8.2 =
 Security hardening: snapshot restores now reject tampered payloads instead of
