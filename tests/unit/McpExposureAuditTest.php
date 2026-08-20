@@ -165,6 +165,35 @@ final class McpExposureAuditTest extends TestCase {
 		$this->assertSame( '', $result['coverage']['cap'] );
 	}
 
+	public function test_the_adapter_version_is_read_from_the_official_constant(): void {
+		// The official WordPress MCP Adapter publishes WP_MCP_ADAPTER_VERSION.
+		// Checking only the bundled-copy name reported an empty version on
+		// exactly the sites most likely to have a second door, and a field that
+		// is present but blank reads as "unknown".
+		$this->assertSame(
+			'1.2.3',
+			Aura_Tool_Audit_Mcp_Exposure::pick_version( array( 'WP_MCP_ADAPTER_VERSION' => '1.2.3' ) )
+		);
+		$this->assertSame(
+			'0.9.0',
+			Aura_Tool_Audit_Mcp_Exposure::pick_version( array( 'WP_MCP_VERSION' => '0.9.0' ) ),
+			'A bundled copy still answers.'
+		);
+		$this->assertSame(
+			'1.2.3',
+			Aura_Tool_Audit_Mcp_Exposure::pick_version(
+				array( 'WP_MCP_ADAPTER_VERSION' => '1.2.3', 'WP_MCP_VERSION' => '0.9.0' )
+			),
+			'The official constant wins when both are present.'
+		);
+		$this->assertSame( '', Aura_Tool_Audit_Mcp_Exposure::pick_version( array() ) );
+		$this->assertSame(
+			'',
+			Aura_Tool_Audit_Mcp_Exposure::pick_version( array( 'WP_MCP_ADAPTER_VERSION' => '' ) ),
+			'An empty constant is no answer, not an answer of "".'
+		);
+	}
+
 	// --- servers -------------------------------------------------------------
 
 	public function test_no_mcp_adapter_means_no_servers_and_no_claim(): void {

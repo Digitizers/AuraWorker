@@ -37,6 +37,15 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	/** Hard cap on named exposed-mutating abilities in the response. */
 	const MAX_NAMED = 100;
 
+	/**
+	 * Where the adapter version lives, most authoritative first. The official
+	 * WordPress MCP Adapter publishes the first; the second is the name a
+	 * bundled copy may use.
+	 *
+	 * @var string[]
+	 */
+	const VERSION_CONSTANTS = array( 'WP_MCP_ADAPTER_VERSION', 'WP_MCP_VERSION' );
+
 	public function get_name() {
 		return 'audit_mcp_exposure';
 	}
@@ -52,7 +61,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	public function get_returns() {
 		return array(
 			'abilities_api_active' => 'bool — whether wp_get_abilities() exists on this site',
-			'mcp_adapter'          => 'object — { active, version }',
+			'mcp_adapter'          => 'object — { active, version }; version is read from WP_MCP_ADAPTER_VERSION (the official adapter) with WP_MCP_VERSION as a fallback for bundled copies',
 			'servers'              => 'array — { id, route, tool_count } for every MCP server registered on this site',
 			'angie'                => 'object — { active, version, mcp_server_present } (the known second door; absence of Angie does not mean absence of a second server)',
 			'abilities'            => 'object — { total, discoverable_by_type_rule, discoverable_and_mutating, discoverable_mutating_names }. These count abilities that PASS the discovery rule co-installed servers apply (no meta.mcp.type, or "tool") — a property of the abilities, NOT proof that anything currently serves them. Reachability additionally requires a server that resolves targets from the site-wide registry; a server with an explicit tool list reaches only what it lists. Read together with `servers`: with none registered, these counts describe a door that does not exist yet.',
@@ -89,10 +98,42 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 * @return array
 	 */
 	protected function adapter_state() {
+		// The official WordPress MCP Adapter publishes WP_MCP_ADAPTER_VERSION;
+		// WP_MCP_VERSION is the name a bundled copy may use. Checking only the
+		// latter reported `active: true` with an empty version on the very sites
+		// most likely to have a second door — a field that is present but blank
+		// reads as "unknown", which is worse than the answer being available.
+		$values = array();
+		foreach ( self::VERSION_CONSTANTS as $constant ) {
+			if ( defined( $constant ) ) {
+				$values[ $constant ] = constant( $constant );
+			}
+		}
+
 		return array(
 			'active'  => class_exists( '\\WP\\MCP\\Core\\McpAdapter' ),
-			'version' => defined( 'WP_MCP_VERSION' ) ? (string) WP_MCP_VERSION : '',
+			'version' => self::pick_version( $values ),
 		);
+	}
+
+	/**
+	 * The adapter version, given whichever constants are defined.
+	 *
+	 * Split from the constant lookup so both branches are reachable in a test:
+	 * a suite cannot define a constant for one case and undefine it for the
+	 * next, and mirroring the precedence in the test instead would be testing
+	 * the mirror.
+	 *
+	 * @param array $values Map of constant name => value, for those defined.
+	 * @return string
+	 */
+	public static function pick_version( array $values ) {
+		foreach ( self::VERSION_CONSTANTS as $constant ) {
+			if ( isset( $values[ $constant ] ) && '' !== (string) $values[ $constant ] ) {
+				return (string) $values[ $constant ];
+			}
+		}
+		return '';
 	}
 
 	/**
