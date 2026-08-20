@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.9.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.9.1-green" alt="Stable" />
 </p>
 
 ---
@@ -150,6 +150,10 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.9.1
+
+- **Second-door hardening for the Abilities surface.** SiteAgent's tools have been dual-registered as WordPress abilities since 2.5.0, and `wp_register_ability` publishes to the **site**, not to a server — so any co-installed MCP server enumerating `wp_get_abilities()` could serve them, writes included. Grant enforcement lives in SiteAgent's REST handlers, which that path never touches, so a mutating tool could run through another plugin's MCP server with no approval, no snapshot binding and no audit entry. Two guards now close it: grant-requiring tools declare a discovery type co-installed servers do not serve, and a grant-requiring ability on any transport but SiteAgent's own is refused without a valid grant bound to that exact call. Gateway-minted grants work unchanged; read-only tools stay discoverable.
 
 ### 2.9.0
 
