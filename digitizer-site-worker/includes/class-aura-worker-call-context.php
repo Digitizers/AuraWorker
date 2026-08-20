@@ -48,6 +48,20 @@ class Aura_Worker_Call_Context {
 	private static $rest_route = null;
 
 	/**
+	 * Calls whose grant already verified during THIS request.
+	 *
+	 * `Aura_Worker_Grant::verify()` reserves the nonce as it validates —
+	 * single-use is the point — and `WP_Ability::execute()` re-runs the
+	 * permission callback before executing. Verifying twice therefore spends
+	 * the grant on the first check and refuses the second, turning every valid
+	 * approved mutation into a denial. The grant is proven once per call and
+	 * the proof is remembered for the rest of the request.
+	 *
+	 * @var array<string,bool>
+	 */
+	private static $verified = array();
+
+	/**
 	 * Start recording the dispatching route.
 	 */
 	public static function init() {
@@ -96,6 +110,7 @@ class Aura_Worker_Call_Context {
 	 */
 	public static function reset() {
 		self::$rest_route = null;
+		self::$verified   = array();
 	}
 
 	/**
@@ -116,8 +131,13 @@ class Aura_Worker_Call_Context {
 			// Not dispatching a REST request.
 			return ! ( defined( 'REST_REQUEST' ) && REST_REQUEST );
 		}
+		$path = ltrim( $route, '/' );
 		foreach ( self::OWN_NAMESPACES as $ns ) {
-			if ( 0 === strpos( ltrim( $route, '/' ), $ns ) ) {
+			// Match at a route boundary, not on any prefix: `aura/v10/...` and
+			// `aura/mcp-foreign/...` both start with a namespace we own and are
+			// neither of them ours. A foreign server is free to choose its own
+			// namespace, so a prefix test hands it the exemption.
+			if ( $path === $ns || 0 === strpos( $path, $ns . '/' ) ) {
 				return true;
 			}
 		}
@@ -246,6 +266,28 @@ class Aura_Worker_Call_Context {
 		if ( '' === $grant ) {
 			return false;
 		}
-		return true === Aura_Worker_Grant::verify( $grant, (string) $tool_name, is_array( $input ) ? $input : array() );
+
+		$params = is_array( $input ) ? $input : array();
+		// Keyed on the grant AND the exact call it is being spent on, so the
+		// memo can only ever re-answer the question it actually answered: a
+		// second ability, or the same ability with different parameters, is a
+		// different call and verifies on its own.
+		$key = hash(
+			'sha256',
+			$grant . '|' . (string) $tool_name . '|' . Aura_Worker_Grant::canonical_json( $params )
+		);
+		if ( isset( self::$verified[ $key ] ) ) {
+			return self::$verified[ $key ];
+		}
+
+		$ok                     = true === Aura_Worker_Grant::verify( $grant, (string) $tool_name, $params );
+		// Only a success is remembered. A failure may be transient (a clock
+		// skew, a grant that has not started yet), and caching it would deny a
+		// call that would otherwise be allowed moments later in the same
+		// request — while caching a success is what keeps single-use single.
+		if ( $ok ) {
+			self::$verified[ $key ] = true;
+		}
+		return $ok;
 	}
 }

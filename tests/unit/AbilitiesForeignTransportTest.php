@@ -142,6 +142,39 @@ final class AbilitiesForeignTransportTest extends TestCase {
 		$this->assertGreaterThan( 0, $checked );
 	}
 
+	public function test_a_namespace_that_merely_starts_like_ours_is_foreign(): void {
+		// A foreign server picks its own namespace. `aura/v10/...` and
+		// `aura/mcp-foreign/...` both start with a namespace we own and are
+		// neither of them, so a prefix test would hand them the exemption.
+		$GLOBALS['_caps'] = array( 'manage_options' );
+
+		foreach ( array( '/aura/v10/write', '/aura/mcp-foreign/tools/execute', '/aura/v1x/y' ) as $route ) {
+			Aura_Worker_Call_Context::set_rest_route_for_tests( $route );
+			$this->assertFalse(
+				Aura_Worker_Call_Context::is_own_transport(),
+				"{$route} was treated as SiteAgent's own transport"
+			);
+
+			foreach ( $this->mutating_abilities() as $name => $args ) {
+				$allowed = call_user_func( $args['permission_callback'], array() );
+				$this->assertTrue(
+					is_wp_error( $allowed ) || false === $allowed,
+					"{$name} was allowed over {$route}"
+				);
+			}
+		}
+	}
+
+	public function test_our_own_namespaces_are_still_recognised(): void {
+		foreach ( array( '/aura/v1/status', '/aura/v2/health', '/aura/mcp/tools/execute', 'aura/mcp' ) as $route ) {
+			Aura_Worker_Call_Context::set_rest_route_for_tests( $route );
+			$this->assertTrue(
+				Aura_Worker_Call_Context::is_own_transport(),
+				"{$route} was not recognised as SiteAgent's own"
+			);
+		}
+	}
+
 	public function test_capability_still_gates_before_any_of_this(): void {
 		// The transport guard is additive. A caller without manage_options is
 		// refused wherever the request came from.
