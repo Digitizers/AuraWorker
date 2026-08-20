@@ -96,10 +96,10 @@ class Aura_Worker_Abilities {
 					'category'            => 'site-management',
 					'input_schema'        => $this->build_input_schema( isset( $meta['parameters'] ) ? $meta['parameters'] : array() ),
 					'execute_callback'    => $this->make_executor( $name ),
-					'permission_callback' => $this->make_permission( $ann ),
+					'permission_callback' => $this->make_permission( $name, $ann ),
 					'meta'                => array(
 						'show_in_rest' => true,
-						'mcp'          => array( 'public' => true ),
+						'mcp'          => $this->mcp_meta( $ann ),
 						'annotations'  => array(
 							'readonly'          => ! empty( $ann['read_only'] ),
 							'destructive'       => ! empty( $ann['destructive'] ),
@@ -157,22 +157,75 @@ class Aura_Worker_Abilities {
 	private function make_executor( $name ) {
 		$tools = $this->tools;
 		return static function ( $input ) use ( $tools, $name ) {
-			return $tools->execute_tool( $name, is_array( $input ) ? $input : array() );
+			$params = is_array( $input ) ? $input : array();
+			try {
+				return $tools->execute_tool( $name, $params );
+			} finally {
+				// The grant authorised THIS execution. Spend the proof with it,
+				// so a batch-capable adapter cannot ride one approval into a
+				// second identical mutation. In a finally because a tool that
+				// throws still consumed the nonce.
+				Aura_Worker_Call_Context::note_executed( $name, $params );
+			}
 		};
 	}
 
 	/**
-	 * Capability gate for an ability. Read-only tools need `read`-level admin
-	 * access; everything else requires `manage_options`.
+	 * Discovery metadata for one ability.
+	 *
+	 * `wp_register_ability` publishes to the SITE, not to a server, so this is
+	 * the only place we get to say who may serve a tool. A co-installed MCP
+	 * server admits a third-party ability when `mcp.type` is absent or `tool`
+	 * — which is every ability by default, including the ones that update
+	 * plugins. Mutating tools therefore declare a type nobody serves.
+	 *
+	 * `private` rather than `resource`: `resource` is a REAL MCP type, and a
+	 * server collecting resources would publish the tool on that surface
+	 * instead of withholding it — moving a write somewhere else is not hiding
+	 * it. Reads keep `public => true`, since being discoverable is the entire
+	 * point of the dual registration.
+	 *
+	 * This is a first layer, not the line of defence: the value is a
+	 * convention, and the bundled MCP adapter coerces unrecognised types back
+	 * to `tool` (WordPress/mcp-adapter#297). The permission-stage transport
+	 * check below is what holds when it does.
 	 *
 	 * @param array $annotations Tool annotations.
+	 * @return array
+	 */
+	private function mcp_meta( $annotations ) {
+		if ( Aura_Worker_Call_Context::tool_needs_grant( $annotations ) ) {
+			return array(
+				'type'   => 'private',
+				'public' => false,
+			);
+		}
+		return array( 'public' => true );
+	}
+
+	/**
+	 * Permission gate for an ability: capability first, then transport.
+	 *
+	 * The capability check is unchanged — SiteAgent tools operate at admin
+	 * level and even reads expose admin data. What is new is the second half:
+	 * a mutating tool reached over a transport SiteAgent does not serve must
+	 * carry a valid approval grant, because the enforcement the gateway path
+	 * relies on lives in REST handlers this path never touches.
+	 *
+	 * At the permission stage rather than inside the executor deliberately: a
+	 * refusal here never reaches `execute_tool()`, so nothing runs, nothing is
+	 * snapshotted, and the caller is told why.
+	 *
+	 * @param string $name        Tool name.
+	 * @param array  $annotations Tool annotations.
 	 * @return callable
 	 */
-	private function make_permission( $annotations ) {
-		$read_only = ! empty( $annotations['read_only'] );
-		return static function () use ( $read_only ) {
-			// SiteAgent tools operate at admin level; even reads expose admin data.
-			return current_user_can( 'manage_options' );
+	private function make_permission( $name, $annotations ) {
+		return static function ( $input = array() ) use ( $name, $annotations ) {
+			if ( ! current_user_can( 'manage_options' ) ) {
+				return false;
+			}
+			return Aura_Worker_Call_Context::guard( $name, $annotations, is_array( $input ) ? $input : array() );
 		};
 	}
 

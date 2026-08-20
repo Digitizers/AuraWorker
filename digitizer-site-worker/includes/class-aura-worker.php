@@ -60,6 +60,12 @@ class Aura_Worker {
 		add_action( 'rest_api_init', array( $this->api, 'register_routes' ) );
 		add_action( 'rest_api_init', array( $this->mcp, 'register_routes' ) );
 
+		// Which transport a call arrived on. Recorded before anything dispatches,
+		// because the abilities path has no other way to tell a gateway call from
+		// a co-installed MCP server serving the same ability.
+		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-call-context.php';
+		Aura_Worker_Call_Context::init();
+
 		// Standards-alignment: also expose tools via the WordPress Abilities API
 		// (when present) so the official MCP adapter can discover them. Additive —
 		// the aura/mcp namespace above is unaffected. The category must register
