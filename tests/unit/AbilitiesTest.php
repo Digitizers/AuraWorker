@@ -60,7 +60,11 @@ final class AbilitiesTest extends TestCase {
 		$this->assertIsCallable( $a['execute_callback'] );
 		$this->assertIsCallable( $a['permission_callback'] );
 		$this->assertTrue( $a['meta']['show_in_rest'] );
-		$this->assertTrue( $a['meta']['mcp']['public'] );
+		// test_double_tool inherits the base annotations, so it MUTATES — and a
+		// mutating ability is withheld from co-installed MCP servers rather
+		// than advertised to them (J5).
+		$this->assertSame( 'private', $a['meta']['mcp']['type'] );
+		$this->assertFalse( $a['meta']['mcp']['public'] );
 	}
 
 	public function test_execute_callback_routes_back_to_the_tool(): void {

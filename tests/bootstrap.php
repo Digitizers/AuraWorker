@@ -843,6 +843,7 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-grant.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-updater.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-api.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-magic-link.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-call-context.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-abilities.php';
 
 // Load every shipped tool class so tool-level tests can instantiate them
