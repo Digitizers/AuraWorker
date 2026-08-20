@@ -15,9 +15,9 @@
   <a href="https://wordpress.org/plugins/digitizer-site-worker/">
     <img src="https://img.shields.io/badge/WordPress.org-Plugin-blue?logo=wordpress" alt="WordPress.org" />
   </a>
-  <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.0-21759b?logo=wordpress" alt="WordPress" />
+  <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.7.1-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.9.0-green" alt="Stable" />
 </p>
 
 ---
@@ -114,7 +114,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `POST` | `/tools/execute` | Execute a tool with validated parameters |
 | `GET` | `/context` | Full site context for AI decision-making |
 
-**Built-in MCP tools (25):**
+**Built-in MCP tools (26):**
 
 | Tool | Kind | Purpose |
 |------|------|---------|
@@ -135,6 +135,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `scan_executable_files` | read | uploads-tree observations: PHP/executables, .htaccess overrides, symlinks (reported, never followed) |
 | `audit_admin_accounts` | read | privileged-account facts: admins + recency, caps outside role, app-password counts, multisite super admins |
 | `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
+| `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many abilities pass the discovery rule such a server applies — a property of the abilities, not proof any server serves them; a registry-resolving server (Angie's) picks up mutating ones outside SiteAgent's approval path |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |
@@ -149,6 +150,27 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.9.0
+
+- **Security-audit read surface (5 tools).** `check_core_checksums` (core files vs the official wp.org manifest), `scan_executable_files` (PHP/executables, `.htaccess` overrides and symlinks under uploads), `audit_admin_accounts`, `audit_cron`, and `audit_mcp_exposure`. All read-only; all report bounded coverage and stop at a cap rather than growing without limit, and an empty result under `truncated: true` means "nothing found before the cap", never "clean".
+- **`audit_mcp_exposure`** answers the question that appears once a site runs more than one AI assistant: which other MCP servers are registered here, and how many abilities pass the discovery rule such a server applies. Abilities are registered site-wide, not to the plugin that declared them, so a server resolving targets from that registry (Angie's does) picks up mutating ones that never went through SiteAgent's approval path. The counts describe the abilities, not what any server currently serves.
+- Compatibility: declared tested up to WordPress 7.1.
+
+### 2.8.2
+
+- **Snapshot restore hardening.** Stored payloads are read back with `unserialize()` restricted to `allowed_classes => false`, so a tampered payload file cannot instantiate arbitrary PHP objects on the restore path; restores fail closed on any object-bearing or malformed payload.
+- Fixes: the self-updater deletes its temp download with `wp_delete_file()`; the SEO auditor reads core's sitemap state through the sitemaps server instead of re-firing the `wp_sitemaps_enabled` filter.
+- CI now gates PRs on PHPCS and the official WordPress Plugin Check.
+
+### 2.8.1
+
+- Docs: the listing describes the optional **SiteAgent Power Pack** companion plugin and its governance model — deliberately not part of the WordPress.org build. No code changes.
+
+### 2.8.0
+
+- Internal snapshot-engine primitives for reversible meta and multi-post writes (`snapshot_meta`, `snapshot_posts`), groundwork for governed Elementor and bulk-post editing; not yet exposed over the remote snapshot API.
+- Fix: SEO-meta writes return a distinct "Failed to write SEO meta" error instead of the misleading "Nothing to update".
 
 ### 2.7.1
 

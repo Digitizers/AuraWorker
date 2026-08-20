@@ -2,9 +2,9 @@
 Contributors: benkalsky
 Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
-Tested up to: 7.0
+Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.8.2
+Stable tag: 2.9.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -26,7 +26,7 @@ Install this plugin on any WordPress site to connect it to Aura — no SSH, no w
 * **Per-plugin rollback** — Every update is zip-snapshotted first; restore any plugin to its last good state on demand.
 * **Bulk translation & database upgrades** — Update all language packs and run WordPress database migrations remotely.
 * **One-click connect (magic link)** — Connect a site to Aura straight from wp-admin — no manual token copy/paste.
-* **AI-agent ready (25 MCP tools)** — Exposes machine-readable, JSON-schema tools for AI-driven management, including SEO/accessibility/performance/broken-link auditors, on-site SEO-meta read/write (Rank Math, Yoast, SEOPress), and Gutenberg block read/edit. Read tools run on demand; mutating tools are approval-gated through Aura, and every call is audited.
+* **AI-agent ready (26 MCP tools)** — Exposes machine-readable, JSON-schema tools for AI-driven management, including SEO/accessibility/performance/broken-link auditors, on-site SEO-meta read/write (Rank Math, Yoast, SEOPress), and Gutenberg block read/edit. Read tools run on demand; mutating tools are approval-gated through Aura, and every call is audited.
 * **Zero frontend impact** — The plugin only registers REST API endpoints. No scripts, no styles, no database queries on visitor-facing page loads.
 
 = How It Works =
@@ -68,7 +68,7 @@ MCP tools under `/wp-json/aura/mcp/`:
 
 = AI Agent Tools (MCP) =
 
-SiteAgent ships **25 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
+SiteAgent ships **26 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
 
 Read tools:
 
@@ -87,6 +87,7 @@ Read tools:
 * `scan_executable_files` — Uploads-directory observations: PHP/executable files, .htaccess overrides, and symlinks (reported, never followed)
 * `audit_admin_accounts` — Privileged-account facts: administrators with recency, admin capabilities outside the role, application-password counts, multisite super admins
 * `audit_cron` — Bounded WP-Cron inventory with sub-60-second-schedule and unresolved-callback fact-flags
+* `audit_mcp_exposure` — Which other MCP servers are registered on this site, and how many abilities pass the discovery rule such a server applies (abilities are registered site-wide, not per-plugin, so a server resolving targets from that registry picks up mutating ones outside SiteAgent's approval path). The counts describe the abilities, not what any server currently serves. Reports only; changes nothing
 * `get_seo_meta` — Read a post/page's SEO title, description, and focus keyword from the active SEO plugin (Rank Math, Yoast, or SEOPress)
 * `list_page_blocks` — Read a page's Gutenberg block structure (block names, attributes, nesting)
 
@@ -189,7 +190,7 @@ No. The plugin registers only REST API endpoints. It does not load any code, scr
 
 = What WordPress versions are supported? =
 
-WordPress 6.2 or higher is required. This is needed for full Application Password support. The plugin has been tested up to WordPress 7.0.
+WordPress 6.2 or higher is required. This is needed for full Application Password support. The plugin has been tested up to WordPress 7.1.
 
 = What PHP versions are supported? =
 
@@ -230,6 +231,30 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.9.0 =
+* New: a read-only security-audit surface — five tools that report what is on
+  the site without changing any of it. `check_core_checksums` compares WordPress
+  core files against the official manifest, `scan_executable_files` looks for
+  executable files and `.htaccess` overrides under uploads, `audit_admin_accounts`
+  and `audit_cron` inventory administrator accounts and scheduled events.
+* New: `audit_mcp_exposure` answers a question that only appears once a site runs
+  more than one AI assistant — which OTHER MCP servers are registered here, and
+  how many of this site's abilities pass the discovery rule such a server
+  applies. Abilities are registered site-wide, not to the plugin that declared
+  them, so a server resolving targets from that registry (as Angie's does) picks
+  up mutating ones that never went through this plugin's approval and audit
+  path. The counts are a property of the abilities, not proof that any server
+  currently serves them — a server with an explicit tool list reaches only what
+  it lists. The tool reports; it changes nothing.
+* All five report bounded coverage — `truncated` and `cap`, alongside a pair of
+  counts naming what was in scope and what was reached (`total_seen` /
+  `returned`, or `files_expected` / `files_checked` for `check_core_checksums`,
+  which counts files rather than rows). They stop at their caps rather than
+  growing without limit on a large site, and an empty result under
+  `truncated: true` means "nothing found before the cap" — it is never reported
+  as "clean".
+* Compatibility: declared tested up to WordPress 7.1.
 
 = 2.8.2 =
 * Security (hardening): the snapshot/rollback engine now reads its stored
@@ -413,6 +438,12 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Zero frontend performance impact.
 
 == Upgrade Notice ==
+
+= 2.9.0 =
+Adds five read-only audit tools, including one that reports which other MCP
+servers are registered on the site and how many of your abilities are
+discoverable to one — worth running if anything else here exposes an AI
+assistant. Nothing existing changes behaviour; no action required.
 
 = 2.8.2 =
 Security hardening: snapshot restores now reject tampered payloads instead of
