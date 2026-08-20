@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.9.0
+Stable tag: 2.9.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -232,6 +232,23 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 
 == Changelog ==
 
+= 2.9.1 =
+* Security (hardening): SiteAgent's tools have been dual-registered as WordPress
+  abilities since 2.5.0, and an ability is published to the SITE rather than to
+  one server — so any co-installed MCP server that enumerates the site's
+  abilities could serve them, including the ones that write. The approval-grant
+  enforcement lives in SiteAgent's own REST handlers, which that route never
+  touches, so a mutating tool could run through another plugin's MCP server with
+  no approval, no snapshot binding, and no audit entry.
+  Two guards close it. Tools that require a grant now declare a discovery type
+  co-installed servers do not serve, and a grant-requiring ability arriving on
+  any transport other than SiteAgent's own is refused unless it carries a valid
+  approval grant bound to that exact call.
+  Nothing changes for the Aura gateway path or for wp-admin: a grant the gateway
+  minted is accepted here unchanged. Read-only tools stay discoverable to other
+  MCP clients, which is what the dual registration is for. Approval-bound reads
+  (`db_query`) follow the write rule, as they already did on the gateway path.
+
 = 2.9.0 =
 * New: a read-only security-audit surface — five tools that report what is on
   the site without changing any of it. `check_core_checksums` compares WordPress
@@ -438,6 +455,12 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Zero frontend performance impact.
 
 == Upgrade Notice ==
+
+= 2.9.1 =
+Security hardening: tools that change your site can no longer be run through
+another plugin's MCP server without an approval grant. Recommended for every
+site, and especially any running a second AI assistant alongside SiteAgent. No
+action required; the Aura connection and read-only tools are unaffected.
 
 = 2.9.0 =
 Adds five read-only audit tools, including one that reports which other MCP
