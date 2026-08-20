@@ -157,7 +157,16 @@ class Aura_Worker_Abilities {
 	private function make_executor( $name ) {
 		$tools = $this->tools;
 		return static function ( $input ) use ( $tools, $name ) {
-			return $tools->execute_tool( $name, is_array( $input ) ? $input : array() );
+			$params = is_array( $input ) ? $input : array();
+			try {
+				return $tools->execute_tool( $name, $params );
+			} finally {
+				// The grant authorised THIS execution. Spend the proof with it,
+				// so a batch-capable adapter cannot ride one approval into a
+				// second identical mutation. In a finally because a tool that
+				// throws still consumed the nonce.
+				Aura_Worker_Call_Context::note_executed( $name, $params );
+			}
 		};
 	}
 

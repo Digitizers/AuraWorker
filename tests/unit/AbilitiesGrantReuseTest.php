@@ -102,6 +102,36 @@ final class AbilitiesGrantReuseTest extends TestCase {
 		);
 	}
 
+	public function test_one_grant_authorises_one_execution_only(): void {
+		// The memo exists to survive the paired permission check, not to make a
+		// single-use grant reusable. A batch-capable adapter running the same
+		// ability twice in one request must be refused the second time.
+		$params = array( 'target' => 'homepage' );
+		$_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] = $this->mint( 'test_double_tool', $params );
+		Aura_Worker_Call_Context::set_rest_route_for_tests( '/mcp/angie' );
+
+		$abilities = new Aura_Worker_Abilities();
+		$abilities->register_category();
+		$abilities->register();
+		$ability = $GLOBALS['_abilities']['aura-worker/test-double-tool'];
+		$gate    = $ability['permission_callback'];
+		$run     = $ability['execute_callback'];
+
+		// First call: checked (twice, as the adapter does), then executed.
+		$this->assertTrue( true === $gate( $params ) );
+		$this->assertTrue( true === $gate( $params ) );
+		$result = $run( $params );
+		$this->assertTrue( $result['success'] );
+
+		// Second call on the same grant: the nonce is spent, and the memo went
+		// with the execution it authorised.
+		$again = $gate( $params );
+		$this->assertTrue(
+			is_wp_error( $again ) || false === $again,
+			'one grant authorised a second mutation'
+		);
+	}
+
 	public function test_a_grant_for_another_tool_is_refused(): void {
 		$params = array( 'target' => 'homepage' );
 		$_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] = $this->mint( 'some_other_tool', $params );

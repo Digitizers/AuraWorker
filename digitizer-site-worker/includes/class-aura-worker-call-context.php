@@ -48,14 +48,19 @@ class Aura_Worker_Call_Context {
 	private static $rest_route = null;
 
 	/**
-	 * Calls whose grant already verified during THIS request.
+	 * Calls whose grant verified and have NOT yet executed.
 	 *
 	 * `Aura_Worker_Grant::verify()` reserves the nonce as it validates —
 	 * single-use is the point — and `WP_Ability::execute()` re-runs the
 	 * permission callback before executing. Verifying twice therefore spends
 	 * the grant on the first check and refuses the second, turning every valid
-	 * approved mutation into a denial. The grant is proven once per call and
-	 * the proof is remembered for the rest of the request.
+	 * approved mutation into a denial.
+	 *
+	 * So the proof is remembered — but only until the call it authorises has
+	 * run. `note_executed()` drops the entry, so the memo covers the gap
+	 * between a check and its execution and nothing beyond it. Left standing
+	 * for the whole request, one grant would authorise a second identical
+	 * mutation from a batch-capable adapter: single-use in name only.
 	 *
 	 * @var array<string,bool>
 	 */
@@ -103,6 +108,24 @@ class Aura_Worker_Call_Context {
 	 */
 	public static function set_rest_route_for_tests( $route ) {
 		self::$rest_route = null === $route ? null : (string) $route;
+	}
+
+	/**
+	 * The call this grant authorised has run: the proof is spent with it.
+	 *
+	 * Called from the ability executor in a `finally`, so a tool that throws
+	 * still closes the window it opened — a failed execution consumed the
+	 * nonce just the same.
+	 *
+	 * @param string $tool_name Tool name.
+	 * @param array  $input     Input the grant was bound to.
+	 */
+	public static function note_executed( $tool_name, $input ) {
+		$grant = self::presented_grant();
+		if ( '' === $grant ) {
+			return;
+		}
+		unset( self::$verified[ self::memo_key( $grant, $tool_name, $input ) ] );
 	}
 
 	/**
@@ -243,6 +266,36 @@ class Aura_Worker_Call_Context {
 	}
 
 	/**
+	 * The grant header as presented, or '' when absent.
+	 *
+	 * @return string
+	 */
+	private static function presented_grant() {
+		if ( ! isset( $_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] ) ) {
+			return '';
+		}
+		return sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] ) );
+	}
+
+	/**
+	 * Memo key: the grant AND the exact call it is being spent on, so the memo
+	 * can only ever re-answer the question it actually answered. A second
+	 * ability, or the same ability with different parameters, is a different
+	 * call and verifies on its own.
+	 *
+	 * @param string $grant     Presented grant.
+	 * @param string $tool_name Tool name.
+	 * @param array  $input     Bound input.
+	 * @return string
+	 */
+	private static function memo_key( $grant, $tool_name, $input ) {
+		return hash(
+			'sha256',
+			$grant . '|' . (string) $tool_name . '|' . Aura_Worker_Grant::canonical_json( is_array( $input ) ? $input : array() )
+		);
+	}
+
+	/**
 	 * Was a valid approval grant presented for this exact call?
 	 *
 	 * The grant binds to the tool name and parameters, exactly as on the
@@ -259,23 +312,13 @@ class Aura_Worker_Call_Context {
 			// is not a grant. decide() turns this into a refusal.
 			return false;
 		}
-		$grant = '';
-		if ( isset( $_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] ) ) {
-			$grant = sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] ) );
-		}
+		$grant = self::presented_grant();
 		if ( '' === $grant ) {
 			return false;
 		}
 
 		$params = is_array( $input ) ? $input : array();
-		// Keyed on the grant AND the exact call it is being spent on, so the
-		// memo can only ever re-answer the question it actually answered: a
-		// second ability, or the same ability with different parameters, is a
-		// different call and verifies on its own.
-		$key = hash(
-			'sha256',
-			$grant . '|' . (string) $tool_name . '|' . Aura_Worker_Grant::canonical_json( $params )
-		);
+		$key    = self::memo_key( $grant, $tool_name, $params );
 		if ( isset( self::$verified[ $key ] ) ) {
 			return self::$verified[ $key ];
 		}
