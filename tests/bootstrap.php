@@ -954,7 +954,47 @@ if ( ! function_exists( 'wp_remote_retrieve_body' ) ) {
 	}
 }
 
+if ( ! function_exists( 'wp_get_abilities' ) ) {
+	/**
+	 * The WordPress Abilities API registry, as the audit tools read it.
+	 *
+	 * Returns objects answering get_name() and get_meta() — the two methods the
+	 * exposure rule depends on. Seed with sa_register_ability().
+	 *
+	 * @return object[]
+	 */
+	function wp_get_abilities(): array {
+		return array_values( $GLOBALS['_abilities'] ?? array() );
+	}
+}
+
+if ( ! function_exists( 'sa_register_ability' ) ) {
+	/**
+	 * Seed one ability into the stub registry.
+	 *
+	 * @param string $name Ability name.
+	 * @param array  $meta Ability meta (mcp.type, annotations.readonly, ...).
+	 */
+	function sa_register_ability( string $name, array $meta = array() ): void {
+		$GLOBALS['_abilities'][ $name ] = new class( $name, $meta ) {
+			private string $name;
+			private array $meta;
+			public function __construct( string $name, array $meta ) {
+				$this->name = $name;
+				$this->meta = $meta;
+			}
+			public function get_name(): string {
+				return $this->name;
+			}
+			public function get_meta(): array {
+				return $this->meta;
+			}
+		};
+	}
+}
+
 function sa_reset_state(): void {
+	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();
 	$GLOBALS['_caps']         = null;
