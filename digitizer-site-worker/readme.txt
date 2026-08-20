@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.8.2
+Stable tag: 2.9.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -231,6 +231,24 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 
 == Changelog ==
 
+= 2.9.0 =
+* New: a read-only security-audit surface — five tools that report what is on
+  the site without changing any of it. `check_core_checksums` compares WordPress
+  core files against the official manifest, `scan_executable_files` looks for
+  executable files and `.htaccess` overrides under uploads, `audit_admin_accounts`
+  and `audit_cron` inventory administrator accounts and scheduled events.
+* New: `audit_mcp_exposure` answers a question that only appears once a site runs
+  more than one AI assistant — which OTHER MCP servers are registered here, and
+  how many of this site's abilities are reachable from them. A second server
+  discovers abilities from the whole site, not from the plugin that registered
+  them, so anything mutating behind one is outside this plugin's approval and
+  audit path. The tool reports what is reachable; it does not change it.
+* All five report bounded coverage (`total_seen`, `returned`, `truncated`, `cap`)
+  and stop at their caps rather than growing without limit on a large site. An
+  empty result under `truncated: true` means "nothing found before the cap" — it
+  is never reported as "clean".
+* Compatibility: declared tested up to WordPress 7.1.
+
 = 2.8.2 =
 * Security (hardening): the snapshot/rollback engine now reads its stored
   payloads back with `unserialize()` restricted to `allowed_classes => false`,
@@ -413,6 +431,12 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Zero frontend performance impact.
 
 == Upgrade Notice ==
+
+= 2.9.0 =
+Adds five read-only audit tools, including one that reports which other MCP
+servers on the site can reach your abilities — worth running if anything else
+here exposes an AI assistant. Nothing existing changes behaviour; no action
+required.
 
 = 2.8.2 =
 Security hardening: snapshot restores now reject tampered payloads instead of
