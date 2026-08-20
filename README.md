@@ -135,7 +135,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `scan_executable_files` | read | uploads-tree observations: PHP/executables, .htaccess overrides, symlinks (reported, never followed) |
 | `audit_admin_accounts` | read | privileged-account facts: admins + recency, caps outside role, app-password counts, multisite super admins |
 | `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
-| `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many site abilities they can reach — a second server discovers abilities site-wide, not per-plugin, so mutating ones behind it sit outside SiteAgent's approval path |
+| `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many abilities pass the discovery rule such a server applies — a property of the abilities, not proof any server serves them; a registry-resolving server (Angie's) picks up mutating ones outside SiteAgent's approval path |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |

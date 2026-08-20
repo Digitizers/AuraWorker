@@ -87,7 +87,7 @@ Read tools:
 * `scan_executable_files` — Uploads-directory observations: PHP/executable files, .htaccess overrides, and symlinks (reported, never followed)
 * `audit_admin_accounts` — Privileged-account facts: administrators with recency, admin capabilities outside the role, application-password counts, multisite super admins
 * `audit_cron` — Bounded WP-Cron inventory with sub-60-second-schedule and unresolved-callback fact-flags
-* `audit_mcp_exposure` — Which other MCP servers are registered on this site, and how many of the site's abilities they can reach (a second server discovers abilities site-wide, not per-plugin, so anything mutating behind one is outside SiteAgent's approval path). Reports only; changes nothing
+* `audit_mcp_exposure` — Which other MCP servers are registered on this site, and how many abilities pass the discovery rule such a server applies (abilities are registered site-wide, not per-plugin, so a server resolving targets from that registry picks up mutating ones outside SiteAgent's approval path). The counts describe the abilities, not what any server currently serves. Reports only; changes nothing
 * `get_seo_meta` — Read a post/page's SEO title, description, and focus keyword from the active SEO plugin (Rank Math, Yoast, or SEOPress)
 * `list_page_blocks` — Read a page's Gutenberg block structure (block names, attributes, nesting)
 
@@ -240,10 +240,13 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   and `audit_cron` inventory administrator accounts and scheduled events.
 * New: `audit_mcp_exposure` answers a question that only appears once a site runs
   more than one AI assistant — which OTHER MCP servers are registered here, and
-  how many of this site's abilities are reachable from them. A second server
-  discovers abilities from the whole site, not from the plugin that registered
-  them, so anything mutating behind one is outside this plugin's approval and
-  audit path. The tool reports what is reachable; it does not change it.
+  how many of this site's abilities pass the discovery rule such a server
+  applies. Abilities are registered site-wide, not to the plugin that declared
+  them, so a server resolving targets from that registry (as Angie's does) picks
+  up mutating ones that never went through this plugin's approval and audit
+  path. The counts are a property of the abilities, not proof that any server
+  currently serves them — a server with an explicit tool list reaches only what
+  it lists. The tool reports; it changes nothing.
 * All five report bounded coverage — `truncated` and `cap`, alongside a pair of
   counts naming what was in scope and what was reached (`total_seen` /
   `returned`, or `files_expected` / `files_checked` for `check_core_checksums`,
