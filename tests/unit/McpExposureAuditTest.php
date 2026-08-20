@@ -58,9 +58,9 @@ final class McpExposureAuditTest extends TestCase {
 		$result = $this->tool->execute( array() );
 
 		$this->assertSame( 1, $result['abilities']['total'] );
-		$this->assertSame( 1, $result['abilities']['exposed_to_other_servers'] );
-		$this->assertSame( 1, $result['abilities']['exposed_and_mutating'] );
-		$this->assertSame( array( 'someplugin/do-thing' ), $result['abilities']['exposed_mutating_names'] );
+		$this->assertSame( 1, $result['abilities']['discoverable_by_type_rule'] );
+		$this->assertSame( 1, $result['abilities']['discoverable_and_mutating'] );
+		$this->assertSame( array( 'someplugin/do-thing' ), $result['abilities']['discoverable_mutating_names'] );
 	}
 
 	public function test_an_ability_declaring_a_non_tool_type_is_not_exposed(): void {
@@ -73,15 +73,15 @@ final class McpExposureAuditTest extends TestCase {
 			$result = $this->tool->execute( array() );
 
 			$this->assertSame( 1, $result['abilities']['total'], $type );
-			$this->assertSame( 0, $result['abilities']['exposed_to_other_servers'], $type );
-			$this->assertSame( 0, $result['abilities']['exposed_and_mutating'], $type );
+			$this->assertSame( 0, $result['abilities']['discoverable_by_type_rule'], $type );
+			$this->assertSame( 0, $result['abilities']['discoverable_and_mutating'], $type );
 		}
 	}
 
 	public function test_an_ability_declaring_tool_explicitly_counts_as_exposed(): void {
 		sa_register_ability( 'someplugin/do-thing', $this->write_meta( array( 'mcp' => array( 'type' => 'tool' ) ) ) );
 
-		$this->assertSame( 1, $this->tool->execute( array() )['abilities']['exposed_to_other_servers'] );
+		$this->assertSame( 1, $this->tool->execute( array() )['abilities']['discoverable_by_type_rule'] );
 	}
 
 	public function test_exposed_reads_are_counted_separately_from_writes(): void {
@@ -92,8 +92,8 @@ final class McpExposureAuditTest extends TestCase {
 
 		$result = $this->tool->execute( array() );
 
-		$this->assertSame( 2, $result['abilities']['exposed_to_other_servers'] );
-		$this->assertSame( 1, $result['abilities']['exposed_and_mutating'] );
+		$this->assertSame( 2, $result['abilities']['discoverable_by_type_rule'] );
+		$this->assertSame( 1, $result['abilities']['discoverable_and_mutating'] );
 	}
 
 	public function test_an_unclassified_ability_is_not_assumed_to_mutate(): void {
@@ -103,8 +103,22 @@ final class McpExposureAuditTest extends TestCase {
 
 		$result = $this->tool->execute( array() );
 
-		$this->assertSame( 1, $result['abilities']['exposed_to_other_servers'] );
-		$this->assertSame( 0, $result['abilities']['exposed_and_mutating'] );
+		$this->assertSame( 1, $result['abilities']['discoverable_by_type_rule'] );
+		$this->assertSame( 0, $result['abilities']['discoverable_and_mutating'] );
+	}
+
+	public function test_counts_are_reported_with_no_server_and_are_gateable(): void {
+		// The counts describe the ABILITIES, not any server's reach: with no
+		// second server registered, nothing serves them, and a consumer must be
+		// able to see that without inferring it. Both facts are in one response,
+		// which is why the counts stay honest on a site with no door — they say
+		// what would be handed over the moment one is installed.
+		sa_register_ability( 'someplugin/do-thing', $this->write_meta() );
+
+		$result = $this->tool->execute( array() );
+
+		$this->assertSame( 1, $result['abilities']['discoverable_and_mutating'] );
+		$this->assertSame( array(), $result['servers'], 'Nothing serves them here, and the response says so.' );
 	}
 
 	// --- bounded coverage ----------------------------------------------------
@@ -133,8 +147,8 @@ final class McpExposureAuditTest extends TestCase {
 
 		$result = $this->tool->execute( array() );
 
-		$this->assertSame( $named + 3, $result['abilities']['exposed_and_mutating'], 'The COUNT is complete…' );
-		$this->assertCount( $named, $result['abilities']['exposed_mutating_names'], '…only the naming is capped.' );
+		$this->assertSame( $named + 3, $result['abilities']['discoverable_and_mutating'], 'The COUNT is complete…' );
+		$this->assertCount( $named, $result['abilities']['discoverable_mutating_names'], '…only the naming is capped.' );
 		$this->assertTrue( $result['coverage']['truncated'] );
 		$this->assertSame( 'max_named', $result['coverage']['cap'] );
 	}
@@ -146,7 +160,7 @@ final class McpExposureAuditTest extends TestCase {
 
 		$this->assertTrue( $result['abilities_api_active'], 'The stub registry exists here.' );
 		$this->assertSame( 0, $result['abilities']['total'] );
-		$this->assertSame( 0, $result['abilities']['exposed_and_mutating'] );
+		$this->assertSame( 0, $result['abilities']['discoverable_and_mutating'] );
 		$this->assertFalse( $result['coverage']['truncated'] );
 		$this->assertSame( '', $result['coverage']['cap'] );
 	}

@@ -55,7 +55,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			'mcp_adapter'          => 'object — { active, version }',
 			'servers'              => 'array — { id, route, tool_count } for every MCP server registered on this site',
 			'angie'                => 'object — { active, version, mcp_server_present } (the known second door; absence of Angie does not mean absence of a second server)',
-			'abilities'            => 'object — { total, exposed_to_other_servers, exposed_and_mutating, exposed_mutating_names } where "exposed" means the ability declares no meta.mcp.type or declares "tool", the rule co-installed servers use to decide what to serve',
+			'abilities'            => 'object — { total, discoverable_by_type_rule, discoverable_and_mutating, discoverable_mutating_names }. These count abilities that PASS the discovery rule co-installed servers apply (no meta.mcp.type, or "tool") — a property of the abilities, NOT proof that anything currently serves them. Reachability additionally requires a server that resolves targets from the site-wide registry; a server with an explicit tool list reaches only what it lists. Read together with `servers`: with none registered, these counts describe a door that does not exist yet.',
 			'coverage'             => 'object — { total_seen, returned, truncated, cap } bounded-coverage contract',
 		);
 	}
@@ -174,8 +174,18 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	}
 
 	/**
-	 * How many registered abilities a co-installed server would serve, and how
-	 * many of those mutate.
+	 * How many registered abilities PASS the discovery rule co-installed servers
+	 * apply, and how many of those mutate.
+	 *
+	 * This is a property of the abilities, not a claim that anything serves
+	 * them. Reachability additionally needs a server that resolves targets from
+	 * the site-wide registry — Angie's `execute-ability` does; a server with an
+	 * explicit tool list reaches only what it lists, and a site with no second
+	 * server at all reaches none of them. The counts are still worth reporting
+	 * on such a site, because they say what WOULD be handed over the moment one
+	 * is installed, and `servers` is right there to say whether one is. Naming
+	 * them after the rule rather than after an outcome keeps a consumer from
+	 * reading "40 exposed" as "40 reachable".
 	 *
 	 * The rule applied is the one co-installed servers use: an ability is
 	 * exposed when it declares no `meta.mcp.type`, or declares `tool`. That is
@@ -195,9 +205,9 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			return array(
 				'abilities' => array(
 					'total'                    => 0,
-					'exposed_to_other_servers' => 0,
-					'exposed_and_mutating'     => 0,
-					'exposed_mutating_names'   => array(),
+					'discoverable_by_type_rule' => 0,
+					'discoverable_and_mutating'     => 0,
+					'discoverable_mutating_names'   => array(),
 				),
 				'coverage'  => array(
 					'total_seen' => 0,
@@ -259,9 +269,9 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		return array(
 			'abilities' => array(
 				'total'                    => $total,
-				'exposed_to_other_servers' => $exposed,
-				'exposed_and_mutating'     => $mutating,
-				'exposed_mutating_names'   => $names,
+				'discoverable_by_type_rule' => $exposed,
+				'discoverable_and_mutating'     => $mutating,
+				'discoverable_mutating_names'   => $names,
 			),
 			'coverage'  => array(
 				'total_seen' => $total,
