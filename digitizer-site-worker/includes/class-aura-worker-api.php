@@ -307,6 +307,20 @@ class Aura_Worker_API {
 			'permission_callback' => array( $this->security, 'check_read_permission' ),
 		) );
 
+		// POST /aura/v2/rules — accept the client's signed operator ruleset.
+		register_rest_route( self::NAMESPACE_V2, '/rules', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'receive_rules' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'ruleset' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
 	}
 
 	/**
@@ -883,6 +897,57 @@ class Aura_Worker_API {
 
 		$status = $result['success'] ? 200 : 400;
 		return new WP_REST_Response( $result, $status );
+	}
+
+	/**
+	 * POST /aura/v2/rules
+	 *
+	 * The gateway pushes the whole signed ruleset whenever a rule changes.
+	 * Verification, the monotonic seq and last-known-good all live in
+	 * Aura_Worker_Rules::accept(); this is transport.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function receive_rules( $request ) {
+		if ( ! Aura_Worker_Grant::has_usable_key() ) {
+			// No USABLE gateway key on this site: nothing can be verified.
+			// Deliberately not is_enforced(), which means only "the option is
+			// non-empty" — a truncated or corrupt key would then answer 400 on
+			// every push, and Aura would spend forever telling the operator to
+			// fix a rule that is fine instead of to reconnect the site.
+			// Distinct from a bad document so the rollup can say "reconnect".
+			return new WP_REST_Response(
+				array(
+					'success' => false,
+					'code'    => 'no_gateway_key',
+					'error'   => 'This site holds no gateway public key and cannot verify a ruleset; reconnect it to Aura.',
+				),
+				412
+			);
+		}
+		$res = Aura_Worker_Rules::accept( (string) $request->get_param( 'ruleset' ) );
+		if ( is_wp_error( $res ) ) {
+			$data = $res->get_error_data();
+			return new WP_REST_Response(
+				array(
+					'success' => false,
+					// The code travels too: Aura retries 503 aura_ruleset_contended
+					// and 500 aura_ruleset_store_failed, and does not treat either
+					// as "your ruleset is bad" the way it treats a 400.
+					'code'    => $res->get_error_code(),
+					'error'   => $res->get_error_message(),
+				),
+				isset( $data['status'] ) ? (int) $data['status'] : 400
+			);
+		}
+		return new WP_REST_Response(
+			array(
+				'success' => true,
+				'seq'     => Aura_Worker_Rules::current()['seq'],
+			),
+			200
+		);
 	}
 
 	/**

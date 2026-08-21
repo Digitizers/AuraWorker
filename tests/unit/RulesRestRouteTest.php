@@ -128,5 +128,85 @@ final class RulesRestRouteTest extends TestCase {
 		$res = $this->api->create_snapshot( $this->request( array( 'kind' => 'option', 'target' => 'blogname' ) ) );
 		$this->assertFalse( is_wp_error( $res ) && 'aura_rule_blocked' === $res->get_error_code(), 'a freeze refused to take a snapshot' );
 	}
+
+	/* ---- POST /aura/v2/rules ---- */
+
+	private $secret;
+
+	private function keys(): void {
+		if ( ! function_exists( 'sodium_crypto_sign_keypair' ) ) {
+			$this->markTestSkipped( 'ext-sodium is not available.' );
+		}
+		$kp           = sodium_crypto_sign_keypair();
+		$this->secret = sodium_crypto_sign_secretkey( $kp );
+		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( sodium_crypto_sign_publickey( $kp ) );
+	}
+
+	private function envelope( int $seq, array $rules = array() ): string {
+		$site = (string) $GLOBALS['_options']['aura_worker_site_token'];
+		$json = wp_json_encode(
+			array( 'v' => 1, 'client' => 'c1', 'site' => $site, 'seq' => $seq, 'issued_at' => gmdate( 'c' ), 'rules' => $rules ),
+			JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+		);
+		$sig  = sodium_crypto_sign_detached( $json, $this->secret );
+		$b64  = static function ( string $s ): string {
+			return rtrim( strtr( base64_encode( $s ), '+/', '-_' ), '=' );
+		};
+		return $b64( $json ) . '.' . $b64( $sig );
+	}
+
+	public function test_the_route_accepts_a_signed_ruleset(): void {
+		$this->keys();
+		$resp = $this->api->receive_rules( $this->request( array( 'ruleset' => $this->envelope( 7 ) ) ) );
+		$this->assertSame( 200, $resp->status );
+		$this->assertSame( 7, $resp->data['seq'] );
+		$this->assertSame( 7, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_the_route_answers_200_to_a_retried_identical_push(): void {
+		$this->keys();
+		$env = $this->envelope( 7 );
+		$this->api->receive_rules( $this->request( array( 'ruleset' => $env ) ) );
+		$resp = $this->api->receive_rules( $this->request( array( 'ruleset' => $env ) ) );
+		$this->assertSame( 200, $resp->status );
+	}
+
+	public function test_the_route_refuses_an_older_ruleset_with_409(): void {
+		$this->keys();
+		$this->api->receive_rules( $this->request( array( 'ruleset' => $this->envelope( 7 ) ) ) );
+		$resp = $this->api->receive_rules( $this->request( array( 'ruleset' => $this->envelope( 6 ) ) ) );
+		$this->assertSame( 409, $resp->status );
+		$this->assertSame( 7, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_the_route_refuses_a_bad_signature_with_400(): void {
+		$this->keys();
+		$resp = $this->api->receive_rules( $this->request( array( 'ruleset' => 'abc.def' ) ) );
+		$this->assertSame( 400, $resp->status );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_the_route_answers_412_on_a_truncated_gateway_key(): void {
+		// A key that is present but unusable verifies nothing. Answering 400
+		// would have Aura record "bad ruleset" on every retry and never raise
+		// the reconnect remedy, while no policy can be installed at all.
+		$this->keys();                 // a real signing key, so envelope() works...
+		$env = $this->envelope( 7 );   // ...and the document itself is valid.
+		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( str_repeat( 'k', 16 ) );
+		$resp = $this->api->receive_rules( $this->request( array( 'ruleset' => $env ) ) );
+		$this->assertSame( 412, $resp->status );
+		$this->assertSame( 'no_gateway_key', $resp->data['code'] );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_the_route_answers_412_on_a_site_with_no_gateway_key(): void {
+		// No key, no verification — and "we refused your ruleset" must not look
+		// like "your ruleset was bad". Aura reads this as "reconnect the site".
+		unset( $GLOBALS['_options']['aura_worker_grant_pubkey'] );
+		$resp = $this->api->receive_rules( $this->request( array( 'ruleset' => 'abc.def' ) ) );
+		$this->assertSame( 412, $resp->status );
+		$this->assertSame( 'no_gateway_key', $resp->data['code'] );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
 }
 
