@@ -62,9 +62,27 @@ class Aura_Tool_Update_Plugin_Safely extends Aura_Tool_Base {
 		);
 	}
 
+	/**
+	 * The plugin slug this call names, normalised exactly the way execute()
+	 * normalises it. touches() decides whether a rule blocks the call and
+	 * execute() decides what the call acts on — if the two normalise the raw
+	 * `plugin_slug` param differently, they can disagree about which plugin
+	 * is named. They previously did: touches() only trimmed, while execute()
+	 * ran sanitize_text_field(), which also strips tags and percent-encoded
+	 * octets — so `plugin_slug => "akis<b>met"` declared `plugin:akis<b>met`
+	 * (no rule names that) while execute() resolved and acted on
+	 * `akismet/akismet.php`. One expression, called from both.
+	 *
+	 * @param array $params Tool params.
+	 * @return string Sanitized slug, or '' if none was supplied.
+	 */
+	private function sanitized_slug( $params ) {
+		return isset( $params['plugin_slug'] ) ? sanitize_text_field( $params['plugin_slug'] ) : '';
+	}
+
 	/** @inheritDoc */
 	public function touches( $params ) {
-		$slug = isset( $params['plugin_slug'] ) ? trim( (string) $params['plugin_slug'] ) : '';
+		$slug = $this->sanitized_slug( $params );
 		if ( '' === $slug ) {
 			return parent::touches( $params ); // Cannot say which plugin: the sentinel.
 		}
@@ -85,7 +103,7 @@ class Aura_Tool_Update_Plugin_Safely extends Aura_Tool_Base {
 	}
 
 	public function execute( $params ) {
-		$plugin_slug   = sanitize_text_field( $params['plugin_slug'] );
+		$plugin_slug   = $this->sanitized_slug( $params );
 		$create_backup = isset( $params['create_backup'] ) ? (bool) $params['create_backup'] : true;
 
 		if ( ! function_exists( 'get_plugins' ) ) {

@@ -94,6 +94,23 @@ final class ToolTouchesTest extends TestCase {
 	}
 
 	/**
+	 * touches() and execute() must normalise identically: execute() sanitizes
+	 * the raw slug with sanitize_text_field(), which strips tags (and, under
+	 * real WordPress, percent-encoded octets) — not merely trim(). A markup
+	 * payload that survives trim() but not sanitize_text_field() must still
+	 * resolve to the same plugin touches() would otherwise let a rule miss.
+	 */
+	public function test_update_plugin_safely_normalises_the_same_way_execute_does(): void {
+		$GLOBALS['_installed_plugins'] = array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+		$tools = new Aura_Worker_Tools();
+		$tool  = $tools->get_tool( 'update_plugin_safely' );
+		$this->assertSame(
+			array( array( 'type' => 'plugin', 'id' => 'akismet' ) ),
+			$tool->touches( array( 'plugin_slug' => 'akis<b>met' ) )
+		);
+	}
+
+	/**
 	 * End to end: a `plugin:akismet` block rule must catch the tool call even
 	 * when the caller passes the dir/file.php form. Ruleset install/rule
 	 * helper pattern copied from RulesEnforcementTest.
