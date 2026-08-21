@@ -193,17 +193,49 @@ final class RulesCoreRestTest extends TestCase {
 	}
 
 	public function test_a_second_mutation_under_the_same_rule_is_still_refused(): void {
-		// Per-request deduplication is about the RECORD, not the decision.
+		// Per-DISPATCH deduplication is about the RECORD, not the decision.
 		// Every call still gets its own verdict — two writes under one freeze
-		// are two refusals, even though the fleet sees one event.
+		// are two refusals — and here the two writes are two properly closed,
+		// separate dispatches, so the fleet sees two events too: each closed
+		// dispatch starts the next one fresh.
 		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
 		foreach ( array( '/wc/v3/products/1', '/wc/v3/products/2' ) as $route ) {
 			$req = $this->call( 'POST', $route );
 			$res = apply_filters( 'rest_request_before_callbacks', null, array(), $req );
 			$this->assertInstanceOf( WP_Error::class, $res, "{$route} was allowed after the rule had already been recorded" );
+			apply_filters( 'rest_request_after_callbacks', new WP_REST_Response( array( 'ok' => true ), 200 ), array(), $req );
 		}
 		$blocked = array_filter( $GLOBALS['_did_actions'], static function ( $a ) { return 'aura_worker_rule_blocked' === $a['tag']; } );
-		$this->assertCount( 1, $blocked, 'the same rule was recorded twice in one request' );
+		$this->assertCount( 2, $blocked, 'a properly closed dispatch did not start the next one fresh' );
+	}
+
+	public function test_a_nested_dispatch_under_the_same_rule_reports_its_own_event(): void {
+		// A handler calling rest_do_request() mid-flight opens a NESTED frame
+		// while the outer one is still open — a different dispatch from the
+		// outer's, even when both happen to match the same rule. Per spec §6
+		// the nested dispatch must get its own event and its own caller must
+		// see its own warning: "a handler calling rest_do_request() would have
+		// the nested dispatch's refusal silence its own" is exactly the bug
+		// this pins against. Deduplication is per-DISPATCH (the innermost open
+		// frame), never per-request.
+		$this->install( array( $this->rule( 'rule/careful', 'warn', 'site' ) ) );
+
+		$outer = $this->call( 'POST', '/wc/v3/products/1' );
+		apply_filters( 'rest_request_before_callbacks', null, array(), $outer ); // records rule/careful
+
+		$inner = $this->call( 'POST', '/wc/v3/products/2' );
+		apply_filters( 'rest_request_before_callbacks', null, array(), $inner ); // nested; same rule
+
+		$inner_resp = apply_filters( 'rest_request_after_callbacks', new WP_REST_Response( array( 'ok' => true ), 200 ), array(), $inner );
+		$outer_resp = apply_filters( 'rest_request_after_callbacks', new WP_REST_Response( array( 'ok' => true ), 200 ), array(), $outer );
+
+		$warned = array_filter( $GLOBALS['_did_actions'], static function ( $a ) { return 'aura_worker_rule_warned' === $a['tag']; } );
+		$this->assertCount( 2, $warned, "the nested dispatch's own event was silenced by the outer one" );
+
+		$this->assertArrayHasKey( 'X-Aura-Rule-Warnings', $inner_resp->get_headers(), "the nested dispatch's caller was told nothing" );
+		$this->assertArrayHasKey( 'X-Aura-Rule-Warnings', $outer_resp->get_headers(), "the outer dispatch's caller was told nothing" );
+		$this->assertNotEmpty( json_decode( $inner_resp->get_headers()['X-Aura-Rule-Warnings'], true ), 'the inner header was empty' );
+		$this->assertNotEmpty( json_decode( $outer_resp->get_headers()['X-Aura-Rule-Warnings'], true ), 'the outer header was empty' );
 	}
 
 	public function test_an_anonymous_delete_at_the_data_seam_is_not_refused(): void {

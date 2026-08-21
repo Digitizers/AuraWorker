@@ -698,22 +698,6 @@ class Aura_Worker_Rules {
 		return $last;
 	}
 
-	/**
-	 * Has this rule|effect key already been recorded in any frame that is
-	 * still open? Used for the dedup in enforce() — see the comment there.
-	 *
-	 * @param string $key `effect|rule-key`.
-	 * @return bool
-	 */
-	private static function recorded_anywhere_open( $key ) {
-		foreach ( self::$scopes as $frame ) {
-			if ( isset( $frame['recorded'][ $key ] ) ) {
-				return true;
-			}
-		}
-		return false;
-	}
-
 	/** Forget every frame. Tests call this; `reset_request_warnings()` does too. */
 	public static function reset_records() {
 		self::$scopes = array( array( 'recorded' => array(), 'warnings' => array() ) );
@@ -832,18 +816,9 @@ class Aura_Worker_Rules {
 		// Per REQUEST would be worse than either: a handler calling
 		// rest_do_request() would have the nested dispatch's refusal silence
 		// its own.
-		//
-		// Freshness is checked across every CURRENTLY OPEN frame, not only the
-		// innermost: two seams on one call can be seen from a frame that opened
-		// before the other recorded (guard_core_any's generic branch, then a
-		// nested guard_core_delete while that frame is still on the stack), and
-		// the record still belongs to one dispatch. A frame that has already
-		// CLOSED does not count — closing drops it from the stack entirely, so
-		// a properly finished, separate dispatch starts fresh, which is what
-		// keeps two independent calls under one freeze two events apiece.
-		$key   = $rule['effect'] . '|' . $rule['key'];
-		$fresh = ! self::recorded_anywhere_open( $key );
 		$scope = &self::scope();
+		$key   = $rule['effect'] . '|' . $rule['key'];
+		$fresh = ! isset( $scope['recorded'][ $key ] );
 		$scope['recorded'][ $key ] = true;
 		if ( 'block' === $rule['effect'] ) {
 			/**
