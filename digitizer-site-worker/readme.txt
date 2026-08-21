@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.9.1
+Stable tag: 2.10.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -26,7 +26,7 @@ Install this plugin on any WordPress site to connect it to Aura — no SSH, no w
 * **Per-plugin rollback** — Every update is zip-snapshotted first; restore any plugin to its last good state on demand.
 * **Bulk translation & database upgrades** — Update all language packs and run WordPress database migrations remotely.
 * **One-click connect (magic link)** — Connect a site to Aura straight from wp-admin — no manual token copy/paste.
-* **AI-agent ready (26 MCP tools)** — Exposes machine-readable, JSON-schema tools for AI-driven management, including SEO/accessibility/performance/broken-link auditors, on-site SEO-meta read/write (Rank Math, Yoast, SEOPress), and Gutenberg block read/edit. Read tools run on demand; mutating tools are approval-gated through Aura, and every call is audited.
+* **AI-agent ready (27 MCP tools)** — Exposes machine-readable, JSON-schema tools for AI-driven management, including SEO/accessibility/performance/broken-link auditors, on-site SEO-meta read/write (Rank Math, Yoast, SEOPress), and Gutenberg block read/edit. Read tools run on demand; mutating tools are approval-gated through Aura, and every call is audited.
 * **Zero frontend impact** — The plugin only registers REST API endpoints. No scripts, no styles, no database queries on visitor-facing page loads.
 
 = How It Works =
@@ -68,7 +68,7 @@ MCP tools under `/wp-json/aura/mcp/`:
 
 = AI Agent Tools (MCP) =
 
-SiteAgent ships **26 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
+SiteAgent ships **27 built-in tools** for AI agents. Read tools return information and run on demand; write tools change the site and are queued for human approval through Aura — an agent can never silently mutate a production site.
 
 Read tools:
 
@@ -88,6 +88,7 @@ Read tools:
 * `audit_admin_accounts` — Privileged-account facts: administrators with recency, admin capabilities outside the role, application-password counts, multisite super admins
 * `audit_cron` — Bounded WP-Cron inventory with sub-60-second-schedule and unresolved-callback fact-flags
 * `audit_mcp_exposure` — Which other MCP servers are registered on this site, and how many abilities pass the discovery rule such a server applies (abilities are registered site-wide, not per-plugin, so a server resolving targets from that registry picks up mutating ones outside SiteAgent's approval path). The counts describe the abilities, not what any server currently serves. Reports only; changes nothing
+* `audit_rules` — Whether a signed operator ruleset is present and how old it is, 24h block/warn counts, expired-but-listed rules, and the enforcement points in this build. Reports only; changes nothing
 * `get_seo_meta` — Read a post/page's SEO title, description, and focus keyword from the active SEO plugin (Rank Math, Yoast, or SEOPress)
 * `list_page_blocks` — Read a page's Gutenberg block structure (block names, attributes, nesting)
 
@@ -231,6 +232,32 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.10.0 =
+* New: operator rules, enforced on the site. A rule is an Aura memory entry
+  (`rule/<slug>`) naming a resource — the whole site, a page or post by ID, or a
+  plugin by slug — with an effect of `block` or `warn` and an optional expiry.
+  Aura signs the client's whole ruleset with the same key that signs approval
+  grants and pushes it to every connected site (`POST /aura/v2/rules`), the site
+  verifies it and keeps only a newer one (a replayed older ruleset is refused
+  even when validly signed). No ruleset means no policy — nothing is refused. A
+  site that has never been reconnected since signed approvals shipped holds no
+  gateway key and cannot verify a ruleset; it says so, and Aura tells you to
+  reconnect it.
+* Enforcement runs on every path a write can take: inside the tool executor
+  before anything runs or is snapshotted; explicitly on the legacy REST update
+  routes; and at WordPress core's own REST API for posts and pages — so a rule on
+  a page holds against Aura's content tools, an assistant with an application
+  password, or another plugin's MCP server alike. A `block` refuses the call and
+  names the rule; **a rule outranks an approval** — a granted call is still
+  refused, and the message says to release the rule first. A `warn` runs and
+  attaches the warning. Previews are never blocked; they now report what a call
+  touches and which rule would decide it.
+* New: `audit_rules` (read-only) — ruleset presence and age, whether the site
+  can verify one, 24h block/warn counts, expired-but-listed rules, and the
+  enforcement points in this build.
+* Every mutating tool now declares what a call touches; one that does not is
+  caught by every rule rather than by none.
 
 = 2.9.1 =
 * Security (hardening): SiteAgent's tools have been dual-registered as WordPress
@@ -455,6 +482,11 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Zero frontend performance impact.
 
 == Upgrade Notice ==
+
+= 2.10.0 =
+Operator rules: write "do not touch checkout" once in Aura and every connected
+site refuses the matching change — even an approved one — until the rule is
+released. No ruleset, no change in behaviour. Recommended for every site.
 
 = 2.9.1 =
 Security hardening: tools that change your site can no longer be run through
