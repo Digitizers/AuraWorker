@@ -590,4 +590,227 @@ class Aura_Worker_Rules {
 			delete_option( $name );
 		}
 	}
+
+	/* ------------------------------------------------------------------ */
+	/* Enforcement — the seam tools and routes call                        */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * One frame per dispatch in flight, innermost last, plus a base frame for
+	 * work outside REST (WP-CLI, cron, a direct call).
+	 *
+	 * Each frame holds what belongs to that dispatch alone:
+	 *  - `recorded` — rules already recorded there, as `effect|key`, so
+	 *    overlapping seams report one mutation once (see enforce()).
+	 *  - `warnings` — warn entries recorded there, so the response that
+	 *    carries them is the response of the dispatch that earned them.
+	 *
+	 * A stack, because dispatches nest: a handler may call rest_do_request()
+	 * mid-flight. Frames rather than one shared list, because a mark-and-slice
+	 * on a shared list gives the OUTER dispatch everything the inner one
+	 * recorded too.
+	 *
+	 * @var array<int,array{recorded:array<string,true>,warnings:array}>
+	 */
+	private static $scopes = array( array( 'recorded' => array(), 'warnings' => array() ) );
+
+	/**
+	 * The innermost frame, by reference.
+	 *
+	 * @return array
+	 */
+	private static function &scope() {
+		if ( empty( self::$scopes ) ) {
+			self::$scopes = array( array( 'recorded' => array(), 'warnings' => array() ) );
+		}
+		$last = &self::$scopes[ count( self::$scopes ) - 1 ];
+		return $last;
+	}
+
+	/** Forget every frame. Tests call this; `reset_request_warnings()` does too. */
+	public static function reset_records() {
+		self::$scopes = array( array( 'recorded' => array(), 'warnings' => array() ) );
+	}
+
+	// EXPIRED_NOTICE, expired_claim() and rule_hash() were added in Task 4
+	// with sweep_stale_claims(); note_expired() below uses them.
+
+	/**
+	 * Keys of rules in the current ruleset whose `until` has passed.
+	 *
+	 * @param int|null $now Unix time.
+	 * @return string[]
+	 */
+	public static function expired_keys( $now = null ) {
+		$now = null === $now ? time() : (int) $now;
+		$out = array();
+		foreach ( self::rules() as $rule ) {
+			if ( is_array( $rule ) && self::is_expired( $rule, $now ) && isset( $rule['key'] ) ) {
+				$out[] = (string) $rule['key'];
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Announce rules that are past `until` — once per rule per day (spec §6).
+	 *
+	 * An expired rule is ignored for matching, which is exactly why it needs
+	 * announcing: it looks like protection and is not. The hook is for
+	 * forensics and for extensions; `audit_rules` (Task 10) reports the same
+	 * set as `expired_active`, but a consumer that subscribes cannot poll a
+	 * tool.
+	 *
+	 * Bounded by a per-rule-per-DAY option that a caller must CLAIM: the name
+	 * carries the day, and `add_option()` inserts only when the row is absent,
+	 * so exactly one of any number of concurrent requests creates it and fires.
+	 * Reading a flag and then writing it would let two requests both see
+	 * yesterday, both write today, and both fire — "once per day" that is once
+	 * per day only when the site is idle. No scheduled job: the announcement
+	 * rides on enforcement, which is when anybody is relying on the rule.
+	 *
+	 * @param int|null $now Unix time.
+	 */
+	private static function note_expired( $now = null ) {
+		$now = null === $now ? time() : (int) $now;
+		$day = (int) floor( $now / DAY_IN_SECONDS );
+		// The sweep is claimed like any other statement about a day, and it is
+		// claimed BEFORE the loop, not inside it. Inside, it would only ever
+		// run for a site that has an expired rule left to announce today —
+		// so a rule retired yesterday, or a day on which every remaining
+		// expired rule was already announced, would leave its claims behind
+		// for good. Its own claim uses the same day-first naming, so tomorrow's
+		// sweep deletes today's sweep claim along with today's rule claims,
+		// and the cost stays one DELETE per day rather than one per
+		// enforcement.
+		if ( add_option( self::expired_claim( self::SWEEP_CLAIM, $day ), 1, '', false ) ) {
+			// Every claim from a day that has ended, for every rule — one
+			// statement, because the day leads the name. This is where retired
+			// rules' claims go too: nothing has to know which rules left.
+			self::sweep_stale_claims( $day );
+		}
+		foreach ( self::expired_keys( $now ) as $key ) {
+			$hash  = self::rule_hash( $key );
+			$today = self::expired_claim( $hash, $day );
+			if ( ! add_option( $today, 1, '', false ) ) {
+				continue; // Somebody else claimed this rule for today.
+			}
+			/**
+			 * Fires once a day for each rule that is past its `until` and still
+			 * in the ruleset.
+			 *
+			 * @param string $key Rule key, e.g. `rule/holiday-freeze`.
+			 * @param int    $day Day index the notice fired for.
+			 */
+			do_action( 'aura_worker_rule_expired', (string) $key, $day );
+		}
+	}
+
+	/**
+	 * Decide this call against the stored ruleset and fire the forensic hook.
+	 *
+	 * @param array    $touches   What the call declares it touches.
+	 * @param string   $tool_name For the hook and the message.
+	 * @param int|null $now       Unix time; injected for tests.
+	 * @return array {effect: null|'warn'|'block', rule?: array, recorded?: bool}
+	 */
+	public static function enforce( array $touches, $tool_name, $now = null ) {
+		self::note_expired( $now );
+		$rule = self::match( $touches, self::rules(), $now );
+		if ( null === $rule ) {
+			return array( 'effect' => null );
+		}
+		// One rule, one record per DISPATCH. Enforcement is per call — every
+		// seam still decides, and every refusal still refuses — but the EVENT
+		// is per dispatch, because that is the scope over which the seams
+		// overlap: one mutation meets the route seam and then core's
+		// pre_trash_post and then pre_delete_post, three decisions on one
+		// deletion, all inside the dispatch that carries it.
+		//
+		// The dispatch, and not the OBJECT, because the overlapping seams do
+		// not agree on an object: under a site rule the generic seam knows
+		// only the route — `site:*` — while the data seam that follows it
+		// names post 7. Keying on the object would split those two decisions
+		// about one deletion into two events, and hand the caller two warnings
+		// for one call.
+		//
+		// The price, stated rather than hidden: a batch endpoint that mutates
+		// N objects under ONE rule in ONE dispatch produces one event, not N.
+		// That is an undercount of MAGNITUDE and never of presence — each of
+		// the N mutations is still refused, the rule still shows as biting,
+		// and `audit_rules` still reports it. Per-object magnitude is Aura's
+		// to report, from its own action log (`AgentAction.touches`, plan 2),
+		// which records one row per action and is not subject to any of this.
+		//
+		// Per REQUEST would be worse than either: a handler calling
+		// rest_do_request() would have the nested dispatch's refusal silence
+		// its own.
+		$scope = &self::scope();
+		$key   = $rule['effect'] . '|' . $rule['key'];
+		$fresh = ! isset( $scope['recorded'][ $key ] );
+		$scope['recorded'][ $key ] = true;
+		if ( 'block' === $rule['effect'] ) {
+			/**
+			 * Fires when a rule refused a call. The refusal is the point; a site
+			 * being probed should still be able to see it.
+			 *
+			 * @param string $tool_name Tool that was refused.
+			 * @param array  $rule      The rule that decided.
+			 */
+			if ( $fresh ) {
+				do_action( 'aura_worker_rule_blocked', (string) $tool_name, $rule );
+			}
+			return array( 'effect' => 'block', 'rule' => $rule );
+		}
+		/**
+		 * Fires when a call proceeded under a warn rule.
+		 *
+		 * @param string $tool_name Tool that ran.
+		 * @param array  $rule      The rule that matched.
+		 */
+		if ( $fresh ) {
+			do_action( 'aura_worker_rule_warned', (string) $tool_name, $rule );
+		}
+		return array( 'effect' => $rule['effect'], 'rule' => $rule, 'recorded' => $fresh );
+	}
+
+	/**
+	 * The tool-result array for a refusal. Says plainly that approval does not
+	 * help — the operator has to release the rule — so nobody goes looking for
+	 * a grant bug.
+	 *
+	 * @param string $tool_name Tool.
+	 * @param array  $rule      Deciding rule.
+	 * @return array
+	 */
+	public static function blocked_result( $tool_name, array $rule ) {
+		$key    = isset( $rule['key'] ) ? (string) $rule['key'] : 'rule/?';
+		$reason = isset( $rule['reason'] ) ? (string) $rule['reason'] : '';
+		return array(
+			'success' => false,
+			'code'    => 'aura_rule_blocked',
+			'status'  => 403,
+			'error'   => sprintf(
+				'%s is blocked by %s%s — approval does not override a rule; release the rule first.',
+				(string) $tool_name,
+				$key,
+				'' === $reason ? '' : ' (' . $reason . ')'
+			),
+			'rule'    => array(
+				'key'    => $key,
+				'reason' => $reason,
+			),
+		);
+	}
+
+	/**
+	 * @param array $rule Matched warn rule.
+	 * @return array {rule: string, reason: string}
+	 */
+	public static function warning_entry( array $rule ) {
+		return array(
+			'rule'   => isset( $rule['key'] ) ? (string) $rule['key'] : 'rule/?',
+			'reason' => isset( $rule['reason'] ) ? (string) $rule['reason'] : '',
+		);
+	}
 }

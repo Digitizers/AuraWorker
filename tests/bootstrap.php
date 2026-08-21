@@ -1285,5 +1285,8 @@ function sa_reset_state(): void {
 		$GLOBALS['wpdb']->last_error = '';
 		$GLOBALS['wpdb']->last_query = '';
 	}
+	if ( class_exists( 'Aura_Worker_Rules' ) ) {
+		Aura_Worker_Rules::reset_records();
+	}
 	$_SERVER['REMOTE_ADDR']   = '203.0.113.10';
 }
