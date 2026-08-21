@@ -78,11 +78,41 @@ class SA_Fatal_Tool extends Aura_Tool_Base {
 	}
 }
 
+/**
+ * A snapshot-first tool, shaped like the real ones (e.g.
+ * class-tool-gutenberg-update-block.php): the FIRST thing execute() does is
+ * capture state before mutating anything. Real tools do this through
+ * `Aura_Worker_Snapshots::snapshot_post()` et al., which hit the filesystem
+ * and are too heavy for a unit double; this double marks the same POINT in
+ * the sequence with a static counter instead, so a test can prove the point
+ * was never reached rather than merely that `execute()` overall didn't run.
+ */
+class SA_Snapshotting_Tool extends Aura_Tool_Base {
+	public static $snapshot_attempts = 0;
+	public function get_name() {
+		return 'test_snapshotting_tool';
+	}
+	public function get_description() {
+		return 'snapshots before it mutates, like a real power tool';
+	}
+	public function get_parameters() {
+		return array();
+	}
+	public function get_returns() {
+		return array( 'ok' => array( 'type' => 'boolean' ) );
+	}
+	public function execute( $params ) {
+		++self::$snapshot_attempts; // Stands in for Aura_Worker_Snapshots::snapshot_post().
+		return array( 'ok' => true );
+	}
+}
+
 final class RulesEnforcementTest extends TestCase {
 
 	protected function setUp(): void {
 		sa_reset_state();
-		SA_Recording_Tool::$ran = 0;
+		SA_Recording_Tool::$ran               = 0;
+		SA_Snapshotting_Tool::$snapshot_attempts = 0;
 	}
 
 	private function install( array $rules ): void {
@@ -184,7 +214,8 @@ final class RulesEnforcementTest extends TestCase {
 	}
 
 	public function test_an_approval_bound_read_is_enforced_like_a_write(): void {
-		// test_read_approval is read_only + requires_approval (ToolBaseTest).
+		// test_read_approval is read_only + requires_approval
+		// (SA_Fake_Read_Approval_Tool, GrantEnforcementTest.php).
 		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
 		$tools = new Aura_Worker_Tools();
 		$res   = $tools->execute_tool( 'test_read_approval', array() );
@@ -244,6 +275,45 @@ final class RulesEnforcementTest extends TestCase {
 		$res   = $tools->execute_tool( 'test_double_tool', array() ); // missing required "target"
 		$this->assertSame( 'Parameter validation failed.', $res['error'] );
 		$this->assertCount( 0, $this->fired( 'aura_worker_rule_blocked' ) );
+	}
+
+	public function test_dedup_never_exempts_a_later_call(): void {
+		// The design's central invariant: the forensic EVENT is deduplicated
+		// per rule per dispatch, but the REFUSAL is never deduplicated — a
+		// second mutation attempted under an already-recorded rule is still
+		// refused. Pin both halves in one test: two calls, two refusals, one
+		// event. (A buggy `if ( ! $fresh ) { return array( 'effect' => null ); }`
+		// short-circuit right before the block branch in enforce() — the exact
+		// defect this invariant guards against — would let the second call
+		// through while still leaving every other test in this file green.)
+		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
+		$tools = new Aura_Worker_Tools();
+
+		$first  = $tools->execute_tool( 'test_recording_tool', array( 'post_id' => 1 ) );
+		$second = $tools->execute_tool( 'test_recording_tool', array( 'post_id' => 2 ) );
+
+		$this->assertSame( 'aura_rule_blocked', $first['code'] ?? null, 'the first call was not refused' );
+		$this->assertSame( 'aura_rule_blocked', $second['code'] ?? null, 'deduplicating the event exempted the second call' );
+		$this->assertSame( 0, SA_Recording_Tool::$ran );
+		$this->assertCount( 1, $this->fired( 'aura_worker_rule_blocked' ), 'the event should fire once per rule per dispatch' );
+	}
+
+	public function test_a_block_lands_before_any_snapshot_is_attempted(): void {
+		// SA_Recording_Tool::$ran === 0 (see test_a_block_runs_nothing_and_says_
+		// which_rule) proves execute() as a whole never ran, but real tools
+		// snapshot as the FIRST statement inside execute() (see
+		// class-tool-gutenberg-update-block.php), before any mutation — so
+		// "execute() didn't run" and "no snapshot was taken" are the same fact
+		// only as long as nobody hoists snapshot creation above the rule check
+		// in execute_tool(). Pin the snapshot point directly: a snapshot of a
+		// call that was refused would be a lie about what happened — there is
+		// nothing to roll back to, because nothing ran.
+		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
+		$tools = new Aura_Worker_Tools();
+		$res   = $tools->execute_tool( 'test_snapshotting_tool', array() );
+
+		$this->assertSame( 'aura_rule_blocked', $res['code'] ?? null );
+		$this->assertSame( 0, SA_Snapshotting_Tool::$snapshot_attempts, 'a blocked call still took a snapshot' );
 	}
 
 	public function test_the_mcp_route_returns_403_for_a_block(): void {
