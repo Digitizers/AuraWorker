@@ -192,7 +192,9 @@ class Aura_Worker_MCP {
 		}
 
 		$result = $this->tools->execute_tool( $tool_name, $params );
-		$status = $result['success'] ? 200 : 400;
+		// A tool result may carry its own HTTP status (a rule block is a 403,
+		// not a 400 — the call was well-formed and refused on policy).
+		$status = $result['success'] ? 200 : ( isset( $result['status'] ) ? (int) $result['status'] : 400 );
 
 		return new WP_REST_Response( $result, $status );
 	}

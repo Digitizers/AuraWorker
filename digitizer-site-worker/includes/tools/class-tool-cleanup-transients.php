@@ -47,6 +47,11 @@ class Aura_Tool_Cleanup_Transients extends Aura_Tool_Base {
 		);
 	}
 
+	/** @inheritDoc — site-wide maintenance: a freeze applies, a page rule does not. */
+	public function touches( $params ) {
+		return array( array( 'type' => 'site', 'id' => '*' ) );
+	}
+
 	public function execute( $params ) {
 		global $wpdb;
 

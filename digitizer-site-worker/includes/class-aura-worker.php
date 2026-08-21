@@ -66,6 +66,11 @@ class Aura_Worker {
 		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-call-context.php';
 		Aura_Worker_Call_Context::init();
 
+		// A rule holds against WordPress core's own REST API, not only
+		// against SiteAgent's tools — the seam Aura's content tools, an
+		// app-password agent and a second MCP server actually write through.
+		Aura_Worker_Rules::init();
+
 		// Standards-alignment: also expose tools via the WordPress Abilities API
 		// (when present) so the official MCP adapter can discover them. Additive —
 		// the aura/mcp namespace above is unaffected. The category must register

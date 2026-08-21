@@ -106,6 +106,20 @@ class Aura_Tool_Set_Seo_Meta extends Aura_Tool_Base {
 		);
 	}
 
+	/** @inheritDoc */
+	public function touches( $params ) {
+		$id = isset( $params['post_id'] ) ? (int) $params['post_id'] : 0;
+		if ( $id <= 0 ) {
+			// No post yet (a create), or none given: the honest answer is the
+			// site — a freeze catches it, a rule on an existing page does not.
+			return array( array( 'type' => 'site', 'id' => '*' ) );
+		}
+		return array(
+			array( 'type' => 'post', 'id' => (string) $id ),
+			array( 'type' => 'page', 'id' => (string) $id ),
+		);
+	}
+
 	public function execute( $params ) {
 		$post_id = isset( $params['post_id'] ) ? (int) $params['post_id'] : 0;
 		if ( $post_id <= 0 || ! get_post( $post_id ) ) {

@@ -197,6 +197,56 @@ class Aura_Worker_Grant {
 	}
 
 	/**
+	 * Verify any document signed by the gateway key, and return its payload.
+	 *
+	 * Same envelope as a grant — `b64url(json).b64url(sig)` — and the same
+	 * public key, so anything Aura signs for this site is checked one way. The
+	 * ruleset (Aura_Worker_Rules) is the first non-grant user. This does NOT
+	 * reserve a nonce or check expiry: documents are not single-use, and the
+	 * caller decides freshness (the ruleset uses a monotonic `seq`).
+	 *
+	 * @param string $envelope Signed document.
+	 * @return array|string Decoded payload, or a reason string on failure.
+	 */
+	public static function has_usable_key() {
+		// NOT is_enforced(), which asks only whether the option is non-empty.
+		// pubkey_raw() returns '' unless the stored value decodes to exactly a
+		// valid Ed25519 public key on a host that has libsodium — which is the
+		// real question behind "can this site verify anything?".
+		return '' !== self::pubkey_raw();
+	}
+
+	public static function verify_signed_document( $envelope ) {
+		if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
+			return 'server is missing libsodium';
+		}
+		if ( ! self::is_enforced() ) {
+			return 'no gateway key provisioned';
+		}
+		$pubkey = self::pubkey_raw();
+		if ( '' === $pubkey ) {
+			return 'gateway key is invalid';
+		}
+		$parts = explode( '.', (string) $envelope );
+		if ( 2 !== count( $parts ) || '' === $parts[0] || '' === $parts[1] ) {
+			return 'malformed envelope';
+		}
+		$json = self::b64url_decode( $parts[0] );
+		$sig  = self::b64url_decode( $parts[1] );
+		if ( '' === $json || SODIUM_CRYPTO_SIGN_BYTES !== strlen( $sig ) ) {
+			return 'malformed envelope';
+		}
+		if ( ! sodium_crypto_sign_verify_detached( $sig, $json, $pubkey ) ) {
+			return 'bad signature';
+		}
+		$doc = json_decode( $json, true );
+		if ( ! is_array( $doc ) ) {
+			return 'payload is not an object';
+		}
+		return $doc;
+	}
+
+	/**
 	 * Guard a non-MCP REST write endpoint with the same grant policy.
 	 *
 	 * The MCP `tools/execute` handler enforces grants for mutating tools; the

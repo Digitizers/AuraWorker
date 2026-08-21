@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.9.1-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.10.0-green" alt="Stable" />
 </p>
 
 ---
@@ -114,7 +114,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `POST` | `/tools/execute` | Execute a tool with validated parameters |
 | `GET` | `/context` | Full site context for AI decision-making |
 
-**Built-in MCP tools (26):**
+**Built-in MCP tools (27):**
 
 | Tool | Kind | Purpose |
 |------|------|---------|
@@ -136,6 +136,7 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `audit_admin_accounts` | read | privileged-account facts: admins + recency, caps outside role, app-password counts, multisite super admins |
 | `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
 | `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many abilities pass the discovery rule such a server applies — a property of the abilities, not proof any server serves them; a registry-resolving server (Angie's) picks up mutating ones outside SiteAgent's approval path |
+| `audit_rules` | read | operator-ruleset presence + age, 24h block/warn counts, expired-but-listed rules, enforcement points in this build |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |
@@ -150,6 +151,11 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.10.0
+
+- **Operator rules, enforced on the site.** A rule is an Aura memory entry (`rule/<slug>`) naming a resource — the whole site, a page or post by ID, or a plugin by slug — with an effect of `block` or `warn` and an optional expiry. Aura signs the client's whole ruleset with the same key that signs approval grants and pushes it to every connected site (`POST /aura/v2/rules`); the site verifies it and keeps only a newer one (a replayed older ruleset is refused even when validly signed). No ruleset means no policy. Enforcement runs on every path a write can take — inside the tool executor, on the legacy REST update routes, and at WordPress core's own REST API for posts and pages — so a rule holds against Aura's content tools, an assistant with an application password, or another plugin's MCP server alike. **A rule outranks an approval grant**; a `warn` runs and attaches the warning, and previews report what a call touches and which rule would decide it.
+- **New: `audit_rules` (read-only).** Ruleset presence and age, whether the site can verify one, 24h block/warn counts, expired-but-listed rules, and the enforcement points in this build.
 
 ### 2.9.1
 

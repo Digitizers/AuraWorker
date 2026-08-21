@@ -28,7 +28,14 @@ define( 'SA_TESTS_DIR', __DIR__ );
 define( 'SA_PLUGIN_DIR', dirname( __DIR__ ) . '/digitizer-site-worker' );
 
 if ( ! defined( 'ABSPATH' ) ) {
-	define( 'ABSPATH', dirname( __DIR__ ) . '/' );
+	// A fixture root, not the repo root: the only thing under it is
+	// wp-admin/includes/*.php — trivial placeholders so the unconditional
+	// require_once calls in class-aura-worker-updater.php (etc.) resolve
+	// without a WordPress install. The real function/class definitions all
+	// live in this file. Keeping them under tests/fixtures/ instead of the
+	// repo root keeps them from reading as vendored WordPress core to anyone
+	// browsing or scanning the plugin, and outside any packaging step's reach.
+	define( 'ABSPATH', __DIR__ . '/fixtures/wp-root/' );
 }
 
 // Filesystem sandbox for the rollback engine. Kept under the system temp dir so
@@ -48,11 +55,20 @@ if ( ! defined( 'ARRAY_A' ) ) {
 if ( ! defined( 'DAY_IN_SECONDS' ) ) {
 	define( 'DAY_IN_SECONDS', 86400 );
 }
+if ( ! defined( 'HOUR_IN_SECONDS' ) ) {
+	define( 'HOUR_IN_SECONDS', 3600 );
+}
 if ( ! defined( 'MINUTE_IN_SECONDS' ) ) {
 	define( 'MINUTE_IN_SECONDS', 60 );
 }
 if ( ! defined( 'OBJECT' ) ) {
 	define( 'OBJECT', 'OBJECT' );
+}
+if ( ! defined( 'AURA_WORKER_VERSION' ) ) {
+	// Aura_Worker_Updater::self_update() reads this for its "old_version" in
+	// the result array. Only reached when a test drives self_update() all the
+	// way through (normally the rule/grant guards stop it first).
+	define( 'AURA_WORKER_VERSION', 'test' );
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +85,10 @@ $GLOBALS['_did_actions']  = array();
 $GLOBALS['_filters']      = array();
 $GLOBALS['_abilities']    = array();
 $GLOBALS['_ability_categories'] = array();
+// Names the mutating stubs below (Plugin_Upgrader::upgrade(), wp_upgrade(), …)
+// append themselves to. RulesRestCoverageTest's freeze sweep asserts this stays
+// empty — a guarded handler that ran under a freeze would leave a mark here.
+$GLOBALS['_mutations']    = array();
 
 // ---------------------------------------------------------------------------
 // WordPress function stubs
@@ -216,17 +236,127 @@ if ( ! function_exists( 'is_wp_error' ) ) {
 	}
 }
 
+// --- Serialization (real WP core semantics; ruleset CAS compares raw bytes) --
+
+if ( ! function_exists( 'is_serialized' ) ) {
+	function is_serialized( $data, $strict = true ) {
+		if ( ! is_string( $data ) ) {
+			return false;
+		}
+		$data = trim( $data );
+		if ( 'N;' === $data ) {
+			return true;
+		}
+		if ( strlen( $data ) < 4 ) {
+			return false;
+		}
+		if ( ':' !== $data[1] ) {
+			return false;
+		}
+		if ( $strict ) {
+			$lastc = substr( $data, -1 );
+			if ( ';' !== $lastc && '}' !== $lastc ) {
+				return false;
+			}
+		} else {
+			$semicolon = strpos( $data, ';' );
+			$brace     = strpos( $data, '}' );
+			if ( false === $semicolon && false === $brace ) {
+				return false;
+			}
+			if ( false !== $semicolon && $semicolon < 3 ) {
+				return false;
+			}
+			if ( false !== $brace && $brace < 4 ) {
+				return false;
+			}
+		}
+		$token = $data[0];
+		switch ( $token ) {
+			case 's':
+				if ( $strict && '"' !== substr( $data, -2, 1 ) ) {
+					return false;
+				} elseif ( false === strpos( $data, '"' ) ) {
+					return false;
+				}
+				return true;
+			case 'a':
+			case 'O':
+			case 'E':
+				return (bool) preg_match( "/^{$token}:[0-9]+:/s", $data );
+			case 'b':
+			case 'i':
+			case 'd':
+				$end = $strict ? '$' : '';
+				return (bool) preg_match( "/^{$token}:[0-9.E+-]+;$end/", $data );
+		}
+		return false;
+	}
+}
+
+if ( ! function_exists( 'maybe_serialize' ) ) {
+	function maybe_serialize( $data ) {
+		if ( is_array( $data ) || is_object( $data ) ) {
+			return serialize( $data );
+		}
+		if ( is_serialized( $data, false ) ) {
+			return serialize( $data );
+		}
+		return $data;
+	}
+}
+
+if ( ! function_exists( 'maybe_unserialize' ) ) {
+	function maybe_unserialize( $data ) {
+		if ( is_serialized( $data ) ) {
+			return @unserialize( trim( (string) $data ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		}
+		return $data;
+	}
+}
+
+if ( ! function_exists( 'wp_cache_delete' ) ) {
+	function wp_cache_delete( $key, $group = '' ) {
+		$GLOBALS['_cache_deletes'][] = array(
+			'key'   => $key,
+			'group' => $group,
+		);
+		return true;
+	}
+}
+
 // --- Option store ----------------------------------------------------------
 
 if ( ! function_exists( 'get_option' ) ) {
 	function get_option( string $option, $default = false ) {
-		return array_key_exists( $option, $GLOBALS['_options'] ) ? $GLOBALS['_options'][ $option ] : $default;
+		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
+			return $GLOBALS['_options'][ $option ];
+		}
+		if ( array_key_exists( $option, $GLOBALS['_rows'] ) ) {
+			// An ordinary cache miss: nothing decoded is cached for this key,
+			// but the row is in the "database" ($_rows) — the ruleset store's
+			// raw $wpdb INSERT/UPDATE never populates $_options (it bypasses
+			// add_option()/update_option() on purpose), so this is the only
+			// way its own writes are ever visible through get_option().
+			return maybe_unserialize( $GLOBALS['_rows'][ $option ] );
+		}
+		return $default;
 	}
 }
 
 if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
 		$GLOBALS['_options'][ $option ] = $value;
+		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
+		// Witness every write, unconditionally. An option name is caller-chosen
+		// data on the restore_snapshot path (create_snapshot accepts any
+		// `target`), so excluding an `aura_worker_*` prefix would blind the
+		// witness to exactly the case it exists for: a snapshot taken over the
+		// plugin's own state (e.g. the site token) and restored under a freeze.
+		// No guarded handler writes an `aura_worker_*` option on any path this
+		// suite exercises, so nothing needs the exclusion — confirmed by running
+		// the full suite with it removed.
+		$GLOBALS['_mutations'][] = 'update_option:' . $option;
 		return true;
 	}
 }
@@ -235,11 +365,17 @@ if ( ! function_exists( 'add_option' ) ) {
 	// Atomic in core (INSERT guarded by option_name's unique index): fails when
 	// the option already exists. The verifier relies on this for single-use
 	// nonce reservation, so the stub mirrors that fail-if-exists semantics.
+	// The ruleset store does NOT use add_option() for its own writes (a real
+	// conditional INSERT through $wpdb replaces it — add_option() skips its
+	// existence check whenever `notoptions` lists the key, and runs
+	// INSERT ... ON DUPLICATE KEY UPDATE instead, which would clobber a
+	// winning racer's row), so this stub carries no ruleset-specific seams.
 	function add_option( string $option, $value = '', $deprecated = '', $autoload = 'yes' ): bool {
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return false;
 		}
 		$GLOBALS['_options'][ $option ] = $value;
+		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
 		return true;
 	}
 }
@@ -254,6 +390,7 @@ if ( ! function_exists( 'wp_schedule_single_event' ) ) {
 if ( ! function_exists( 'delete_option' ) ) {
 	function delete_option( string $option ): bool {
 		unset( $GLOBALS['_options'][ $option ] );
+		unset( $GLOBALS['_rows'][ $option ] );
 		return true;
 	}
 }
@@ -322,6 +459,26 @@ if ( ! function_exists( 'get_users' ) ) {
 if ( ! function_exists( 'do_action' ) ) {
 	function do_action( string $tag, ...$args ): void {
 		$GLOBALS['_did_actions'][] = array( 'tag' => $tag, 'args' => $args );
+		// Mirrors apply_filters() below: a listener registered via add_action()
+		// must actually run (Aura_Worker_Rules::record_block()/record_warn()
+		// bump the audit counters this way), not merely be logged here.
+		$hooks = array();
+		foreach ( $GLOBALS['_filters'][ $tag ] ?? array() as $i => $entry ) {
+			if ( is_array( $entry ) && array_key_exists( 'callback', $entry ) ) {
+				$hooks[] = $entry;
+			} else {
+				$hooks[] = array( 'priority' => 10, 'seq' => $i, 'callback' => $entry );
+			}
+		}
+		usort(
+			$hooks,
+			static function ( $a, $b ) {
+				return $a['priority'] <=> $b['priority'] ?: $a['seq'] <=> $b['seq'];
+			}
+		);
+		foreach ( $hooks as $hook ) {
+			( $hook['callback'] )( ...$args );
+		}
 	}
 }
 
@@ -349,22 +506,47 @@ if ( ! function_exists( 'wp_register_ability_category' ) ) {
 
 if ( ! function_exists( 'add_filter' ) ) {
 	function add_filter( string $tag, $callback, int $priority = 10, int $accepted_args = 1 ): bool {
-		$GLOBALS['_filters'][ $tag ][] = $callback;
+		// Wrapped with priority + insertion order, so apply_filters() can run
+		// hooks in the order WordPress actually does: two callbacks on the
+		// same tag (e.g. open_frame() at priority 1, guard_core_any() at
+		// priority 5) must run lowest-priority-first regardless of which
+		// add_filter() call happened to run last.
+		$GLOBALS['_filters'][ $tag ][] = array(
+			'priority' => $priority,
+			'seq'      => count( $GLOBALS['_filters'][ $tag ] ?? array() ),
+			'callback' => $callback,
+		);
 		return true;
 	}
 }
 
 if ( ! function_exists( 'add_action' ) ) {
 	function add_action( string $tag, $callback, int $priority = 10, int $accepted_args = 1 ): bool {
-		$GLOBALS['_filters'][ $tag ][] = $callback;
-		return true;
+		return add_filter( $tag, $callback, $priority, $accepted_args );
 	}
 }
 
 if ( ! function_exists( 'apply_filters' ) ) {
 	function apply_filters( string $tag, $value, ...$args ) {
-		foreach ( $GLOBALS['_filters'][ $tag ] ?? array() as $callback ) {
-			$value = $callback( $value, ...$args );
+		$hooks = array();
+		foreach ( $GLOBALS['_filters'][ $tag ] ?? array() as $i => $entry ) {
+			// A test may push a bare callable straight onto $GLOBALS['_filters']
+			// (bypassing add_filter()), so normalise both shapes rather than
+			// assuming every entry carries a priority wrapper.
+			if ( is_array( $entry ) && array_key_exists( 'callback', $entry ) ) {
+				$hooks[] = $entry;
+			} else {
+				$hooks[] = array( 'priority' => 10, 'seq' => $i, 'callback' => $entry );
+			}
+		}
+		usort(
+			$hooks,
+			static function ( $a, $b ) {
+				return $a['priority'] <=> $b['priority'] ?: $a['seq'] <=> $b['seq'];
+			}
+		);
+		foreach ( $hooks as $hook ) {
+			$value = ( $hook['callback'] )( $value, ...$args );
 		}
 		return $value;
 	}
@@ -380,7 +562,12 @@ if ( ! function_exists( 'wp_mkdir_p' ) ) {
 
 if ( ! function_exists( 'wp_delete_file' ) ) {
 	function wp_delete_file( string $file ): bool {
-		return @unlink( $file );
+		$existed = file_exists( $file );
+		$ok      = @unlink( $file );
+		if ( $existed && $ok ) {
+			$GLOBALS['_mutations'][] = 'wp_delete_file';
+		}
+		return $ok;
 	}
 }
 
@@ -391,6 +578,172 @@ if ( ! function_exists( 'WP_Filesystem' ) ) {
 			$wp_filesystem = new SA_Test_Filesystem();
 		}
 		return true;
+	}
+}
+
+// --- Update/upgrade surface -------------------------------------------------
+//
+// The nine direct REST handlers in class-aura-worker-api.php (Task 6) reach
+// this rather than execute_tool(). In the passing suite every one of them is
+// exercised under a matching rule (block or warn) except update_plugin and
+// create_snapshot, whose "not this plugin" / "always allowed" paths run the
+// real Aura_Worker_Updater / Aura_Worker_Snapshots code — so update_plugin's
+// dependencies are stubbed for real; the rest exist so a temporarily-unguarded
+// handler (RulesRestCoverageTest's revert-verify) fails on the rule-blocked
+// assertion rather than a fatal from a missing WP core file.
+//
+// load_upgrade_dependencies() require_once's wp-admin/includes/*.php
+// unconditionally (no function_exists guard — that is how WordPress itself
+// does it), so the files below exist on disk purely so those requires resolve;
+// the real definitions are the ones in this file, loaded first.
+
+if ( ! function_exists( 'get_plugins' ) ) {
+	function get_plugins() {
+		return isset( $GLOBALS['_installed_plugins'] )
+			? $GLOBALS['_installed_plugins']
+			: array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+	}
+}
+
+if ( ! function_exists( 'is_plugin_active' ) ) {
+	function is_plugin_active( $plugin ) {
+		return isset( $GLOBALS['_active_plugins'][ $plugin ] );
+	}
+}
+
+if ( ! function_exists( 'activate_plugin' ) ) {
+	function activate_plugin( $plugin ) {
+		$GLOBALS['_active_plugins'][ $plugin ] = true;
+		$GLOBALS['_mutations'][]               = 'activate_plugin';
+	}
+}
+
+if ( ! class_exists( 'SA_Test_Theme' ) ) {
+	/** Minimal WP_Theme stand-in: exists() is true for any non-empty slug. */
+	class SA_Test_Theme {
+		private string $slug;
+
+		public function __construct( $slug = '' ) {
+			$this->slug = (string) $slug;
+		}
+
+		public function exists(): bool {
+			return '' !== $this->slug && ! isset( $GLOBALS['_missing_themes'][ $this->slug ] );
+		}
+	}
+}
+
+if ( ! function_exists( 'wp_get_theme' ) ) {
+	function wp_get_theme( $stylesheet = '' ) {
+		return new SA_Test_Theme( $stylesheet );
+	}
+}
+
+if ( ! function_exists( 'switch_theme' ) ) {
+	function switch_theme( $stylesheet ) {
+		$GLOBALS['_mutations'][] = 'switch_theme';
+	}
+}
+
+if ( ! function_exists( 'get_core_updates' ) ) {
+	function get_core_updates() {
+		// Default: "already up to date" — update_core() returns success without
+		// reaching Core_Upgrader. Tests that need an available update set
+		// $GLOBALS['_core_updates'] themselves.
+		return isset( $GLOBALS['_core_updates'] )
+			? $GLOBALS['_core_updates']
+			: array( (object) array( 'response' => 'latest' ) );
+	}
+}
+
+if ( ! function_exists( 'wp_raise_memory_limit' ) ) {
+	function wp_raise_memory_limit( $context = 'admin' ) {
+		return false;
+	}
+}
+
+if ( ! function_exists( 'wp_cache_flush' ) ) {
+	function wp_cache_flush() {
+		return true;
+	}
+}
+
+if ( ! function_exists( 'wp_clean_plugins_cache' ) ) {
+	function wp_clean_plugins_cache( $clear_update_cache = true ) {}
+}
+
+if ( ! function_exists( 'get_plugin_data' ) ) {
+	function get_plugin_data( $plugin_file, $markup = true, $translate = true ) {
+		return array( 'Version' => 'unknown' );
+	}
+}
+
+if ( ! function_exists( 'download_url' ) ) {
+	function download_url( $url, $timeout = 300, $signature_verification = false ) {
+		return isset( $GLOBALS['_download_url_result'] ) ? $GLOBALS['_download_url_result'] : '';
+	}
+}
+
+if ( ! function_exists( 'wp_upgrade' ) ) {
+	function wp_upgrade() {
+		$GLOBALS['_mutations'][] = 'wp_upgrade';
+	}
+}
+
+if ( ! class_exists( 'Automatic_Upgrader_Skin' ) ) {
+	class Automatic_Upgrader_Skin {
+		public function get_upgrade_messages() {
+			return array();
+		}
+	}
+}
+
+if ( ! class_exists( 'Plugin_Upgrader' ) ) {
+	class Plugin_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function upgrade( $plugin_file ) {
+			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::upgrade';
+			return true;
+		}
+
+		public function install( $package, $args = array() ) {
+			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::install';
+			return true;
+		}
+	}
+}
+
+if ( ! class_exists( 'Theme_Upgrader' ) ) {
+	class Theme_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function upgrade( $theme_slug ) {
+			$GLOBALS['_mutations'][] = 'Theme_Upgrader::upgrade';
+			return true;
+		}
+	}
+}
+
+if ( ! class_exists( 'Core_Upgrader' ) ) {
+	class Core_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function upgrade( $update ) {
+			$GLOBALS['_mutations'][] = 'Core_Upgrader::upgrade';
+			return true;
+		}
+	}
+}
+
+if ( ! class_exists( 'Language_Pack_Upgrader' ) ) {
+	class Language_Pack_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function bulk_upgrade() {
+			$GLOBALS['_mutations'][] = 'Language_Pack_Upgrader::bulk_upgrade';
+			return array();
+		}
 	}
 }
 
@@ -432,6 +785,15 @@ if ( ! class_exists( 'WP_REST_Request' ) ) {
 		private array $headers = array();
 		private array $params  = array();
 		private string $route  = '/aura/v1/status';
+		private string $method = 'GET';
+
+		public function set_method( string $m ): void {
+			$this->method = strtoupper( $m );
+		}
+
+		public function get_method(): string {
+			return $this->method;
+		}
 
 		public function set_header( string $key, $value ): void {
 			$this->headers[ strtolower( $key ) ] = $value;
@@ -463,6 +825,7 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 	class WP_REST_Response {
 		public $data;
 		public int $status;
+		private array $headers = array();
 
 		public function __construct( $data = null, int $status = 200 ) {
 			$this->data   = $data;
@@ -476,12 +839,41 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 		public function get_status(): int {
 			return $this->status;
 		}
+
+		public function header( string $key, $value ): void {
+			$this->headers[ $key ] = $value;
+		}
+
+		public function get_headers(): array {
+			return $this->headers;
+		}
 	}
 }
 
 if ( ! function_exists( 'rest_ensure_response' ) ) {
 	function rest_ensure_response( $response ) {
 		return ( $response instanceof WP_REST_Response ) ? $response : new WP_REST_Response( $response, 200 );
+	}
+}
+
+if ( ! function_exists( 'rest_convert_error_to_response' ) ) {
+	// The conversion send_warning_header() performs one statement before core
+	// would (rest-api.php:3464): the status comes from the error data, the body
+	// is the code, message and that same data.
+	function rest_convert_error_to_response( $error ) {
+		$code   = $error->get_error_code();
+		$data   = $error->get_error_data( $code );
+		$status = ( is_array( $data ) && isset( $data['status'] ) ) ? (int) $data['status'] : 500;
+		return new WP_REST_Response(
+			array( 'code' => $code, 'message' => $error->get_error_message( $code ), 'data' => $data ),
+			$status
+		);
+	}
+}
+
+if ( ! function_exists( 'rest_get_authenticated_app_password' ) ) {
+	function rest_get_authenticated_app_password() {
+		return $GLOBALS['_rest_app_password'] ?? null;
 	}
 }
 
@@ -509,9 +901,20 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			return $GLOBALS['_db_rows'];
 		}
 
-		/** get_var returns the next queued scalar, else $_db_var. */
+		/**
+		 * get_var returns the next queued scalar, else $_db_var — except the one
+		 * shape the ruleset store's insert_if_absent() issues to classify a
+		 * losing INSERT: a raw re-read of the row from $_rows (the
+		 * "database"), recorded into $_db_queries so a test can confirm the
+		 * classification really came from a query, not from get_option().
+		 */
 		public function get_var( $query = null, $x = 0, $y = 0 ) {
 			$this->last_query = (string) $query;
+			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				// The row, not the cache: $_rows is what the "database" holds.
+				return isset( $GLOBALS['_rows'][ $m[1] ] ) ? $GLOBALS['_rows'][ $m[1] ] : null;
+			}
 			if ( ! empty( $GLOBALS['_db_var_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_var_queue'] );
 			}
@@ -524,22 +927,164 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			return $GLOBALS['_db_row'];
 		}
 
-		/** Records the prepared (query, args) and returns the query verbatim. */
+		/**
+		 * get_col: the one shape sweep_options() issues (a LIKE-prefix bounded
+		 * by an upper name), read against $_rows — the same table query()/
+		 * get_var() treat as the "database". Every sweep in the class is
+		 * bounded, so there is no unbounded form to emulate.
+		 */
+		public function get_col( $query = null, $x = 0 ) {
+			$this->last_query         = (string) $query;
+			$GLOBALS['_db_queries'][] = (string) $query;
+			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", (string) $query, $m ) ) {
+				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				$before = stripslashes( $m[2] );
+				return array_values(
+					array_filter(
+						array_keys( $GLOBALS['_rows'] ),
+						static function ( $k ) use ( $prefix, $before ) {
+							return 0 === strpos( $k, $prefix ) && strcmp( $k, $before ) < 0;
+						}
+					)
+				);
+			}
+			return array();
+		}
+
+		/**
+		 * Records the prepared (query, args) and returns the query with each
+		 * `%s` substituted by its escaped, quoted argument (and `%d` by its
+		 * integer value) — real enough for the ruleset CAS statements, which
+		 * this stub's query()/get_var() match by parsing the substituted SQL.
+		 */
 		public function prepare( $query, ...$args ) {
 			// Some callers pass a single array of args.
 			if ( 1 === count( $args ) && is_array( $args[0] ) ) {
 				$args = $args[0];
 			}
-			$GLOBALS['_db_prepared'][] = array( 'query' => (string) $query, 'args' => $args );
-			return (string) $query;
+			$query                      = (string) $query;
+			$GLOBALS['_db_prepared'][] = array( 'query' => $query, 'args' => $args );
+			$i = 0;
+			return preg_replace_callback(
+				'/%[sd]/',
+				static function ( $m ) use ( $args, &$i ) {
+					$arg = $args[ $i ] ?? '';
+					++$i;
+					if ( '%d' === $m[0] ) {
+						return (string) (int) $arg;
+					}
+					return "'" . addslashes( (string) $arg ) . "'";
+				},
+				$query
+			);
 		}
 
 		public function esc_like( $text ) {
 			return addcslashes( (string) $text, '_%\\' );
 		}
 
+		/**
+		 * The write paths the ruleset store's compare-and-swap issues, plus
+		 * whatever a test has queued in $_db_query_result for anything else.
+		 * Models both statements against $_rows (the "database"):
+		 *
+		 *  - the conditional INSERT ( insert_if_absent() ) — a real
+		 *    `INSERT ... SELECT ... WHERE NOT EXISTS`, not add_option(), so a
+		 *    racer's already-committed row is never clobbered by this one;
+		 *  - the UPDATE ( swap_raw() ) — the byte-exact compare-and-swap.
+		 *
+		 * `_insert_racer` / `_cas_racer` inject a second write between this
+		 * caller's read and its own write; `_cas_always_lose` and
+		 * `_db_query_error` inject unresolved contention and a hard DB error
+		 * respectively (on both statements — a real driver doesn't care which
+		 * statement it was asked to run when the connection is the problem).
+		 */
 		public function query( $query ) {
-			$this->last_query = (string) $query;
+			$query                    = (string) $query;
+			$this->last_query         = $query;
+			$GLOBALS['_db_queries'][] = $query;
+
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
+				if ( ! empty( $GLOBALS['_db_query_error'] ) ) {
+					return false; // An SQL error, which is NOT a lost race.
+				}
+				// A second request inserting between this caller's own
+				// existence check (there is none — that's the point of a real
+				// conditional INSERT) and this statement running.
+				if ( ! empty( $GLOBALS['_insert_racer'] ) ) {
+					$racer                    = $GLOBALS['_insert_racer'];
+					$GLOBALS['_insert_racer'] = null;
+					Aura_Worker_Rules::accept( $racer );
+				}
+				list( , $name, $value, ) = array_map( 'stripslashes', $m );
+				if ( isset( $GLOBALS['_rows'][ $name ] ) ) {
+					return 0; // A row is already there — lost the race.
+				}
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				return 1;
+			}
+
+			if ( preg_match( "/^UPDATE \S+ SET option_value = '(.*)' WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
+				if ( ! empty( $GLOBALS['_db_query_error'] ) ) {
+					return false; // An SQL error, which is NOT a lost race.
+				}
+				if ( ! empty( $GLOBALS['_cas_always_lose'] ) ) {
+					return 0; // Contention that never resolves.
+				}
+				// A second request landing between this caller's read and its
+				// write — exactly the window the CAS exists to close.
+				if ( ! empty( $GLOBALS['_cas_racer'] ) ) {
+					$racer                 = $GLOBALS['_cas_racer'];
+					$GLOBALS['_cas_racer'] = null;
+					Aura_Worker_Rules::accept( $racer );
+				}
+				list( , $new, $name, $expected ) = array_map( 'stripslashes', $m );
+				// Compare the ROW, byte for byte, the way MySQL does. Going
+				// through $_options and re-serializing would decode `i:5;` to 5
+				// and compare "5" — so the corrupt-row repair, whose whole point
+				// is that the predicate is the raw bytes, could never match.
+				if ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $expected ) {
+					return 0; // Someone else wrote first.
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				return 1;
+			}
+
+			// Emulate the counters' atomic create-or-increment: one statement,
+			// no read, so a first bump inserts '1' and every later bump in the
+			// same hour adds one to whatever is there — never the two-step
+			// add_option()-then-UPDATE this replaced, which core's real
+			// add_option() could silently reset to the seed value (see
+			// bump()'s comment). Writes BOTH $_rows (the "database" get_col()
+			// and get_var() read) and $_options (the cache get_option() reads
+			// first), matching the CAS branches above — a bump that only
+			// touched $_options would leave the "database" holding a stale
+			// count the moment anything reads it back through $_rows.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', '1', 'no'\) ON DUPLICATE KEY UPDATE option_value = option_value \+ 1$/", $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				$GLOBALS['_rows'][ $name ]    = isset( $GLOBALS['_rows'][ $name ] ) ? (string) ( (int) $GLOBALS['_rows'][ $name ] + 1 ) : '1';
+				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
+				return 1;
+			}
+			// Used by the counters AND by the expired-notice claim sweep.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", $query, $m ) ) {
+				// Two layers of escaping to undo, or nothing matches: prepare()
+				// escaped the string for SQL, and esc_like() escaped `_` and
+				// `%` for LIKE beforehand — and every option name here is full
+				// of underscores.
+				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				$n      = 0;
+				foreach ( array_keys( $GLOBALS['_options'] ) as $k ) {
+					if ( 0 === strpos( $k, $prefix ) && strcmp( $k, stripslashes( $m[2] ) ) < 0 ) {
+						unset( $GLOBALS['_options'][ $k ], $GLOBALS['_rows'][ $k ] );
+						++$n;
+					}
+				}
+				return $n;
+			}
+
 			return isset( $GLOBALS['_db_query_result'] ) ? $GLOBALS['_db_query_result'] : 0;
 		}
 	}
@@ -551,6 +1096,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_db_row']           = null;
 	$GLOBALS['_db_prepared']      = array();
 	$GLOBALS['_db_query_result']  = 0;
+	$GLOBALS['_db_queries']       = array();
+	$GLOBALS['_cache_deletes']    = array();
+	$GLOBALS['_rows']             = array(); // Raw, serialized bytes — the "database" the ruleset CAS reads/writes.
+	$GLOBALS['_cas_racer']        = null;
+	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_cas_always_lose']  = false;
+	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
 }
 
@@ -602,8 +1154,21 @@ if ( ! class_exists( 'SA_Test_Filesystem' ) ) {
 
 		/**
 		 * Recursively delete a path. Mirrors $wp_filesystem->delete( $dir, true, 'd' ).
+		 *
+		 * Aura_Worker_Rollback::delete_directory() routes a real rollback's
+		 * directory-replace step through here (`$wp_filesystem->delete( $dir, true,
+		 * 'd' )`), and it is the only caller that ever passes a non-false $type — the
+		 * recursive descent below always passes false. That makes $type the marker
+		 * for "this is the outer call a guarded handler made", so one mutation is
+		 * recorded per real delete rather than once per file/directory underneath it.
+		 * The plugin's own directory bootstrapping (the .htaccess/index.php sentinel
+		 * writes in the Snapshots/Rollback constructors) goes through put_contents(),
+		 * never through here, so it needs no exclusion.
 		 */
 		public function delete( string $path, bool $recursive = false, $type = false ): bool {
+			if ( false !== $type && ( is_file( $path ) || is_dir( $path ) || is_link( $path ) ) ) {
+				$GLOBALS['_mutations'][] = 'SA_Test_Filesystem::delete';
+			}
 			if ( is_file( $path ) || is_link( $path ) ) {
 				return @unlink( $path );
 			}
@@ -691,6 +1256,7 @@ if ( ! function_exists( 'wp_update_post' ) ) {
 		foreach ( $args as $k => $v ) {
 			$GLOBALS['_posts'][ $id ]->$k = $v;
 		}
+		$GLOBALS['_mutations'][] = 'wp_update_post';
 		return $id;
 	}
 }
@@ -844,6 +1410,7 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-updater.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-api.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-magic-link.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-call-context.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-abilities.php';
 
 // Load every shipped tool class so tool-level tests can instantiate them
@@ -1011,6 +1578,13 @@ function sa_reset_state(): void {
 	$GLOBALS['_db_row']           = null;
 	$GLOBALS['_db_prepared']      = array();
 	$GLOBALS['_db_query_result']  = 0;
+	$GLOBALS['_db_queries']       = array();
+	$GLOBALS['_cache_deletes']    = array();
+	$GLOBALS['_rows']             = array();
+	$GLOBALS['_cas_racer']        = null;
+	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_cas_always_lose']  = false;
+	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['_posts']        = array();
 	$GLOBALS['_post_meta']    = array();
 	$GLOBALS['_cleaned_post_cache'] = array();
@@ -1038,9 +1612,26 @@ function sa_reset_state(): void {
 	$GLOBALS['_cron_schedules'] = null;
 	$GLOBALS['_http_response']  = null;
 	$GLOBALS['_http_error']     = false;
+	$GLOBALS['_mutations']      = array();
+	unset( $GLOBALS['wp_rest_auth_cookie'] );
+	$GLOBALS['_rest_app_password'] = null;
 	if ( isset( $GLOBALS['wpdb'] ) ) {
 		$GLOBALS['wpdb']->last_error = '';
 		$GLOBALS['wpdb']->last_query = '';
 	}
+	if ( class_exists( 'Aura_Worker_Rules' ) ) {
+		Aura_Worker_Rules::reset_records();
+		// A test-only seam and a REST-detection override, both statics: a test
+		// that sets either and forgets to clear it would otherwise poison
+		// every test that runs after it in the same process, silently, rather
+		// than failing the test that actually left it set.
+		Aura_Worker_Rules::$rest_request_override = null;
+		Aura_Worker_Rules::$cookie_auth_override  = null;
+	}
+	// Update-tool fixtures: a test that seeds these and forgets to clear them
+	// would otherwise leak into every later test's get_plugins()/
+	// get_core_updates()/wp_get_theme() stub, in place of the intended
+	// defaults (see the stubs' own comments a few hundred lines up).
+	unset( $GLOBALS['_installed_plugins'], $GLOBALS['_core_updates'], $GLOBALS['_missing_themes'] );
 	$_SERVER['REMOTE_ADDR']   = '203.0.113.10';
 }

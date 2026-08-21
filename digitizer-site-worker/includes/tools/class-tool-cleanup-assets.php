@@ -80,6 +80,11 @@ class Aura_Tool_Cleanup_Assets extends Aura_Tool_Base {
 		return $this->execute( $params );
 	}
 
+	/** @inheritDoc — site-wide maintenance: a freeze applies, a page rule does not. */
+	public function touches( $params ) {
+		return array( array( 'type' => 'site', 'id' => '*' ) );
+	}
+
 	public function execute( $params ) {
 		$dry_run      = isset( $params['dry_run'] ) ? (bool) $params['dry_run'] : true;
 		$sample_limit = isset( $params['sample_limit'] ) ? (int) $params['sample_limit'] : 20;

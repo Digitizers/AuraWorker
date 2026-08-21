@@ -307,6 +307,20 @@ class Aura_Worker_API {
 			'permission_callback' => array( $this->security, 'check_read_permission' ),
 		) );
 
+		// POST /aura/v2/rules — accept the client's signed operator ruleset.
+		register_rest_route( self::NAMESPACE_V2, '/rules', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'receive_rules' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'ruleset' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+			),
+		) );
+
 	}
 
 	/**
@@ -403,9 +417,17 @@ class Aura_Worker_API {
 		if ( is_wp_error( $guard ) ) {
 			return $guard;
 		}
+
+		// No narrower resource in the vocabulary: a freeze catches this, and
+		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.update.core' );
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		$result = $this->updater->update_core();
 		$status = $result['success'] ? 200 : 500;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
@@ -422,6 +444,17 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
+		// Operator rules. This handler bypasses execute_tool() (it calls the
+		// updater directly), so it enforces here; see Aura_Worker_Rules for why
+		// there are exactly two enforcement points and this is the second.
+		$rule = Aura_Worker_Rules::guard_rest(
+			array( array( 'type' => 'plugin', 'id' => Aura_Worker_Rules::plugin_slug( $plugin_file ) ) ),
+			'wp.update.plugin'
+		);
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		// Validate plugin exists.
 		if ( ! function_exists( 'get_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
@@ -429,15 +462,15 @@ class Aura_Worker_API {
 		$all_plugins = get_plugins();
 
 		if ( ! isset( $all_plugins[ $plugin_file ] ) ) {
-			return new WP_REST_Response( array(
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 				'success' => false,
 				'error'   => __( 'Plugin not found.', 'digitizer-site-worker' ),
-			), 404 );
+			) ), 404 );
 		}
 
 		$result = $this->updater->update_plugin( $plugin_file );
 		$status = $result['success'] ? 200 : 500;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
@@ -454,18 +487,25 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
+		// No narrower resource in the vocabulary: a freeze catches this, and
+		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.update.theme' );
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		// Validate theme exists.
 		$theme = wp_get_theme( $theme_slug );
 		if ( ! $theme->exists() ) {
-			return new WP_REST_Response( array(
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 				'success' => false,
 				'error'   => __( 'Theme not found.', 'digitizer-site-worker' ),
-			), 404 );
+			) ), 404 );
 		}
 
 		$result = $this->updater->update_theme( $theme_slug );
 		$status = $result['success'] ? 200 : 500;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
@@ -479,9 +519,17 @@ class Aura_Worker_API {
 		if ( is_wp_error( $guard ) ) {
 			return $guard;
 		}
+
+		// No narrower resource in the vocabulary: a freeze catches this, and
+		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.update.translations' );
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		$result = $this->updater->update_translations();
 		$status = $result['success'] ? 200 : 500;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
@@ -521,19 +569,26 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
+		// No narrower resource in the vocabulary: a freeze catches this, and
+		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.self_update' );
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		// Source allowlist: only install self-update zips from the official repo.
 		// Bounds a signed grant to a trusted source, so even an approved
 		// self-update can't be pointed at attacker-hosted code.
 		if ( ! $this->is_allowed_self_update_url( $zip_url ) ) {
-			return new WP_REST_Response( array(
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 				'success' => false,
 				'error'   => __( 'Self-update source not allowed.', 'digitizer-site-worker' ),
-			), 400 );
+			) ), 400 );
 		}
 
 		$result = $this->updater->self_update( $zip_url, $sha256 );
 		$status = $result['success'] ? 200 : 500;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
@@ -613,9 +668,16 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
+		// No narrower resource in the vocabulary: a freeze catches this, and
+		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.update.database' );
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		$result = $this->updater->update_database( $plugin );
 		$status = $result['success'] ? 200 : 500;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
@@ -670,8 +732,19 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
+		// A batch touches the site (it is a maintenance operation) AND each
+		// named plugin, so a freeze and a per-plugin rule both apply.
+		$touches = array( array( 'type' => 'site', 'id' => '*' ) );
+		foreach ( (array) $plugins as $p ) {
+			$touches[] = array( 'type' => 'plugin', 'id' => Aura_Worker_Rules::plugin_slug( $p ) );
+		}
+		$rule = Aura_Worker_Rules::guard_rest( $touches, 'wp.update.batch' );
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		$result = $this->updater->batch_update_plugins( $plugins, (int) $chunk_size, (bool) $create_backup );
-		return new WP_REST_Response( array_merge( array( 'success' => true ), $result ), 200 );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array_merge( array( 'success' => true ), $result ) ), 200 );
 	}
 
 	/**
@@ -718,23 +791,31 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
+		$rule = Aura_Worker_Rules::guard_rest(
+			array( array( 'type' => 'plugin', 'id' => Aura_Worker_Rules::plugin_slug( (string) $plugin_slug ) ) ),
+			'wp.rollback'
+		);
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		$rollback = new Aura_Worker_Rollback();
 
 		// If no specific backup path given, use the most recent backup.
 		if ( empty( $backup_path ) ) {
 			$backups = $rollback->list_backups( $plugin_slug );
 			if ( empty( $backups ) ) {
-				return new WP_REST_Response( array(
+				return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 					'success' => false,
 					'error'   => __( 'No backups found for this plugin.', 'digitizer-site-worker' ),
-				), 404 );
+				) ), 404 );
 			}
 			$backup_path = $backups[0]['path'];
 		}
 
 		$result = $rollback->restore_plugin( $plugin_slug, $backup_path );
 		$status = $result['success'] ? 200 : 500;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
@@ -781,6 +862,10 @@ class Aura_Worker_API {
 		$kind   = $request->get_param( 'kind' );
 		$target = $request->get_param( 'target' );
 
+		// Deliberately NOT rule-guarded: a snapshot captures state and changes
+		// nothing, and a freeze must not refuse the safety net during exactly the
+		// window it exists for. RulesRestCoverageTest lists this as the one
+		// exemption.
 		$guard = Aura_Worker_Grant::require_for(
 			$request,
 			'wp.snapshot.create',
@@ -815,6 +900,65 @@ class Aura_Worker_API {
 	}
 
 	/**
+	 * POST /aura/v2/rules
+	 *
+	 * The gateway pushes the whole signed ruleset whenever a rule changes.
+	 * Verification, the monotonic seq and last-known-good all live in
+	 * Aura_Worker_Rules::accept(); this is transport.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function receive_rules( $request ) {
+		if ( ! Aura_Worker_Grant::has_usable_key() ) {
+			// No USABLE gateway key on this site: nothing can be verified.
+			// Deliberately not is_enforced(), which means only "the option is
+			// non-empty" — a truncated or corrupt key would then answer 400 on
+			// every push, and Aura would spend forever telling the operator to
+			// fix a rule that is fine instead of to reconnect the site.
+			// Distinct from a bad document so the rollup can say "reconnect".
+			return new WP_REST_Response(
+				array(
+					'success' => false,
+					'code'    => 'no_gateway_key',
+					'error'   => 'This site holds no gateway public key and cannot verify a ruleset; reconnect it to Aura.',
+				),
+				412
+			);
+		}
+		$res = Aura_Worker_Rules::accept( (string) $request->get_param( 'ruleset' ) );
+		if ( is_wp_error( $res ) ) {
+			$data = $res->get_error_data();
+			return new WP_REST_Response(
+				array(
+					'success' => false,
+					// The code travels too: Aura retries 503 aura_ruleset_contended
+					// and 500 aura_ruleset_store_failed, and does not treat either
+					// as "your ruleset is bad" the way it treats a 400.
+					'code'    => $res->get_error_code(),
+					'error'   => $res->get_error_message(),
+				),
+				isset( $data['status'] ) ? (int) $data['status'] : 400
+			);
+		}
+		// current() can still read null right after a successful accept(): a
+		// lost insert race falls through to a repaired/re-read row whose
+		// notoptions cache entry a persistent object cache would otherwise
+		// keep stale (see insert_if_absent()) — so this is not merely
+		// defensive, Fix 2 makes it reachable. Report seq as null rather than
+		// fatal on an array-index into null.
+		$rec = Aura_Worker_Rules::current();
+		$seq = is_array( $rec ) && isset( $rec['seq'] ) ? (int) $rec['seq'] : null;
+		return new WP_REST_Response(
+			array(
+				'success' => true,
+				'seq'     => $seq,
+			),
+			200
+		);
+	}
+
+	/**
 	 * POST /aura/v2/snapshot/restore
 	 *
 	 * Restore state captured by a prior snapshot (undo a power write).
@@ -830,11 +974,18 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
+		// No narrower resource in the vocabulary: a freeze catches this, and
+		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.snapshot.restore' );
+		if ( is_wp_error( $rule ) ) {
+			return $rule;
+		}
+
 		$snapshots = new Aura_Worker_Snapshots();
 		$result    = $snapshots->restore( $id );
 
 		$status = $result['success'] ? 200 : 404;
-		return new WP_REST_Response( $result, $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**

@@ -54,6 +54,11 @@ class Aura_Tool_Backup_Plugins extends Aura_Tool_Base {
 		);
 	}
 
+	/** @inheritDoc — site-wide maintenance: a freeze applies, a page rule does not. */
+	public function touches( $params ) {
+		return array( array( 'type' => 'site', 'id' => '*' ) );
+	}
+
 	public function execute( $params ) {
 		$file = dirname( __DIR__ ) . '/class-aura-worker-rollback.php';
 		if ( ! class_exists( 'Aura_Worker_Rollback' ) && file_exists( $file ) ) {

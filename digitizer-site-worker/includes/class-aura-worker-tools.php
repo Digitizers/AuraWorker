@@ -142,6 +142,26 @@ class Aura_Worker_Tools {
 		}
 
 		$annotations = $tool->get_annotations();
+
+		// Operator rules, decided AFTER parameter validation (a malformed call
+		// fails on its parameters, not on a rule) and BEFORE anything runs or
+		// snapshots — and only for calls that could change something. A plain
+		// read inherits the unknown sentinel too, and enforcing it would let a
+		// freeze refuse audit_rules itself. Same predicate as the grant gate:
+		// mutating, or an approval-bound read such as db_query.
+		//
+		// This is the one place every tool path passes through — the legacy REST
+		// update handlers in class-aura-worker-api.php and core's own /wp/v2
+		// content routes do not, and enforce separately; audit_rules lists all
+		// three points so a fourth is visible when it is missing.
+		$verdict = array( 'effect' => null );
+		if ( Aura_Worker_Call_Context::tool_needs_grant( $annotations ) ) {
+			$verdict = Aura_Worker_Rules::enforce( $tool->touches( $params ), $name );
+			if ( 'block' === $verdict['effect'] ) {
+				return Aura_Worker_Rules::blocked_result( $name, $verdict['rule'] );
+			}
+		}
+
 		if ( ! empty( $annotations['requires_approval'] ) ) {
 			/**
 			 * Fires immediately before an approval-required (power) tool executes.
@@ -159,18 +179,37 @@ class Aura_Worker_Tools {
 			do_action( 'aura_worker_power_execute', $name, $params );
 		}
 
+		// Decided before the call, attached after it, whichever way it went.
+		// A failure does not retract the warning, and this path has no second
+		// channel to recover it: execute_tool() answers its own caller
+		// directly, and SiteAgent's own routes are exempt from the core REST
+		// seam, so a warning dropped in the catch is one nobody ever hears.
+		$warnings = 'warn' === $verdict['effect']
+			? array( Aura_Worker_Rules::warning_entry( $verdict['rule'] ) )
+			: array();
+
 		try {
-			$result = $tool->execute( $params );
-			return array(
+			$out = array(
 				'success' => true,
-				'result'  => $result,
+				'result'  => $tool->execute( $params ),
 			);
-		} catch ( Exception $e ) {
-			return array(
+		} catch ( Throwable $e ) {
+			// Throwable, not Exception. A TypeError or any other PHP Error
+			// implements Throwable WITHOUT extending Exception, so the narrower
+			// catch let it past — and past this point there is no failure
+			// result, no warning, and no response: one tool's fatal takes down
+			// the whole MCP request. Nothing is silenced by widening it; the
+			// message still goes back to the caller, and the tool boundary is
+			// exactly where a per-tool failure should stop being everyone's.
+			$out = array(
 				'success' => false,
 				'error'   => $e->getMessage(),
 			);
 		}
+		if ( ! empty( $warnings ) ) {
+			$out['warnings'] = $warnings;
+		}
+		return $out;
 	}
 
 	/**
@@ -204,20 +243,36 @@ class Aura_Worker_Tools {
 			);
 		}
 
+		// What this call touches, and which rule would decide it — without
+		// enforcing. Previews are exempt from rules (an agent may SEE what would
+		// happen), and the gateway reads these two fields to warn before approval.
+		// A plain read touches nothing a rule governs, so it declares nothing.
 		$annotations = $tool->get_annotations();
+		$touches     = Aura_Worker_Call_Context::tool_needs_grant( $annotations ) ? $tool->touches( $params ) : array();
+		$rule        = empty( $touches ) ? null : Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules() );
+		$rule_match  = null === $rule ? null : array(
+			'key'    => isset( $rule['key'] ) ? (string) $rule['key'] : 'rule/?',
+			'effect' => (string) $rule['effect'],
+			'reason' => isset( $rule['reason'] ) ? (string) $rule['reason'] : '',
+		);
+
 		if ( empty( $annotations['supports_preview'] ) ) {
 			return array(
-				'success'   => true,
-				'supported' => false,
-				'preview'   => null,
+				'success'    => true,
+				'supported'  => false,
+				'preview'    => null,
+				'touches'    => $touches,
+				'rule_match' => $rule_match,
 			);
 		}
 
 		try {
 			return array(
-				'success'   => true,
-				'supported' => true,
-				'preview'   => $tool->dry_run( $params ),
+				'success'    => true,
+				'supported'  => true,
+				'preview'    => $tool->dry_run( $params ),
+				'touches'    => $touches,
+				'rule_match' => $rule_match,
 			);
 		} catch ( Exception $e ) {
 			return array(

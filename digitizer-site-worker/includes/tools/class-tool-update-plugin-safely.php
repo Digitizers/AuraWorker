@@ -62,8 +62,48 @@ class Aura_Tool_Update_Plugin_Safely extends Aura_Tool_Base {
 		);
 	}
 
+	/**
+	 * The plugin slug this call names, normalised exactly the way execute()
+	 * normalises it. touches() decides whether a rule blocks the call and
+	 * execute() decides what the call acts on — if the two normalise the raw
+	 * `plugin_slug` param differently, they can disagree about which plugin
+	 * is named. They previously did: touches() only trimmed, while execute()
+	 * ran sanitize_text_field(), which also strips tags and percent-encoded
+	 * octets — so `plugin_slug => "akis<b>met"` declared `plugin:akis<b>met`
+	 * (no rule names that) while execute() resolved and acted on
+	 * `akismet/akismet.php`. One expression, called from both.
+	 *
+	 * @param array $params Tool params.
+	 * @return string Sanitized slug, or '' if none was supplied.
+	 */
+	private function sanitized_slug( $params ) {
+		return isset( $params['plugin_slug'] ) ? sanitize_text_field( $params['plugin_slug'] ) : '';
+	}
+
+	/** @inheritDoc */
+	public function touches( $params ) {
+		$slug = $this->sanitized_slug( $params );
+		if ( '' === $slug ) {
+			return parent::touches( $params ); // Cannot say which plugin: the sentinel.
+		}
+		// Resolve and normalise the same way execute() will (resolve_plugin_file()
+		// below, then Aura_Worker_Rules::plugin_slug() — the same normaliser the
+		// REST route already applies in class-aura-worker-api.php update_plugin()).
+		// Declaring the raw caller-supplied slug verbatim let `plugin_slug =>
+		// "akismet/akismet.php"` declare `plugin:akismet/akismet.php`, which a
+		// `plugin:akismet` block rule never matches — a bypass of the block from
+		// this tool path alone. If nothing resolves, normalise the raw input too,
+		// so the declaration is consistent either way.
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		$resolved = $this->resolve_plugin_file( $slug );
+		$declared = Aura_Worker_Rules::plugin_slug( null !== $resolved ? $resolved : $slug );
+		return array( array( 'type' => 'plugin', 'id' => $declared ) );
+	}
+
 	public function execute( $params ) {
-		$plugin_slug   = sanitize_text_field( $params['plugin_slug'] );
+		$plugin_slug   = $this->sanitized_slug( $params );
 		$create_backup = isset( $params['create_backup'] ) ? (bool) $params['create_backup'] : true;
 
 		if ( ! function_exists( 'get_plugins' ) ) {
