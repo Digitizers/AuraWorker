@@ -52,6 +52,73 @@ final class ToolTouchesTest extends TestCase {
 		);
 	}
 
+	/**
+	 * touches() must resolve the plugin file the same way execute() will
+	 * (resolve_plugin_file(), then Aura_Worker_Rules::plugin_slug() of the
+	 * result) — not declare the caller's raw plugin_slug verbatim. Otherwise
+	 * `plugin_slug => "akismet/akismet.php"` declares `plugin:akismet/akismet.php`,
+	 * which a `plugin:akismet` block rule never matches: a bypass reachable
+	 * from the tool path alone (the REST route already normalises this way,
+	 * see class-aura-worker-api.php update_plugin() ~449).
+	 */
+	public function test_update_plugin_safely_normalises_the_dir_file_form(): void {
+		$GLOBALS['_installed_plugins'] = array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+		$tools = new Aura_Worker_Tools();
+		$tool  = $tools->get_tool( 'update_plugin_safely' );
+		$this->assertSame(
+			array( array( 'type' => 'plugin', 'id' => 'akismet' ) ),
+			$tool->touches( array( 'plugin_slug' => 'akismet/akismet.php' ) )
+		);
+	}
+
+	/** A substring resolve_plugin_file() maps to akismet must declare plugin:akismet too. */
+	public function test_update_plugin_safely_normalises_a_resolved_substring(): void {
+		$GLOBALS['_installed_plugins'] = array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+		$tools = new Aura_Worker_Tools();
+		$tool  = $tools->get_tool( 'update_plugin_safely' );
+		$this->assertSame(
+			array( array( 'type' => 'plugin', 'id' => 'akismet' ) ),
+			$tool->touches( array( 'plugin_slug' => 'akis' ) ) // substring of akismet/akismet.php
+		);
+	}
+
+	/** A bare slug that resolves exactly still declares the normalised form. */
+	public function test_update_plugin_safely_normalises_a_bare_slug(): void {
+		$GLOBALS['_installed_plugins'] = array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+		$tools = new Aura_Worker_Tools();
+		$tool  = $tools->get_tool( 'update_plugin_safely' );
+		$this->assertSame(
+			array( array( 'type' => 'plugin', 'id' => 'akismet' ) ),
+			$tool->touches( array( 'plugin_slug' => 'akismet' ) )
+		);
+	}
+
+	/**
+	 * End to end: a `plugin:akismet` block rule must catch the tool call even
+	 * when the caller passes the dir/file.php form. Ruleset install/rule
+	 * helper pattern copied from RulesEnforcementTest.
+	 */
+	public function test_a_plugin_block_rule_catches_the_dir_file_form_end_to_end(): void {
+		$GLOBALS['_installed_plugins'] = array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = array(
+			'envelope'    => 'x.y',
+			'seq'         => 1,
+			'issued_at'   => '2026-08-21T00:00:00Z',
+			'received_at' => time(),
+			'rules'       => array(
+				array(
+					'key'    => 'rule/no-akismet',
+					'effect' => 'block',
+					'target' => array( 'type' => 'plugin', 'id' => 'akismet' ),
+					'reason' => 'r:rule/no-akismet',
+				),
+			),
+		);
+		$tools = new Aura_Worker_Tools();
+		$res   = $tools->execute_tool( 'update_plugin_safely', array( 'plugin_slug' => 'akismet/akismet.php' ) );
+		$this->assertSame( 'aura_rule_blocked', $res['code'] ?? null );
+	}
+
 	/** @dataProvider content_tools */
 	public function test_content_tools_touch_the_post_under_both_names( string $name ): void {
 		$tools = new Aura_Worker_Tools();

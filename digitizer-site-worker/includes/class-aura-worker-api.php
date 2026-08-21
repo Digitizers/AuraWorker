@@ -941,10 +941,18 @@ class Aura_Worker_API {
 				isset( $data['status'] ) ? (int) $data['status'] : 400
 			);
 		}
+		// current() can still read null right after a successful accept(): a
+		// lost insert race falls through to a repaired/re-read row whose
+		// notoptions cache entry a persistent object cache would otherwise
+		// keep stale (see insert_if_absent()) — so this is not merely
+		// defensive, Fix 2 makes it reachable. Report seq as null rather than
+		// fatal on an array-index into null.
+		$rec = Aura_Worker_Rules::current();
+		$seq = is_array( $rec ) && isset( $rec['seq'] ) ? (int) $rec['seq'] : null;
 		return new WP_REST_Response(
 			array(
 				'success' => true,
-				'seq'     => Aura_Worker_Rules::current()['seq'],
+				'seq'     => $seq,
 			),
 			200
 		);

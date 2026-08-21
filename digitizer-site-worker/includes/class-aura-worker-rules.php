@@ -528,6 +528,14 @@ class Aura_Worker_Rules {
 			)
 		);
 		if ( false === $rows ) {
+			// Evict even on a hard database error: this INSERT is only reached
+			// right after current() just missed, and a real get_option() lists
+			// the key in `notoptions` on exactly that miss (wp-includes/option.php
+			// ~107) — short-circuiting every later read in this request. Leave
+			// it evicted so the next current() actually re-queries rather than
+			// trusting a "no row" cache entry the database error never confirmed.
+			wp_cache_delete( self::OPTION, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
 			return new WP_Error(
 				'aura_ruleset_store_failed',
 				'Ruleset not stored: the database refused the write.',
@@ -539,9 +547,22 @@ class Aura_Worker_Rules {
 			wp_cache_delete( 'notoptions', 'options' );
 			return true;
 		}
-		// A row is there. It might be a racer's valid record (re-decide
-		// against it from the top) or a truncated/hand-edited value with no
-		// seq to compare (repair it, still by CAS against its exact bytes).
+		// A row is there — we lost this INSERT. Evict `notoptions` here too:
+		// core's get_option() writes the option into `notoptions` on the miss
+		// that got us into insert_if_absent() in the first place, and
+		// delete_option() (used elsewhere) ADDS to that same cache
+		// (wp-includes/option.php ~48/~107) — so without this eviction every
+		// later current() in this request short-circuits to null even though
+		// the row now visibly exists. That silently disables enforcement for
+		// the rest of the request on a corrupt-row repair (swap_raw() below
+		// succeeds but nothing can read it back), and sends a lost race back
+		// into accept() reading null again. Evict unconditionally, whichever
+		// of the three sub-paths below decides: a racer's valid record
+		// (re-decide against it from the top) or a truncated/hand-edited value
+		// with no seq to compare (repair it, still by CAS against its exact
+		// bytes).
+		wp_cache_delete( self::OPTION, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
 		$raw = $wpdb->get_var(
 			$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::OPTION )
 		);

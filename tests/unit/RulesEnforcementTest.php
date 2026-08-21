@@ -316,6 +316,63 @@ final class RulesEnforcementTest extends TestCase {
 		$this->assertSame( 0, SA_Snapshotting_Tool::$snapshot_attempts, 'a blocked call still took a snapshot' );
 	}
 
+	/**
+	 * Spec decision 4: a rule outranks an approval. A valid, correctly-scoped
+	 * grant is not enough to run a call a rule blocks — the message must name
+	 * the rule so nobody goes looking for a grant bug instead. This has to run
+	 * through Aura_Worker_MCP::execute_tool(), the only path where the grant
+	 * gate and the rule decision both sit in front of the same call: the grant
+	 * gate passes (the grant is genuinely valid), then Aura_Worker_Tools::
+	 * execute_tool() decides the rule and blocks anyway. Mint pattern copied
+	 * from GrantEnforcementTest / AbilitiesGrantReuseTest.
+	 */
+	public function test_a_rule_outranks_a_valid_approval_grant(): void {
+		if ( ! function_exists( 'sodium_crypto_sign_keypair' ) ) {
+			$this->markTestSkipped( 'ext-sodium is not available.' );
+		}
+		$keypair = sodium_crypto_sign_keypair();
+		$secret  = sodium_crypto_sign_secretkey( $keypair );
+		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( sodium_crypto_sign_publickey( $keypair ) );
+		$site_hash = hash( 'sha256', 'raw-site-token' );
+		$GLOBALS['_options']['aura_worker_site_token'] = $site_hash;
+
+		$this->install( array( $this->rule( 'rule/checkout', 'block', 'site' ) ) );
+
+		$params  = array( 'post_id' => 7 );
+		$payload = array(
+			'v'             => 1,
+			'tool'          => 'test_recording_tool',
+			'params_sha256' => hash( 'sha256', Aura_Worker_Grant::canonical_json( $params ) ),
+			'site'          => $site_hash,
+			'nonce'         => bin2hex( random_bytes( 16 ) ),
+			'iat'           => time(),
+			'exp'           => time() + 300,
+		);
+		$json = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+		$sig  = sodium_crypto_sign_detached( $json, $secret );
+		$b64  = static function ( string $s ): string {
+			return rtrim( strtr( base64_encode( $s ), '+/', '-_' ), '=' );
+		};
+		$grant = $b64( $json ) . '.' . $b64( $sig );
+
+		$req = new WP_REST_Request();
+		$req->set_param( 'tool', 'test_recording_tool' );
+		$req->set_param( 'params', $params );
+		$req->set_header( 'X-Aura-Approval-Grant', $grant );
+
+		$mcp  = new Aura_Worker_MCP( new Aura_Worker_Security() );
+		$resp = $mcp->execute_tool( $req );
+
+		$this->assertSame( 403, $resp->get_status() );
+		$data = $resp->get_data();
+		$this->assertSame( 'aura_rule_blocked', $data['code'] ?? null );
+		// blocked_result()'s exact wording — the point of this test is that it
+		// still says this even though a valid grant was presented.
+		$this->assertStringContainsString( 'rule/checkout', $data['error'] );
+		$this->assertStringContainsString( 'approval does not override a rule; release the rule first', $data['error'] );
+		$this->assertSame( 0, SA_Recording_Tool::$ran, 'a rule-blocked call under a valid grant still ran the tool' );
+	}
+
 	public function test_the_mcp_route_returns_403_for_a_block(): void {
 		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
 		$GLOBALS['_options']['aura_worker_site_token'] = Aura_Worker_Security::hash_token( 'tok' );

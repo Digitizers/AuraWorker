@@ -1621,6 +1621,17 @@ function sa_reset_state(): void {
 	}
 	if ( class_exists( 'Aura_Worker_Rules' ) ) {
 		Aura_Worker_Rules::reset_records();
+		// A test-only seam and a REST-detection override, both statics: a test
+		// that sets either and forgets to clear it would otherwise poison
+		// every test that runs after it in the same process, silently, rather
+		// than failing the test that actually left it set.
+		Aura_Worker_Rules::$rest_request_override = null;
+		Aura_Worker_Rules::$cookie_auth_override  = null;
 	}
+	// Update-tool fixtures: a test that seeds these and forgets to clear them
+	// would otherwise leak into every later test's get_plugins()/
+	// get_core_updates()/wp_get_theme() stub, in place of the intended
+	// defaults (see the stubs' own comments a few hundred lines up).
+	unset( $GLOBALS['_installed_plugins'], $GLOBALS['_core_updates'], $GLOBALS['_missing_themes'] );
 	$_SERVER['REMOTE_ADDR']   = '203.0.113.10';
 }

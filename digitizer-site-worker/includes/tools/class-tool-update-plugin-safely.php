@@ -68,7 +68,20 @@ class Aura_Tool_Update_Plugin_Safely extends Aura_Tool_Base {
 		if ( '' === $slug ) {
 			return parent::touches( $params ); // Cannot say which plugin: the sentinel.
 		}
-		return array( array( 'type' => 'plugin', 'id' => $slug ) );
+		// Resolve and normalise the same way execute() will (resolve_plugin_file()
+		// below, then Aura_Worker_Rules::plugin_slug() — the same normaliser the
+		// REST route already applies in class-aura-worker-api.php update_plugin()).
+		// Declaring the raw caller-supplied slug verbatim let `plugin_slug =>
+		// "akismet/akismet.php"` declare `plugin:akismet/akismet.php`, which a
+		// `plugin:akismet` block rule never matches — a bypass of the block from
+		// this tool path alone. If nothing resolves, normalise the raw input too,
+		// so the declaration is consistent either way.
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		$resolved = $this->resolve_plugin_file( $slug );
+		$declared = Aura_Worker_Rules::plugin_slug( null !== $resolved ? $resolved : $slug );
+		return array( array( 'type' => 'plugin', 'id' => $declared ) );
 	}
 
 	public function execute( $params ) {

@@ -186,6 +186,26 @@ final class RulesetStoreTest extends TestCase {
 			static fn( $q ) => false !== strpos( $q, 'SELECT option_value' )
 		);
 		$this->assertNotEmpty( $reread, 'the lost INSERT must be classified by re-reading the row, not by trusting a cache' );
+		// insert_if_absent() must evict `notoptions` on this losing branch too,
+		// not only when it wins: real get_option() lists the key in
+		// `notoptions` on the very miss that sent us into this INSERT, and that
+		// cache entry would otherwise short-circuit every later current() in
+		// this request to null even though a valid ruleset (seq 8) now sits in
+		// the row we just lost the race for. The stub simulates the racer by
+		// calling accept() recursively (see bootstrap.php `query()`), which
+		// itself wins and evicts once via the pre-existing winning branch — so
+		// a plain "contains" check would pass even without this fix. Count the
+		// occurrences instead: the recursive winner accounts for exactly one,
+		// and this call's own losing branch must contribute a second.
+		$notoptions_evictions = array_filter(
+			$GLOBALS['_cache_deletes'],
+			static fn( $d ) => $d === array( 'key' => 'notoptions', 'group' => 'options' )
+		);
+		$this->assertGreaterThanOrEqual(
+			2,
+			count( $notoptions_evictions ),
+			'the losing branch itself must also evict notoptions, not only the nested race winner'
+		);
 	}
 
 	public function test_two_first_pushes_racing_do_not_let_the_older_one_win(): void {
@@ -237,6 +257,16 @@ final class RulesetStoreTest extends TestCase {
 
 		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 4, array( $this->freeze() ) ) ) );
 		$this->assertSame( 4, Aura_Worker_Rules::current()['seq'] );
+		// The repair goes through insert_if_absent()'s losing branch (this row
+		// already exists) before swap_raw() fixes it — so notoptions must be
+		// evicted here too, or the repaired ruleset is unreadable by
+		// current() for the rest of the request (indefinitely under a
+		// persistent object cache), and enforcement goes silently off.
+		$this->assertContains(
+			array( 'key' => 'notoptions', 'group' => 'options' ),
+			$GLOBALS['_cache_deletes'],
+			'a corrupt-row repair must evict notoptions so a later current() re-reads the database'
+		);
 	}
 
 	public static function corrupt_values(): array {
