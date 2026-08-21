@@ -483,22 +483,47 @@ if ( ! function_exists( 'wp_register_ability_category' ) ) {
 
 if ( ! function_exists( 'add_filter' ) ) {
 	function add_filter( string $tag, $callback, int $priority = 10, int $accepted_args = 1 ): bool {
-		$GLOBALS['_filters'][ $tag ][] = $callback;
+		// Wrapped with priority + insertion order, so apply_filters() can run
+		// hooks in the order WordPress actually does: two callbacks on the
+		// same tag (e.g. open_frame() at priority 1, guard_core_any() at
+		// priority 5) must run lowest-priority-first regardless of which
+		// add_filter() call happened to run last.
+		$GLOBALS['_filters'][ $tag ][] = array(
+			'priority' => $priority,
+			'seq'      => count( $GLOBALS['_filters'][ $tag ] ?? array() ),
+			'callback' => $callback,
+		);
 		return true;
 	}
 }
 
 if ( ! function_exists( 'add_action' ) ) {
 	function add_action( string $tag, $callback, int $priority = 10, int $accepted_args = 1 ): bool {
-		$GLOBALS['_filters'][ $tag ][] = $callback;
-		return true;
+		return add_filter( $tag, $callback, $priority, $accepted_args );
 	}
 }
 
 if ( ! function_exists( 'apply_filters' ) ) {
 	function apply_filters( string $tag, $value, ...$args ) {
-		foreach ( $GLOBALS['_filters'][ $tag ] ?? array() as $callback ) {
-			$value = $callback( $value, ...$args );
+		$hooks = array();
+		foreach ( $GLOBALS['_filters'][ $tag ] ?? array() as $i => $entry ) {
+			// A test may push a bare callable straight onto $GLOBALS['_filters']
+			// (bypassing add_filter()), so normalise both shapes rather than
+			// assuming every entry carries a priority wrapper.
+			if ( is_array( $entry ) && array_key_exists( 'callback', $entry ) ) {
+				$hooks[] = $entry;
+			} else {
+				$hooks[] = array( 'priority' => 10, 'seq' => $i, 'callback' => $entry );
+			}
+		}
+		usort(
+			$hooks,
+			static function ( $a, $b ) {
+				return $a['priority'] <=> $b['priority'] ?: $a['seq'] <=> $b['seq'];
+			}
+		);
+		foreach ( $hooks as $hook ) {
+			$value = ( $hook['callback'] )( $value, ...$args );
 		}
 		return $value;
 	}
@@ -737,6 +762,15 @@ if ( ! class_exists( 'WP_REST_Request' ) ) {
 		private array $headers = array();
 		private array $params  = array();
 		private string $route  = '/aura/v1/status';
+		private string $method = 'GET';
+
+		public function set_method( string $m ): void {
+			$this->method = strtoupper( $m );
+		}
+
+		public function get_method(): string {
+			return $this->method;
+		}
 
 		public function set_header( string $key, $value ): void {
 			$this->headers[ strtolower( $key ) ] = $value;
@@ -768,6 +802,7 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 	class WP_REST_Response {
 		public $data;
 		public int $status;
+		private array $headers = array();
 
 		public function __construct( $data = null, int $status = 200 ) {
 			$this->data   = $data;
@@ -781,12 +816,41 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 		public function get_status(): int {
 			return $this->status;
 		}
+
+		public function header( string $key, $value ): void {
+			$this->headers[ $key ] = $value;
+		}
+
+		public function get_headers(): array {
+			return $this->headers;
+		}
 	}
 }
 
 if ( ! function_exists( 'rest_ensure_response' ) ) {
 	function rest_ensure_response( $response ) {
 		return ( $response instanceof WP_REST_Response ) ? $response : new WP_REST_Response( $response, 200 );
+	}
+}
+
+if ( ! function_exists( 'rest_convert_error_to_response' ) ) {
+	// The conversion send_warning_header() performs one statement before core
+	// would (rest-api.php:3464): the status comes from the error data, the body
+	// is the code, message and that same data.
+	function rest_convert_error_to_response( $error ) {
+		$code   = $error->get_error_code();
+		$data   = $error->get_error_data( $code );
+		$status = ( is_array( $data ) && isset( $data['status'] ) ) ? (int) $data['status'] : 500;
+		return new WP_REST_Response(
+			array( 'code' => $code, 'message' => $error->get_error_message( $code ), 'data' => $data ),
+			$status
+		);
+	}
+}
+
+if ( ! function_exists( 'rest_get_authenticated_app_password' ) ) {
+	function rest_get_authenticated_app_password() {
+		return $GLOBALS['_rest_app_password'] ?? null;
 	}
 }
 
@@ -1493,6 +1557,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_http_response']  = null;
 	$GLOBALS['_http_error']     = false;
 	$GLOBALS['_mutations']      = array();
+	unset( $GLOBALS['wp_rest_auth_cookie'] );
+	$GLOBALS['_rest_app_password'] = null;
 	if ( isset( $GLOBALS['wpdb'] ) ) {
 		$GLOBALS['wpdb']->last_error = '';
 		$GLOBALS['wpdb']->last_query = '';

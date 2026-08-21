@@ -22,6 +22,77 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Aura_Worker_Rules {
 
+	/**
+	 * Wire the core-REST enforcement seams and the (currently empty) counter
+	 * hooks Task 10 fills in.
+	 *
+	 * Two ID-aware filters, because core fires the post-type-specific name: a
+	 * page save is rest_pre_insert_page, a post save rest_pre_insert_post.
+	 * Deletion has NO rest_pre_delete_* filter — core's post controller offers
+	 * only `rest_{type}_trashable` (a bool) and the after-the-fact
+	 * `rest_delete_{type}` action. The seams that can actually refuse are
+	 * core's own data-layer short-circuits, which every deletion path goes
+	 * through: wp_delete_post() → `pre_delete_post`, wp_trash_post() →
+	 * `pre_trash_post`. They fire for wp-admin and WP-CLI too, so the callback
+	 * applies the same agent test — a human deleting a page in wp-admin is
+	 * unaffected.
+	 *
+	 * And any mutation on any route, for the freeze: products, media, menus,
+	 * settings, routes nobody has thought of. Site rules only — this seam does
+	 * not know target IDs; the filters above do.
+	 *
+	 * A warn at a core seam cannot change core's body; it goes out as a
+	 * header. The frame that collects those warnings opens and closes on the
+	 * ONE pair of hooks core runs together: both live in respond_to_request()
+	 * (class-wp-rest-server.php :1256 and :1318) with no return between them,
+	 * and respond_to_request() is reached from dispatch(), so an internal
+	 * rest_do_request() opens and closes its own frame too. Neither
+	 * rest_post_dispatch (serve_request() only — an internal dispatch never
+	 * reaches it) nor rest_pre_dispatch (three exits after it that never reach
+	 * a callback) can promise that. Priority 1 for the open, so the frame
+	 * precedes guard_core_any()'s records at priority 5.
+	 */
+	public static function init() {
+		add_action( 'aura_worker_rule_blocked', array( __CLASS__, 'record_block' ), 10, 2 );
+		add_action( 'aura_worker_rule_warned', array( __CLASS__, 'record_warn' ), 10, 2 );
+
+		// Core's own REST API is where Aura's content tools, an app-password
+		// agent and a second MCP server all write posts and pages. Nothing on
+		// that path reaches execute_tool(), so the rule is enforced at core's
+		// seam — which is what makes it a property of the site, not of one
+		// client. Third enforcement point; audit_rules lists it.
+		add_filter( 'rest_pre_insert_post', array( __CLASS__, 'guard_core_post' ), 5, 2 );
+		add_filter( 'rest_pre_insert_page', array( __CLASS__, 'guard_core_post' ), 5, 2 );
+		add_filter( 'pre_delete_post', array( __CLASS__, 'guard_core_delete' ), 5, 3 );
+		add_filter( 'pre_trash_post', array( __CLASS__, 'guard_core_delete' ), 5, 3 );
+
+		add_filter( 'rest_request_before_callbacks', array( __CLASS__, 'guard_core_any' ), 5, 3 );
+
+		add_filter( 'rest_request_before_callbacks', array( __CLASS__, 'open_frame' ), 1, 3 );
+		add_filter( 'rest_request_after_callbacks', array( __CLASS__, 'send_warning_header' ), 10, 3 );
+	}
+
+	/**
+	 * Bumps the blocked-in-the-last-24h counter. Empty for now — Task 10 fills
+	 * this in with an atomic hour-bucketed increment; only the hook wiring
+	 * above is this task's to add.
+	 *
+	 * @param string $tool_name Tool that was refused.
+	 * @param array  $rule      The rule that decided.
+	 */
+	public static function record_block( $tool_name = '', $rule = array() ) {
+	}
+
+	/**
+	 * Bumps the warned-in-the-last-24h counter. Empty for now — see
+	 * record_block().
+	 *
+	 * @param string $tool_name Tool that ran.
+	 * @param array  $rule      The rule that matched.
+	 */
+	public static function record_warn( $tool_name = '', $rule = array() ) {
+	}
+
 	/** The only resource types a rule may name. Anything else never matches. */
 	const TYPES = array( 'site', 'page', 'post', 'plugin' );
 
@@ -627,6 +698,22 @@ class Aura_Worker_Rules {
 		return $last;
 	}
 
+	/**
+	 * Has this rule|effect key already been recorded in any frame that is
+	 * still open? Used for the dedup in enforce() — see the comment there.
+	 *
+	 * @param string $key `effect|rule-key`.
+	 * @return bool
+	 */
+	private static function recorded_anywhere_open( $key ) {
+		foreach ( self::$scopes as $frame ) {
+			if ( isset( $frame['recorded'][ $key ] ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Forget every frame. Tests call this; `reset_request_warnings()` does too. */
 	public static function reset_records() {
 		self::$scopes = array( array( 'recorded' => array(), 'warnings' => array() ) );
@@ -745,9 +832,18 @@ class Aura_Worker_Rules {
 		// Per REQUEST would be worse than either: a handler calling
 		// rest_do_request() would have the nested dispatch's refusal silence
 		// its own.
-		$scope = &self::scope();
+		//
+		// Freshness is checked across every CURRENTLY OPEN frame, not only the
+		// innermost: two seams on one call can be seen from a frame that opened
+		// before the other recorded (guard_core_any's generic branch, then a
+		// nested guard_core_delete while that frame is still on the stack), and
+		// the record still belongs to one dispatch. A frame that has already
+		// CLOSED does not count — closing drops it from the stack entirely, so
+		// a properly finished, separate dispatch starts fresh, which is what
+		// keeps two independent calls under one freeze two events apiece.
 		$key   = $rule['effect'] . '|' . $rule['key'];
-		$fresh = ! isset( $scope['recorded'][ $key ] );
+		$fresh = ! self::recorded_anywhere_open( $key );
+		$scope = &self::scope();
 		$scope['recorded'][ $key ] = true;
 		if ( 'block' === $rule['effect'] ) {
 			/**
@@ -1055,5 +1151,296 @@ class Aura_Worker_Rules {
 			return $dir;
 		}
 		return preg_replace( '/\.php$/', '', basename( $plugin_file ) );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Core REST content writes                                            */
+	/* ------------------------------------------------------------------ */
+
+	/** Post types the vocabulary can name. The delete filter fires for all. */
+	const CORE_TYPES = array( 'post', 'page' );
+
+	/**
+	 * Test seam for REST_REQUEST, which a test cannot define per case.
+	 *
+	 * @var bool|null
+	 */
+	public static $rest_request_override = null;
+
+	/**
+	 * Test seam for core's $wp_rest_auth_cookie global.
+	 *
+	 * @var bool|null
+	 */
+	public static $cookie_auth_override = null;
+
+	// self::$scopes and reset_records() were added with enforce() in Task 5;
+	// the seams below only consume the `recorded` flag it returns.
+
+	/**
+	 * Did WordPress itself authenticate this request from a cookie session?
+	 *
+	 * Core decides this before any handler runs: rest_cookie_collect_status()
+	 * sets $wp_rest_auth_cookie = true only when the auth cookie validated,
+	 * and rest_cookie_check_errors() then requires a verified nonce or ends
+	 * the request (no nonce at all → the user is set to 0 and could not write).
+	 * So `true === $wp_rest_auth_cookie` at our seams means cookie AND nonce,
+	 * verified by core. A header the caller chose to send proves nothing —
+	 * any bearer client can add X-WP-Nonce — so it is never consulted.
+	 *
+	 * An application-password session sets this global false and reports
+	 * itself through rest_get_authenticated_app_password(); checked too, as
+	 * defence in depth.
+	 *
+	 * @return bool
+	 */
+	private static function is_cookie_authenticated() {
+		if ( function_exists( 'rest_get_authenticated_app_password' ) && null !== rest_get_authenticated_app_password() ) {
+			return false; // An agent, whatever else is true.
+		}
+		if ( null !== self::$cookie_auth_override ) {
+			return (bool) self::$cookie_auth_override;
+		}
+		return isset( $GLOBALS['wp_rest_auth_cookie'] ) && true === $GLOBALS['wp_rest_auth_cookie'];
+	}
+
+	/**
+	 * Is this a REST request from an agent — not a human, not the public, not
+	 * SiteAgent itself?
+	 *
+	 * Not agents, at every seam:
+	 *  - wp-admin, WP-CLI and cron: the site operating on itself (not REST).
+	 *  - A Gutenberg save: that is REST too (/wp/v2), but core authenticated it
+	 *    from a cookie session with a verified nonce (see
+	 *    is_cookie_authenticated()). That is an editor at the keyboard, and the
+	 *    spec promises wp-admin is unaffected.
+	 *  - SiteAgent's own routes: execute_tool() already decided; refusing again
+	 *    would double-enforce the same call on its way to the same post.
+	 *
+	 * And at the GENERIC seam only ($require_identity = true), an agent must be
+	 * POSITIVELY identified: an authenticated user. That seam sees every REST
+	 * route, public ones included — a storefront checkout, a form submission,
+	 * a payment webhook — and "not a cookie session" must never be read there
+	 * as "therefore an agent", or a freeze takes the shop offline.
+	 *
+	 * The ID-aware INSERT filters pass false. Core reaches
+	 * rest_pre_insert_{post,page} only for a caller it has already authorised
+	 * to edit, so nothing legitimate is anonymous there — and if an anonymous
+	 * write ever did arrive, standing aside would be the wrong answer.
+	 *
+	 * The DELETE data seam does NOT get that exemption, and the difference is
+	 * the reason this parameter exists rather than being hard-coded.
+	 * `pre_delete_post` / `pre_trash_post` are data-layer hooks, not REST
+	 * ones: any plugin's PUBLIC endpoint can reach them, and core has
+	 * authorised nothing. Reading "not a cookie session" as "therefore an
+	 * agent" there would let a site freeze break an unauthenticated form
+	 * submission or checkout cleanup that deletes a draft — precisely the
+	 * anonymous traffic guard_core_any() is careful to let through, reversed
+	 * one layer down. So guard_core_delete() demands the same positive
+	 * identity as the generic seam.
+	 *
+	 * @param WP_REST_Request|null $request          Request, when the filter has one.
+	 * @param bool                 $require_identity Demand an authenticated user (generic seam).
+	 * @return bool
+	 */
+	private static function is_agent_rest_request( $request = null, $require_identity = true ) {
+		$is_rest = null !== self::$rest_request_override
+			? (bool) self::$rest_request_override
+			: ( defined( 'REST_REQUEST' ) && REST_REQUEST );
+		if ( ! $is_rest ) {
+			return false;
+		}
+		if ( $require_identity && ! is_user_logged_in() ) {
+			return false; // Public traffic on a public route.
+		}
+		if ( self::is_cookie_authenticated() ) {
+			return false;
+		}
+		if ( class_exists( 'Aura_Worker_Call_Context' ) && Aura_Worker_Call_Context::is_own_transport() && null !== Aura_Worker_Call_Context::rest_route() ) {
+			return false;
+		}
+		return true;
+	}
+
+	/** Methods that do not change anything. */
+	const SAFE_METHODS = array( 'GET', 'HEAD', 'OPTIONS' );
+
+	/**
+	 * Routes whose writes the ID-aware filter owns — EXACTLY the shapes core
+	 * dispatches through rest_pre_insert_{post,page}: the collection
+	 * (`/wp/v2/posts`) and one item (`/wp/v2/posts/7`), with or without a
+	 * trailing slash. The generic seam skips a CREATE or UPDATE on these: a
+	 * site rule already matches any non-empty declaration, so the insert
+	 * filter enforces a freeze on a page write by itself, and enforcing here
+	 * too would fire the warn hook twice for one mutation. A DELETE on the
+	 * same shapes is not skipped — core runs no pre-delete filter in the REST
+	 * controller, so this seam is where the route's ID can still stop it.
+	 *
+	 * Nothing nested is exempt. `/wp/v2/posts/7/revisions/9` (DELETE) and
+	 * `/wp/v2/posts/7/autosaves` (POST) are mutations core serves WITHOUT
+	 * running either ID filter; a prefix match would have handed them a hole
+	 * under the site freeze. They go through the generic seam like any route.
+	 */
+	const ID_AWARE_ROUTES = '#^/wp/v2/(posts|pages)(/\d+)?/?$#';
+
+	/**
+	 * `rest_request_before_callbacks` — every REST route, before its handler.
+	 *
+	 * Applies SITE rules only: under a freeze, any unsafe method from an agent
+	 * on a route SiteAgent does not own is refused. Page/post rules are not
+	 * applied here because this seam does not reliably know the target ID;
+	 * the type-specific filters do.
+	 *
+	 * @param mixed           $response Earlier short-circuit, if any.
+	 * @param array           $handler  Route handler.
+	 * @param WP_REST_Request $request  Request.
+	 * @return mixed
+	 */
+	public static function guard_core_any( $response, $handler, $request ) {
+		if ( null !== $response || ! self::is_agent_rest_request( $request ) ) {
+			return $response;
+		}
+		$method = is_object( $request ) && method_exists( $request, 'get_method' ) ? strtoupper( (string) $request->get_method() ) : 'GET';
+		if ( in_array( $method, self::SAFE_METHODS, true ) ) {
+			return $response;
+		}
+		$route = is_object( $request ) && method_exists( $request, 'get_route' ) ? (string) $request->get_route() : '';
+		if ( preg_match( self::ID_AWARE_ROUTES, $route, $shape ) ) {
+			// `rest_pre_insert_{post,page}` owns creates and updates on these
+			// routes and carries the rule there, so enforcing here as well
+			// would record one mutation twice.
+			//
+			// DELETE is different: core runs NO pre-delete filter in the REST
+			// controller, so nothing downstream of this point knows the rule
+			// until the post is already gone. The route names the target, so
+			// this seam enforces it — belt to the `pre_delete_post` braces.
+			if ( 'DELETE' !== $method || ! isset( $shape[2] ) || '' === $shape[2] ) {
+				return $response;
+			}
+			$id      = (string) (int) ltrim( $shape[2], '/' );
+			$verdict = self::enforce(
+				array(
+					array( 'type' => 'page', 'id' => $id ),
+					array( 'type' => 'post', 'id' => $id ),
+				),
+				'core.rest.delete:' . $route
+			);
+			if ( 'block' === $verdict['effect'] ) {
+				$res = self::blocked_result( 'DELETE ' . $route, $verdict['rule'] );
+				return new WP_Error( 'aura_rule_blocked', $res['error'], array( 'status' => 403, 'rule' => $res['rule'] ) );
+			}
+			if ( 'warn' === $verdict['effect'] && ! empty( $verdict['recorded'] ) ) {
+				self::note_warning( $verdict['rule'] );
+			}
+			return $response;
+		}
+		$verdict = self::enforce( array( array( 'type' => 'site', 'id' => '*' ) ), 'core.rest.' . strtolower( $method ) . ':' . $route );
+		if ( 'block' === $verdict['effect'] ) {
+			$res = self::blocked_result( $method . ' ' . $route, $verdict['rule'] );
+			return new WP_Error( 'aura_rule_blocked', $res['error'], array( 'status' => 403, 'rule' => $res['rule'] ) );
+		}
+		if ( 'warn' === $verdict['effect'] && ! empty( $verdict['recorded'] ) ) {
+			self::note_warning( $verdict['rule'] );
+		}
+		return $response;
+	}
+
+	/**
+	 * `rest_pre_insert_post` / `rest_pre_insert_page`.
+	 *
+	 * @param stdClass|WP_Error $prepared Prepared post, or an earlier error.
+	 * @param WP_REST_Request   $request  Request.
+	 * @return stdClass|WP_Error
+	 */
+	public static function guard_core_post( $prepared, $request ) {
+		if ( is_wp_error( $prepared ) || ! self::is_agent_rest_request( $request, false ) ) {
+			return $prepared;
+		}
+		$id = 0;
+		if ( is_object( $request ) && method_exists( $request, 'get_param' ) ) {
+			$id = (int) $request->get_param( 'id' );
+		}
+		if ( $id <= 0 && is_object( $prepared ) && isset( $prepared->ID ) ) {
+			$id = (int) $prepared->ID;
+		}
+		$touches = $id > 0
+			? array( array( 'type' => 'post', 'id' => (string) $id ), array( 'type' => 'page', 'id' => (string) $id ) )
+			: array( array( 'type' => 'site', 'id' => '*' ) ); // A create: nothing narrower yet.
+
+		$verdict = self::enforce( $touches, 'core.rest.insert' );
+		if ( 'block' === $verdict['effect'] ) {
+			$res = self::blocked_result( 'core.rest.insert', $verdict['rule'] );
+			return new WP_Error( 'aura_rule_blocked', $res['error'], array( 'status' => 403, 'rule' => $res['rule'] ) );
+		}
+		if ( 'warn' === $verdict['effect'] && ! empty( $verdict['recorded'] ) ) {
+			self::note_warning( $verdict['rule'] );
+		}
+		return $prepared;
+	}
+
+	/**
+	 * `pre_delete_post` and `pre_trash_post` — core's data-layer short-circuits.
+	 *
+	 * These are the only seams that can actually stop a deletion: the REST post
+	 * controller has no pre-delete filter (only `rest_{type}_trashable`, a
+	 * bool, and `rest_delete_{type}`, an action that fires after the post is
+	 * gone). Returning a non-null value here stops `wp_delete_post()` /
+	 * `wp_trash_post()`, and every deletion path in WordPress goes through one
+	 * of them — REST routes we anticipated, routes a plugin adds, and anything
+	 * else an agent can reach. That is why this is a rule about deletion rather
+	 * than a list of routes.
+	 *
+	 * Because they also fire for wp-admin, WP-CLI and cron, the callback keeps
+	 * the same agent test used everywhere else: a human deleting a page in the
+	 * editor is not touched.
+	 *
+	 * @param mixed          $check Earlier short-circuit, if any (null = proceed).
+	 * @param WP_Post|object $post  Post being deleted or trashed.
+	 * @param mixed          $extra `$force_delete` (delete) / previous status (trash).
+	 * @return mixed `$check` (null) to proceed, false to refuse. NEVER WP_Error.
+	 */
+	public static function guard_core_delete( $check, $post, $extra = null ) {
+		// Positive identity, as at the generic seam: this hook is reachable
+		// from any public endpoint, and an anonymous caller is not an agent.
+		if ( null !== $check || ! self::is_agent_rest_request() ) {
+			return $check;
+		}
+		if ( ! is_object( $post ) || ! isset( $post->ID, $post->post_type ) || ! in_array( (string) $post->post_type, self::CORE_TYPES, true ) ) {
+			return $check;
+		}
+		$id      = (string) (int) $post->ID;
+		$verdict = self::enforce(
+			array( array( 'type' => 'post', 'id' => $id ), array( 'type' => 'page', 'id' => $id ) ),
+			'core.delete:' . $post->post_type . ':' . $id
+		);
+		if ( 'block' === $verdict['effect'] ) {
+			// `false`, and nothing more.
+			//
+			// This value becomes wp_delete_post()'s / wp_trash_post()'s return
+			// value, whose contract is a post object or false — a WP_Error here
+			// is truthy and would be read as success. `false` is the "did not
+			// delete" every caller already handles, so the deletion stops and
+			// the REST controller answers its own `rest_cannot_delete`.
+			//
+			// It does NOT carry the rule's name to the caller on this path, and
+			// that is a deliberate limit rather than an oversight. Reporting it
+			// would mean holding the refusal until something can attach it to a
+			// response, and WordPress gives no seam that reliably runs for the
+			// dispatch that caused it: `rest_post_dispatch` fires in
+			// serve_request(), while an internal rest_do_request() calls
+			// dispatch() directly and never reaches it.
+			//
+			// Nothing about the ENFORCEMENT depends on it: the post is not
+			// deleted, `aura_worker_rule_blocked` fires, `audit_rules` counts
+			// it, and the fleet sees it. The exact 403 naming the rule is
+			// carried by guard_core_any() for `/wp/v2/(posts|pages)/<id>` —
+			// the routes Aura's own tools and Angie actually use. What is lost
+			// is only the message quality on a route nobody anticipated.
+			return false;
+		}
+		if ( 'warn' === $verdict['effect'] && ! empty( $verdict['recorded'] ) ) {
+			self::note_warning( $verdict['rule'] );
+		}
+		return $check;
 	}
 }
