@@ -73,24 +73,105 @@ class Aura_Worker_Rules {
 	}
 
 	/**
-	 * Bumps the blocked-in-the-last-24h counter. Empty for now — Task 10 fills
-	 * this in with an atomic hour-bucketed increment; only the hook wiring
-	 * above is this task's to add.
+	 * Rolling 24h counters: ONE OPTION PER HOUR, each bumped with an atomic
+	 * SQL increment.
 	 *
-	 * @param string $tool_name Tool that was refused.
-	 * @param array  $rule      The rule that decided.
+	 * Not a transient (a TTL reset on every bump never expires on a busy site
+	 * and counts forever). Not an hour => count map in one option either: that
+	 * is read-modify-write, and two refusals in the same second would both
+	 * read N and both write N+1, losing one — the audit would undercount
+	 * exactly when enforcement is busiest. `UPDATE ... SET option_value =
+	 * option_value + 1` is one statement; the database serialises it.
+	 *
+	 * Hour-granular: the bucket that straddles the 24h mark is KEPT, so the
+	 * count is "the last 24h rounded up to the hour" — it may include up to 59
+	 * minutes more, it never omits an event younger than 24h.
+	 *
+	 * Option names are prefix + hour index (hours since the epoch), zero-padded
+	 * to seven digits in bucket_name() so the string comparison the sweep
+	 * relies on orders exactly as the numbers do — today's index is six digits
+	 * (~496000) and crosses a million in 2084.
 	 */
-	public static function record_block( $tool_name = '', $rule = array() ) {
+	const BLOCKED_COUNTER = 'aura_worker_rules_blocked_h';
+	const WARNED_COUNTER  = 'aura_worker_rules_warned_h';
+
+	/**
+	 * Bumps the blocked-in-the-last-24h counter.
+	 *
+	 * @param string   $tool_name Tool that was refused.
+	 * @param array    $rule      The rule that decided.
+	 * @param int|null $now       Unix time; injected for tests.
+	 */
+	public static function record_block( $tool_name = '', $rule = array(), $now = null ) {
+		self::bump( self::BLOCKED_COUNTER, $now );
 	}
 
 	/**
-	 * Bumps the warned-in-the-last-24h counter. Empty for now — see
-	 * record_block().
+	 * Bumps the warned-in-the-last-24h counter. See record_block().
 	 *
-	 * @param string $tool_name Tool that ran.
-	 * @param array  $rule      The rule that matched.
+	 * @param string   $tool_name Tool that ran.
+	 * @param array    $rule      The rule that matched.
+	 * @param int|null $now       Unix time; injected for tests.
 	 */
-	public static function record_warn( $tool_name = '', $rule = array() ) {
+	public static function record_warn( $tool_name = '', $rule = array(), $now = null ) {
+		self::bump( self::WARNED_COUNTER, $now );
+	}
+
+	/**
+	 * Option name for one hour of one counter.
+	 *
+	 * @param string $prefix BLOCKED_COUNTER or WARNED_COUNTER.
+	 * @param int    $hour   Hours since the epoch.
+	 * @return string
+	 */
+	public static function bucket_name( $prefix, $hour ) {
+		// Zero-pad to 7 so lexical order == numeric order past hour 999999 too.
+		return $prefix . str_pad( (string) (int) $hour, 7, '0', STR_PAD_LEFT );
+	}
+
+	/**
+	 * @param string   $prefix BLOCKED_COUNTER or WARNED_COUNTER.
+	 * @param int|null $now    Unix time; injected for tests.
+	 */
+	private static function bump( $prefix, $now = null ) {
+		global $wpdb;
+		$now  = null === $now ? time() : (int) $now;
+		$hour = (int) floor( $now / HOUR_IN_SECONDS );
+		$name = self::bucket_name( $prefix, $hour );
+
+		// Create the row if this is the hour's first event. add_option() is a
+		// no-op when the row exists; if two requests race here, one INSERT
+		// fails quietly and both increments below still land.
+		add_option( $name, '0', '', false );
+		$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = option_value + 1 WHERE option_name = %s", $name ) );
+		wp_cache_delete( $name, 'options' );
+
+		// Sweep hour-options older than the boundary hour. Same-length names
+		// (see bucket_name) make the string comparison a numeric one.
+		// Through sweep_options() (Task 4), which evicts what it deletes: a
+		// stale cache entry for a deleted bucket would be counted again by
+		// count_24h() long after its hour had passed.
+		$oldest = (int) floor( ( $now - DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		self::sweep_options( $prefix, self::bucket_name( $prefix, $oldest ) );
+	}
+
+	/**
+	 * Events in the last 24 hours, rounded up to the hour (the boundary
+	 * bucket is kept — see the class comment).
+	 *
+	 * @param string   $prefix Counter prefix.
+	 * @param int|null $now    Unix time.
+	 * @return int
+	 */
+	public static function count_24h( $prefix, $now = null ) {
+		$now    = null === $now ? time() : (int) $now;
+		$oldest = (int) floor( ( $now - DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		$newest = (int) floor( $now / HOUR_IN_SECONDS );
+		$sum    = 0;
+		for ( $h = $oldest; $h <= $newest; $h++ ) {
+			$sum += (int) get_option( self::bucket_name( $prefix, $h ), 0 );
+		}
+		return $sum;
 	}
 
 	/** The only resource types a rule may name. Anything else never matches. */

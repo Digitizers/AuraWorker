@@ -371,18 +371,14 @@ final class RulesCoreRestTest extends TestCase {
 		// seam (site rules only) matches neither earlier dispatch, and the
 		// deletion is the FIRST time this rule is seen.
 		//
-		// NOTE: the brief's own version of this test also compares
-		// Aura_Worker_Rules::count_24h( BLOCKED_COUNTER ) before/after. That
-		// counter and its bump hooks (record_block()/record_warn() with real
-		// bodies, plus a do_action() stub that actually invokes registered
-		// callbacks) are explicitly Task 10's responsibility per this task's
-		// brief ("Task 10 adds counter hooks... create record_block()/
-		// record_warn() as empty static methods now") and per task-10-brief.md
-		// itself ("do_action stub invokes registered add_action callbacks...
-		// otherwise test_blocks_and_warns_are_counted cannot pass"). Neither
-		// BLOCKED_COUNTER nor a dispatching do_action() exists yet, so that
-		// half of the assertion is deferred to Task 10; the audit-hook half
-		// (which does not depend on either) is kept in full.
+		// Task 10 carry-forward: the brief's own version of this test also
+		// compares Aura_Worker_Rules::count_24h( BLOCKED_COUNTER ) before/after.
+		// Now that the counters and a dispatching do_action() stub both exist,
+		// that half is restored — record_block() is not called directly; it
+		// runs because the real code path does: enforce() fires
+		// `aura_worker_rule_blocked`, init() (called from setUp()) registered
+		// record_block() on it, and the bootstrap's do_action() now actually
+		// invokes registered listeners instead of only logging.
 		$this->install( array( $this->rule( 'rule/checkout', 'block', 'post', '7' ) ) );
 
 		$outer = $this->call( 'POST', '/foo/v1/thing' );
@@ -392,7 +388,8 @@ final class RulesCoreRestTest extends TestCase {
 		$orphan = $this->call( 'POST', '/foo/v1/nested' );
 		apply_filters( 'rest_request_before_callbacks', null, array(), $orphan );
 
-		$before = count( array_filter( $GLOBALS['_did_actions'], static function ( $a ) { return 'aura_worker_rule_blocked' === $a['tag']; } ) );
+		$before         = count( array_filter( $GLOBALS['_did_actions'], static function ( $a ) { return 'aura_worker_rule_blocked' === $a['tag']; } ) );
+		$blocked_before = Aura_Worker_Rules::count_24h( Aura_Worker_Rules::BLOCKED_COUNTER );
 		$this->assertSame( 0, $before, 'the rule fired before the mutation under test' );
 
 		// The outer handler carries on and deletes the ruled post.
@@ -403,6 +400,11 @@ final class RulesCoreRestTest extends TestCase {
 
 		$after = count( array_filter( $GLOBALS['_did_actions'], static function ( $a ) { return 'aura_worker_rule_blocked' === $a['tag']; } ) );
 		$this->assertSame( $before + 1, $after, 'the audit lost this mutation to the orphaned frame' );
+		$this->assertSame(
+			$blocked_before + 1,
+			Aura_Worker_Rules::count_24h( Aura_Worker_Rules::BLOCKED_COUNTER ),
+			'the audit counter lost this mutation to the orphaned frame'
+		);
 	}
 
 	public function test_a_batch_dispatch_refuses_every_mutation_and_reports_the_rule_once(): void {

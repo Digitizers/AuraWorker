@@ -55,6 +55,9 @@ if ( ! defined( 'ARRAY_A' ) ) {
 if ( ! defined( 'DAY_IN_SECONDS' ) ) {
 	define( 'DAY_IN_SECONDS', 86400 );
 }
+if ( ! defined( 'HOUR_IN_SECONDS' ) ) {
+	define( 'HOUR_IN_SECONDS', 3600 );
+}
 if ( ! defined( 'MINUTE_IN_SECONDS' ) ) {
 	define( 'MINUTE_IN_SECONDS', 60 );
 }
@@ -456,6 +459,26 @@ if ( ! function_exists( 'get_users' ) ) {
 if ( ! function_exists( 'do_action' ) ) {
 	function do_action( string $tag, ...$args ): void {
 		$GLOBALS['_did_actions'][] = array( 'tag' => $tag, 'args' => $args );
+		// Mirrors apply_filters() below: a listener registered via add_action()
+		// must actually run (Aura_Worker_Rules::record_block()/record_warn()
+		// bump the audit counters this way), not merely be logged here.
+		$hooks = array();
+		foreach ( $GLOBALS['_filters'][ $tag ] ?? array() as $i => $entry ) {
+			if ( is_array( $entry ) && array_key_exists( 'callback', $entry ) ) {
+				$hooks[] = $entry;
+			} else {
+				$hooks[] = array( 'priority' => 10, 'seq' => $i, 'callback' => $entry );
+			}
+		}
+		usort(
+			$hooks,
+			static function ( $a, $b ) {
+				return $a['priority'] <=> $b['priority'] ?: $a['seq'] <=> $b['seq'];
+			}
+		);
+		foreach ( $hooks as $hook ) {
+			( $hook['callback'] )( ...$args );
+		}
 	}
 }
 
@@ -1027,6 +1050,32 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_rows'][ $name ]    = $new;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
 				return 1;
+			}
+
+			// Emulate the two statements the rules counters issue, against the
+			// same $_options the get/update_option stubs use.
+			if ( preg_match( "/^UPDATE \S+ SET option_value = option_value \+ 1 WHERE option_name = '([^']+)'$/", $query, $m ) ) {
+				if ( ! isset( $GLOBALS['_options'][ $m[1] ] ) ) {
+					return 0;
+				}
+				$GLOBALS['_options'][ $m[1] ] = (string) ( (int) $GLOBALS['_options'][ $m[1] ] + 1 );
+				return 1;
+			}
+			// Used by the counters AND by the expired-notice claim sweep.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", $query, $m ) ) {
+				// Two layers of escaping to undo, or nothing matches: prepare()
+				// escaped the string for SQL, and esc_like() escaped `_` and
+				// `%` for LIKE beforehand — and every option name here is full
+				// of underscores.
+				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				$n      = 0;
+				foreach ( array_keys( $GLOBALS['_options'] ) as $k ) {
+					if ( 0 === strpos( $k, $prefix ) && strcmp( $k, stripslashes( $m[2] ) ) < 0 ) {
+						unset( $GLOBALS['_options'][ $k ], $GLOBALS['_rows'][ $k ] );
+						++$n;
+					}
+				}
+				return $n;
 			}
 
 			return isset( $GLOBALS['_db_query_result'] ) ? $GLOBALS['_db_query_result'] : 0;
