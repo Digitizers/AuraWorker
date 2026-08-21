@@ -28,7 +28,14 @@ define( 'SA_TESTS_DIR', __DIR__ );
 define( 'SA_PLUGIN_DIR', dirname( __DIR__ ) . '/digitizer-site-worker' );
 
 if ( ! defined( 'ABSPATH' ) ) {
-	define( 'ABSPATH', dirname( __DIR__ ) . '/' );
+	// A fixture root, not the repo root: the only thing under it is
+	// wp-admin/includes/*.php — trivial placeholders so the unconditional
+	// require_once calls in class-aura-worker-updater.php (etc.) resolve
+	// without a WordPress install. The real function/class definitions all
+	// live in this file. Keeping them under tests/fixtures/ instead of the
+	// repo root keeps them from reading as vendored WordPress core to anyone
+	// browsing or scanning the plugin, and outside any packaging step's reach.
+	define( 'ABSPATH', __DIR__ . '/fixtures/wp-root/' );
 }
 
 // Filesystem sandbox for the rollback engine. Kept under the system temp dir so
@@ -53,6 +60,12 @@ if ( ! defined( 'MINUTE_IN_SECONDS' ) ) {
 }
 if ( ! defined( 'OBJECT' ) ) {
 	define( 'OBJECT', 'OBJECT' );
+}
+if ( ! defined( 'AURA_WORKER_VERSION' ) ) {
+	// Aura_Worker_Updater::self_update() reads this for its "old_version" in
+	// the result array. Only reached when a test drives self_update() all the
+	// way through (normally the rule/grant guards stop it first).
+	define( 'AURA_WORKER_VERSION', 'test' );
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +345,16 @@ if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
+		// Witness every write EXCEPT the plugin's own bookkeeping (site token,
+		// grant pubkey, connect state, the ruleset record, …): those are internal
+		// accounting the connect/grant/rules layer performs on its own behalf,
+		// not a guarded handler mutating the site. RulesRestCoverageTest's freeze
+		// sweep asserts $GLOBALS['_mutations'] stays empty while every handler is
+		// still blocked; recording our own state writes would make that
+		// assertion fail even when nothing a rule is meant to catch happened.
+		if ( 0 !== strpos( $option, 'aura_worker_' ) ) {
+			$GLOBALS['_mutations'][] = 'update_option:' . $option;
+		}
 		return true;
 	}
 }
@@ -492,7 +515,12 @@ if ( ! function_exists( 'wp_mkdir_p' ) ) {
 
 if ( ! function_exists( 'wp_delete_file' ) ) {
 	function wp_delete_file( string $file ): bool {
-		return @unlink( $file );
+		$existed = file_exists( $file );
+		$ok      = @unlink( $file );
+		if ( $existed && $ok ) {
+			$GLOBALS['_mutations'][] = 'wp_delete_file';
+		}
+		return $ok;
 	}
 }
 
@@ -1007,8 +1035,21 @@ if ( ! class_exists( 'SA_Test_Filesystem' ) ) {
 
 		/**
 		 * Recursively delete a path. Mirrors $wp_filesystem->delete( $dir, true, 'd' ).
+		 *
+		 * Aura_Worker_Rollback::delete_directory() routes a real rollback's
+		 * directory-replace step through here (`$wp_filesystem->delete( $dir, true,
+		 * 'd' )`), and it is the only caller that ever passes a non-false $type — the
+		 * recursive descent below always passes false. That makes $type the marker
+		 * for "this is the outer call a guarded handler made", so one mutation is
+		 * recorded per real delete rather than once per file/directory underneath it.
+		 * The plugin's own directory bootstrapping (the .htaccess/index.php sentinel
+		 * writes in the Snapshots/Rollback constructors) goes through put_contents(),
+		 * never through here, so it needs no exclusion.
 		 */
 		public function delete( string $path, bool $recursive = false, $type = false ): bool {
+			if ( false !== $type && ( is_file( $path ) || is_dir( $path ) || is_link( $path ) ) ) {
+				$GLOBALS['_mutations'][] = 'SA_Test_Filesystem::delete';
+			}
 			if ( is_file( $path ) || is_link( $path ) ) {
 				return @unlink( $path );
 			}
@@ -1096,6 +1137,7 @@ if ( ! function_exists( 'wp_update_post' ) ) {
 		foreach ( $args as $k => $v ) {
 			$GLOBALS['_posts'][ $id ]->$k = $v;
 		}
+		$GLOBALS['_mutations'][] = 'wp_update_post';
 		return $id;
 	}
 }

@@ -107,36 +107,107 @@ final class RulesRestCoverageTest extends TestCase {
 			'envelope' => 'x.y', 'client' => 'c1', 'seq' => 1, 'issued_at' => '', 'received_at' => time(),
 			'rules'    => array( array( 'key' => 'rule/freeze', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'deploy' ) ),
 		);
-		foreach ( $guarded as $name ) {
-			$request = new WP_REST_Request();
-			// Parameters every handler in this file might read. A handler that
-			// needs one this list does not have will fail loudly here, which is
-			// the right moment to add it.
-			foreach ( array(
-				'plugin' => 'akismet/akismet.php',
-				'theme'  => 'twentytwentyfive',
-				'id'     => 1,
-				'kind'   => 'option',
-				'target' => 'blogname',
-				'plugins' => array( 'akismet/akismet.php' ),
-			) as $key => $value ) {
-				$request->set_param( $key, $value );
+
+		// Real fixtures for the three handlers whose mutating call needs a
+		// genuine target to reach: an id-less snapshot or a not-found backup
+		// path/plugin dir make guard-before and guard-after indistinguishable —
+		// the "already mutated" case this loop exists to catch would silently
+		// no-op either way. self::real_fixture_overrides() sets these up and
+		// returns the per-handler param overrides that reach them; cleaned up
+		// in the finally block below.
+		$overrides = self::real_fixture_overrides();
+
+		try {
+			foreach ( $guarded as $name ) {
+				$request = new WP_REST_Request();
+				// Parameters every handler in this file might read. A handler that
+				// needs one this list does not have will fail loudly here, which is
+				// the right moment to add it.
+				foreach ( array_merge(
+					array(
+						'plugin'  => 'akismet/akismet.php',
+						'theme'   => 'twentytwentyfive',
+						'id'      => 1,
+						'kind'    => 'option',
+						'target'  => 'blogname',
+						'plugins' => array( 'akismet/akismet.php' ),
+					),
+					$overrides[ $name ] ?? array()
+				) as $key => $value ) {
+					$request->set_param( $key, $value );
+				}
+				$GLOBALS['_mutations'] = array();
+				$result                = $api->$name( $request );
+				$error                 = is_wp_error( $result ) ? $result : null;
+				$this->assertNotNull( $error, "{$name} ran under a site freeze instead of refusing" );
+				$this->assertSame( 'aura_rule_blocked', $error->get_error_code(), "{$name} refused, but not because of the rule" );
+				// The refusal has to happen INSTEAD of the work, not after it. A
+				// handler that updates the site and then returns the rule's error
+				// answers exactly the same way to the two assertions above — and
+				// has already done the thing the freeze exists to prevent.
+				$this->assertSame(
+					array(),
+					$GLOBALS['_mutations'],
+					"{$name} refused, but only after mutating: " . implode( ', ', $GLOBALS['_mutations'] )
+				);
 			}
-			$GLOBALS['_mutations'] = array();
-			$result                = $api->$name( $request );
-			$error                 = is_wp_error( $result ) ? $result : null;
-			$this->assertNotNull( $error, "{$name} ran under a site freeze instead of refusing" );
-			$this->assertSame( 'aura_rule_blocked', $error->get_error_code(), "{$name} refused, but not because of the rule" );
-			// The refusal has to happen INSTEAD of the work, not after it. A
-			// handler that updates the site and then returns the rule's error
-			// answers exactly the same way to the two assertions above — and
-			// has already done the thing the freeze exists to prevent.
-			$this->assertSame(
-				array(),
-				$GLOBALS['_mutations'],
-				"{$name} refused, but only after mutating: " . implode( ', ', $GLOBALS['_mutations'] )
-			);
+		} finally {
+			self::clean_up_real_fixtures();
 		}
+	}
+
+	/**
+	 * Real, reachable targets for the three handlers whose guarded mutation
+	 * would otherwise no-op on the placeholder params shared above:
+	 *
+	 *  - restore_snapshot needs a snapshot that actually exists at `id` — a
+	 *    made-up id makes Aura_Worker_Snapshots::restore() answer "not found"
+	 *    before it ever reaches update_option(), whether the guard ran first
+	 *    or not, so the witness would see nothing either way.
+	 *  - rollback_plugin needs `backup_path` to be a real file AND the plugin
+	 *    directory to exist — Aura_Worker_Rollback::restore_plugin() deletes
+	 *    the plugin directory (via $wp_filesystem->delete(), witnessed) before
+	 *    it ever opens the zip, so the backup itself does not need to be valid.
+	 *  - self_update needs `zip_url` to pass is_allowed_self_update_url()
+	 *    (https, github.com, the release-download path, a .zip suffix) so it
+	 *    reaches Plugin_Upgrader::install() (already witnessed).
+	 *
+	 * @return array<string,array<string,mixed>>
+	 */
+	private static function real_fixture_overrides() {
+		$snapshots   = new Aura_Worker_Snapshots();
+		$GLOBALS['_options']['blogname'] = 'Test Site'; // existed=true → restore() takes the update_option() branch, not delete_option().
+		$snapshot    = $snapshots->snapshot_option( 'blogname' );
+
+		$plugin_dir = WP_PLUGIN_DIR . '/akismet/akismet.php';
+		wp_mkdir_p( $plugin_dir );
+		file_put_contents( $plugin_dir . '/main.php', "<?php // fixture\n" );
+
+		$backup_path = WP_CONTENT_DIR . '/aura-backups/rules-coverage-fixture.zip';
+		wp_mkdir_p( dirname( $backup_path ) );
+		file_put_contents( $backup_path, 'not a real zip, but a real file' );
+
+		return array(
+			'restore_snapshot' => array( 'id' => $snapshot['snapshot']['id'] ),
+			'rollback_plugin'  => array( 'plugin' => 'akismet/akismet.php', 'backup_path' => $backup_path ),
+			'self_update'      => array( 'zip_url' => 'https://github.com/Digitizers/SiteAgent/releases/download/v9.9.9/plugin.zip' ),
+		);
+	}
+
+	/** Remove what real_fixture_overrides() created on disk. */
+	private static function clean_up_real_fixtures() {
+		$rrmdir = static function ( $dir ) use ( &$rrmdir ) {
+			if ( ! is_dir( $dir ) ) {
+				return;
+			}
+			foreach ( array_diff( scandir( $dir ), array( '.', '..' ) ) as $item ) {
+				$path = $dir . '/' . $item;
+				is_dir( $path ) ? $rrmdir( $path ) : @unlink( $path );
+			}
+			@rmdir( $dir );
+		};
+		$rrmdir( WP_PLUGIN_DIR . '/akismet' );
+		@unlink( WP_CONTENT_DIR . '/aura-backups/rules-coverage-fixture.zip' );
 	}
 
 	/**

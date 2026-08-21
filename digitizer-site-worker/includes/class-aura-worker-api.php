@@ -448,10 +448,10 @@ class Aura_Worker_API {
 		$all_plugins = get_plugins();
 
 		if ( ! isset( $all_plugins[ $plugin_file ] ) ) {
-			return new WP_REST_Response( array(
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 				'success' => false,
 				'error'   => __( 'Plugin not found.', 'digitizer-site-worker' ),
-			), 404 );
+			) ), 404 );
 		}
 
 		$result = $this->updater->update_plugin( $plugin_file );
@@ -483,10 +483,10 @@ class Aura_Worker_API {
 		// Validate theme exists.
 		$theme = wp_get_theme( $theme_slug );
 		if ( ! $theme->exists() ) {
-			return new WP_REST_Response( array(
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 				'success' => false,
 				'error'   => __( 'Theme not found.', 'digitizer-site-worker' ),
-			), 404 );
+			) ), 404 );
 		}
 
 		$result = $this->updater->update_theme( $theme_slug );
@@ -566,10 +566,10 @@ class Aura_Worker_API {
 		// Bounds a signed grant to a trusted source, so even an approved
 		// self-update can't be pointed at attacker-hosted code.
 		if ( ! $this->is_allowed_self_update_url( $zip_url ) ) {
-			return new WP_REST_Response( array(
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 				'success' => false,
 				'error'   => __( 'Self-update source not allowed.', 'digitizer-site-worker' ),
-			), 400 );
+			) ), 400 );
 		}
 
 		$result = $this->updater->self_update( $zip_url, $sha256 );
