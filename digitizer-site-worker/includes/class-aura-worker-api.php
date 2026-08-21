@@ -791,10 +791,10 @@ class Aura_Worker_API {
 		if ( empty( $backup_path ) ) {
 			$backups = $rollback->list_backups( $plugin_slug );
 			if ( empty( $backups ) ) {
-				return new WP_REST_Response( array(
+				return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array(
 					'success' => false,
 					'error'   => __( 'No backups found for this plugin.', 'digitizer-site-worker' ),
-				), 404 );
+				) ), 404 );
 			}
 			$backup_path = $backups[0]['path'];
 		}

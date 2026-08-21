@@ -345,16 +345,15 @@ if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
-		// Witness every write EXCEPT the plugin's own bookkeeping (site token,
-		// grant pubkey, connect state, the ruleset record, …): those are internal
-		// accounting the connect/grant/rules layer performs on its own behalf,
-		// not a guarded handler mutating the site. RulesRestCoverageTest's freeze
-		// sweep asserts $GLOBALS['_mutations'] stays empty while every handler is
-		// still blocked; recording our own state writes would make that
-		// assertion fail even when nothing a rule is meant to catch happened.
-		if ( 0 !== strpos( $option, 'aura_worker_' ) ) {
-			$GLOBALS['_mutations'][] = 'update_option:' . $option;
-		}
+		// Witness every write, unconditionally. An option name is caller-chosen
+		// data on the restore_snapshot path (create_snapshot accepts any
+		// `target`), so excluding an `aura_worker_*` prefix would blind the
+		// witness to exactly the case it exists for: a snapshot taken over the
+		// plugin's own state (e.g. the site token) and restored under a freeze.
+		// No guarded handler writes an `aura_worker_*` option on any path this
+		// suite exercises, so nothing needs the exclusion — confirmed by running
+		// the full suite with it removed.
+		$GLOBALS['_mutations'][] = 'update_option:' . $option;
 		return true;
 	}
 }
