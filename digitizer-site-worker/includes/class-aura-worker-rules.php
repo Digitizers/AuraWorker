@@ -172,4 +172,397 @@ class Aura_Worker_Rules {
 		}
 		return isset( $touched[ $type . ':' . $id ] );
 	}
+
+	/* ------------------------------------------------------------------ */
+	/* The store — option-backed, signed, monotonic                        */
+	/* ------------------------------------------------------------------ */
+
+	/** Option holding the last accepted ruleset record. */
+	const OPTION = 'aura_worker_ruleset';
+
+	/** How many times a caller that loses the swap re-decides before giving up. */
+	const MAX_SWAP_ATTEMPTS = 3;
+
+	/**
+	 * Accept a signed ruleset if it verifies and is newer than what we hold.
+	 *
+	 * Whole document every time, so there is no delta to misapply and no order
+	 * to get wrong. `seq` is monotonic: an older document is refused even when
+	 * validly signed, because replaying one is exactly how a released rule
+	 * would come back or a new one would vanish. Any failure leaves the stored
+	 * record untouched — last-known-good is the contract.
+	 *
+	 * @param string $envelope Signed document from the gateway.
+	 * @param int    $attempt  Internal: how many times this call has re-decided
+	 *                         after losing the compare-and-swap.
+	 * @return true|WP_Error
+	 */
+	public static function accept( $envelope, $attempt = 0 ) {
+		$doc = Aura_Worker_Grant::verify_signed_document( (string) $envelope );
+		if ( ! is_array( $doc ) ) {
+			return new WP_Error( 'aura_ruleset_rejected', 'Ruleset refused: ' . $doc, array( 'status' => 400 ) );
+		}
+		if ( ! isset( $doc['v'] ) || 1 !== (int) $doc['v'] ) {
+			return new WP_Error( 'aura_ruleset_rejected', 'Ruleset refused: unsupported version', array( 'status' => 400 ) );
+		}
+		if ( ! isset( $doc['seq'] ) || ! is_int( $doc['seq'] ) || $doc['seq'] < 0 ) {
+			return new WP_Error( 'aura_ruleset_rejected', 'Ruleset refused: seq must be a non-negative integer', array( 'status' => 400 ) );
+		}
+		if ( ! isset( $doc['rules'] ) || ! is_array( $doc['rules'] ) ) {
+			return new WP_Error( 'aura_ruleset_rejected', 'Ruleset refused: rules must be a list', array( 'status' => 400 ) );
+		}
+		$client = isset( $doc['client'] ) && is_string( $doc['client'] ) ? trim( $doc['client'] ) : '';
+		if ( '' === $client ) {
+			return new WP_Error( 'aura_ruleset_rejected', 'Ruleset refused: client is required', array( 'status' => 400 ) );
+		}
+
+		// Bound to THIS site, exactly as grants are (`site` = the token hash).
+		// The gateway key is shared across clients, so without this a valid
+		// envelope for site A plus site B's token could install A's rules on B
+		// before B's first push — and B's real documents would then be refused
+		// as a client mismatch. Checked before anything about the stored record,
+		// so it holds for the very first document too.
+		$site = isset( $doc['site'] ) && is_string( $doc['site'] ) ? $doc['site'] : '';
+		$ours = (string) get_option( 'aura_worker_site_token', '' );
+		if ( '' === $site || '' === $ours || ! hash_equals( $ours, $site ) ) {
+			return new WP_Error( 'aura_ruleset_wrong_site', 'Ruleset refused: not issued for this site', array( 'status' => 403 ) );
+		}
+
+		$current = self::current();
+		if ( null !== $current && isset( $current['envelope'] ) && hash_equals( (string) $current['envelope'], (string) $envelope ) ) {
+			// The very document we already hold — a retry after a lost 200.
+			// Delivered is delivered; saying 409 would record it as failed forever.
+			return true;
+		}
+		if ( null !== $current && isset( $current['client'] ) && $client !== (string) $current['client'] ) {
+			// A rebinding goes through connect(), which clears first. Anything
+			// else is a misroute or a replay, and the stored rules are not its
+			// to replace — the seq comparison below would be meaningless across
+			// clients.
+			return new WP_Error(
+				'aura_ruleset_client_mismatch',
+				sprintf( 'Ruleset refused: issued for client %s, this site is bound to %s', $client, (string) $current['client'] ),
+				array( 'status' => 409 )
+			);
+		}
+		if ( null !== $current && $doc['seq'] <= (int) $current['seq'] ) {
+			return new WP_Error(
+				'aura_ruleset_stale',
+				sprintf( 'Ruleset refused: seq %d is not newer than stored seq %d', $doc['seq'], (int) $current['seq'] ),
+				array( 'status' => 409 )
+			);
+		}
+
+		// Compare-and-swap. The seq check above read $current; between that read
+		// and this write another request can install a newer ruleset — a retry
+		// of seq 6 racing a fresh seq 7 would otherwise land last and roll policy
+		// backwards, silently removing a block the operator just added. The
+		// write therefore names the value it expects to replace, and a losing
+		// racer re-reads and re-decides rather than overwriting.
+		$record = array(
+			'envelope'    => (string) $envelope,
+			'client'      => $client,
+			'seq'         => (int) $doc['seq'],
+			'issued_at'   => isset( $doc['issued_at'] ) ? (string) $doc['issued_at'] : '',
+			'received_at' => time(),
+			'rules'       => array_values( array_filter( $doc['rules'], 'is_array' ) ),
+		);
+		$swapped = self::swap( $current, $record );
+		if ( true !== $swapped ) {
+			if ( is_wp_error( $swapped ) ) {
+				// The database refused the write. Retrying cannot help and
+				// would spin: say so, and let Aura retry the push later.
+				return $swapped;
+			}
+			// Someone else wrote first. Whatever they wrote, this document is
+			// judged against it from the top: an identical envelope is a 200, a
+			// newer seq installs, an older one is the 409 it always was. Bounded:
+			// a site losing this race repeatedly is a site under a push storm,
+			// and unbounded recursion would answer that with a stack overflow.
+			if ( $attempt >= self::MAX_SWAP_ATTEMPTS ) {
+				return new WP_Error(
+					'aura_ruleset_contended',
+					'Ruleset not stored: another push kept winning the write; retry.',
+					array( 'status' => 503 )
+				);
+			}
+			return self::accept( $envelope, $attempt + 1 );
+		}
+		// A new ruleset retires rules, and a retired rule's daily claim is
+		// named after a key nothing will visit again. Retired ones only: a rule
+		// this document still carries keeps today's claim, or accepting a
+		// ruleset would announce it a second time.
+		// Accepting a ruleset does NOT touch the claims. They are statements
+		// about a day, not about a ruleset: yesterday's are swept by
+		// note_expired() on the next enforcement, today's are still true. That
+		// is also what makes this safe under overlapping pushes — there is no
+		// keep-set to go stale between deciding and deleting.
+		return true;
+	}
+
+	/**
+	 * Replace the stored record only if it is still $expected.
+	 *
+	 * WordPress has no compare-and-swap for options, so this is one UPDATE with
+	 * the old serialized value in the WHERE clause, or one INSERT via
+	 * add_option() when the decision was made against nothing stored.
+	 *
+	 * Three outcomes, kept distinct on purpose:
+	 *  - true      — this caller's write landed.
+	 *  - false     — a racer wrote first. The caller must re-decide; it must
+	 *                NOT read the racer's value and swap against that, which
+	 *                would install this document without ever comparing its
+	 *                seq to the one now stored. That is the same rollback the
+	 *                CAS exists to prevent, one level down.
+	 *  - WP_Error  — the database refused the statement. Retrying cannot help.
+	 *
+	 * @param array|null $expected Record read before the decision, or null.
+	 * @param array      $record   Record to store.
+	 * @return true|false|WP_Error
+	 */
+	private static function swap( $expected, $record ) {
+		global $wpdb;
+		if ( null === $expected ) {
+			if ( add_option( self::OPTION, $record, '', false ) ) {
+				return true;
+			}
+			// add_option() answers false for two different things: the row
+			// already exists (a racer inserted first) and the database refused
+			// the write. Only the first is a lost swap; reading the second as
+			// one would retry a broken database three times and then report
+			// contention that never happened. One re-read tells them apart —
+			// and it goes to the DATABASE, not through get_option(): the
+			// add_option() call just failed its own existence check, which
+			// caches this key in `notoptions`, so a cached read would answer
+			// "absent" for a row a racer has since inserted and turn a lost
+			// race into a phantom store failure.
+			$raw = $wpdb->get_var(
+				$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::OPTION )
+			);
+			if ( null === $raw ) {
+				return new WP_Error(
+					'aura_ruleset_store_failed',
+					'Ruleset not stored: the database refused the write.',
+					array( 'status' => 500 )
+				);
+			}
+			// The row is there, so the caches that said otherwise are wrong.
+			wp_cache_delete( 'notoptions', 'options' );
+			wp_cache_delete( self::OPTION, 'options' );
+			$stored = maybe_unserialize( $raw );
+			if ( self::is_record( $stored ) ) {
+				return false; // A racer's record. Re-decide against it.
+			}
+			// A row exists but is not a readable record — a truncated or
+			// hand-edited value. It carries no seq, so there is no policy to
+			// roll back and nothing to compare against: replace it, still by
+			// CAS so a real racer arriving now still wins.
+			//
+			// The predicate is the RAW bytes, not the decoded value. A row
+			// holding `i:5;` decodes to int 5, and maybe_serialize( 5 ) is the
+			// string "5" — which matches nothing, so every retry would lose and
+			// the corrupt row could never be repaired. Round-tripping is only
+			// lossless for values maybe_serialize() would have written.
+			return self::swap_raw( $raw, $record );
+		}
+		return self::swap_raw( maybe_serialize( $expected ), $record );
+	}
+
+	/**
+	 * The CAS itself, against the exact bytes expected in the row.
+	 *
+	 * @param string $expected_raw Serialized value the decision was made against.
+	 * @param array  $record       Record to store.
+	 * @return bool|WP_Error
+	 */
+	private static function swap_raw( $expected_raw, $record ) {
+		global $wpdb;
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				maybe_serialize( $record ),
+				self::OPTION,
+				(string) $expected_raw
+			)
+		);
+		wp_cache_delete( self::OPTION, 'options' );
+		if ( false === $rows ) {
+			// $wpdb->query() returns false for an SQL error and 0 for "matched
+			// nothing". Collapsing the two would turn a broken database into an
+			// endless retry.
+			return new WP_Error(
+				'aura_ruleset_store_failed',
+				'Ruleset not stored: the database refused the write.',
+				array( 'status' => 500 )
+			);
+		}
+		return $rows > 0;
+	}
+
+	/**
+	 * The stored record, or null when no ruleset has ever been accepted.
+	 *
+	 * @return array|null
+	 */
+	public static function current() {
+		$rec = get_option( self::OPTION, null );
+		return self::is_record( $rec ) ? $rec : null;
+	}
+
+	/**
+	 * Is this value a stored ruleset record? One definition, used by current()
+	 * and by swap() on a value read straight from the database.
+	 *
+	 * @param mixed $rec Candidate.
+	 * @return bool
+	 */
+	private static function is_record( $rec ) {
+		return is_array( $rec ) && isset( $rec['seq'], $rec['rules'] ) && is_array( $rec['rules'] );
+	}
+
+	/**
+	 * Rules to match against. Empty when there is no ruleset — which means no
+	 * policy, not a refusal.
+	 *
+	 * @return array
+	 */
+	public static function rules() {
+		$rec = self::current();
+		return null === $rec ? array() : $rec['rules'];
+	}
+
+	/**
+	 * Forget the ruleset (disconnect, tests).
+	 */
+	public static function clear() {
+		delete_option( self::OPTION );
+		// The claims are deliberately NOT swept here. They are statements
+		// about a DAY, and the time-based sweep in note_expired() drops every
+		// claim older than today whatever the ruleset now holds — so a claim
+		// left by a disconnect outlives it by at most a day, and no dedicated
+		// cleanup is owed. Sweeping here would also be the one UNBOUNDED
+		// sweep in the class, the only one whose range includes names an
+		// in-flight enforcement can still create; see sweep_options().
+	}
+
+	/** Prefix for the per-rule-per-day "already announced" claims. */
+	const EXPIRED_NOTICE = 'aura_worker_rule_expired_';
+
+	/**
+	 * The rule slot the daily sweep claims for itself.
+	 *
+	 * A reserved word, not a hash: `rule_hash()` returns 20 hex characters, so
+	 * nothing a real rule key can produce collides with it. Sharing the claim
+	 * naming is the point — the sweep's own claims are swept by later sweeps,
+	 * so it leaves no growing residue of its own.
+	 */
+	const SWEEP_CLAIM = 'sweep';
+
+	/**
+	 * Option name claiming one rule for one day: prefix, DAY, then the rule.
+	 *
+	 * The day comes first on purpose. A claim is a statement about a day — "we
+	 * announced this rule today" — so it stops meaning anything when the day
+	 * ends, not when the ruleset changes. With the day leading, one
+	 * `option_name < prefix<today>_` deletes every stale claim of every rule in
+	 * a single statement, no keep-set and no coupling to what the ruleset
+	 * currently holds. Zero-padded to seven digits so lexical order is numeric
+	 * order (today's index is five digits, ~20800, under 10^7 past year 29000).
+	 *
+	 * @param string $hash Rule-key hash (see rule_hash()).
+	 * @param int    $day  Day index.
+	 * @return string
+	 */
+	public static function expired_claim( $hash, $day ) {
+		return self::EXPIRED_NOTICE . str_pad( (string) (int) $day, 7, '0', STR_PAD_LEFT ) . '_' . $hash;
+	}
+
+	/**
+	 * The short hash a claim names a rule by.
+	 *
+	 * @param string $key Rule key.
+	 * @return string
+	 */
+	public static function rule_hash( $key ) {
+		return substr( hash( 'sha256', (string) $key ), 0, 20 );
+	}
+
+	/**
+	 * Drop every claim from a day that has ended.
+	 *
+	 * A claim says "this rule was announced on this day". Yesterday's claim is
+	 * spent whatever the ruleset now holds, and today's is needed whatever the
+	 * ruleset now holds — so cleanup is about TIME, and never about ruleset
+	 * membership. That is what keeps it correct under concurrency: an accepted
+	 * ruleset does not sweep, so no interleaving of two pushes can delete a
+	 * claim the winner still needs, and no retired rule can leave a claim
+	 * behind for longer than a day.
+	 *
+	 * One statement, because the day leads the name (see expired_claim()).
+	 *
+	 * @param int $day Today's day index; claims for earlier days go.
+	 */
+	private static function sweep_stale_claims( $day ) {
+		self::sweep_options(
+			self::EXPIRED_NOTICE,
+			self::EXPIRED_NOTICE . str_pad( (string) (int) $day, 7, '0', STR_PAD_LEFT ) . '_'
+		);
+	}
+
+	/**
+	 * Delete option rows by name prefix — and evict what was deleted.
+	 *
+	 * `$wpdb` finds the names — nothing else can, without the caller knowing
+	 * which rules or which hours exist, which is the coupling these sweeps
+	 * are built to avoid. But the DELETE goes through `delete_option()`, one
+	 * name at a time, and NOT through a second `LIKE` statement.
+	 *
+	 * Two reasons, and both are about the object cache rather than SQL:
+	 *
+	 *  1. A raw DELETE removes rows and leaves their `options` cache entries.
+	 *     A stale entry for a deleted row is worse than the row itself:
+	 *     `add_option()` consults the cache, sees a claim that no longer
+	 *     exists, returns false, and the expiry announcement it was supposed
+	 *     to permit never fires. `clear()` would report having forgotten every
+	 *     claim while the site still behaved as though it remembered them.
+	 *  2. A second `LIKE` statement does not delete the set that was read. A
+	 *     row inserted between the SELECT and the DELETE is deleted by
+	 *     name-pattern while the eviction loop, which only knows the names it
+	 *     read, leaves its cached value behind. Deleting exactly the captured
+	 *     names cannot do that: whatever is not in the set is left whole, row
+	 *     and cache together.
+	 *
+	 * `$before` is REQUIRED, and that is what closes the last race rather
+	 * than narrowing it. Every sweep deletes only names strictly below a
+	 * bound — an earlier day, an earlier hour — and nothing in the system
+	 * ever creates a name below its own bound: a claim is always for TODAY, a
+	 * bucket always for THIS hour. So a name this sweep read can never be
+	 * recreated in time to be deleted by a second sweep that did not read it.
+	 * An unbounded sweep would have exactly that hole, which is why there is
+	 * no longer one anywhere in the class.
+	 *
+	 * `delete_option()` also handles `notoptions` and the autoload cache the
+	 * way core expects, which hand-rolled eviction gets wrong quietly.
+	 *
+	 * The counts are small by construction — one claim per expired rule per
+	 * day, one bucket per hour — so N statements is not a cost worth a
+	 * correctness hole.
+	 *
+	 * @param string $prefix Option-name prefix.
+	 * @param string $before Delete only names strictly less than this.
+	 */
+	private static function sweep_options( $prefix, $before ) {
+		global $wpdb;
+		$names = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name < %s",
+				$wpdb->esc_like( $prefix ) . '%',
+				$before
+			)
+		);
+
+		foreach ( (array) $names as $name ) {
+			delete_option( $name );
+		}
+	}
 }

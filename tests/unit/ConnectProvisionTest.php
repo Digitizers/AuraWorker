@@ -97,4 +97,13 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertFalse( array_key_exists( 'aura_worker_grant_pubkey', $GLOBALS['_options'] ) );
 		$this->assertFalse( Aura_Worker_Grant::is_enforced() );
 	}
+
+	public function test_a_connect_clears_any_previous_ruleset(): void {
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = array(
+			'envelope' => 'x.y', 'client' => 'old', 'seq' => 9, 'issued_at' => '', 'received_at' => time(), 'rules' => array(),
+		);
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
 }

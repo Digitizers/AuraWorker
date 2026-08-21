@@ -216,10 +216,110 @@ if ( ! function_exists( 'is_wp_error' ) ) {
 	}
 }
 
+// --- Serialization (real WP core semantics; ruleset CAS compares raw bytes) --
+
+if ( ! function_exists( 'is_serialized' ) ) {
+	function is_serialized( $data, $strict = true ) {
+		if ( ! is_string( $data ) ) {
+			return false;
+		}
+		$data = trim( $data );
+		if ( 'N;' === $data ) {
+			return true;
+		}
+		if ( strlen( $data ) < 4 ) {
+			return false;
+		}
+		if ( ':' !== $data[1] ) {
+			return false;
+		}
+		if ( $strict ) {
+			$lastc = substr( $data, -1 );
+			if ( ';' !== $lastc && '}' !== $lastc ) {
+				return false;
+			}
+		} else {
+			$semicolon = strpos( $data, ';' );
+			$brace     = strpos( $data, '}' );
+			if ( false === $semicolon && false === $brace ) {
+				return false;
+			}
+			if ( false !== $semicolon && $semicolon < 3 ) {
+				return false;
+			}
+			if ( false !== $brace && $brace < 4 ) {
+				return false;
+			}
+		}
+		$token = $data[0];
+		switch ( $token ) {
+			case 's':
+				if ( $strict && '"' !== substr( $data, -2, 1 ) ) {
+					return false;
+				} elseif ( false === strpos( $data, '"' ) ) {
+					return false;
+				}
+				return true;
+			case 'a':
+			case 'O':
+			case 'E':
+				return (bool) preg_match( "/^{$token}:[0-9]+:/s", $data );
+			case 'b':
+			case 'i':
+			case 'd':
+				$end = $strict ? '$' : '';
+				return (bool) preg_match( "/^{$token}:[0-9.E+-]+;$end/", $data );
+		}
+		return false;
+	}
+}
+
+if ( ! function_exists( 'maybe_serialize' ) ) {
+	function maybe_serialize( $data ) {
+		if ( is_array( $data ) || is_object( $data ) ) {
+			return serialize( $data );
+		}
+		if ( is_serialized( $data, false ) ) {
+			return serialize( $data );
+		}
+		return $data;
+	}
+}
+
+if ( ! function_exists( 'maybe_unserialize' ) ) {
+	function maybe_unserialize( $data ) {
+		if ( is_serialized( $data ) ) {
+			return @unserialize( trim( (string) $data ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		}
+		return $data;
+	}
+}
+
+if ( ! function_exists( 'wp_cache_delete' ) ) {
+	function wp_cache_delete( $key, $group = '' ) {
+		$GLOBALS['_cache_deletes'][] = array(
+			'key'   => $key,
+			'group' => $group,
+		);
+		if ( 'notoptions' === $key && 'options' === $group ) {
+			// The eviction the negative cache was lying through. From here the
+			// "cache" agrees with the "database" again, same as real WordPress
+			// once the stale notoptions entry is deleted.
+			$GLOBALS['_notoptions_lies'] = false;
+		}
+		return true;
+	}
+}
+
 // --- Option store ----------------------------------------------------------
 
 if ( ! function_exists( 'get_option' ) ) {
 	function get_option( string $option, $default = false ) {
+		if ( ! empty( $GLOBALS['_notoptions_lies'] ) && Aura_Worker_Rules::OPTION === $option ) {
+			// WordPress's negative cache, modelled: a row exists in the
+			// "database" but a cached read still answers "absent".
+			return $default;
+		}
 		return array_key_exists( $option, $GLOBALS['_options'] ) ? $GLOBALS['_options'][ $option ] : $default;
 	}
 }
@@ -227,6 +327,7 @@ if ( ! function_exists( 'get_option' ) ) {
 if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
 		$GLOBALS['_options'][ $option ] = $value;
+		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
 		return true;
 	}
 }
@@ -236,10 +337,25 @@ if ( ! function_exists( 'add_option' ) ) {
 	// the option already exists. The verifier relies on this for single-use
 	// nonce reservation, so the stub mirrors that fail-if-exists semantics.
 	function add_option( string $option, $value = '', $deprecated = '', $autoload = 'yes' ): bool {
+		if ( ! empty( $GLOBALS['_add_option_fails'] ) && Aura_Worker_Rules::OPTION === $option ) {
+			return false; // The database refused, and no row was written ($_rows stays empty).
+		}
+		if ( ! empty( $GLOBALS['_insert_racer'] ) && Aura_Worker_Rules::OPTION === $option ) {
+			$racer                    = $GLOBALS['_insert_racer'];
+			$GLOBALS['_insert_racer'] = null;
+			Aura_Worker_Rules::accept( $racer ); // inserts first: writes $_options AND $_rows.
+			// _notoptions_lies is NOT modelled by touching $_options here — that
+			// would make the racer's row unrecoverable through get_option() even
+			// after the cache is evicted. It is modelled entirely in
+			// get_option() itself (below), gated by the flag, so the real value
+			// reappears the moment swap() evicts the negative cache — exactly
+			// as a real re-query would find the row that was there all along.
+		}
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return false;
 		}
 		$GLOBALS['_options'][ $option ] = $value;
+		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
 		return true;
 	}
 }
@@ -254,6 +370,7 @@ if ( ! function_exists( 'wp_schedule_single_event' ) ) {
 if ( ! function_exists( 'delete_option' ) ) {
 	function delete_option( string $option ): bool {
 		unset( $GLOBALS['_options'][ $option ] );
+		unset( $GLOBALS['_rows'][ $option ] );
 		return true;
 	}
 }
@@ -509,9 +626,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			return $GLOBALS['_db_rows'];
 		}
 
-		/** get_var returns the next queued scalar, else $_db_var. */
+		/**
+		 * get_var returns the next queued scalar, else $_db_var — except the one
+		 * shape swap() issues to classify a losing INSERT, which answers from
+		 * the "database" ($_rows), not the cache ($_options), independent of
+		 * the queued/_db_var behaviour so a test can make the cache lie.
+		 */
 		public function get_var( $query = null, $x = 0, $y = 0 ) {
 			$this->last_query = (string) $query;
+			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
+				// The row, not the cache: $_rows is what the "database" holds.
+				return isset( $GLOBALS['_rows'][ $m[1] ] ) ? $GLOBALS['_rows'][ $m[1] ] : null;
+			}
 			if ( ! empty( $GLOBALS['_db_var_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_var_queue'] );
 			}
@@ -524,22 +650,99 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			return $GLOBALS['_db_row'];
 		}
 
-		/** Records the prepared (query, args) and returns the query verbatim. */
+		/**
+		 * get_col: the one shape sweep_options() issues (a LIKE-prefix bounded
+		 * by an upper name), read against $_rows — the same table query()/
+		 * get_var() treat as the "database". Every sweep in the class is
+		 * bounded, so there is no unbounded form to emulate.
+		 */
+		public function get_col( $query = null, $x = 0 ) {
+			$this->last_query         = (string) $query;
+			$GLOBALS['_db_queries'][] = (string) $query;
+			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", (string) $query, $m ) ) {
+				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				$before = stripslashes( $m[2] );
+				return array_values(
+					array_filter(
+						array_keys( $GLOBALS['_rows'] ),
+						static function ( $k ) use ( $prefix, $before ) {
+							return 0 === strpos( $k, $prefix ) && strcmp( $k, $before ) < 0;
+						}
+					)
+				);
+			}
+			return array();
+		}
+
+		/**
+		 * Records the prepared (query, args) and returns the query with each
+		 * `%s` substituted by its escaped, quoted argument (and `%d` by its
+		 * integer value) — real enough for the ruleset CAS statements, which
+		 * this stub's query()/get_var() match by parsing the substituted SQL.
+		 */
 		public function prepare( $query, ...$args ) {
 			// Some callers pass a single array of args.
 			if ( 1 === count( $args ) && is_array( $args[0] ) ) {
 				$args = $args[0];
 			}
-			$GLOBALS['_db_prepared'][] = array( 'query' => (string) $query, 'args' => $args );
-			return (string) $query;
+			$query                      = (string) $query;
+			$GLOBALS['_db_prepared'][] = array( 'query' => $query, 'args' => $args );
+			$i = 0;
+			return preg_replace_callback(
+				'/%[sd]/',
+				static function ( $m ) use ( $args, &$i ) {
+					$arg = $args[ $i ] ?? '';
+					++$i;
+					if ( '%d' === $m[0] ) {
+						return (string) (int) $arg;
+					}
+					return "'" . addslashes( (string) $arg ) . "'";
+				},
+				$query
+			);
 		}
 
 		public function esc_like( $text ) {
 			return addcslashes( (string) $text, '_%\\' );
 		}
 
+		/**
+		 * The one write path the ruleset store's compare-and-swap issues, plus
+		 * whatever a test has queued in $_db_query_result for anything else.
+		 * Models the CAS against $_rows (the "database"), and is where the
+		 * two racer seams (_cas_racer / _cas_always_lose / _db_query_error)
+		 * inject their behaviour.
+		 */
 		public function query( $query ) {
-			$this->last_query = (string) $query;
+			$query                    = (string) $query;
+			$this->last_query         = $query;
+			$GLOBALS['_db_queries'][] = $query;
+			if ( preg_match( "/^UPDATE \S+ SET option_value = '(.*)' WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
+				if ( ! empty( $GLOBALS['_db_query_error'] ) ) {
+					return false; // An SQL error, which is NOT a lost race.
+				}
+				if ( ! empty( $GLOBALS['_cas_always_lose'] ) ) {
+					return 0; // Contention that never resolves.
+				}
+				// A second request landing between this caller's read and its
+				// write — exactly the window the CAS exists to close.
+				if ( ! empty( $GLOBALS['_cas_racer'] ) ) {
+					$racer                 = $GLOBALS['_cas_racer'];
+					$GLOBALS['_cas_racer'] = null;
+					Aura_Worker_Rules::accept( $racer );
+				}
+				list( , $new, $name, $expected ) = array_map( 'stripslashes', $m );
+				// Compare the ROW, byte for byte, the way MySQL does. Going
+				// through $_options and re-serializing would decode `i:5;` to 5
+				// and compare "5" — so the corrupt-row repair, whose whole point
+				// is that the predicate is the raw bytes, could never match.
+				if ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $expected ) {
+					return 0; // Someone else wrote first.
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				return 1;
+			}
 			return isset( $GLOBALS['_db_query_result'] ) ? $GLOBALS['_db_query_result'] : 0;
 		}
 	}
@@ -551,6 +754,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_db_row']           = null;
 	$GLOBALS['_db_prepared']      = array();
 	$GLOBALS['_db_query_result']  = 0;
+	$GLOBALS['_db_queries']       = array();
+	$GLOBALS['_cache_deletes']    = array();
+	$GLOBALS['_rows']             = array(); // Raw, serialized bytes — the "database" the ruleset CAS reads/writes.
+	$GLOBALS['_cas_racer']        = null;
+	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_add_option_fails'] = false;
+	$GLOBALS['_notoptions_lies']  = false;
+	$GLOBALS['_cas_always_lose']  = false;
+	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
 }
 
@@ -1012,6 +1224,15 @@ function sa_reset_state(): void {
 	$GLOBALS['_db_row']           = null;
 	$GLOBALS['_db_prepared']      = array();
 	$GLOBALS['_db_query_result']  = 0;
+	$GLOBALS['_db_queries']       = array();
+	$GLOBALS['_cache_deletes']    = array();
+	$GLOBALS['_rows']             = array();
+	$GLOBALS['_cas_racer']        = null;
+	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_add_option_fails'] = false;
+	$GLOBALS['_notoptions_lies']  = false;
+	$GLOBALS['_cas_always_lose']  = false;
+	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['_posts']        = array();
 	$GLOBALS['_post_meta']    = array();
 	$GLOBALS['_cleaned_post_cache'] = array();

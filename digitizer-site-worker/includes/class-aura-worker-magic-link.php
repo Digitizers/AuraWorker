@@ -238,6 +238,10 @@ class Aura_Worker_Magic_Link {
 			update_option( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'] );
 		}
 		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( $token ) );
+		// A (re)connect may bind this site to a different client. The old
+		// client's rules are not this site's to keep, and the new client's seq
+		// starts wherever it starts.
+		Aura_Worker_Rules::clear();
 		update_option( 'aura_worker_dashboard_url', $dashboard_url );
 		if ( '' !== $grant_pubkey ) {
 			// Provision the gateway key → turns on approval-grant enforcement
@@ -248,6 +252,7 @@ class Aura_Worker_Magic_Link {
 			// dashboard that doesn't use grants isn't left unable to run writes
 			// against a stale key it can't sign for. Enforcement follows the key.
 			delete_option( 'aura_worker_grant_pubkey' );
+			Aura_Worker_Rules::clear();
 		}
 		delete_transient( 'aura_magic_' . $magic_id );
 

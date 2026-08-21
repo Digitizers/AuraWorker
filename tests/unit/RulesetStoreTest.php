@@ -75,4 +75,273 @@ final class RulesetStoreTest extends TestCase {
 		unset( $GLOBALS['_options']['aura_worker_grant_pubkey'] );
 		$this->assertFalse( Aura_Worker_Grant::has_usable_key() );
 	}
+
+	/** This site's token hash — the ruleset is bound to it exactly as grants are. */
+	private function site(): string {
+		if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
+			$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'raw-site-token' );
+		}
+		return (string) $GLOBALS['_options']['aura_worker_site_token'];
+	}
+
+	private function ruleset( int $seq, array $rules = array(), ?string $secret = null, ?string $client = null, ?string $site = null ): string {
+		return $this->sign(
+			array(
+				'v'         => 1,
+				'client'    => $client ?? 'client-1',
+				'site'      => $site ?? $this->site(),
+				'seq'       => $seq,
+				'issued_at' => gmdate( 'c', 1_800_000_000 + $seq ),
+				'rules'     => $rules,
+			),
+			$secret
+		);
+	}
+
+	private function freeze(): array {
+		return array(
+			'key'    => 'rule/freeze',
+			'effect' => 'block',
+			'target' => array( 'type' => 'site' ),
+			'reason' => 'deploy night',
+		);
+	}
+
+	public function test_a_first_ruleset_is_stored(): void {
+		$this->assertNull( Aura_Worker_Rules::current() );
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ) ) ) );
+		$cur = Aura_Worker_Rules::current();
+		$this->assertSame( 1, $cur['seq'] );
+		$this->assertCount( 1, Aura_Worker_Rules::rules() );
+		$this->assertArrayHasKey( 'received_at', $cur );
+	}
+
+	public function test_a_newer_ruleset_replaces_the_stored_one(): void {
+		Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ) ) );
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 2, array() ) ) );
+		$this->assertSame( 2, Aura_Worker_Rules::current()['seq'] );
+		$this->assertSame( array(), Aura_Worker_Rules::rules() );
+	}
+
+	public function test_an_older_ruleset_is_refused_even_when_validly_signed(): void {
+		// Replaying an old document is how a released rule would come back —
+		// or how a newly added one would vanish.
+		Aura_Worker_Rules::accept( $this->ruleset( 5, array( $this->freeze() ) ) );
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 4, array() ) );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 5, Aura_Worker_Rules::current()['seq'] );
+		$this->assertCount( 1, Aura_Worker_Rules::rules() );
+	}
+
+	public function test_the_same_seq_with_different_content_is_refused(): void {
+		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->ruleset( 5, array( $this->freeze() ) ) ) );
+	}
+
+	public function test_a_racing_older_push_cannot_overwrite_a_newer_one(): void {
+		// Two pushes overlap: a retry of seq 6 has already passed the seq check
+		// against the stored seq 5 when a fresh seq 7 lands. Without a
+		// compare-and-swap the retry writes last and policy rolls backwards —
+		// the block the operator added in seq 7 silently disappears. The racer
+		// is injected by the $wpdb stub between this call's read and its write.
+		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
+		$GLOBALS['_cas_racer'] = $this->ruleset( 7, array( $this->freeze() ) );
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 6 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res, 'the losing racer overwrote a newer ruleset' );
+		$this->assertSame( 'aura_ruleset_stale', $res->get_error_code(), 're-deciding after a lost CAS must reach the ordinary stale answer' );
+		$this->assertSame( 7, Aura_Worker_Rules::current()['seq'] );
+		$this->assertCount( 1, Aura_Worker_Rules::rules(), 'the freeze added by seq 7 was rolled back' );
+	}
+
+	public function test_a_racing_newer_push_still_installs_after_a_lost_swap(): void {
+		// The mirror image: losing the swap is not a refusal. Seq 9 re-reads,
+		// finds the racer's 7, and installs — one retry, not an error.
+		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
+		$GLOBALS['_cas_racer'] = $this->ruleset( 7, array( $this->freeze() ) );
+
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 9 ) ) );
+		$this->assertSame( 9, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_a_losing_insert_is_classified_from_the_database_not_the_cache(): void {
+		// add_option() fails its own existence check first, which caches this
+		// key in `notoptions`. If the loser then classified the failure with
+		// get_option(), it would read the cached "absent" for a row the winner
+		// has since inserted and report a store failure instead of re-deciding.
+		// The stub models exactly that: a cached read answers null.
+		$GLOBALS['_insert_racer']    = $this->ruleset( 8, array( $this->freeze() ) );
+		$GLOBALS['_notoptions_lies'] = true; // get_option() returns null for OPTION
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_stale', $res->get_error_code(), 'a lost race was reported as a store failure' );
+		$this->assertSame( 8, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_two_first_pushes_racing_do_not_let_the_older_one_win(): void {
+		// Nothing is stored yet, so both callers decided against null and both
+		// take the INSERT path. The loser must re-decide, NOT read the winner's
+		// row and swap against it — that would install seq 2 over seq 8 without
+		// ever comparing them, which is the rollback one level down.
+		$GLOBALS['_insert_racer'] = $this->ruleset( 8, array( $this->freeze() ) );
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_stale', $res->get_error_code() );
+		$this->assertSame( 8, Aura_Worker_Rules::current()['seq'] );
+		$this->assertCount( 1, Aura_Worker_Rules::rules() );
+	}
+
+	public function test_a_database_error_on_the_first_insert_is_a_store_error(): void {
+		// The first write is an INSERT and never reaches the UPDATE branch, so
+		// it needs its own way to tell "the row already exists" from "the
+		// database refused". Reporting contention here would send Aura chasing
+		// a race that never happened while the site holds no policy at all.
+		$GLOBALS['_add_option_fails'] = true;
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
+		$this->assertSame( 500, $res->get_error_data()['status'] );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	/**
+	 * @dataProvider corrupt_values
+	 */
+	public function test_an_unreadable_stored_record_is_replaced_not_retried_forever( $raw ): void {
+		// A truncated or hand-edited option is not a racer's record: it has no
+		// seq, so there is nothing to compare and nothing to roll back. It is
+		// replaced (still by CAS), rather than making every push contend.
+		// The serialized scalar is the case that catches a decoded predicate:
+		// `i:5;` unserializes to 5, and maybe_serialize( 5 ) is "5", which
+		// matches no row — the repair would lose the CAS forever.
+		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ]    = $raw;
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = maybe_unserialize( $raw );
+
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 4, array( $this->freeze() ) ) ) );
+		$this->assertSame( 4, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public static function corrupt_values(): array {
+		return array(
+			'a bare string'         => array( 'not-a-record' ),
+			'a serialized int'      => array( 'i:5;' ),
+			'a serialized bool'     => array( 'b:0;' ),
+			'a half-written array'  => array( 'a:2:{s:3:"seq";i:4;' ),
+			'an array without rules' => array( maybe_serialize( array( 'seq' => 4 ) ) ),
+		);
+	}
+
+	public function test_a_database_error_is_reported_not_retried(): void {
+		// $wpdb->query() answers false for an SQL error and 0 for "matched
+		// nothing". Reading both as "lost the race" would retry a broken
+		// database until the stack gives out.
+		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
+		$GLOBALS['_db_query_error'] = true;
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 6 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
+		$this->assertSame( 500, $res->get_error_data()['status'] );
+		$this->assertSame( 5, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_endless_contention_ends_in_a_bounded_refusal(): void {
+		// A racer that keeps winning must not recurse forever. The stub loses
+		// every CAS while leaving the stored record untouched, so each round
+		// re-decides against the same seq 5 and the swap fails again — the one
+		// arrangement in which the retry could run without end.
+		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
+		$GLOBALS['_cas_always_lose'] = true;
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 6 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_contended', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertSame( 5, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_a_bad_signature_keeps_the_previous_ruleset(): void {
+		Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ) ) );
+		$other = sodium_crypto_sign_secretkey( sodium_crypto_sign_keypair() );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->ruleset( 9, array(), $other ) ) );
+		$this->assertSame( 1, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_a_document_of_the_wrong_shape_is_refused(): void {
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->sign( array( 'v' => 2, 'seq' => 1, 'rules' => array() ) ) ) );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->sign( array( 'v' => 1, 'seq' => 'one', 'rules' => array() ) ) ) );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->sign( array( 'v' => 1, 'seq' => 1, 'rules' => 'nope' ) ) ) );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->sign( array( 'v' => 1, 'seq' => -1, 'rules' => array() ) ) ) );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_a_ruleset_for_another_client_is_refused(): void {
+		// Rebinding goes through connect(), which clears. A document for a
+		// different client arriving without that is either a misroute or a
+		// replay, and either way the stored rules are not its to replace.
+		Aura_Worker_Rules::accept( $this->ruleset( 5, array( $this->freeze() ) ) );
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, 'client-2' ) );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_client_mismatch', $res->get_error_code() );
+		$this->assertSame( 'client-1', Aura_Worker_Rules::current()['client'] );
+	}
+
+	public function test_after_clear_a_lower_seq_from_a_new_client_is_accepted(): void {
+		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
+		Aura_Worker_Rules::clear();
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, 'client-2' ) ) );
+		$this->assertSame( 'client-2', Aura_Worker_Rules::current()['client'] );
+	}
+
+	public function test_a_document_without_a_client_is_refused(): void {
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->sign( array( 'v' => 1, 'site' => $this->site(), 'seq' => 1, 'rules' => array() ) ) ) );
+	}
+
+	public function test_a_document_for_another_site_is_refused_even_as_the_first(): void {
+		// The gateway key is shared across clients, so a valid envelope for
+		// site A plus site B's token would otherwise install A's rules on B
+		// before B's first push — and then refuse B's real documents as a
+		// client mismatch. Bound to the site hash exactly as grants are.
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ), null, null, hash( 'sha256', 'some-other-site' ) ) );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_wrong_site', $res->get_error_code() );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_a_document_without_a_site_is_refused(): void {
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->sign( array( 'v' => 1, 'client' => 'client-1', 'seq' => 1, 'rules' => array() ) ) ) );
+	}
+
+	public function test_the_identical_envelope_again_is_success_not_a_replay(): void {
+		// Aura retries a push whose 200 was lost. The same document at the
+		// same seq is already what we hold; saying 409 would record a delivered
+		// update as failed forever.
+		$env = $this->ruleset( 5, array( $this->freeze() ) );
+		$this->assertTrue( Aura_Worker_Rules::accept( $env ) );
+		$this->assertTrue( Aura_Worker_Rules::accept( $env ) );
+		$this->assertSame( 5, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_a_different_document_at_the_same_seq_is_still_refused(): void {
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 5, array( $this->freeze() ) ) ) );
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 5, array() ) ); // same seq, different rules
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertCount( 1, Aura_Worker_Rules::rules() );
+	}
+
+	public function test_clear_forgets_everything(): void {
+		Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
+		Aura_Worker_Rules::clear();
+		$this->assertNull( Aura_Worker_Rules::current() );
+		$this->assertSame( array(), Aura_Worker_Rules::rules() );
+	}
 }
