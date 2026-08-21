@@ -93,4 +93,34 @@ final class PreviewTest extends TestCase {
 		$this->assertSame( 400, $resp->get_status() );
 		$this->assertFalse( $resp->get_data()['success'] );
 	}
+
+	public function test_preview_declares_what_the_call_touches_even_without_a_dry_run(): void {
+		$tools = new Aura_Worker_Tools();
+		$res   = $tools->preview_tool( 'test_double_tool', array( 'target' => 'x' ) );
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['supported'] );
+		// test_double_tool declares nothing (Task 5), so it carries the sentinel —
+		// which is exactly what the gateway must see for an undeclared tool.
+		$this->assertSame( array( array( 'type' => Aura_Worker_Rules::UNKNOWN, 'id' => '*' ) ), $res['touches'] );
+		$this->assertNull( $res['rule_match'] );
+	}
+
+	public function test_preview_reports_the_rule_that_would_block_without_blocking(): void {
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = array(
+			'envelope'    => 'x.y',
+			'seq'         => 1,
+			'issued_at'   => '',
+			'received_at' => time(),
+			'rules'       => array(
+				array( 'key' => 'rule/freeze', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'deploy' ),
+			),
+		);
+		$tools = new Aura_Worker_Tools();
+		$res   = $tools->preview_tool( 'test_double_tool', array( 'target' => 'x' ) );
+		$this->assertTrue( $res['success'], 'a preview must not be blocked' );
+		$this->assertSame( array( 'key' => 'rule/freeze', 'effect' => 'block', 'reason' => 'deploy' ), $res['rule_match'] );
+		$this->assertEmpty( array_filter( $GLOBALS['_did_actions'], static function ( $a ) {
+			return 'aura_worker_rule_blocked' === $a['tag'];
+		} ), 'a preview fired the block hook' );
+	}
 }

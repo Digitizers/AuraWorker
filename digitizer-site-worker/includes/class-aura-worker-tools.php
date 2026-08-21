@@ -243,20 +243,36 @@ class Aura_Worker_Tools {
 			);
 		}
 
+		// What this call touches, and which rule would decide it — without
+		// enforcing. Previews are exempt from rules (an agent may SEE what would
+		// happen), and the gateway reads these two fields to warn before approval.
+		// A plain read touches nothing a rule governs, so it declares nothing.
 		$annotations = $tool->get_annotations();
+		$touches     = Aura_Worker_Call_Context::tool_needs_grant( $annotations ) ? $tool->touches( $params ) : array();
+		$rule        = empty( $touches ) ? null : Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules() );
+		$rule_match  = null === $rule ? null : array(
+			'key'    => isset( $rule['key'] ) ? (string) $rule['key'] : 'rule/?',
+			'effect' => (string) $rule['effect'],
+			'reason' => isset( $rule['reason'] ) ? (string) $rule['reason'] : '',
+		);
+
 		if ( empty( $annotations['supports_preview'] ) ) {
 			return array(
-				'success'   => true,
-				'supported' => false,
-				'preview'   => null,
+				'success'    => true,
+				'supported'  => false,
+				'preview'    => null,
+				'touches'    => $touches,
+				'rule_match' => $rule_match,
 			);
 		}
 
 		try {
 			return array(
-				'success'   => true,
-				'supported' => true,
-				'preview'   => $tool->dry_run( $params ),
+				'success'    => true,
+				'supported'  => true,
+				'preview'    => $tool->dry_run( $params ),
+				'touches'    => $touches,
+				'rule_match' => $rule_match,
 			);
 		} catch ( Exception $e ) {
 			return array(
