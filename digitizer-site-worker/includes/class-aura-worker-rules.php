@@ -303,9 +303,9 @@ class Aura_Worker_Rules {
 	/**
 	 * Replace the stored record only if it is still $expected.
 	 *
-	 * WordPress has no compare-and-swap for options, so this is one UPDATE with
-	 * the old serialized value in the WHERE clause, or one INSERT via
-	 * add_option() when the decision was made against nothing stored.
+	 * WordPress has no compare-and-swap for options, so this is one UPDATE
+	 * with the old serialized value in the WHERE clause, or a conditional
+	 * INSERT when the decision was made against nothing stored.
 	 *
 	 * Three outcomes, kept distinct on purpose:
 	 *  - true      — this caller's write landed.
@@ -321,51 +321,76 @@ class Aura_Worker_Rules {
 	 * @return true|false|WP_Error
 	 */
 	private static function swap( $expected, $record ) {
-		global $wpdb;
 		if ( null === $expected ) {
-			if ( add_option( self::OPTION, $record, '', false ) ) {
-				return true;
-			}
-			// add_option() answers false for two different things: the row
-			// already exists (a racer inserted first) and the database refused
-			// the write. Only the first is a lost swap; reading the second as
-			// one would retry a broken database three times and then report
-			// contention that never happened. One re-read tells them apart —
-			// and it goes to the DATABASE, not through get_option(): the
-			// add_option() call just failed its own existence check, which
-			// caches this key in `notoptions`, so a cached read would answer
-			// "absent" for a row a racer has since inserted and turn a lost
-			// race into a phantom store failure.
-			$raw = $wpdb->get_var(
-				$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::OPTION )
-			);
-			if ( null === $raw ) {
-				return new WP_Error(
-					'aura_ruleset_store_failed',
-					'Ruleset not stored: the database refused the write.',
-					array( 'status' => 500 )
-				);
-			}
-			// The row is there, so the caches that said otherwise are wrong.
-			wp_cache_delete( 'notoptions', 'options' );
-			wp_cache_delete( self::OPTION, 'options' );
-			$stored = maybe_unserialize( $raw );
-			if ( self::is_record( $stored ) ) {
-				return false; // A racer's record. Re-decide against it.
-			}
-			// A row exists but is not a readable record — a truncated or
-			// hand-edited value. It carries no seq, so there is no policy to
-			// roll back and nothing to compare against: replace it, still by
-			// CAS so a real racer arriving now still wins.
-			//
-			// The predicate is the RAW bytes, not the decoded value. A row
-			// holding `i:5;` decodes to int 5, and maybe_serialize( 5 ) is the
-			// string "5" — which matches nothing, so every retry would lose and
-			// the corrupt row could never be repaired. Round-tripping is only
-			// lossless for values maybe_serialize() would have written.
-			return self::swap_raw( $raw, $record );
+			return self::insert_if_absent( $record );
 		}
 		return self::swap_raw( maybe_serialize( $expected ), $record );
+	}
+
+	/**
+	 * Insert the record only if no row named self::OPTION exists yet.
+	 *
+	 * NOT add_option(): core's add_option() skips its own existence check
+	 * whenever the option name is already listed in the `notoptions` cache —
+	 * which is exactly the state a first push finds it in, since current()
+	 * just missed — and falls through to `INSERT ... ON DUPLICATE KEY
+	 * UPDATE`, silently clobbering a winning racer's row and reporting
+	 * success. A real conditional insert through $wpdb cannot be fooled that
+	 * way: the database, not a cache, decides. Its affected-row count is the
+	 * tri-state directly: 1 inserted (we won), 0 a row was already there (we
+	 * lost — re-decide), false a database error (store failure, not a race).
+	 *
+	 * This bypasses add_option()'s own cache maintenance, so a successful
+	 * insert evicts explicitly.
+	 *
+	 * @param array $record Record to store.
+	 * @return true|false|WP_Error
+	 */
+	private static function insert_if_absent( $record ) {
+		global $wpdb;
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+				self::OPTION,
+				maybe_serialize( $record ),
+				'no',
+				self::OPTION
+			)
+		);
+		if ( false === $rows ) {
+			return new WP_Error(
+				'aura_ruleset_store_failed',
+				'Ruleset not stored: the database refused the write.',
+				array( 'status' => 500 )
+			);
+		}
+		if ( $rows > 0 ) {
+			wp_cache_delete( self::OPTION, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			return true;
+		}
+		// A row is there. It might be a racer's valid record (re-decide
+		// against it from the top) or a truncated/hand-edited value with no
+		// seq to compare (repair it, still by CAS against its exact bytes).
+		$raw = $wpdb->get_var(
+			$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::OPTION )
+		);
+		if ( null === $raw ) {
+			// The row we just failed to beat has vanished under us (deleted
+			// between the INSERT and this read). Re-decide from the top
+			// rather than guessing at a value that no longer exists.
+			return false;
+		}
+		$stored = maybe_unserialize( $raw );
+		if ( self::is_record( $stored ) ) {
+			return false; // A racer's record. Re-decide against it.
+		}
+		// The predicate is the RAW bytes, not the decoded value. A row
+		// holding `i:5;` decodes to int 5, and maybe_serialize( 5 ) is the
+		// string "5" — which matches nothing, so every retry would lose and
+		// the corrupt row could never be repaired. Round-tripping is only
+		// lossless for values maybe_serialize() would have written.
+		return self::swap_raw( $raw, $record );
 	}
 
 	/**

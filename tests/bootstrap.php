@@ -301,12 +301,6 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 			'key'   => $key,
 			'group' => $group,
 		);
-		if ( 'notoptions' === $key && 'options' === $group ) {
-			// The eviction the negative cache was lying through. From here the
-			// "cache" agrees with the "database" again, same as real WordPress
-			// once the stale notoptions entry is deleted.
-			$GLOBALS['_notoptions_lies'] = false;
-		}
 		return true;
 	}
 }
@@ -315,12 +309,18 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 
 if ( ! function_exists( 'get_option' ) ) {
 	function get_option( string $option, $default = false ) {
-		if ( ! empty( $GLOBALS['_notoptions_lies'] ) && Aura_Worker_Rules::OPTION === $option ) {
-			// WordPress's negative cache, modelled: a row exists in the
-			// "database" but a cached read still answers "absent".
-			return $default;
+		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
+			return $GLOBALS['_options'][ $option ];
 		}
-		return array_key_exists( $option, $GLOBALS['_options'] ) ? $GLOBALS['_options'][ $option ] : $default;
+		if ( array_key_exists( $option, $GLOBALS['_rows'] ) ) {
+			// An ordinary cache miss: nothing decoded is cached for this key,
+			// but the row is in the "database" ($_rows) — the ruleset store's
+			// raw $wpdb INSERT/UPDATE never populates $_options (it bypasses
+			// add_option()/update_option() on purpose), so this is the only
+			// way its own writes are ever visible through get_option().
+			return maybe_unserialize( $GLOBALS['_rows'][ $option ] );
+		}
+		return $default;
 	}
 }
 
@@ -336,21 +336,12 @@ if ( ! function_exists( 'add_option' ) ) {
 	// Atomic in core (INSERT guarded by option_name's unique index): fails when
 	// the option already exists. The verifier relies on this for single-use
 	// nonce reservation, so the stub mirrors that fail-if-exists semantics.
+	// The ruleset store does NOT use add_option() for its own writes (a real
+	// conditional INSERT through $wpdb replaces it — add_option() skips its
+	// existence check whenever `notoptions` lists the key, and runs
+	// INSERT ... ON DUPLICATE KEY UPDATE instead, which would clobber a
+	// winning racer's row), so this stub carries no ruleset-specific seams.
 	function add_option( string $option, $value = '', $deprecated = '', $autoload = 'yes' ): bool {
-		if ( ! empty( $GLOBALS['_add_option_fails'] ) && Aura_Worker_Rules::OPTION === $option ) {
-			return false; // The database refused, and no row was written ($_rows stays empty).
-		}
-		if ( ! empty( $GLOBALS['_insert_racer'] ) && Aura_Worker_Rules::OPTION === $option ) {
-			$racer                    = $GLOBALS['_insert_racer'];
-			$GLOBALS['_insert_racer'] = null;
-			Aura_Worker_Rules::accept( $racer ); // inserts first: writes $_options AND $_rows.
-			// _notoptions_lies is NOT modelled by touching $_options here — that
-			// would make the racer's row unrecoverable through get_option() even
-			// after the cache is evicted. It is modelled entirely in
-			// get_option() itself (below), gated by the flag, so the real value
-			// reappears the moment swap() evicts the negative cache — exactly
-			// as a real re-query would find the row that was there all along.
-		}
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return false;
 		}
@@ -628,13 +619,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 
 		/**
 		 * get_var returns the next queued scalar, else $_db_var — except the one
-		 * shape swap() issues to classify a losing INSERT, which answers from
-		 * the "database" ($_rows), not the cache ($_options), independent of
-		 * the queued/_db_var behaviour so a test can make the cache lie.
+		 * shape the ruleset store's insert_if_absent() issues to classify a
+		 * losing INSERT: a raw re-read of the row from $_rows (the
+		 * "database"), recorded into $_db_queries so a test can confirm the
+		 * classification really came from a query, not from get_option().
 		 */
 		public function get_var( $query = null, $x = 0, $y = 0 ) {
 			$this->last_query = (string) $query;
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
 				// The row, not the cache: $_rows is what the "database" holds.
 				return isset( $GLOBALS['_rows'][ $m[1] ] ) ? $GLOBALS['_rows'][ $m[1] ] : null;
 			}
@@ -707,16 +700,47 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		}
 
 		/**
-		 * The one write path the ruleset store's compare-and-swap issues, plus
+		 * The write paths the ruleset store's compare-and-swap issues, plus
 		 * whatever a test has queued in $_db_query_result for anything else.
-		 * Models the CAS against $_rows (the "database"), and is where the
-		 * two racer seams (_cas_racer / _cas_always_lose / _db_query_error)
-		 * inject their behaviour.
+		 * Models both statements against $_rows (the "database"):
+		 *
+		 *  - the conditional INSERT ( insert_if_absent() ) — a real
+		 *    `INSERT ... SELECT ... WHERE NOT EXISTS`, not add_option(), so a
+		 *    racer's already-committed row is never clobbered by this one;
+		 *  - the UPDATE ( swap_raw() ) — the byte-exact compare-and-swap.
+		 *
+		 * `_insert_racer` / `_cas_racer` inject a second write between this
+		 * caller's read and its own write; `_cas_always_lose` and
+		 * `_db_query_error` inject unresolved contention and a hard DB error
+		 * respectively (on both statements — a real driver doesn't care which
+		 * statement it was asked to run when the connection is the problem).
 		 */
 		public function query( $query ) {
 			$query                    = (string) $query;
 			$this->last_query         = $query;
 			$GLOBALS['_db_queries'][] = $query;
+
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
+				if ( ! empty( $GLOBALS['_db_query_error'] ) ) {
+					return false; // An SQL error, which is NOT a lost race.
+				}
+				// A second request inserting between this caller's own
+				// existence check (there is none — that's the point of a real
+				// conditional INSERT) and this statement running.
+				if ( ! empty( $GLOBALS['_insert_racer'] ) ) {
+					$racer                    = $GLOBALS['_insert_racer'];
+					$GLOBALS['_insert_racer'] = null;
+					Aura_Worker_Rules::accept( $racer );
+				}
+				list( , $name, $value, ) = array_map( 'stripslashes', $m );
+				if ( isset( $GLOBALS['_rows'][ $name ] ) ) {
+					return 0; // A row is already there — lost the race.
+				}
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				return 1;
+			}
+
 			if ( preg_match( "/^UPDATE \S+ SET option_value = '(.*)' WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
 				if ( ! empty( $GLOBALS['_db_query_error'] ) ) {
 					return false; // An SQL error, which is NOT a lost race.
@@ -743,6 +767,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
 				return 1;
 			}
+
 			return isset( $GLOBALS['_db_query_result'] ) ? $GLOBALS['_db_query_result'] : 0;
 		}
 	}
@@ -759,8 +784,6 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_rows']             = array(); // Raw, serialized bytes — the "database" the ruleset CAS reads/writes.
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;
-	$GLOBALS['_add_option_fails'] = false;
-	$GLOBALS['_notoptions_lies']  = false;
 	$GLOBALS['_cas_always_lose']  = false;
 	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
@@ -1229,8 +1252,6 @@ function sa_reset_state(): void {
 	$GLOBALS['_rows']             = array();
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;
-	$GLOBALS['_add_option_fails'] = false;
-	$GLOBALS['_notoptions_lies']  = false;
 	$GLOBALS['_cas_always_lose']  = false;
 	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['_posts']        = array();

@@ -166,26 +166,35 @@ final class RulesetStoreTest extends TestCase {
 	}
 
 	public function test_a_losing_insert_is_classified_from_the_database_not_the_cache(): void {
-		// add_option() fails its own existence check first, which caches this
-		// key in `notoptions`. If the loser then classified the failure with
-		// get_option(), it would read the cached "absent" for a row the winner
-		// has since inserted and report a store failure instead of re-deciding.
-		// The stub models exactly that: a cached read answers null.
-		$GLOBALS['_insert_racer']    = $this->ruleset( 8, array( $this->freeze() ) );
-		$GLOBALS['_notoptions_lies'] = true; // get_option() returns null for OPTION
+		// insert_if_absent() issues a real conditional INSERT through $wpdb —
+		// not add_option(), which core skips its own existence check for
+		// whenever the option is already listed in `notoptions` and would
+		// otherwise clobber a winning racer's row via `ON DUPLICATE KEY
+		// UPDATE`. When the INSERT reports 0 rows affected (a row is already
+		// there), the loser must classify that from an actual re-read of the
+		// row — a real SELECT against $wpdb — never from get_option().
+		$GLOBALS['_insert_racer'] = $this->ruleset( 8, array( $this->freeze() ) );
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
 
 		$this->assertInstanceOf( WP_Error::class, $res );
 		$this->assertSame( 'aura_ruleset_stale', $res->get_error_code(), 'a lost race was reported as a store failure' );
 		$this->assertSame( 8, Aura_Worker_Rules::current()['seq'] );
+		// The classification came from a query, not a guess or a cache read.
+		$reread = array_filter(
+			$GLOBALS['_db_queries'],
+			static fn( $q ) => false !== strpos( $q, 'SELECT option_value' )
+		);
+		$this->assertNotEmpty( $reread, 'the lost INSERT must be classified by re-reading the row, not by trusting a cache' );
 	}
 
 	public function test_two_first_pushes_racing_do_not_let_the_older_one_win(): void {
 		// Nothing is stored yet, so both callers decided against null and both
-		// take the INSERT path. The loser must re-decide, NOT read the winner's
-		// row and swap against it — that would install seq 2 over seq 8 without
-		// ever comparing them, which is the rollback one level down.
+		// take the INSERT path — a real `INSERT ... WHERE NOT EXISTS`, which
+		// the database itself (not a pre-check that a cache can fool) decides
+		// between. The loser must re-decide, NOT read the winner's row and
+		// swap against it — that would install seq 2 over seq 8 without ever
+		// comparing them, which is the rollback one level down.
 		$GLOBALS['_insert_racer'] = $this->ruleset( 8, array( $this->freeze() ) );
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
@@ -197,11 +206,13 @@ final class RulesetStoreTest extends TestCase {
 	}
 
 	public function test_a_database_error_on_the_first_insert_is_a_store_error(): void {
-		// The first write is an INSERT and never reaches the UPDATE branch, so
-		// it needs its own way to tell "the row already exists" from "the
-		// database refused". Reporting contention here would send Aura chasing
-		// a race that never happened while the site holds no policy at all.
-		$GLOBALS['_add_option_fails'] = true;
+		// The first write is a conditional INSERT and never reaches the
+		// UPDATE branch, so it needs its own way to tell "a row already
+		// exists" (0 affected — a lost race) from "the database refused the
+		// statement" (false — a hard error). Reporting contention here would
+		// send Aura chasing a race that never happened while the site holds
+		// no policy at all.
+		$GLOBALS['_db_query_error'] = true;
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
 
@@ -310,7 +321,23 @@ final class RulesetStoreTest extends TestCase {
 		// The gateway key is shared across clients, so a valid envelope for
 		// site A plus site B's token would otherwise install A's rules on B
 		// before B's first push — and then refuse B's real documents as a
-		// client mismatch. Bound to the site hash exactly as grants are.
+		// client mismatch. Bound to the site hash exactly as grants are: THIS
+		// site (B) has already provisioned its own token, so the refusal
+		// below must come from comparing it against A's hash — not merely
+		// from nothing being stored yet (see the empty-token case next).
+		$this->site(); // provisions this site's own (B's) token.
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ), null, null, hash( 'sha256', 'some-other-site' ) ) );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_wrong_site', $res->get_error_code() );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_a_document_is_refused_before_this_site_has_provisioned_a_token(): void {
+		// The other half of the binding: before any token is stored,
+		// `aura_worker_site_token` reads as empty, and accept() must still
+		// refuse rather than trust an envelope with nothing to check it
+		// against.
+		$this->assertFalse( array_key_exists( 'aura_worker_site_token', $GLOBALS['_options'] ) );
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ), null, null, hash( 'sha256', 'some-other-site' ) ) );
 		$this->assertInstanceOf( WP_Error::class, $res );
 		$this->assertSame( 'aura_ruleset_wrong_site', $res->get_error_code() );
