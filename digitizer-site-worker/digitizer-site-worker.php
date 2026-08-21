@@ -33,6 +33,7 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-snapshots.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-grant.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-mcp.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-call-context.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-rules.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-abilities.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';
 
