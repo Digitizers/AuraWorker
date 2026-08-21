@@ -813,4 +813,247 @@ class Aura_Worker_Rules {
 			'reason' => isset( $rule['reason'] ) ? (string) $rule['reason'] : '',
 		);
 	}
+
+	/* ------------------------------------------------------------------ */
+	/* REST — the legacy direct handlers that bypass execute_tool()        */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * REST-flavoured enforcement for handlers that do not pass through
+	 * execute_tool(): the legacy update routes in class-aura-worker-api.php.
+	 *
+	 * @param array  $touches What the handler is about to touch.
+	 * @param string $action  Grant action name, for the hook and message.
+	 * @return true|WP_Error
+	 */
+	public static function guard_rest( array $touches, $action ) {
+		$verdict = self::enforce( $touches, $action );
+		if ( 'warn' === $verdict['effect'] && ! empty( $verdict['recorded'] ) ) {
+			self::note_warning( $verdict['rule'] );
+			return true;
+		}
+		if ( 'block' !== $verdict['effect'] ) {
+			return true;
+		}
+		$res = self::blocked_result( $action, $verdict['rule'] );
+		return new WP_Error(
+			'aura_rule_blocked',
+			$res['error'],
+			array(
+				'status' => 403,
+				'rule'   => $res['rule'],
+			)
+		);
+	}
+
+	/**
+	 * `rest_request_before_callbacks` — open a frame for this dispatch.
+	 *
+	 * This hook, not `rest_pre_dispatch`, because this is the pair WordPress
+	 * actually guarantees: `rest_request_before_callbacks`
+	 * (class-wp-rest-server.php:1256) and `rest_request_after_callbacks`
+	 * (:1318) sit in the same method with no `return` between them, so every
+	 * path that opens a frame closes it — a block from `guard_core_any()`, a
+	 * failed permission callback, a handler returning `WP_Error`, all still
+	 * reach the after filter. `rest_pre_dispatch` (:1079) has three exits
+	 * after it that never reach a callback at all: a short-circuit by any
+	 * other plugin's filter, an unmatched route, an invalid request. A frame
+	 * opened there and never closed is closed by the OUTER dispatch instead,
+	 * which then loses its own warnings to the leak.
+	 *
+	 * Priority 1, so the frame exists before `guard_core_any()` (priority 5)
+	 * records into it.
+	 *
+	 * The frame remembers WHICH request opened it. Core's structure makes the
+	 * pair reliable, but an exception unwinding out of a nested
+	 * `rest_do_request()` that an outer handler catches would still leave a
+	 * frame behind — see `close_frame()`, which discards such a frame rather
+	 * than letting an outer dispatch mistake it for its own.
+	 *
+	 * Pass-through filter: returns $response untouched, always.
+	 *
+	 * @param mixed $response Response so far.
+	 * @param array $handler  Route handler.
+	 * @param mixed $request  Request being dispatched.
+	 * @return mixed
+	 */
+	public static function open_frame( $response, $handler = null, $request = null ) {
+		self::$scopes[] = array(
+			'recorded' => array(),
+			'warnings' => array(),
+			'request'  => is_object( $request ) ? spl_object_id( $request ) : 0,
+		);
+		return $response;
+	}
+
+	/**
+	 * Take the frame this request opened, and drop anything stacked on top.
+	 *
+	 * A frame above ours belongs to a dispatch that exited without reaching
+	 * its own after-callbacks; it belongs to nobody now, and popping blindly
+	 * would hand it to us and strand our own. Finding our frame by request
+	 * identity is what makes that distinguishable.
+	 *
+	 * ONE THING THIS DOES NOT FIX, stated rather than implied. Between the
+	 * moment a nested dispatch is orphaned — an exception unwinding out of
+	 * rest_do_request() that the outer handler catches — and the moment the
+	 * outer dispatch closes, the orphan is still the innermost frame, so a
+	 * mutation the outer handler performs after the catch records into it and
+	 * its warning is discarded here with the rest of the orphan. Repairing
+	 * that needs a seam that fires as a nested dispatch unwinds, and
+	 * WordPress has none: dispatch() does not even pop its own
+	 * `dispatching_requests` on an exception (no `finally`,
+	 * class-wp-rest-server.php :1064-1127), and `is_dispatching()` answers
+	 * whether ANY dispatch is live, never which.
+	 *
+	 * ENFORCEMENT is untouched: every seam still decides and every block still
+	 * blocks, whatever frame the decision records into. What the window
+	 * affects is REPORTING, in two ways. The caller-visible warning is
+	 * discarded with the orphan. And because the orphan carries its own
+	 * `recorded` set, a rule the nested dispatch had already recorded is
+	 * deduplicated against that set rather than the outer one — so the event
+	 * fires once for the pair instead of once for each, which is the same
+	 * per-dispatch bound applied to the wrong dispatch. A rule the orphan
+	 * never saw fires and counts normally. Same class as the deletion message
+	 * limit in spec §7: reporting quality on a path nobody anticipated, never
+	 * enforcement.
+	 *
+	 * @param mixed $request Request whose dispatch is ending.
+	 * @return array The frame, or the base frame when this request opened none.
+	 */
+	private static function close_frame( $request ) {
+		$id   = is_object( $request ) ? spl_object_id( $request ) : 0;
+		$mine = null;
+		for ( $i = count( self::$scopes ) - 1; $i > 0; $i-- ) {
+			if ( isset( self::$scopes[ $i ]['request'] ) && self::$scopes[ $i ]['request'] === $id ) {
+				$mine = $i;
+				break;
+			}
+		}
+		if ( null === $mine ) {
+			return self::scope(); // No frame of ours: read, take nothing.
+		}
+		$frame        = self::$scopes[ $mine ];
+		self::$scopes = array_slice( self::$scopes, 0, $mine );
+		return $frame;
+	}
+
+	/**
+	 * Record a warn entry against the dispatch that earned it.
+	 *
+	 * @param array $rule Matched warn rule.
+	 */
+	public static function note_warning( array $rule ) {
+		$scope                = &self::scope();
+		$scope['warnings'][]  = self::warning_entry( $rule );
+	}
+
+	/**
+	 * Attach this request's warnings to a handler result.
+	 *
+	 * @param array $result Handler result array.
+	 * @return array
+	 */
+	public static function with_warnings( array $result ) {
+		// Delivering a warning CONSUMES it. A direct handler puts the entry in
+		// its own body, and this dispatch's response then goes out through
+		// send_warning_header() like any other — which would attach the same
+		// entry again as X-Aura-Rule-Warnings, and a client reading both
+		// channels would report one mutation twice. Each warning is delivered
+		// exactly once, by whichever channel the response can carry: the body
+		// where we own it, the header where core does.
+		$mine  = self::request_warnings();
+		$scope = &self::scope();
+		$scope['warnings'] = array();
+		if ( ! empty( $mine ) ) {
+			$result['warnings'] = array_values( $mine );
+		}
+		return $result;
+	}
+
+	/** Test hook. */
+	public static function reset_request_warnings() {
+		self::reset_records(); // Frames hold the warnings too (Task 5).
+	}
+
+	/**
+	 * Warnings recorded this request — what the caller will be told, whether
+	 * that arrives in a body or a header.
+	 *
+	 * @return array<int,array{rule:string,reason:string}>
+	 */
+	public static function request_warnings() {
+		$scope = &self::scope();
+		return $scope['warnings'];
+	}
+
+	/**
+	 * `rest_request_after_callbacks` — core routes own their response body, so
+	 * a warn that fired at a core seam reaches the caller as a header instead.
+	 *
+	 * This hook, not `rest_post_dispatch`: it runs inside
+	 * `WP_REST_Server::respond_to_request()`, which `dispatch()` calls — so it
+	 * fires for an internal `rest_do_request()` too. `rest_post_dispatch` lives
+	 * in `serve_request()` and never sees one, which would leave a warn
+	 * recorded and no header on the response the caller actually gets.
+	 *
+	 * @param mixed $response Response (or WP_Error).
+	 * @param array $handler  Route handler.
+	 * @param mixed $request  Request.
+	 * @return mixed
+	 */
+	public static function send_warning_header( $response, $handler = null, $request = null ) {
+		// This dispatch's frame, and only it. A shared list with a start mark
+		// would hand the OUTER dispatch everything a nested rest_do_request()
+		// recorded as well — the inner warning attributed to both.
+		$frame = self::close_frame( $request );
+		$mine  = isset( $frame['warnings'] ) ? $frame['warnings'] : array();
+		if ( empty( $mine ) ) {
+			return $response;
+		}
+		if ( is_wp_error( $response ) ) {
+			// The callback failed AFTER a warn rule matched — a guarded
+			// updater that ran and then errored, say. The warning is still
+			// true and the caller still needs it, and a direct handler that
+			// errored early never reached its own with_warnings().
+			//
+			// Convert here rather than writing into the WP_Error. Core's very
+			// next statement is the same conversion
+			// (respond_to_request() :1319 calls error_to_response(), which is
+			// rest_convert_error_to_response()); doing it one line early costs
+			// nothing — core then takes its `else` branch and
+			// rest_ensure_response() returns our object untouched, with the
+			// status the error carried — and it means the error path uses the
+			// SAME single delivery channel as every other response instead of
+			// a second one. Writing to the error instead would mean
+			// WP_Error::add_data() archiving the previous data into
+			// additional_data, which core then emits alongside the real one.
+			$response = rest_convert_error_to_response( $response );
+		}
+		// A route callback may return a bare array; core runs
+		// rest_ensure_response() AFTER this filter, so testing for an object
+		// here would skip exactly the plugin routes the generic seam exists to
+		// cover. Normalise first — rest_ensure_response() is idempotent, and
+		// core re-running it on the object we return changes nothing.
+		$response = rest_ensure_response( $response );
+		if ( is_object( $response ) && method_exists( $response, 'header' ) ) {
+			$response->header( 'X-Aura-Rule-Warnings', wp_json_encode( array_values( $mine ) ) );
+		}
+		return $response;
+	}
+
+	/**
+	 * The plugin slug a rule names, from the `dir/file.php` form REST uses.
+	 *
+	 * @param string $plugin_file Plugin basename.
+	 * @return string
+	 */
+	public static function plugin_slug( $plugin_file ) {
+		$plugin_file = (string) $plugin_file;
+		$dir         = dirname( $plugin_file );
+		if ( '.' !== $dir && '' !== $dir ) {
+			return $dir;
+		}
+		return preg_replace( '/\.php$/', '', basename( $plugin_file ) );
+	}
 }

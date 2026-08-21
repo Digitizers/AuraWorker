@@ -69,6 +69,10 @@ $GLOBALS['_did_actions']  = array();
 $GLOBALS['_filters']      = array();
 $GLOBALS['_abilities']    = array();
 $GLOBALS['_ability_categories'] = array();
+// Names the mutating stubs below (Plugin_Upgrader::upgrade(), wp_upgrade(), …)
+// append themselves to. RulesRestCoverageTest's freeze sweep asserts this stays
+// empty — a guarded handler that ran under a freeze would leave a mark here.
+$GLOBALS['_mutations']    = array();
 
 // ---------------------------------------------------------------------------
 // WordPress function stubs
@@ -499,6 +503,172 @@ if ( ! function_exists( 'WP_Filesystem' ) ) {
 			$wp_filesystem = new SA_Test_Filesystem();
 		}
 		return true;
+	}
+}
+
+// --- Update/upgrade surface -------------------------------------------------
+//
+// The nine direct REST handlers in class-aura-worker-api.php (Task 6) reach
+// this rather than execute_tool(). In the passing suite every one of them is
+// exercised under a matching rule (block or warn) except update_plugin and
+// create_snapshot, whose "not this plugin" / "always allowed" paths run the
+// real Aura_Worker_Updater / Aura_Worker_Snapshots code — so update_plugin's
+// dependencies are stubbed for real; the rest exist so a temporarily-unguarded
+// handler (RulesRestCoverageTest's revert-verify) fails on the rule-blocked
+// assertion rather than a fatal from a missing WP core file.
+//
+// load_upgrade_dependencies() require_once's wp-admin/includes/*.php
+// unconditionally (no function_exists guard — that is how WordPress itself
+// does it), so the files below exist on disk purely so those requires resolve;
+// the real definitions are the ones in this file, loaded first.
+
+if ( ! function_exists( 'get_plugins' ) ) {
+	function get_plugins() {
+		return isset( $GLOBALS['_installed_plugins'] )
+			? $GLOBALS['_installed_plugins']
+			: array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+	}
+}
+
+if ( ! function_exists( 'is_plugin_active' ) ) {
+	function is_plugin_active( $plugin ) {
+		return isset( $GLOBALS['_active_plugins'][ $plugin ] );
+	}
+}
+
+if ( ! function_exists( 'activate_plugin' ) ) {
+	function activate_plugin( $plugin ) {
+		$GLOBALS['_active_plugins'][ $plugin ] = true;
+		$GLOBALS['_mutations'][]               = 'activate_plugin';
+	}
+}
+
+if ( ! class_exists( 'SA_Test_Theme' ) ) {
+	/** Minimal WP_Theme stand-in: exists() is true for any non-empty slug. */
+	class SA_Test_Theme {
+		private string $slug;
+
+		public function __construct( $slug = '' ) {
+			$this->slug = (string) $slug;
+		}
+
+		public function exists(): bool {
+			return '' !== $this->slug && ! isset( $GLOBALS['_missing_themes'][ $this->slug ] );
+		}
+	}
+}
+
+if ( ! function_exists( 'wp_get_theme' ) ) {
+	function wp_get_theme( $stylesheet = '' ) {
+		return new SA_Test_Theme( $stylesheet );
+	}
+}
+
+if ( ! function_exists( 'switch_theme' ) ) {
+	function switch_theme( $stylesheet ) {
+		$GLOBALS['_mutations'][] = 'switch_theme';
+	}
+}
+
+if ( ! function_exists( 'get_core_updates' ) ) {
+	function get_core_updates() {
+		// Default: "already up to date" — update_core() returns success without
+		// reaching Core_Upgrader. Tests that need an available update set
+		// $GLOBALS['_core_updates'] themselves.
+		return isset( $GLOBALS['_core_updates'] )
+			? $GLOBALS['_core_updates']
+			: array( (object) array( 'response' => 'latest' ) );
+	}
+}
+
+if ( ! function_exists( 'wp_raise_memory_limit' ) ) {
+	function wp_raise_memory_limit( $context = 'admin' ) {
+		return false;
+	}
+}
+
+if ( ! function_exists( 'wp_cache_flush' ) ) {
+	function wp_cache_flush() {
+		return true;
+	}
+}
+
+if ( ! function_exists( 'wp_clean_plugins_cache' ) ) {
+	function wp_clean_plugins_cache( $clear_update_cache = true ) {}
+}
+
+if ( ! function_exists( 'get_plugin_data' ) ) {
+	function get_plugin_data( $plugin_file, $markup = true, $translate = true ) {
+		return array( 'Version' => 'unknown' );
+	}
+}
+
+if ( ! function_exists( 'download_url' ) ) {
+	function download_url( $url, $timeout = 300, $signature_verification = false ) {
+		return isset( $GLOBALS['_download_url_result'] ) ? $GLOBALS['_download_url_result'] : '';
+	}
+}
+
+if ( ! function_exists( 'wp_upgrade' ) ) {
+	function wp_upgrade() {
+		$GLOBALS['_mutations'][] = 'wp_upgrade';
+	}
+}
+
+if ( ! class_exists( 'Automatic_Upgrader_Skin' ) ) {
+	class Automatic_Upgrader_Skin {
+		public function get_upgrade_messages() {
+			return array();
+		}
+	}
+}
+
+if ( ! class_exists( 'Plugin_Upgrader' ) ) {
+	class Plugin_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function upgrade( $plugin_file ) {
+			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::upgrade';
+			return true;
+		}
+
+		public function install( $package, $args = array() ) {
+			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::install';
+			return true;
+		}
+	}
+}
+
+if ( ! class_exists( 'Theme_Upgrader' ) ) {
+	class Theme_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function upgrade( $theme_slug ) {
+			$GLOBALS['_mutations'][] = 'Theme_Upgrader::upgrade';
+			return true;
+		}
+	}
+}
+
+if ( ! class_exists( 'Core_Upgrader' ) ) {
+	class Core_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function upgrade( $update ) {
+			$GLOBALS['_mutations'][] = 'Core_Upgrader::upgrade';
+			return true;
+		}
+	}
+}
+
+if ( ! class_exists( 'Language_Pack_Upgrader' ) ) {
+	class Language_Pack_Upgrader {
+		public function __construct( $skin = null ) {}
+
+		public function bulk_upgrade() {
+			$GLOBALS['_mutations'][] = 'Language_Pack_Upgrader::bulk_upgrade';
+			return array();
+		}
 	}
 }
 
@@ -1281,6 +1451,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_cron_schedules'] = null;
 	$GLOBALS['_http_response']  = null;
 	$GLOBALS['_http_error']     = false;
+	$GLOBALS['_mutations']      = array();
 	if ( isset( $GLOBALS['wpdb'] ) ) {
 		$GLOBALS['wpdb']->last_error = '';
 		$GLOBALS['wpdb']->last_query = '';
