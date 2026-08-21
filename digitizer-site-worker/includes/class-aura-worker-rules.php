@@ -139,11 +139,29 @@ class Aura_Worker_Rules {
 		$hour = (int) floor( $now / HOUR_IN_SECONDS );
 		$name = self::bucket_name( $prefix, $hour );
 
-		// Create the row if this is the hour's first event. add_option() is a
-		// no-op when the row exists; if two requests race here, one INSERT
-		// fails quietly and both increments below still land.
-		add_option( $name, '0', '', false );
-		$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = option_value + 1 WHERE option_name = %s", $name ) );
+		// Atomic create-or-increment, one statement, no window at all.
+		//
+		// NOT add_option() to seed a '0' row before incrementing. Core's
+		// add_option() SKIPS its own existence check whenever `notoptions`
+		// lists the key — and get_option() writes `notoptions[$name] = true`
+		// on every MISS, which count_24h() causes routinely just by reading
+		// buckets that do not exist yet. When that happens, add_option()
+		// falls through to `INSERT ... ON DUPLICATE KEY UPDATE option_value
+		// = VALUES(option_value)`, which OVERWRITES an existing row with the
+		// seed value and reports success — resetting a live count back to
+		// zero. That is the same hazard insert_if_absent() (Task 4) documents
+		// for the ruleset store, and it is exactly the undercount this
+		// counter exists to prevent.
+		//
+		// So the seed and the increment are ONE statement instead: the first
+		// bump of the hour inserts '1', every later bump in the same hour
+		// adds one to whatever is there. Nothing ever reads the row first.
+		$wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+				$name
+			)
+		);
 		wp_cache_delete( $name, 'options' );
 
 		// Sweep hour-options older than the boundary hour. Same-length names
@@ -835,6 +853,14 @@ class Aura_Worker_Rules {
 		// sweep deletes today's sweep claim along with today's rule claims,
 		// and the cost stays one DELETE per day rather than one per
 		// enforcement.
+		//
+		// add_option() is safe here, unlike in bump(): the claim's value is
+		// the constant 1, so if the row already exists this write's fallback
+		// `INSERT ... ON DUPLICATE KEY UPDATE` sets option_value back to the
+		// same 1, MySQL reports 0 rows affected, and add_option() correctly
+		// returns false ("already claimed"). Never copy this for a value that
+		// changes between calls — that is precisely the shape bump() had to
+		// stop using because it silently overwrites a real count with the seed.
 		if ( add_option( self::expired_claim( self::SWEEP_CLAIM, $day ), 1, '', false ) ) {
 			// Every claim from a day that has ended, for every rule — one
 			// statement, because the day leads the name. This is where retired
@@ -844,6 +870,7 @@ class Aura_Worker_Rules {
 		foreach ( self::expired_keys( $now ) as $key ) {
 			$hash  = self::rule_hash( $key );
 			$today = self::expired_claim( $hash, $day );
+			// Same constant-value reasoning as the sweep's own claim above.
 			if ( ! add_option( $today, 1, '', false ) ) {
 				continue; // Somebody else claimed this rule for today.
 			}

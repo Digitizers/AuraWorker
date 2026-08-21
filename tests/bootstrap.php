@@ -1052,13 +1052,20 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return 1;
 			}
 
-			// Emulate the two statements the rules counters issue, against the
-			// same $_options the get/update_option stubs use.
-			if ( preg_match( "/^UPDATE \S+ SET option_value = option_value \+ 1 WHERE option_name = '([^']+)'$/", $query, $m ) ) {
-				if ( ! isset( $GLOBALS['_options'][ $m[1] ] ) ) {
-					return 0;
-				}
-				$GLOBALS['_options'][ $m[1] ] = (string) ( (int) $GLOBALS['_options'][ $m[1] ] + 1 );
+			// Emulate the counters' atomic create-or-increment: one statement,
+			// no read, so a first bump inserts '1' and every later bump in the
+			// same hour adds one to whatever is there — never the two-step
+			// add_option()-then-UPDATE this replaced, which core's real
+			// add_option() could silently reset to the seed value (see
+			// bump()'s comment). Writes BOTH $_rows (the "database" get_col()
+			// and get_var() read) and $_options (the cache get_option() reads
+			// first), matching the CAS branches above — a bump that only
+			// touched $_options would leave the "database" holding a stale
+			// count the moment anything reads it back through $_rows.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', '1', 'no'\) ON DUPLICATE KEY UPDATE option_value = option_value \+ 1$/", $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				$GLOBALS['_rows'][ $name ]    = isset( $GLOBALS['_rows'][ $name ] ) ? (string) ( (int) $GLOBALS['_rows'][ $name ] + 1 ) : '1';
+				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
 				return 1;
 			}
 			// Used by the counters AND by the expired-notice claim sweep.
