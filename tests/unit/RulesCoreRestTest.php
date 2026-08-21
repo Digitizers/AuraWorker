@@ -559,6 +559,83 @@ final class RulesCoreRestTest extends TestCase {
 		$this->assertInstanceOf( WP_Error::class, apply_filters( 'rest_request_before_callbacks', null, array(), $req ) );
 	}
 
+	/* ---- plugin rules at core's own plugin routes (no rest_pre_* filter exists there) ---- */
+
+	public function test_a_plugin_activation_is_refused_by_a_plugin_rule(): void {
+		$this->install( array( $this->rule( 'rule/no-akismet', 'block', 'plugin', 'akismet' ) ) );
+		$req = $this->call( 'PUT', '/wp/v2/plugins/akismet/akismet' );
+		$res = apply_filters( 'rest_request_before_callbacks', null, array(), $req );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+		$blocked = array_values( array_filter( $GLOBALS['_did_actions'], static function ( $a ) { return 'aura_worker_rule_blocked' === $a['tag']; } ) );
+		$this->assertCount( 1, $blocked );
+		$this->assertSame( 'rule/no-akismet', $blocked[0]['args'][1]['key'] );
+	}
+
+	public function test_a_plugin_deletion_is_refused_by_a_plugin_rule(): void {
+		$this->install( array( $this->rule( 'rule/no-akismet', 'block', 'plugin', 'akismet' ) ) );
+		$req = $this->call( 'DELETE', '/wp/v2/plugins/akismet/akismet' );
+		$res = apply_filters( 'rest_request_before_callbacks', null, array(), $req );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+	}
+
+	public function test_a_plugin_install_is_refused_by_a_plugin_rule(): void {
+		$this->install( array( $this->rule( 'rule/no-akismet', 'block', 'plugin', 'akismet' ) ) );
+		$req = $this->call( 'POST', '/wp/v2/plugins' );
+		$req->set_param( 'slug', 'akismet' );
+		$res = apply_filters( 'rest_request_before_callbacks', null, array(), $req );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+	}
+
+	public function test_an_unrelated_plugin_passes_a_plugin_rule(): void {
+		// Different dir ("hello-dolly" vs "akismet") — plugin_slug() takes
+		// the dirname, so this must not match.
+		$this->install( array( $this->rule( 'rule/no-akismet', 'block', 'plugin', 'akismet' ) ) );
+		$req = $this->call( 'PUT', '/wp/v2/plugins/hello-dolly/hello' );
+		$this->assertNull( apply_filters( 'rest_request_before_callbacks', null, array(), $req ) );
+	}
+
+	public function test_a_plugin_touch_is_still_caught_by_a_site_freeze(): void {
+		// A site rule matches any non-empty declaration, so the plugin
+		// declaration this branch makes is caught by a freeze too.
+		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
+		$req = $this->call( 'PUT', '/wp/v2/plugins/akismet/akismet' );
+		$res = apply_filters( 'rest_request_before_callbacks', null, array(), $req );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+	}
+
+	public function test_a_plugin_warn_reaches_the_caller_as_a_header(): void {
+		$this->install( array( $this->rule( 'rule/careful-akismet', 'warn', 'plugin', 'akismet' ) ) );
+		$req = $this->call( 'PUT', '/wp/v2/plugins/akismet/akismet' );
+		$res = apply_filters( 'rest_request_before_callbacks', null, array(), $req ); // opens the frame, records the warn
+		$this->assertNull( $res, 'a warn must not refuse the write' );
+
+		$resp = apply_filters( 'rest_request_after_callbacks', new WP_REST_Response( array( 'ok' => true ), 200 ), array(), $req );
+		$this->assertSame(
+			wp_json_encode( array( array( 'rule' => 'rule/careful-akismet', 'reason' => 'r:rule/careful-akismet' ) ) ),
+			$resp->get_headers()['X-Aura-Rule-Warnings'] ?? null
+		);
+
+		$warned = array_values( array_filter( $GLOBALS['_did_actions'], static function ( $a ) { return 'aura_worker_rule_warned' === $a['tag']; } ) );
+		$this->assertCount( 1, $warned );
+		$this->assertSame( 'rule/careful-akismet', $warned[0]['args'][1]['key'] );
+	}
+
+	public function test_an_anonymous_plugin_write_under_a_freeze_is_not_refused(): void {
+		// The existing generic-seam exemption for public traffic still holds
+		// at this branch: an anonymous caller is not an agent.
+		$GLOBALS['_logged_in'] = false;
+		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
+		$req = $this->call( 'PUT', '/wp/v2/plugins/akismet/akismet' );
+		$this->assertNull( apply_filters( 'rest_request_before_callbacks', null, array(), $req ) );
+	}
+
 	public function test_a_freeze_lets_reads_through(): void {
 		$this->install( array( $this->rule( 'rule/freeze', 'block', 'site' ) ) );
 		foreach ( array( 'GET', 'HEAD', 'OPTIONS' ) as $m ) {

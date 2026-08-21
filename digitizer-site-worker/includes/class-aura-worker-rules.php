@@ -1388,12 +1388,29 @@ class Aura_Worker_Rules {
 	const ID_AWARE_ROUTES = '#^/wp/v2/(posts|pages)(/\d+)?/?$#';
 
 	/**
+	 * Core's plugins controller route — collection (`/wp/v2/plugins`, install
+	 * via POST) and item (`/wp/v2/plugins/<dir>/<file>` or a bare `<file>` for
+	 * a single-file plugin, PUT/PATCH activates or deactivates via `status`,
+	 * DELETE removes). Mirrors
+	 * `WP_REST_Plugins_Controller`'s own item pattern exactly — do not loosen
+	 * it; a wider match would misparse a slug that happens to contain a dot.
+	 * There is no `rest_pre_*` filter anywhere in this controller, so this
+	 * route seam is the only place a plugin rule can hold.
+	 */
+	const PLUGIN_ROUTE = '#^/wp/v2/plugins(?:/(?P<plugin>[^.\/]+(?:/[^.\/]+)?))?/?$#';
+
+	/**
 	 * `rest_request_before_callbacks` — every REST route, before its handler.
 	 *
-	 * Applies SITE rules only: under a freeze, any unsafe method from an agent
-	 * on a route SiteAgent does not own is refused. Page/post rules are not
-	 * applied here because this seam does not reliably know the target ID;
-	 * the type-specific filters do.
+	 * Applies SITE rules on any route SiteAgent does not own — under a
+	 * freeze, any unsafe method from an agent is refused — plus PLUGIN rules
+	 * on core's own plugin routes (activate/deactivate/delete/install via
+	 * `/wp/v2/plugins`): that controller has no `rest_pre_*` filter at all,
+	 * so the route seam is the only place a `plugin:<slug>` rule can meet an
+	 * agent using core's REST API directly (the legacy SiteAgent update route
+	 * and `update_plugin_safely` already declare `plugin:<slug>`; this closes
+	 * the third door). Page/post rules are not applied here because this seam
+	 * does not reliably know the target ID; the type-specific filters do.
 	 *
 	 * @param mixed           $response Earlier short-circuit, if any.
 	 * @param array           $handler  Route handler.
@@ -1437,6 +1454,43 @@ class Aura_Worker_Rules {
 				self::note_warning( $verdict['rule'] );
 			}
 			return $response;
+		}
+		if ( preg_match( self::PLUGIN_ROUTE, $route, $pm ) ) {
+			// Core runs no rest_pre_* filter on the plugins controller at
+			// all, so this route seam is the only place a plugin:<slug> rule
+			// can meet activate/deactivate (PUT/PATCH via `status`), delete,
+			// or install (POST with `slug`) through /wp/v2/plugins directly.
+			$slug = '';
+			if ( isset( $pm['plugin'] ) && '' !== $pm['plugin'] ) {
+				$slug = self::plugin_slug( $pm['plugin'] );
+			} elseif ( 'POST' === $method && is_object( $request ) && method_exists( $request, 'get_param' ) ) {
+				$raw = (string) $request->get_param( 'slug' );
+				if ( '' !== $raw ) {
+					$slug = self::plugin_slug( sanitize_text_field( $raw ) );
+				}
+			}
+			if ( '' !== $slug ) {
+				// Declare the plugin touch ONLY. A site rule already matches
+				// any non-empty declaration, so a freeze catches this the
+				// same way a plugin rule does; declaring site:* alongside
+				// would change nothing and read as if it did.
+				$verdict = self::enforce(
+					array( array( 'type' => 'plugin', 'id' => $slug ) ),
+					'core.rest.' . strtolower( $method ) . ':' . $route
+				);
+				if ( 'block' === $verdict['effect'] ) {
+					$res = self::blocked_result( $method . ' ' . $route, $verdict['rule'] );
+					return new WP_Error( 'aura_rule_blocked', $res['error'], array( 'status' => 403, 'rule' => $res['rule'] ) );
+				}
+				if ( 'warn' === $verdict['effect'] && ! empty( $verdict['recorded'] ) ) {
+					self::note_warning( $verdict['rule'] );
+				}
+				return $response;
+			}
+			// Nothing usable derived (e.g. an install request with no slug —
+			// core rejects that itself). Fall through to the site-only
+			// branch below rather than declaring an empty list, which
+			// normalises to the "undeclared" sentinel and would over-block.
 		}
 		$verdict = self::enforce( array( array( 'type' => 'site', 'id' => '*' ) ), 'core.rest.' . strtolower( $method ) . ':' . $route );
 		if ( 'block' === $verdict['effect'] ) {
