@@ -174,6 +174,20 @@ class Aura_Tool_Gutenberg_Update_Block extends Aura_Tool_Base {
 		return $preview;
 	}
 
+	/** @inheritDoc */
+	public function touches( $params ) {
+		$id = isset( $params['post_id'] ) ? (int) $params['post_id'] : 0;
+		if ( $id <= 0 ) {
+			// No post yet (a create), or none given: the honest answer is the
+			// site — a freeze catches it, a rule on an existing page does not.
+			return array( array( 'type' => 'site', 'id' => '*' ) );
+		}
+		return array(
+			array( 'type' => 'post', 'id' => (string) $id ),
+			array( 'type' => 'page', 'id' => (string) $id ),
+		);
+	}
+
 	public function execute( $params ) {
 		$located = $this->locate( $params );
 		if ( ! $located['ok'] ) {

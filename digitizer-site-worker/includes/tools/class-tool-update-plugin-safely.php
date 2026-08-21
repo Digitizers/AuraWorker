@@ -62,6 +62,15 @@ class Aura_Tool_Update_Plugin_Safely extends Aura_Tool_Base {
 		);
 	}
 
+	/** @inheritDoc */
+	public function touches( $params ) {
+		$slug = isset( $params['plugin_slug'] ) ? trim( (string) $params['plugin_slug'] ) : '';
+		if ( '' === $slug ) {
+			return parent::touches( $params ); // Cannot say which plugin: the sentinel.
+		}
+		return array( array( 'type' => 'plugin', 'id' => $slug ) );
+	}
+
 	public function execute( $params ) {
 		$plugin_slug   = sanitize_text_field( $params['plugin_slug'] );
 		$create_backup = isset( $params['create_backup'] ) ? (bool) $params['create_backup'] : true;

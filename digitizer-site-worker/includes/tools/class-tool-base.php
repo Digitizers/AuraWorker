@@ -97,6 +97,30 @@ abstract class Aura_Tool_Base {
 	}
 
 	/**
+	 * Which resources does this call touch?
+	 *
+	 * Operator rules (Aura_Worker_Rules) match against this. The default is the
+	 * `unknown` sentinel, which matches EVERY rule: a tool that does not declare
+	 * itself is caught by a page rule, a plugin rule and a freeze alike. Silence
+	 * is the most restrictive answer — the opposite of the default J5 found on
+	 * the abilities path.
+	 *
+	 * A tool whose honest answer IS the whole site (a cache flush) declares
+	 * `site:*` explicitly instead: that is caught by a freeze and not by a page
+	 * rule, which is the distinction the sentinel exists to keep.
+	 *
+	 * Vocabulary: site | page | post | plugin. A content tool declares the same
+	 * ID under both `post` and `page`, because the operator writing the rule
+	 * does not know which one "checkout" is.
+	 *
+	 * @param array $params Validated parameters.
+	 * @return array<array{type:string,id:string}>
+	 */
+	public function touches( $params ) {
+		return array( array( 'type' => Aura_Worker_Rules::UNKNOWN, 'id' => '*' ) );
+	}
+
+	/**
 	 * Get the full metadata array for this tool (used by list_tools).
 	 *
 	 * @return array
