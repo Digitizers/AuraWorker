@@ -39,11 +39,15 @@ final class AuditRulesTest extends TestCase {
 
 	public function test_reports_whether_the_site_can_verify_a_ruleset_at_all(): void {
 		$this->assertFalse( $this->run_tool()['keyed'] );
-		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( str_repeat( 'k', 32 ) );
+		// Through update_option(), the way connect stores it: the first read
+		// above was a miss, and core's `notoptions` remembers misses until a
+		// real write forgets them. Seeding the cache array directly would
+		// model a key that appeared behind WordPress's back.
+		update_option( 'aura_worker_grant_pubkey', base64_encode( str_repeat( 'k', 32 ) ) );
 		$this->assertTrue( $this->run_tool()['keyed'] );
 		// Present but unusable is not keyed: the rollup must reach
 		// ruleset_unverifiable and say "reconnect", not report healthy.
-		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( str_repeat( 'k', 16 ) );
+		update_option( 'aura_worker_grant_pubkey', base64_encode( str_repeat( 'k', 16 ) ) );
 		$this->assertFalse( $this->run_tool()['keyed'] );
 	}
 
@@ -112,6 +116,25 @@ final class AuditRulesTest extends TestCase {
 		$this->assertCount( 2, $increments, 'the counter was not bumped with an atomic UPDATE' );
 		$this->assertSame( '2', $GLOBALS['_options'][ $name ], 'the stub emulation did not apply the increment' );
 		$this->assertSame( 2, Aura_Worker_Rules::count_24h( Aura_Worker_Rules::BLOCKED_COUNTER, $now ) );
+	}
+
+	public function test_a_bucket_read_before_its_first_bump_is_still_counted_after_it(): void {
+		// count_24h() reads every bucket in the window through get_option(),
+		// and a miss lists the name in core's `notoptions` negative cache.
+		// bump()'s raw INSERT then creates the row behind that cache's back;
+		// evicting only the per-key entry leaves `notoptions` saying "absent",
+		// so every later read — the rest of this request, and on a site with
+		// a persistent object cache every request after — answers 0 for a row
+		// that exists. audit_rules before the first refusal of the hour is
+		// exactly this read-before-bump sequence.
+		$now = 1_800_001_800;
+		$this->assertSame( 0, Aura_Worker_Rules::count_24h( Aura_Worker_Rules::BLOCKED_COUNTER, $now ) );
+		Aura_Worker_Rules::record_block( 'x', array(), $now );
+		$this->assertSame(
+			1,
+			Aura_Worker_Rules::count_24h( Aura_Worker_Rules::BLOCKED_COUNTER, $now ),
+			'a bucket created after a negative-cache miss is invisible to count_24h()'
+		);
 	}
 
 	public function test_old_hour_options_are_deleted_on_bump(): void {

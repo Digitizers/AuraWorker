@@ -321,6 +321,11 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 			'key'   => $key,
 			'group' => $group,
 		);
+		// The one cache entry this stub models: core's `notoptions` negative
+		// cache (wp-includes/option.php). Evicting it forgets every miss.
+		if ( 'notoptions' === $key && 'options' === $group ) {
+			$GLOBALS['_notoptions'] = array();
+		}
 		return true;
 	}
 }
@@ -329,6 +334,15 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 
 if ( ! function_exists( 'get_option' ) ) {
 	function get_option( string $option, $default = false ) {
+		// Core consults `notoptions` FIRST: a name listed there is answered
+		// "absent" without looking at the cache or the database, and a miss
+		// below lists the name. A raw $wpdb INSERT creates a row behind this
+		// cache's back, so the code that issues one must evict `notoptions`
+		// (wp_cache_delete( 'notoptions', 'options' )) or get_option() keeps
+		// answering the default for a row that exists.
+		if ( isset( $GLOBALS['_notoptions'][ $option ] ) ) {
+			return $default;
+		}
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return $GLOBALS['_options'][ $option ];
 		}
@@ -340,12 +354,14 @@ if ( ! function_exists( 'get_option' ) ) {
 			// way its own writes are ever visible through get_option().
 			return maybe_unserialize( $GLOBALS['_rows'][ $option ] );
 		}
+		$GLOBALS['_notoptions'][ $option ] = true;
 		return $default;
 	}
 }
 
 if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
+		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
 		// Witness every write, unconditionally. An option name is caller-chosen
@@ -374,6 +390,7 @@ if ( ! function_exists( 'add_option' ) ) {
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return false;
 		}
+		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
 		return true;
@@ -391,6 +408,8 @@ if ( ! function_exists( 'delete_option' ) ) {
 	function delete_option( string $option ): bool {
 		unset( $GLOBALS['_options'][ $option ] );
 		unset( $GLOBALS['_rows'][ $option ] );
+		// Core lists a deleted name in `notoptions` (option.php, delete_option()).
+		$GLOBALS['_notoptions'][ $option ] = true;
 		return true;
 	}
 }
@@ -1098,6 +1117,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_db_query_result']  = 0;
 	$GLOBALS['_db_queries']       = array();
 	$GLOBALS['_cache_deletes']    = array();
+	$GLOBALS['_notoptions']       = array(); // Core's negative option cache — see get_option().
 	$GLOBALS['_rows']             = array(); // Raw, serialized bytes — the "database" the ruleset CAS reads/writes.
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;
@@ -1580,6 +1600,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_db_query_result']  = 0;
 	$GLOBALS['_db_queries']       = array();
 	$GLOBALS['_cache_deletes']    = array();
+	$GLOBALS['_notoptions']       = array(); // Core's negative option cache — see get_option().
 	$GLOBALS['_rows']             = array();
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;

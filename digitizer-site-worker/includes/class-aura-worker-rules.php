@@ -163,6 +163,13 @@ class Aura_Worker_Rules {
 			)
 		);
 		wp_cache_delete( $name, 'options' );
+		// And `notoptions`: count_24h() reads this bucket through get_option()
+		// before the first bump of the hour, and that miss lists the name in
+		// core's negative cache. The INSERT above creates the row behind that
+		// cache's back, so without this eviction get_option() keeps answering
+		// "absent" — for the rest of the request, and on a persistent object
+		// cache for every request after — and the count stays at zero.
+		wp_cache_delete( 'notoptions', 'options' );
 
 		// Sweep hour-options older than the boundary hour. Same-length names
 		// (see bucket_name) make the string comparison a numeric one.
