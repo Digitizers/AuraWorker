@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.10.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.10.1-green" alt="Stable" />
 </p>
 
 ---
@@ -151,6 +151,10 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.10.1
+
+- **Fix: `audit_rules` under-reported the current hour.** Reading the block/warn counters before the hour's first refusal listed the bucket in WordPress's negative option cache (`notoptions`), and the refusal's atomic insert did not clear it — so the count stayed at zero for the rest of the request, and on a site with a persistent object cache until the cache was flushed. Enforcement was never affected; only what the audit reported.
 
 ### 2.10.0
 

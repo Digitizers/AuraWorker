@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.10.0
+Stable tag: 2.10.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -232,6 +232,14 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.10.1 =
+* Fix: `audit_rules` could report zero blocked/warned events for the current
+  hour. Reading the counters before the hour's first refusal put the bucket in
+  WordPress's negative option cache, and the refusal's atomic insert did not
+  clear it — so the count stayed at zero for the rest of the request, and on a
+  site with a persistent object cache until the cache was flushed. Enforcement
+  was never affected; only what the audit reported.
 
 = 2.10.0 =
 * New: operator rules, enforced on the site. A rule is an Aura memory entry
@@ -482,6 +490,10 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Zero frontend performance impact.
 
 == Upgrade Notice ==
+
+= 2.10.1 =
+Fixes audit_rules under-reporting the current hour's block/warn counts on
+sites with a persistent object cache. No change to enforcement. Recommended.
 
 = 2.10.0 =
 Operator rules: write "do not touch checkout" once in Aura and every connected
