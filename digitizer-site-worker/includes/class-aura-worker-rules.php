@@ -534,7 +534,15 @@ class Aura_Worker_Rules {
 				self::OPTION
 			)
 		);
-		if ( false === $rows ) {
+		if ( false === $rows && ! self::is_lost_race_error( $wpdb->last_error ) ) {
+			// A hard database error. NOT a duplicate-key or deadlock error:
+			// two first pushes racing can both see no row in the NOT EXISTS
+			// subquery before either INSERT commits, and then the unique index
+			// on option_name — or InnoDB's gap locks — decides, reporting the
+			// loser's statement as an error rather than as 0 rows. That is the
+			// same lost race as 0 rows, arriving through a different door, and
+			// it falls through to the re-read below (2.10.1).
+			//
 			// Evict even on a hard database error: this INSERT is only reached
 			// right after current() just missed, and a real get_option() lists
 			// the key in `notoptions` on exactly that miss (wp-includes/option.php
@@ -549,12 +557,13 @@ class Aura_Worker_Rules {
 				array( 'status' => 500 )
 			);
 		}
-		if ( $rows > 0 ) {
+		if ( false !== $rows && $rows > 0 ) {
 			wp_cache_delete( self::OPTION, 'options' );
 			wp_cache_delete( 'notoptions', 'options' );
 			return true;
 		}
-		// A row is there — we lost this INSERT. Evict `notoptions` here too:
+		// A row is there — we lost this INSERT (0 rows, or a duplicate-key /
+		// deadlock error, see above). Evict `notoptions` here too:
 		// core's get_option() writes the option into `notoptions` on the miss
 		// that got us into insert_if_absent() in the first place, and
 		// delete_option() (used elsewhere) ADDS to that same cache
@@ -589,6 +598,22 @@ class Aura_Worker_Rules {
 		// the corrupt row could never be repaired. Round-tripping is only
 		// lossless for values maybe_serialize() would have written.
 		return self::swap_raw( $raw, $record );
+	}
+
+	/**
+	 * Is this $wpdb->last_error the database deciding a first-insert race?
+	 *
+	 * MySQL 1062 "Duplicate entry '…' for key '…'" — the unique index caught
+	 * what the NOT EXISTS subquery could not see yet; 1213 "Deadlock found when
+	 * trying to get lock" and 1205 "Lock wait timeout exceeded" — InnoDB's gap
+	 * locks on the same statement pair. Each means another writer got there:
+	 * re-read the row and decide against it. Anything else is a store failure.
+	 *
+	 * @param string $last_error $wpdb->last_error after the INSERT.
+	 * @return bool
+	 */
+	public static function is_lost_race_error( $last_error ) {
+		return (bool) preg_match( '/Duplicate entry|Deadlock found|Lock wait timeout/i', (string) $last_error );
 	}
 
 	/**

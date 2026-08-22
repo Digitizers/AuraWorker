@@ -225,6 +225,37 @@ final class RulesetStoreTest extends TestCase {
 		$this->assertCount( 1, Aura_Worker_Rules::rules() );
 	}
 
+	public function test_a_duplicate_key_error_on_the_first_insert_is_a_lost_race_not_a_store_error(): void {
+		// Two first pushes racing: both NOT EXISTS subqueries can see no row
+		// before either INSERT commits, and then the unique index on
+		// option_name turns the loser's statement into a duplicate-key error
+		// (or InnoDB's gap locks deadlock the pair and roll one back).
+		// $wpdb->query() reports that as false — the same value a broken
+		// database returns — so the classification must read last_error, and
+		// a lost race must end in the ordinary re-decision against the
+		// winner's row, never in 500 aura_ruleset_store_failed while the
+		// winner sits installed.
+		$GLOBALS['_insert_racer']   = $this->ruleset( 8, array( $this->freeze() ) );
+		$GLOBALS['_db_query_error'] = 'duplicate';
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_stale', $res->get_error_code(), 'a duplicate-key race was reported as a store failure' );
+		$this->assertSame( 8, Aura_Worker_Rules::current()['seq'], 'the winner must stay installed' );
+	}
+
+	public function test_a_newer_push_that_loses_the_first_insert_by_duplicate_key_still_installs(): void {
+		// The mirror image of the test above: losing the INSERT to the unique
+		// index is not a refusal. Seq 9 re-reads, finds the racer's 5, and
+		// installs over it by CAS — one retry, not an error.
+		$GLOBALS['_insert_racer']   = $this->ruleset( 5 );
+		$GLOBALS['_db_query_error'] = 'duplicate';
+
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 9 ) ) );
+		$this->assertSame( 9, Aura_Worker_Rules::current()['seq'] );
+	}
+
 	public function test_a_database_error_on_the_first_insert_is_a_store_error(): void {
 		// The first write is a conditional INSERT and never reaches the
 		// UPDATE branch, so it needs its own way to tell "a row already

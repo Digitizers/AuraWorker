@@ -1021,10 +1021,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public function query( $query ) {
 			$query                    = (string) $query;
 			$this->last_query         = $query;
+			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
-				if ( ! empty( $GLOBALS['_db_query_error'] ) ) {
+				if ( true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
 				// A second request inserting between this caller's own
@@ -1037,6 +1038,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				list( , $name, $value, ) = array_map( 'stripslashes', $m );
 				if ( isset( $GLOBALS['_rows'][ $name ] ) ) {
+					if ( 'duplicate' === $GLOBALS['_db_query_error'] ) {
+						// The race decided by the unique index rather than by
+						// the NOT EXISTS subquery: MySQL 1062, reported by
+						// $wpdb->query() as false with last_error set.
+						$this->last_error = "Duplicate entry '{$name}' for key 'option_name'";
+						return false;
+					}
 					return 0; // A row is already there — lost the race.
 				}
 				$GLOBALS['_rows'][ $name ]    = $value;
@@ -1045,7 +1053,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			}
 
 			if ( preg_match( "/^UPDATE \S+ SET option_value = '(.*)' WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
-				if ( ! empty( $GLOBALS['_db_query_error'] ) ) {
+				if ( true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
 				if ( ! empty( $GLOBALS['_cas_always_lose'] ) ) {
