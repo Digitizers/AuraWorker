@@ -534,60 +534,58 @@ class Aura_Worker_Rules {
 				self::OPTION
 			)
 		);
-		if ( false === $rows && ! self::is_lost_race_error( $wpdb->last_error ) ) {
-			// A hard database error. NOT a duplicate-key or deadlock error:
-			// two first pushes racing can both see no row in the NOT EXISTS
-			// subquery before either INSERT commits, and then the unique index
-			// on option_name — or InnoDB's gap locks — decides, reporting the
-			// loser's statement as an error rather than as 0 rows. That is the
-			// same lost race as 0 rows, arriving through a different door, and
-			// it falls through to the re-read below (2.10.1).
-			//
-			// Evict even on a hard database error: this INSERT is only reached
-			// right after current() just missed, and a real get_option() lists
-			// the key in `notoptions` on exactly that miss (wp-includes/option.php
-			// ~107) — short-circuiting every later read in this request. Leave
-			// it evicted so the next current() actually re-queries rather than
-			// trusting a "no row" cache entry the database error never confirmed.
-			wp_cache_delete( self::OPTION, 'options' );
-			wp_cache_delete( 'notoptions', 'options' );
-			return new WP_Error(
-				'aura_ruleset_store_failed',
-				'Ruleset not stored: the database refused the write.',
-				array( 'status' => 500 )
-			);
-		}
 		if ( false !== $rows && $rows > 0 ) {
 			wp_cache_delete( self::OPTION, 'options' );
 			wp_cache_delete( 'notoptions', 'options' );
 			return true;
 		}
-		// A row is there — we lost this INSERT (0 rows, or a duplicate-key /
-		// deadlock error, see above). Evict `notoptions` here too:
-		// core's get_option() writes the option into `notoptions` on the miss
-		// that got us into insert_if_absent() in the first place, and
-		// delete_option() (used elsewhere) ADDS to that same cache
-		// (wp-includes/option.php ~48/~107) — so without this eviction every
-		// later current() in this request short-circuits to null even though
-		// the row now visibly exists. That silently disables enforcement for
-		// the rest of the request on a corrupt-row repair (swap_raw() below
-		// succeeds but nothing can read it back), and sends a lost race back
-		// into accept() reading null again. Evict unconditionally, whichever
-		// of the three sub-paths below decides: a racer's valid record
-		// (re-decide against it from the top) or a truncated/hand-edited value
-		// with no seq to compare (repair it, still by CAS against its exact
-		// bytes).
+
+		// Either 0 rows (the NOT EXISTS subquery saw a row) or false (the
+		// statement failed). For two first pushes racing, false is how the
+		// unique index on option_name (MySQL 1062) or InnoDB's gap locks
+		// (1213 deadlock) report the loser — the same lost race as 0 rows,
+		// arriving through a different door. For a broken database it is a
+		// real error. The database says which, and says it locale-free: a row
+		// is there, or it is not. Never the error text — lc_messages
+		// localises $wpdb->last_error, so matching "Duplicate entry" fixes
+		// the race on English servers only. And never a retry when no row is
+		// there: a lock-wait timeout (1205) leaves no winner, and retrying the
+		// INSERT would wait the full innodb_lock_wait_timeout again on every
+		// attempt (2.10.1).
+		//
+		// Evict first, whichever way this goes: this INSERT is only reached
+		// right after current() just missed, and a real get_option() lists
+		// the key in `notoptions` on exactly that miss (wp-includes/option.php
+		// ~107) — short-circuiting every later read in this request. Evicted,
+		// the next current() actually re-queries rather than trusting a
+		// "no row" cache entry the database never confirmed; and on the lost
+		// race below, swap_raw() succeeds but nothing could read it back
+		// otherwise, silently disabling enforcement for the rest of the
+		// request on a corrupt-row repair.
 		wp_cache_delete( self::OPTION, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		$raw = $wpdb->get_var(
 			$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::OPTION )
 		);
 		if ( null === $raw ) {
-			// The row we just failed to beat has vanished under us (deleted
-			// between the INSERT and this read). Re-decide from the top
-			// rather than guessing at a value that no longer exists.
+			if ( false === $rows ) {
+				// The statement failed and nothing won: a store failure, not a
+				// race. Aura retries a 500 later; this request does not.
+				return new WP_Error(
+					'aura_ruleset_store_failed',
+					'Ruleset not stored: the database refused the write.',
+					array( 'status' => 500 )
+				);
+			}
+			// 0 rows, yet the row the subquery saw has vanished under us
+			// (deleted between the INSERT and this read). Re-decide from the
+			// top rather than guessing at a value that no longer exists.
 			return false;
 		}
+		// A row is there — we lost this INSERT. Whichever of the three
+		// sub-paths below decides: a racer's valid record (re-decide against
+		// it from the top) or a truncated/hand-edited value with no seq to
+		// compare (repair it, still by CAS against its exact bytes).
 		$stored = maybe_unserialize( $raw );
 		if ( self::is_record( $stored ) ) {
 			return false; // A racer's record. Re-decide against it.
@@ -598,22 +596,6 @@ class Aura_Worker_Rules {
 		// the corrupt row could never be repaired. Round-tripping is only
 		// lossless for values maybe_serialize() would have written.
 		return self::swap_raw( $raw, $record );
-	}
-
-	/**
-	 * Is this $wpdb->last_error the database deciding a first-insert race?
-	 *
-	 * MySQL 1062 "Duplicate entry '…' for key '…'" — the unique index caught
-	 * what the NOT EXISTS subquery could not see yet; 1213 "Deadlock found when
-	 * trying to get lock" and 1205 "Lock wait timeout exceeded" — InnoDB's gap
-	 * locks on the same statement pair. Each means another writer got there:
-	 * re-read the row and decide against it. Anything else is a store failure.
-	 *
-	 * @param string $last_error $wpdb->last_error after the INSERT.
-	 * @return bool
-	 */
-	public static function is_lost_race_error( $last_error ) {
-		return (bool) preg_match( '/Duplicate entry|Deadlock found|Lock wait timeout/i', (string) $last_error );
 	}
 
 	/**

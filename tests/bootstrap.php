@@ -1041,8 +1041,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					if ( 'duplicate' === $GLOBALS['_db_query_error'] ) {
 						// The race decided by the unique index rather than by
 						// the NOT EXISTS subquery: MySQL 1062, reported by
-						// $wpdb->query() as false with last_error set.
-						$this->last_error = "Duplicate entry '{$name}' for key 'option_name'";
+						// $wpdb->query() as false with last_error set. The
+						// message is deliberately NOT English: lc_messages
+						// localises it on real servers, and the code under
+						// test must classify the race without reading it.
+						$this->last_error = "Doppelter Eintrag '{$name}' für Schlüssel 'option_name'";
 						return false;
 					}
 					return 0; // A row is already there — lost the race.

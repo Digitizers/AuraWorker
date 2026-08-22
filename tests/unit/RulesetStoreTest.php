@@ -231,9 +231,10 @@ final class RulesetStoreTest extends TestCase {
 		// option_name turns the loser's statement into a duplicate-key error
 		// (or InnoDB's gap locks deadlock the pair and roll one back).
 		// $wpdb->query() reports that as false — the same value a broken
-		// database returns — so the classification must read last_error, and
-		// a lost race must end in the ordinary re-decision against the
-		// winner's row, never in 500 aura_ruleset_store_failed while the
+		// database returns — so the classification must come from the row
+		// (there, or not), never from last_error, which the stub localises
+		// on purpose. A lost race ends in the ordinary re-decision against
+		// the winner's row, never in 500 aura_ruleset_store_failed while the
 		// winner sits installed.
 		$GLOBALS['_insert_racer']   = $this->ruleset( 8, array( $this->freeze() ) );
 		$GLOBALS['_db_query_error'] = 'duplicate';
@@ -254,6 +255,25 @@ final class RulesetStoreTest extends TestCase {
 
 		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 9 ) ) );
 		$this->assertSame( 9, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_a_failed_first_insert_with_no_row_behind_it_is_not_retried(): void {
+		// A lock-wait timeout (MySQL 1205) fails the statement and leaves no
+		// winner. Treating that as a lost race would send accept() back to
+		// the INSERT, which waits the full innodb_lock_wait_timeout again —
+		// up to MAX_SWAP_ATTEMPTS times, minutes for one REST request. One
+		// statement, one 500; Aura retries later, this request does not.
+		$GLOBALS['_db_query_error'] = true;
+
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
+		$inserts = array_filter(
+			$GLOBALS['_db_queries'],
+			static fn( $q ) => false !== strpos( $q, 'WHERE NOT EXISTS' )
+		);
+		$this->assertCount( 1, $inserts, 'a failed INSERT with no row behind it was retried' );
 	}
 
 	public function test_a_database_error_on_the_first_insert_is_a_store_error(): void {
