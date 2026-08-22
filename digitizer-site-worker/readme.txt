@@ -240,6 +240,11 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   clear it — so the count stayed at zero for the rest of the request, and on a
   site with a persistent object cache until the cache was flushed. Enforcement
   was never affected; only what the audit reported.
+* Fix: two rulesets pushed to a site at the same moment, before it held any,
+  could answer the loser with 500 instead of the ordinary "a newer ruleset is
+  already installed" decision. Aura retries a 500, so no policy was lost; the
+  site now classifies the database's duplicate-key or deadlock answer as the
+  lost race it is.
 
 = 2.10.0 =
 * New: operator rules, enforced on the site. A rule is an Aura memory entry
@@ -493,7 +498,8 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 
 = 2.10.1 =
 Fixes audit_rules under-reporting the current hour's block/warn counts on
-sites with a persistent object cache. No change to enforcement. Recommended.
+sites with a persistent object cache, and a spurious 500 when two first
+rulesets race. No change to enforcement. Recommended.
 
 = 2.10.0 =
 Operator rules: write "do not touch checkout" once in Aura and every connected
