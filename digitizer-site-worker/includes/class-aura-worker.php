@@ -128,20 +128,24 @@ class Aura_Worker {
 			// value back before reporting, so a failed rotation cannot lock the
 			// site out, and say which of the two states we actually ended in
 			// rather than assuming the store was left untouched.
-			$restored = hash_equals( $previous, $stored );
-			if ( ! $restored ) {
-				update_option( 'aura_worker_site_token', $previous );
-				$restored = hash_equals( $previous, (string) get_option( 'aura_worker_site_token', '' ) );
+			if ( ! hash_equals( $previous, $stored ) ) {
+				$this->restore_token_if_unchanged( $stored, $previous );
 			}
 
-			wp_send_json_error(
-				array(
-					'message' => $restored
-						? __( 'The new site token could not be saved, so the current token is unchanged. Check for a plugin filtering this option, or for a database write error.', 'digitizer-site-worker' )
-						: __( 'The new site token could not be saved and the previous one could not be restored, so this site may now accept no token at all. Set the option directly (its value is the SHA-256 of the token) and check for a plugin filtering it.', 'digitizer-site-worker' ),
-				),
-				500
-			);
+			// Report the state the store is ACTUALLY in, which is not always the
+			// one this request produced: a concurrent rotation may have landed
+			// and won the compare-and-swap, and saying "unchanged" over its token
+			// would be as wrong as the claim this whole fix removes.
+			$final = (string) get_option( 'aura_worker_site_token', '' );
+			if ( hash_equals( $previous, $final ) ) {
+				$message = __( 'The new site token could not be saved, so the current token is unchanged. Check for a plugin filtering this option, or for a database write error.', 'digitizer-site-worker' );
+			} elseif ( hash_equals( $stored, $final ) ) {
+				$message = __( 'The new site token could not be saved and the previous one could not be restored, so this site may now accept no token at all. Set the option directly (its value is the SHA-256 of the token) and check for a plugin filtering it.', 'digitizer-site-worker' );
+			} else {
+				$message = __( 'The new site token could not be saved, and another token was stored while this request ran. That token is the current one — this request changed nothing.', 'digitizer-site-worker' );
+			}
+
+			wp_send_json_error( array( 'message' => $message ), 500 );
 		}
 
 		update_option( 'aura_worker_connect_user_id', get_current_user_id() );
@@ -149,6 +153,38 @@ class Aura_Worker {
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
 
 		wp_send_json_success( array( 'token' => $raw ) );
+	}
+
+	/**
+	 * Put the previous token back, but only if the row still holds $expected.
+	 *
+	 * A plain update_option() here would overwrite a rotation that completed
+	 * concurrently: the other administrator's token would stop working and the
+	 * token this request was rotating away from — possibly the compromised one —
+	 * would become valid again. So the restore is a compare-and-swap in a single
+	 * statement, against the exact bytes this request decided against, and does
+	 * nothing at all if anyone else has since written the row.
+	 *
+	 * @since 2.10.3
+	 *
+	 * @param string $expected Value observed in the row after the failed write.
+	 * @param string $previous Value to put back.
+	 * @return bool True when this call restored the row.
+	 */
+	private function restore_token_if_unchanged( $expected, $previous ) {
+		global $wpdb;
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				(string) $previous,
+				'aura_worker_site_token',
+				(string) $expected
+			)
+		);
+		// $wpdb->query() answers false for an SQL error and 0 for "matched
+		// nothing" — a lost race, not a fault. Neither restored the row.
+		wp_cache_delete( 'aura_worker_site_token', 'options' );
+		return is_int( $rows ) && $rows > 0;
 	}
 
 	/**

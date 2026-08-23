@@ -164,11 +164,45 @@ final class TokenRegenerateTest extends TestCase {
 		$res = $this->regenerate();
 
 		$this->assertFalse( $res->success, 'a rotation that did not persist must report failure' );
+		// The restore is a raw compare-and-swap, so it lands the exact bytes and
+		// is not passed back through the rewriting filter. Read the row, not the
+		// option cache.
 		$this->assertSame(
 			$previous,
-			strrev( (string) get_option( 'aura_worker_site_token', '' ) ),
-			'the previous token must be restored (through the same rewriting filter)'
+			sa_read_option_uncached( 'aura_worker_site_token' ),
+			'the previous token must be restored exactly'
 		);
 		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ), 'no token may be revealed' );
+	}
+
+	/**
+	 * A failed rotation must never overwrite one that succeeded concurrently.
+	 *
+	 * Two administrators rotating at once: request A fails and restores, request
+	 * B succeeds in between. An unconditional restore would revoke B's token AND
+	 * bring back the token A was rotating away from — the compromised one, in the
+	 * case this feature exists for. The restore is therefore a compare-and-swap
+	 * against the exact value A observed, and must do nothing once B has written.
+	 */
+	public function test_a_failed_rotation_does_not_clobber_a_concurrent_success(): void {
+		$previous  = Aura_Worker_Security::hash_token( 'the-previous-token' );
+		$observed  = Aura_Worker_Security::hash_token( 'what-request-a-saw' );
+		$concurrent = Aura_Worker_Security::hash_token( 'request-b-token' );
+
+		// The row already holds B's successful rotation.
+		update_option( 'aura_worker_site_token', $concurrent );
+
+		$restore = new ReflectionMethod( Aura_Worker::class, 'restore_token_if_unchanged' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$restore->setAccessible( true );
+		}
+		$did = $restore->invoke( $this->plugin, $observed, $previous );
+
+		$this->assertFalse( $did, 'the restore must report that it changed nothing' );
+		$this->assertSame(
+			$concurrent,
+			sa_read_option_uncached( 'aura_worker_site_token' ),
+			"the concurrent rotation's token must survive"
+		);
 	}
 }
