@@ -102,16 +102,16 @@ final class TokenRegenerateTest extends TestCase {
 		);
 	}
 
-	/** A write the database refuses must not hand out a token as if it worked. */
+	/** A database that refuses the write must not hand out a token as if it worked. */
 	public function test_a_failed_write_reports_an_error_and_reveals_nothing(): void {
 		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( 'the-previous-token' ) );
 		$before = get_option( 'aura_worker_site_token' );
 
-		$GLOBALS['_sa_option_write_fail']['aura_worker_site_token'] = true;
+		$GLOBALS['_db_query_error'] = true;
 		$res = $this->regenerate();
 
 		$this->assertFalse( $res->success, 'a rotation that did not persist must report failure' );
-		$this->assertSame( $before, get_option( 'aura_worker_site_token' ), 'the stored token must be untouched' );
+		$this->assertSame( $before, sa_read_option_uncached( 'aura_worker_site_token' ), 'the stored token must be untouched' );
 		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ), 'no token may be revealed' );
 	}
 
@@ -142,18 +142,16 @@ final class TokenRegenerateTest extends TestCase {
 	}
 
 	/**
-	 * A filter that REWRITES the value must not leave the site tokenless.
+	 * A filter rewriting this option can no longer corrupt the stored token.
 	 *
-	 * Refusing a write and rewriting it fail differently: a rewrite persists, so
-	 * the row ends up matching neither the new token nor the old one and the site
-	 * authenticates nothing. The handler must put the previous value back rather
-	 * than report "unchanged" over a store it has just invalidated.
+	 * The rotation is a raw compare-and-swap, so an option filter never sees it.
+	 * That is the point: the bug this fixes was a filter silently deciding what
+	 * the token would be, and the cure must not depend on detecting one.
 	 */
-	public function test_a_rewriting_filter_leaves_the_previous_token_in_place(): void {
+	public function test_a_rewriting_filter_cannot_corrupt_the_stored_token(): void {
 		$previous = Aura_Worker_Security::hash_token( 'the-previous-token' );
 		update_option( 'aura_worker_site_token', $previous );
 
-		// Installed AFTER the seeding write so the seed lands intact.
 		add_filter(
 			'sanitize_option_aura_worker_site_token',
 			static function ( $value ) {
@@ -163,16 +161,12 @@ final class TokenRegenerateTest extends TestCase {
 
 		$res = $this->regenerate();
 
-		$this->assertFalse( $res->success, 'a rotation that did not persist must report failure' );
-		// The restore is a raw compare-and-swap, so it lands the exact bytes and
-		// is not passed back through the rewriting filter. Read the row, not the
-		// option cache.
+		$this->assertTrue( $res->success, 'the rotation must succeed despite the filter' );
 		$this->assertSame(
-			$previous,
+			Aura_Worker_Security::hash_token( $res->data['token'] ),
 			sa_read_option_uncached( 'aura_worker_site_token' ),
-			'the previous token must be restored exactly'
+			'the row must hold the hash of the revealed token, unmodified'
 		);
-		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ), 'no token may be revealed' );
 	}
 
 	/**
@@ -200,47 +194,50 @@ final class TokenRegenerateTest extends TestCase {
 
 		$res = $this->regenerate();
 
-		$this->assertFalse( $res->success, 'a rotation that did not persist must report failure' );
+		$this->assertTrue( $res->success, 'the rotation must be decided by the row, not the stale cache' );
 		$this->assertSame(
-			$previous,
+			Aura_Worker_Security::hash_token( $res->data['token'] ),
 			sa_read_option_uncached( 'aura_worker_site_token' ),
-			'the row must be restored even while the cache serves something else'
-		);
-		$this->assertStringContainsString(
-			'current token is unchanged',
-			(string) ( $res->data['message'] ?? '' ),
-			'the message must describe the database, not the cache'
+			'the row must hold the hash of the revealed token'
 		);
 	}
 
 	/**
-	 * A failed rotation must never overwrite one that succeeded concurrently.
+	 * Losing the race must write nothing and say so.
 	 *
-	 * Two administrators rotating at once: request A fails and restores, request
-	 * B succeeds in between. An unconditional restore would revoke B's token AND
-	 * bring back the token A was rotating away from — the compromised one, in the
-	 * case this feature exists for. The restore is therefore a compare-and-swap
-	 * against the exact value A observed, and must do nothing once B has written.
+	 * Two administrators read the same previous value and both try to swap;
+	 * MySQL lets exactly one match. The loser must not touch the row — the
+	 * earlier write-then-repair shape could revoke the winner's fresh token and
+	 * revive the one both were rotating away from.
 	 */
-	public function test_a_failed_rotation_does_not_clobber_a_concurrent_success(): void {
-		$previous  = Aura_Worker_Security::hash_token( 'the-previous-token' );
-		$observed  = Aura_Worker_Security::hash_token( 'what-request-a-saw' );
-		$concurrent = Aura_Worker_Security::hash_token( 'request-b-token' );
+	public function test_losing_the_swap_writes_nothing_and_reveals_nothing(): void {
+		$previous = Aura_Worker_Security::hash_token( 'the-previous-token' );
+		update_option( 'aura_worker_site_token', $previous );
 
-		// The row already holds B's successful rotation.
-		update_option( 'aura_worker_site_token', $concurrent );
+		// A compare-and-swap that never matches: someone else holds the row.
+		$GLOBALS['_cas_always_lose'] = true;
 
-		$restore = new ReflectionMethod( Aura_Worker::class, 'restore_token_if_unchanged' );
-		if ( PHP_VERSION_ID < 80100 ) {
-			$restore->setAccessible( true );
-		}
-		$did = $restore->invoke( $this->plugin, $observed, $previous );
+		$res = $this->regenerate();
 
-		$this->assertFalse( $did, 'the restore must report that it changed nothing' );
+		$this->assertFalse( $res->success, 'a rotation that wrote nothing must report failure' );
 		$this->assertSame(
-			$concurrent,
+			$previous,
 			sa_read_option_uncached( 'aura_worker_site_token' ),
-			"the concurrent rotation's token must survive"
+			'the row must be exactly as the loser found it'
+		);
+		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ), 'no token may be revealed' );
+	}
+
+	/** With no row yet, the rotation inserts one rather than swapping. */
+	public function test_a_site_with_no_token_yet_gets_one(): void {
+		unset( $GLOBALS['_options']['aura_worker_site_token'], $GLOBALS['_rows']['aura_worker_site_token'] );
+
+		$res = $this->regenerate();
+
+		$this->assertTrue( $res->success, 'a site with no token must be able to get one' );
+		$this->assertSame(
+			Aura_Worker_Security::hash_token( $res->data['token'] ),
+			sa_read_option_uncached( 'aura_worker_site_token' )
 		);
 	}
 }

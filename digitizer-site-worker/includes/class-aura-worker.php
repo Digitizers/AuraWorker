@@ -111,41 +111,36 @@ class Aura_Worker {
 		$previous = $this->stored_token();
 		$raw      = wp_generate_password( 48, false );
 		$hashed   = Aura_Worker_Security::hash_token( $raw );
-		update_option( 'aura_worker_site_token', $hashed );
 
-		// Prove the rotation happened before telling anyone it did. A filter that
-		// rewrites the value, or a database that refuses the row, both leave
-		// update_option() looking fine while the previous token stays valid — and
-		// an admin rotating a leaked token would be handed a replacement that
-		// authenticates nowhere and told the old one is revoked (#67). Read the
-		// value back and compare; on a mismatch nothing else is touched and no
-		// token is revealed.
-		$stored = $this->stored_token();
-		if ( ! hash_equals( $hashed, $stored ) ) {
-			// A filter may REWRITE the value rather than refuse it, in which case
-			// the row now holds a hash matching neither the new token nor the old
-			// one — the site would authenticate nothing at all. Put the previous
-			// value back before reporting, so a failed rotation cannot lock the
-			// site out, and say which of the two states we actually ended in
-			// rather than assuming the store was left untouched.
-			if ( ! hash_equals( $previous, $stored ) ) {
-				$this->restore_token_if_unchanged( $stored, $previous );
-			}
-
-			// Report the state the store is ACTUALLY in, which is not always the
-			// one this request produced: a concurrent rotation may have landed
-			// and won the compare-and-swap, and saying "unchanged" over its token
-			// would be as wrong as the claim this whole fix removes.
-			$final = $this->stored_token();
-			if ( hash_equals( $previous, $final ) ) {
-				$message = __( 'The new site token could not be saved, so the current token is unchanged. Check for a plugin filtering this option, or for a database write error.', 'digitizer-site-worker' );
-			} elseif ( hash_equals( $stored, $final ) ) {
-				$message = __( 'The new site token could not be saved and the previous one could not be restored, so this site may now accept no token at all. Set the option directly (its value is the SHA-256 of the token) and check for a plugin filtering it.', 'digitizer-site-worker' );
-			} else {
-				$message = __( 'The new site token could not be saved, and another token was stored while this request ran. That token is the current one — this request changed nothing.', 'digitizer-site-worker' );
-			}
-
+		// Claim the rotation with a compare-and-swap against the value this
+		// request read, in one statement. Writing and then repairing cannot work
+		// here: a read-back proves only what the row holds, never who put it
+		// there, so a request that lost a race to a concurrent rotation could not
+		// tell that from its own write being rewritten — and "repairing" it would
+		// revoke the other administrator's fresh token and bring back the one
+		// both requests were rotating away from. Exactly one of two concurrent
+		// rotations can match the predicate; the loser writes nothing at all.
+		//
+		// Raw SQL also puts the write out of reach of any option filter, which is
+		// the failure this whole change exists to remove (#67).
+		if ( ! $this->swap_token( $previous, $hashed ) ) {
+			$current = $this->stored_token();
+			$message = hash_equals( $previous, $current )
+				? __( 'The new site token could not be saved, so the current token is unchanged. Check the database for write errors and try again.', 'digitizer-site-worker' )
+				: __( 'Another site token was stored while this request ran, so this one changed nothing. That token is now the current one — regenerate again if you still want a new one.', 'digitizer-site-worker' );
 			wp_send_json_error( array( 'message' => $message ), 500 );
+		}
+
+		// The swap reported a row changed; confirm from the row itself before a
+		// token is revealed to anyone. Nothing is written on this path either, so
+		// a failure here leaves the store exactly as the swap left it.
+		if ( ! hash_equals( $hashed, $this->stored_token() ) ) {
+			wp_send_json_error(
+				array(
+					'message' => __( 'The new site token did not read back as written, so it has not been shown. Check the database and the site token option before rotating again.', 'digitizer-site-worker' ),
+				),
+				500
+			);
 		}
 
 		update_option( 'aura_worker_connect_user_id', get_current_user_id() );
@@ -176,46 +171,57 @@ class Aura_Worker {
 	}
 
 	/**
-	 * Put the previous token back, but only if the row still holds $expected.
+	 * Store $new only if the row still holds $expected — one statement.
 	 *
-	 * A plain update_option() here would overwrite a rotation that completed
-	 * concurrently: the other administrator's token would stop working and the
-	 * token this request was rotating away from — possibly the compromised one —
-	 * would become valid again. So the restore is a compare-and-swap in a single
-	 * statement, against the exact bytes this request decided against, and does
-	 * nothing at all if anyone else has since written the row.
+	 * The predicate is what makes concurrent rotation safe: two administrators
+	 * both read the same previous value, both try to swap, and MySQL lets exactly
+	 * one match. The loser is told so and writes nothing, instead of "repairing"
+	 * a row that was never its own write to repair.
+	 *
+	 * When there is no row at all the analogue is a conditional INSERT, so a
+	 * racer's already-committed row is never clobbered.
 	 *
 	 * @since 2.10.3
 	 *
-	 * @param string $expected Value observed in the row after the failed write.
-	 * @param string $previous Value to put back.
-	 * @return bool True when this call restored the row.
+	 * @param string $expected Value this request read, '' when there is no row.
+	 * @param string $new      Hash to store.
+	 * @return bool True when this call wrote the row.
 	 */
-	private function restore_token_if_unchanged( $expected, $previous ) {
+	private function swap_token( $expected, $new ) {
 		global $wpdb;
-		$rows = $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
-				(string) $previous,
-				'aura_worker_site_token',
-				(string) $expected
-			)
-		);
+		$name = 'aura_worker_site_token';
+		if ( '' === (string) $expected ) {
+			$rows = $wpdb->query(
+				$wpdb->prepare(
+					"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+					$name,
+					(string) $new,
+					'yes',
+					$name
+				)
+			);
+		} else {
+			$rows = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+					(string) $new,
+					$name,
+					(string) $expected
+				)
+			);
+		}
+
 		// The row was written behind get_option()'s back, so both caches core
-		// might serve it from must go. `alloptions` is the one that matters
-		// here: this option is autoloaded (nothing ever passed an explicit
-		// $autoload), so core serves it from that bucket and never from the
-		// per-key entry — evicting only the key would leave every later
-		// get_option() answering with the value we just replaced, which with a
-		// persistent object cache means the site keeps authenticating against a
-		// token that no longer exists in the database. (swap_raw() in
-		// class-aura-worker-rules.php evicts only the key because the ruleset
-		// option is written with autoload 'no'; that is not true here.)
-		//
-		// $wpdb->query() answers false for an SQL error and 0 for "matched
-		// nothing" — a lost race, not a fault. Neither restored the row.
-		wp_cache_delete( 'aura_worker_site_token', 'options' );
+		// might serve it from must go. `alloptions` is the one that matters: this
+		// option is autoloaded (nothing ever passed an explicit $autoload), so
+		// core serves it from that bucket and never from the per-key entry.
+		// (swap_raw() in class-aura-worker-rules.php evicts only the key because
+		// the ruleset option is written with autoload 'no'; not so here.)
+		wp_cache_delete( $name, 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
+
+		// $wpdb->query() answers false for an SQL error and 0 for "matched
+		// nothing" — a lost race, not a fault. Neither wrote the row.
 		return is_int( $rows ) && $rows > 0;
 	}
 
