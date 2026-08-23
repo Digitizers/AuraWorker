@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.10.2
+Stable tag: 2.10.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -232,6 +232,18 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.10.3 =
+* Fix (security): **"Regenerate Token" revealed a new site token without ever
+  storing it.** The option was registered as a read-only setting, and the
+  callback enforcing that ran on every write — not only on the settings form —
+  so the handler's write was discarded while the one-time reveal still
+  appeared. Two consequences: an admin rotating a leaked token was told it was
+  revoked when the old token stayed valid, and a site disconnected from the
+  dashboard could not be reconnected, because no token the screen displayed
+  ever authenticated. The token is no longer registered as a setting (it is
+  display-only, so nothing submits it), and regeneration now reads the stored
+  value back and refuses to reveal a token it could not save.
 
 = 2.10.2 =
 * Fix: a site moved from one Aura client to another while the old client's
@@ -504,6 +516,18 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Zero frontend performance impact.
 
 == Upgrade Notice ==
+
+= 2.10.3 =
+* Fix (security): **"Regenerate Token" revealed a new site token without ever
+  storing it.** The option was registered as a read-only setting, and the
+  callback enforcing that ran on every write — not only on the settings form —
+  so the handler's write was discarded while the one-time reveal still
+  appeared. Two consequences: an admin rotating a leaked token was told it was
+  revoked when the old token stayed valid, and a site disconnected from the
+  dashboard could not be reconnected, because no token the screen displayed
+  ever authenticated. The token is no longer registered as a setting (it is
+  display-only, so nothing submits it), and regeneration now reads the stored
+  value back and refuses to reveal a token it could not save.
 
 = 2.10.2 =
 * Fix: a site moved from one Aura client to another while the old client's

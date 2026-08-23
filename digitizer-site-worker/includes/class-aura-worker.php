@@ -108,8 +108,26 @@ class Aura_Worker {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'digitizer-site-worker' ) ), 403 );
 		}
 
-		$raw = wp_generate_password( 48, false );
-		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( $raw ) );
+		$raw    = wp_generate_password( 48, false );
+		$hashed = Aura_Worker_Security::hash_token( $raw );
+		update_option( 'aura_worker_site_token', $hashed );
+
+		// Prove the rotation happened before telling anyone it did. A filter that
+		// rewrites the value, or a database that refuses the row, both leave
+		// update_option() looking fine while the previous token stays valid — and
+		// an admin rotating a leaked token would be handed a replacement that
+		// authenticates nowhere and told the old one is revoked (#67). Read the
+		// value back and compare; on a mismatch nothing else is touched and no
+		// token is revealed.
+		if ( ! hash_equals( $hashed, (string) get_option( 'aura_worker_site_token', '' ) ) ) {
+			wp_send_json_error(
+				array(
+					'message' => __( 'The new site token could not be saved, so the current token is unchanged. Check for a plugin filtering this option, or for a database write error.', 'digitizer-site-worker' ),
+				),
+				500
+			);
+		}
+
 		update_option( 'aura_worker_connect_user_id', get_current_user_id() );
 		delete_option( 'aura_worker_dashboard_url' );
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
@@ -147,13 +165,18 @@ class Aura_Worker {
 	 * Register plugin settings.
 	 */
 	public function register_settings() {
-		register_setting( 'aura_worker_settings', 'aura_worker_site_token', array(
-			'type'              => 'string',
-			'sanitize_callback' => function( $new_value ) {
-				// Token is read-only; always preserve the existing value.
-				return get_option( 'aura_worker_site_token', $new_value );
-			},
-		) );
+		// The site token is deliberately NOT registered as a setting. It is
+		// display-only on this screen (render_token_field() emits no input
+		// carrying its name), so nothing submits it, and leaving it out of the
+		// group's allow-list is what stops options.php from ever writing it.
+		//
+		// It used to be registered with a sanitize_callback that returned the
+		// stored value, to make it read-only. That guard reached far wider than
+		// the form: register_setting() installs the callback as a
+		// `sanitize_option_aura_worker_site_token` filter, and update_option()
+		// applies that filter on every write from any caller — so regeneration
+		// (and the legacy raw-to-hash migration) silently stored nothing while
+		// still revealing a token to the admin (#67).
 
 		register_setting( 'aura_worker_settings', 'aura_worker_allowed_ips', array(
 			'type'              => 'string',
