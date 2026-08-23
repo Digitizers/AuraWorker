@@ -228,6 +228,62 @@ final class TokenRegenerateTest extends TestCase {
 		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ), 'no token may be revealed' );
 	}
 
+	/**
+	 * A successful swap must never be second-guessed by a read.
+	 *
+	 * The compare-and-swap matched a row and changed it, which is the only proof
+	 * available that THIS request stored the token — a read answers what the row
+	 * holds, never who wrote it. A confirming read after the write can therefore
+	 * only fail spuriously (a transient database error, a stale autoloaded copy),
+	 * and failing there revokes the previous token while revealing no
+	 * replacement: the administrator is locked out with nothing to reconnect
+	 * with. So assert the shape directly — nothing reads the token row after the
+	 * write.
+	 */
+	public function test_no_read_of_the_token_row_follows_a_successful_swap(): void {
+		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( 'the-previous-token' ) );
+
+		$this->assertTrue( $this->regenerate()->success );
+
+		$write = null;
+		foreach ( $GLOBALS['_db_queries'] as $i => $query ) {
+			if ( 0 === strpos( $query, 'UPDATE' ) && false !== strpos( $query, 'aura_worker_site_token' ) ) {
+				$write = $i;
+			}
+		}
+		$this->assertNotNull( $write, 'the rotation must have issued its compare-and-swap' );
+
+		$after = array_slice( $GLOBALS['_db_queries'], $write + 1 );
+		foreach ( $after as $query ) {
+			$this->assertFalse(
+				0 === strpos( $query, 'SELECT' ) && false !== strpos( $query, 'aura_worker_site_token' ),
+				'the token row must not be read back after the swap: a read that fails would revoke the old token without revealing the new one'
+			);
+		}
+	}
+
+	/**
+	 * A row that exists but holds an empty value must still be rotatable.
+	 *
+	 * '' is two states — no row, and a row holding an empty string — and neither
+	 * the settings screen nor get_option() can tell them apart. Picking the write
+	 * statement from that read is the trap: an empty row given only the
+	 * conditional INSERT can never satisfy NOT EXISTS, so the site would report a
+	 * failed rotation forever and could never be configured.
+	 */
+	public function test_an_existing_empty_token_row_can_be_rotated(): void {
+		update_option( 'aura_worker_site_token', '' );
+		$this->assertSame( '', sa_read_option_uncached( 'aura_worker_site_token' ), 'the row must exist and be empty' );
+
+		$res = $this->regenerate();
+
+		$this->assertTrue( $res->success, 'a site whose token row is empty must be able to get one' );
+		$this->assertSame(
+			Aura_Worker_Security::hash_token( $res->data['token'] ),
+			sa_read_option_uncached( 'aura_worker_site_token' )
+		);
+	}
+
 	/** With no row yet, the rotation inserts one rather than swapping. */
 	public function test_a_site_with_no_token_yet_gets_one(): void {
 		unset( $GLOBALS['_options']['aura_worker_site_token'], $GLOBALS['_rows']['aura_worker_site_token'] );

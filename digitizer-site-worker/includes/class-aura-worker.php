@@ -131,18 +131,14 @@ class Aura_Worker {
 			wp_send_json_error( array( 'message' => $message ), 500 );
 		}
 
-		// The swap reported a row changed; confirm from the row itself before a
-		// token is revealed to anyone. Nothing is written on this path either, so
-		// a failure here leaves the store exactly as the swap left it.
-		if ( ! hash_equals( $hashed, $this->stored_token() ) ) {
-			wp_send_json_error(
-				array(
-					'message' => __( 'The new site token did not read back as written, so it has not been shown. Check the database and the site token option before rotating again.', 'digitizer-site-worker' ),
-				),
-				500
-			);
-		}
-
+		// Nothing is read back here, on purpose. The swap matched a row and
+		// changed it, so the store already holds $hashed and this request is the
+		// one that put it there — the affected-row count is the proof, and it is
+		// the only proof available (a read answers what the row holds, never who
+		// wrote it). A confirming read could only ever fail spuriously — a
+		// transient database error, a stale autoloaded copy — and failing here
+		// would revoke the previous token while revealing no replacement, which
+		// is worse than the defect this rotation exists to fix.
 		update_option( 'aura_worker_connect_user_id', get_current_user_id() );
 		delete_option( 'aura_worker_dashboard_url' );
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
@@ -178,19 +174,40 @@ class Aura_Worker {
 	 * one match. The loser is told so and writes nothing, instead of "repairing"
 	 * a row that was never its own write to repair.
 	 *
-	 * When there is no row at all the analogue is a conditional INSERT, so a
-	 * racer's already-committed row is never clobbered.
+	 * The swap is always attempted first, including when the value read was ''.
+	 * An empty '' is two different states — no row at all, and a row holding an
+	 * empty string — and a read cannot tell them apart, because both the settings
+	 * screen and get_option()'s default answer ''. Choosing the statement from
+	 * that ambiguous read is what breaks: a site whose row exists but is empty
+	 * would get only the conditional INSERT, whose NOT EXISTS can never be
+	 * satisfied, so its rotation would fail forever and it could never be
+	 * configured. The UPDATE settles it instead — it matches the empty row and
+	 * changes nothing when there is no row — and only then, having learnt that no
+	 * row matched, does an absent row get the conditional INSERT, so a racer's
+	 * already-committed row is never clobbered.
 	 *
 	 * @since 2.10.3
 	 *
-	 * @param string $expected Value this request read, '' when there is no row.
+	 * @param string $expected Value this request read; '' for an empty or absent row.
 	 * @param string $new      Hash to store.
 	 * @return bool True when this call wrote the row.
 	 */
 	private function swap_token( $expected, $new ) {
 		global $wpdb;
 		$name = 'aura_worker_site_token';
-		if ( '' === (string) $expected ) {
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				(string) $new,
+				$name,
+				(string) $expected
+			)
+		);
+
+		// 0 rows and an expected '' is the one case that may still be an absent
+		// row rather than a lost race. false is a driver error — not a race, and
+		// not something a second statement would clarify.
+		if ( 0 === $rows && '' === (string) $expected ) {
 			$rows = $wpdb->query(
 				$wpdb->prepare(
 					"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
@@ -198,15 +215,6 @@ class Aura_Worker {
 					(string) $new,
 					'yes',
 					$name
-				)
-			);
-		} else {
-			$rows = $wpdb->query(
-				$wpdb->prepare(
-					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
-					(string) $new,
-					$name,
-					(string) $expected
 				)
 			);
 		}

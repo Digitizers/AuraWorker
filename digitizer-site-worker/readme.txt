@@ -242,8 +242,11 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   revoked when the old token stayed valid, and a site disconnected from the
   dashboard could not be reconnected, because no token the screen displayed
   ever authenticated. The token is no longer registered as a setting (it is
-  display-only, so nothing submits it), and regeneration now reads the stored
-  value back and refuses to reveal a token it could not save.
+  display-only, so nothing submits it), and regeneration now stores the new
+  hash with a single compare-and-swap, out of reach of any option filter — a
+  token is revealed only when that one statement reports it wrote the row, and
+  a site whose row is missing or empty can be given its first token the same
+  way.
 
 = 2.10.2 =
 * Fix: a site moved from one Aura client to another while the old client's
@@ -526,8 +529,11 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   revoked when the old token stayed valid, and a site disconnected from the
   dashboard could not be reconnected, because no token the screen displayed
   ever authenticated. The token is no longer registered as a setting (it is
-  display-only, so nothing submits it), and regeneration now reads the stored
-  value back and refuses to reveal a token it could not save.
+  display-only, so nothing submits it), and regeneration now stores the new
+  hash with a single compare-and-swap, out of reach of any option filter — a
+  token is revealed only when that one statement reports it wrote the row, and
+  a site whose row is missing or empty can be given its first token the same
+  way.
 
 = 2.10.2 =
 * Fix: a site moved from one Aura client to another while the old client's

@@ -158,8 +158,9 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 the option was a registered read-only setting, and the callback enforcing that ran on
 every write, discarding the handler's. The old token stayed valid (so rotating a leaked
 token did nothing) and a disconnected site could not be reconnected. The token is no
-longer a registered setting, and regeneration verifies the write before revealing
-anything.
+longer a registered setting, and regeneration stores the new hash with a single
+compare-and-swap that no option filter can reach — a token is revealed only when that
+statement reports it wrote the row.
 
 ### 2.10.2
 
