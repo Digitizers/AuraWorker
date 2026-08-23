@@ -176,6 +176,44 @@ final class TokenRegenerateTest extends TestCase {
 	}
 
 	/**
+	 * State must be judged from the database, not from the option cache.
+	 *
+	 * The token option is autoloaded, so core serves it from the `alloptions`
+	 * bucket — which a raw compare-and-swap writes straight past. Judging the
+	 * outcome with get_option() therefore reads a value the database no longer
+	 * holds: the handler would report a correctly restored row as a failure, and
+	 * with a persistent object cache the site would keep authenticating against a
+	 * token that no longer exists.
+	 */
+	public function test_state_is_judged_from_the_database_not_the_cache(): void {
+		$previous = Aura_Worker_Security::hash_token( 'the-previous-token' );
+		update_option( 'aura_worker_site_token', $previous );
+
+		add_filter(
+			'sanitize_option_aura_worker_site_token',
+			static function ( $value ) {
+				return strrev( (string) $value );
+			}
+		);
+		// Model the stale autoloaded copy get_option() would serve.
+		$GLOBALS['_sa_option_cache']['aura_worker_site_token'] = 'a-stale-cached-value';
+
+		$res = $this->regenerate();
+
+		$this->assertFalse( $res->success, 'a rotation that did not persist must report failure' );
+		$this->assertSame(
+			$previous,
+			sa_read_option_uncached( 'aura_worker_site_token' ),
+			'the row must be restored even while the cache serves something else'
+		);
+		$this->assertStringContainsString(
+			'current token is unchanged',
+			(string) ( $res->data['message'] ?? '' ),
+			'the message must describe the database, not the cache'
+		);
+	}
+
+	/**
 	 * A failed rotation must never overwrite one that succeeded concurrently.
 	 *
 	 * Two administrators rotating at once: request A fails and restores, request

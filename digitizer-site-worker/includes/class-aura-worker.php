@@ -108,7 +108,7 @@ class Aura_Worker {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'digitizer-site-worker' ) ), 403 );
 		}
 
-		$previous = (string) get_option( 'aura_worker_site_token', '' );
+		$previous = $this->stored_token();
 		$raw      = wp_generate_password( 48, false );
 		$hashed   = Aura_Worker_Security::hash_token( $raw );
 		update_option( 'aura_worker_site_token', $hashed );
@@ -120,7 +120,7 @@ class Aura_Worker {
 		// authenticates nowhere and told the old one is revoked (#67). Read the
 		// value back and compare; on a mismatch nothing else is touched and no
 		// token is revealed.
-		$stored = (string) get_option( 'aura_worker_site_token', '' );
+		$stored = $this->stored_token();
 		if ( ! hash_equals( $hashed, $stored ) ) {
 			// A filter may REWRITE the value rather than refuse it, in which case
 			// the row now holds a hash matching neither the new token nor the old
@@ -136,7 +136,7 @@ class Aura_Worker {
 			// one this request produced: a concurrent rotation may have landed
 			// and won the compare-and-swap, and saying "unchanged" over its token
 			// would be as wrong as the claim this whole fix removes.
-			$final = (string) get_option( 'aura_worker_site_token', '' );
+			$final = $this->stored_token();
 			if ( hash_equals( $previous, $final ) ) {
 				$message = __( 'The new site token could not be saved, so the current token is unchanged. Check for a plugin filtering this option, or for a database write error.', 'digitizer-site-worker' );
 			} elseif ( hash_equals( $stored, $final ) ) {
@@ -153,6 +153,26 @@ class Aura_Worker {
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
 
 		wp_send_json_success( array( 'token' => $raw ) );
+	}
+
+	/**
+	 * The stored token hash, read from the database rather than the cache.
+	 *
+	 * Every decision this handler makes is about what the row actually holds:
+	 * whether a filter rewrote the write, whether a restore landed, whether a
+	 * concurrent rotation won. get_option() answers from `alloptions` for this
+	 * autoloaded option and cannot see a raw compare-and-swap, so it would report
+	 * a correct database as a failure — and, with a persistent object cache, keep
+	 * doing so. Falls back to the cached read only if the database itself errors,
+	 * where a stale answer beats no answer.
+	 *
+	 * @since 2.10.3
+	 *
+	 * @return string
+	 */
+	private function stored_token() {
+		$raw = Aura_Worker_Rules::site_token_uncached();
+		return is_wp_error( $raw ) ? (string) get_option( 'aura_worker_site_token', '' ) : (string) $raw;
 	}
 
 	/**
@@ -181,9 +201,21 @@ class Aura_Worker {
 				(string) $expected
 			)
 		);
+		// The row was written behind get_option()'s back, so both caches core
+		// might serve it from must go. `alloptions` is the one that matters
+		// here: this option is autoloaded (nothing ever passed an explicit
+		// $autoload), so core serves it from that bucket and never from the
+		// per-key entry — evicting only the key would leave every later
+		// get_option() answering with the value we just replaced, which with a
+		// persistent object cache means the site keeps authenticating against a
+		// token that no longer exists in the database. (swap_raw() in
+		// class-aura-worker-rules.php evicts only the key because the ruleset
+		// option is written with autoload 'no'; that is not true here.)
+		//
 		// $wpdb->query() answers false for an SQL error and 0 for "matched
 		// nothing" — a lost race, not a fault. Neither restored the row.
 		wp_cache_delete( 'aura_worker_site_token', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
 		return is_int( $rows ) && $rows > 0;
 	}
 
