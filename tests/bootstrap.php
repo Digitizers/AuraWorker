@@ -334,6 +334,14 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 
 if ( ! function_exists( 'get_option' ) ) {
 	function get_option( string $option, $default = false ) {
+		// This request's option cache (2.10.2). WordPress caches every option
+		// it reads for the rest of the request, and another request's
+		// update_option() cannot invalidate that copy. A test populates this
+		// to model a request that read a value BEFORE a connect replaced it —
+		// exactly what accept()'s uncached reads must not be fooled by.
+		if ( isset( $GLOBALS['_sa_option_cache'] ) && array_key_exists( $option, (array) $GLOBALS['_sa_option_cache'] ) ) {
+			return $GLOBALS['_sa_option_cache'][ $option ];
+		}
 		// Core consults `notoptions` FIRST: a name listed there is answered
 		// "absent" without looking at the cache or the database, and a miss
 		// below lists the name. A raw $wpdb INSERT creates a row behind this
@@ -361,6 +369,13 @@ if ( ! function_exists( 'get_option' ) ) {
 
 if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
+		// The database refusing (or a filter short-circuiting) a write:
+		// update_option() answers false and stores NOTHING. Code that must
+		// prove a value landed cannot use the return value alone — it reads
+		// the row back.
+		if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $option ] ) ) {
+			return false;
+		}
 		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
@@ -373,6 +388,9 @@ if ( ! function_exists( 'update_option' ) ) {
 		// suite exercises, so nothing needs the exclusion — confirmed by running
 		// the full suite with it removed.
 		$GLOBALS['_mutations'][] = 'update_option:' . $option;
+		// Which options a code path writes, in order — appended, never reset
+		// here, so a test that empties it sees exactly its own call's writes.
+		$GLOBALS['_option_writes'][] = array( 'set', $option );
 		return true;
 	}
 }
@@ -410,7 +428,40 @@ if ( ! function_exists( 'delete_option' ) ) {
 		unset( $GLOBALS['_rows'][ $option ] );
 		// Core lists a deleted name in `notoptions` (option.php, delete_option()).
 		$GLOBALS['_notoptions'][ $option ] = true;
+		$GLOBALS['_option_writes'][] = array( 'delete', $option );
 		return true;
+	}
+}
+
+/**
+ * One options-table row, read the way $wpdb reads it: the DATABASE, never this
+ * request's option cache ($GLOBALS['_sa_option_cache'], which get_option()
+ * serves from). $_rows holds the raw serialized bytes the ruleset CAS writes;
+ * a test that seeds $_options directly is seeding the database too, so that is
+ * the fallback — serialized, because callers maybe_unserialize() what they get.
+ *
+ * @param string $name Option name.
+ * @return string|null Raw value, or null when there is no row.
+ */
+function sa_read_option_uncached( string $name ) {
+	if ( array_key_exists( $name, $GLOBALS['_rows'] ) ) {
+		return $GLOBALS['_rows'][ $name ];
+	}
+	if ( array_key_exists( $name, $GLOBALS['_options'] ) ) {
+		return maybe_serialize( $GLOBALS['_options'][ $name ] );
+	}
+	return null;
+}
+
+/**
+ * The seam that runs between a caller's read and its compare-and-swap — the
+ * window in which a concurrent connect writes its binding. A test sets
+ * $GLOBALS['_sa_before_swap'] to a callable (which clears itself, so it fires
+ * once). Inert when unset.
+ */
+function sa_before_swap(): void {
+	if ( isset( $GLOBALS['_sa_before_swap'] ) && is_callable( $GLOBALS['_sa_before_swap'] ) ) {
+		call_user_func( $GLOBALS['_sa_before_swap'] );
 	}
 }
 
@@ -914,6 +965,23 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		public function get_results( $query, $output = OBJECT ) {
 			$this->last_query = (string) $query;
+			// The one shape the value-parsed sweep issues: names AND values for
+			// a prefix, read against the "database" ($_rows, else $_options).
+			if ( preg_match( "/^SELECT option_name, option_value FROM \S+ WHERE option_name LIKE '([^']+)%'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				$out    = array();
+				$names = array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) );
+				foreach ( $names as $name ) {
+					if ( 0 === strpos( (string) $name, $prefix ) ) {
+						$out[] = array(
+							'option_name'  => (string) $name,
+							'option_value' => (string) sa_read_option_uncached( (string) $name ),
+						);
+					}
+				}
+				return $out;
+			}
 			if ( ! empty( $GLOBALS['_db_results_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_results_queue'] );
 			}
@@ -929,10 +997,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		public function get_var( $query = null, $x = 0, $y = 0 ) {
 			$this->last_query = (string) $query;
+			// A driver-level failure answers null AND sets last_error — the one
+			// thing that tells "no such row" apart from "the database is
+			// broken". Code that reads a row to decide must consult it.
+			$this->last_error = (string) ( $GLOBALS['_sa_wpdb_error'] ?? '' );
+			if ( '' !== $this->last_error ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return null;
+			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
-				// The row, not the cache: $_rows is what the "database" holds.
-				return isset( $GLOBALS['_rows'][ $m[1] ] ) ? $GLOBALS['_rows'][ $m[1] ] : null;
+				// The row, not the cache (see sa_read_option_uncached()).
+				return sa_read_option_uncached( stripslashes( $m[1] ) );
 			}
 			if ( ! empty( $GLOBALS['_db_var_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_var_queue'] );
@@ -1028,6 +1104,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
+				sa_before_swap();
 				// A second request inserting between this caller's own
 				// existence check (there is none — that's the point of a real
 				// conditional INSERT) and this statement running.
@@ -1062,6 +1139,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! empty( $GLOBALS['_cas_always_lose'] ) ) {
 					return 0; // Contention that never resolves.
 				}
+				sa_before_swap();
 				// A second request landing between this caller's read and its
 				// write — exactly the window the CAS exists to close.
 				if ( ! empty( $GLOBALS['_cas_racer'] ) ) {
@@ -1097,6 +1175,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_rows'][ $name ]    = isset( $GLOBALS['_rows'][ $name ] ) ? (string) ( (int) $GLOBALS['_rows'][ $name ] + 1 ) : '1';
 				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
 				return 1;
+			}
+			// The conditional DELETE a magic-link claim release issues: the row
+			// goes only while it still carries THIS handler's fence, so a
+			// double release can never remove somebody else's claim.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)' AND option_value LIKE '(.*)%'$/", $query, $m ) ) {
+				$name  = stripslashes( $m[1] );
+				$fence = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[2] ) );
+				if ( isset( $GLOBALS['_options'][ $name ] ) && 0 === strpos( (string) $GLOBALS['_options'][ $name ], $fence ) ) {
+					unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ] );
+					return 1;
+				}
+				return 0;
 			}
 			// Used by the counters AND by the expired-notice claim sweep.
 			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", $query, $m ) ) {
@@ -1134,6 +1224,12 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_insert_racer']     = null;
 	$GLOBALS['_cas_always_lose']  = false;
 	$GLOBALS['_db_query_error']   = false;
+	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
+	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
+	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
+	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
+	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
 }
 
@@ -1617,6 +1713,12 @@ function sa_reset_state(): void {
 	$GLOBALS['_insert_racer']     = null;
 	$GLOBALS['_cas_always_lose']  = false;
 	$GLOBALS['_db_query_error']   = false;
+	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
+	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
+	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
+	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
+	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_posts']        = array();
 	$GLOBALS['_post_meta']    = array();
 	$GLOBALS['_cleaned_post_cache'] = array();

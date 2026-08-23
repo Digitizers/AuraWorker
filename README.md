@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.10.1-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.10.2-green" alt="Stable" />
 </p>
 
 ---
@@ -151,6 +151,10 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.10.2
+
+- **Fix: the connect binds the site to its client — inside the ruleset store.** Aura clears a site it is about to forget by pushing an empty ruleset from the old client. If that push — or a late real ruleset from the old client — was still in flight when the same site was re-homed to a new client, it could land in the store the connect had just emptied and bind the site back to the old client; the new client's documents were then answered `client_mismatch` until someone reconnected (Aura#378 Ruling C1; #65). The signed `/connect` callback now carries the client as an optional sixth field, and the connect writes a seq-0 binding record into `aura_worker_ruleset` in place of clearing it — the one value `POST /aura/v2/rules` reads, decides against and compare-and-swaps — so an in-flight document for another client loses its swap and is refused, with no second option to interleave and nothing for the per-request option cache to serve stale. The binding names the token its connect installed; one written by a connect whose token a concurrent connect then overwrote is stale and replaceable, never a lock-out. A connect without the field (an older dashboard) clears as before. Known residual, accepted by the owner: two connects for the same site racing each other while an old client's push is in flight can leave the site bound to that client until the next push, which heals it; Aura's fleet audit shows the site as `ruleset_wrong_client` meanwhile.
 
 ### 2.10.1
 

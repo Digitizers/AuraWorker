@@ -35,9 +35,11 @@ final class ConnectProvisionTest extends TestCase {
 		$dashboard_url = $over['dashboard_url'] ?? 'https://dash.example';
 		$timestamp     = $over['timestamp'] ?? time();
 		$pubkey        = array_key_exists( 'grant_pubkey', $over ) ? $over['grant_pubkey'] : $this->pubkey;
-		// Sign with the pubkey the gateway intends (or omit it from the message).
+		$client        = array_key_exists( 'client', $over ) ? $over['client'] : null;
+		// Sign with the pubkey / client the gateway intends (or omit them from the message).
 		$sig_pubkey = array_key_exists( 'sign_pubkey', $over ) ? $over['sign_pubkey'] : $pubkey;
-		$signature  = Aura_Worker_Magic_Link::sign_connect_payload( $this->secret, $this->magic_id, $token, $dashboard_url, $timestamp, (string) $sig_pubkey );
+		$sig_client = array_key_exists( 'sign_client', $over ) ? $over['sign_client'] : $client;
+		$signature  = Aura_Worker_Magic_Link::sign_connect_payload( $this->secret, $this->magic_id, $token, $dashboard_url, $timestamp, (string) $sig_pubkey, (string) $sig_client );
 
 		$req = new WP_REST_Request();
 		$req->set_param( 'magic_id', $this->magic_id );
@@ -48,6 +50,16 @@ final class ConnectProvisionTest extends TestCase {
 		if ( null !== $pubkey ) {
 			$req->set_param( 'grant_pubkey', $pubkey );
 		}
+		if ( null !== $client ) {
+			$req->set_param( 'client', $client );
+		}
+		return $req;
+	}
+
+	/** The same request under another magic link — nothing has minted a transient for it. */
+	private function request_for( string $magic_id ): WP_REST_Request {
+		$req = $this->request();
+		$req->set_param( 'magic_id', $magic_id );
 		return $req;
 	}
 
@@ -105,5 +117,202 @@ final class ConnectProvisionTest extends TestCase {
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 200, $res->get_status() );
 		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_a_signed_connect_binds_the_site_to_its_client_inside_the_ruleset_store(): void {
+		$GLOBALS['_options']['aura_worker_ruleset'] = array( 'client' => 'client-old', 'seq' => 5, 'rules' => array( array( 'key' => 'rule/x' ) ), 'envelope' => 'e' );
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'client-new', 'token' => 'raw-token' ) ) );
+		$this->assertSame( 200, $res->get_status() );
+		$stored = Aura_Worker_Rules::stored();
+		$this->assertSame( 'client-new', $stored['client'] );
+		$this->assertSame( Aura_Worker_Security::hash_token( 'raw-token' ), $stored['token_hash'] );
+		$this->assertSame( 0, $stored['seq'] );
+		$this->assertSame( array(), $stored['rules'] );
+		$this->assertTrue( $stored['bound'] );
+		$this->assertNull( Aura_Worker_Rules::current(), 'A sentinel is not a ruleset: no policy until the first push.' );
+		$this->assertSame( array(), Aura_Worker_Rules::rules() );
+		$this->assertSame( 'client-new', Aura_Worker_Rules::bound_client() );
+	}
+
+	public function test_the_binding_is_one_write_to_the_one_value_accept_swaps_against(): void {
+		// There is no separate binding option to interleave with the store, and
+		// no moment at which the store is empty and unbound: the old record is
+		// REPLACED by the sentinel, never deleted first.
+		$GLOBALS['_options']['aura_worker_ruleset'] = array( 'client' => 'client-old', 'seq' => 5, 'rules' => array(), 'envelope' => 'e' );
+		$GLOBALS['_option_writes'] = array();
+		$this->ml->handle_connect( $this->request( array( 'client' => 'client-new' ) ) );
+		$writes = array_values( array_filter( $GLOBALS['_option_writes'], static function ( $w ) { return 'aura_worker_ruleset' === $w[1] || 'aura_worker_client' === $w[1]; } ) );
+		$this->assertSame( array( array( 'set', 'aura_worker_ruleset' ) ), $writes, 'One write, to the ruleset option; no delete, no second option.' );
+	}
+
+	public function test_a_token_write_that_does_not_land_fails_the_connect_before_binding_or_consuming_the_magic_link(): void {
+		// Codex round 30: the token row is verified exactly like the sentinel —
+		// read back from the database. A refused or filtered token write must
+		// not be followed by a sentinel for the requested hash (it would read as
+		// stale: unbound behind a 200) nor by a consumed transient.
+		$GLOBALS['_options']['aura_worker_site_token'] = Aura_Worker_Security::hash_token( 'old-token' );
+		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_site_token' => true );
+		$GLOBALS['_option_writes'] = array();
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'client-new', 'token' => 'new-token' ) ) );
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
+		$this->assertNotContains( array( 'set', 'aura_worker_ruleset' ), $GLOBALS['_option_writes'], 'No sentinel for a token that is not there.' );
+		$this->assertSame( Aura_Worker_Security::hash_token( 'old-token' ), get_option( 'aura_worker_site_token' ) );
+		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ) );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ) );
+	}
+
+	public function test_a_binding_that_does_not_land_fails_the_connect_without_consuming_the_magic_link(): void {
+		// update_option() can fail (or be a no-op) after the token was stored.
+		// The connect must not report success unbound, and must leave the
+		// one-time transient so the same variant can be retried.
+		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_ruleset' => true );
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'client-new' ) ) );
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
+		$this->assertSame( '', Aura_Worker_Rules::bound_client() );
+		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'The magic link is still usable for the retry.' );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), '…and the claim is released, so the retry is not refused as in-progress.' );
+	}
+
+	public function test_a_client_line_not_covered_by_the_signature_is_refused(): void {
+		// The param is present but the HMAC was computed without it: a stolen
+		// token cannot re-home a site to an attacker-chosen client.
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'client-evil', 'sign_client' => '' ) ) );
+		$this->assertSame( 401, $res->get_status() );
+		$this->assertSame( '', Aura_Worker_Rules::bound_client() );
+	}
+
+	public function test_a_pubkey_moved_into_the_client_field_is_refused(): void {
+		// Codex round 32: the 5th line for a pubkey is bare (2.x format). Were the
+		// client line bare too, a request signed for { pubkey: PK, client: '' }
+		// would verify unchanged as { pubkey: '', client: PK } — same five lines —
+		// and bind the site to "PK" without the secret. The client line is
+		// labelled `client:<id>`, so the moved value recomputes differently.
+		$res = $this->ml->handle_connect( $this->request( array(
+			'grant_pubkey' => '',
+			'client'       => $this->pubkey,
+			'sign_pubkey'  => $this->pubkey,
+			'sign_client'  => '',
+		) ) );
+		$this->assertSame( 401, $res->get_status() );
+		$this->assertSame( '', Aura_Worker_Rules::bound_client() );
+		$this->assertNotSame( Aura_Worker_Security::hash_token( 'raw-token' ), get_option( 'aura_worker_site_token' ), 'nothing installed' );
+	}
+
+	public function test_a_client_line_without_a_pubkey_is_the_fifth_line_and_the_sentinel_survives_the_keyless_branch(): void {
+		// Each optional line is appended iff its parameter is non-empty, in the
+		// fixed order pubkey, client — a keyless connect with a client signs five
+		// lines, and the plugin recomputes exactly that. This is the variant a
+		// 2.10.2 site WITHOUT libsodium accepts, so the keyless branch (which
+		// deletes the grant key and, for an older dashboard, clears the store)
+		// must leave the sentinel alone (Codex round 18).
+		$res = $this->ml->handle_connect( $this->request( array( 'grant_pubkey' => null, 'client' => 'client-new' ) ) );
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( 'client-new', Aura_Worker_Rules::bound_client() );
+		$this->assertNotNull( Aura_Worker_Rules::stored(), 'The sentinel is still there.' );
+		$this->assertFalse( Aura_Worker_Grant::is_enforced() );
+	}
+
+	public function test_a_connect_without_a_client_clears_as_before(): void {
+		// An older Aura binds nothing: the store is cleared, exactly as 2.10.0
+		// did, and the site reads as unbound.
+		$GLOBALS['_options']['aura_worker_ruleset'] = array( 'client' => 'client-old', 'token_hash' => 'h', 'seq' => 0, 'rules' => array(), 'bound' => true );
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNull( Aura_Worker_Rules::stored() );
+		$this->assertSame( '', Aura_Worker_Rules::bound_client() );
+	}
+
+	public function test_a_concurrent_connect_for_the_same_magic_id_is_refused_at_the_claim_while_the_first_still_runs(): void {
+		// Codex round 21 on the plan PR: Aura's fallback after a TIMEOUT can send
+		// the next (weaker) variant while the first handler is still running —
+		// past the transient check, before its success path deletes the
+		// transient. Both would see the magic link as valid; the weaker one
+		// would clear the binding the first is about to write. The claim is
+		// taken before anything else and the second handler is refused there.
+		$GLOBALS['_options']['aura_magic_claim_' . $this->magic_id] = 'other-fence|' . time(); // the first handler holds the claim
+		$GLOBALS['_option_writes'] = array();
+		$res = $this->ml->handle_connect( $this->request( array( 'grant_pubkey' => null ) ) ); // the weaker, clientless variant
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_connect_in_progress', $res->get_data()['code'] );
+		$this->assertSame( array(), $GLOBALS['_option_writes'], 'Refused before the transient check: nothing written, nothing cleared.' );
+		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ) );
+		// …and the claim really is FIRST: with the same claim held, a magic link
+		// whose transient is gone still answers the claim's 409, never the
+		// transient's 400. Taken any later, the handler would already have run
+		// checks — and, further down, writes — on a link another handler owns.
+		delete_transient( 'aura_magic_' . $this->magic_id );
+		$this->assertSame( 409, $this->ml->handle_connect( $this->request( array( 'client' => 'client-new' ) ) )->get_status() );
+	}
+
+	public function test_the_claim_is_released_on_a_refusal_and_after_a_success(): void {
+		$this->assertSame( 401, $this->ml->handle_connect( $this->request( array( 'signature' => 'bad' ) ) )->get_status() );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), 'A refused attempt releases the claim so the next variant can try.' );
+		$this->assertSame( 200, $this->ml->handle_connect( $this->request( array( 'client' => 'client-new' ) ) )->get_status() );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), 'Released after success too — no orphan row per connect; the CONSUMED TRANSIENT is what refuses a replay (400), not a lingering claim (409).' );
+		$this->assertFalse( get_transient( 'aura_magic_' . $this->magic_id ) );
+	}
+
+	public function test_a_claim_is_never_taken_over_by_age(): void {
+		// No timed takeover (Codex rounds 21–26): every takeover rule leaves an
+		// interleaving in which a paused original resumes over its replacement.
+		// A row — however old — refuses. A dead handler costs one magic link.
+		$GLOBALS['_options']['aura_magic_claim_' . $this->magic_id] = 'dead-fence|' . ( time() - 6 * HOUR_IN_SECONDS );
+		$GLOBALS['_option_writes'] = array();
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'client-new' ) ) );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_connect_in_progress', $res->get_data()['code'] );
+		$this->assertSame( array(), $GLOBALS['_option_writes'] );
+	}
+
+	public function test_a_release_never_deletes_another_handlers_claim(): void {
+		// The conditional DELETE names this handler's fence; a foreign row is untouched.
+		$key = 'aura_magic_claim_' . $this->magic_id;
+		$GLOBALS['_options'][ $key ] = 'other-fence|' . time();
+		$m = new ReflectionMethod( Aura_Worker_Magic_Link::class, 'release_magic_link' );
+		// Reflection ignores visibility since PHP 8.1; setAccessible() is only
+		// needed on 7.4 (and is a deprecated no-op from 8.5) — as in SecurityTest.
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		$m->invoke( null, $key, 'my-fence' );
+		$this->assertSame( 0, strpos( (string) $GLOBALS['_options'][ $key ], 'other-fence|' ) );
+	}
+
+	public function test_orphaned_claims_are_swept_by_age_and_a_swept_orphan_admits_nobody(): void {
+		// A dead handler's row is garbage: its transient is long gone. The daily
+		// sweep removes rows older than an hour; the magic link still refuses
+		// at the transient check.
+		$key = 'aura_magic_claim_old';
+		$GLOBALS['_options'][ $key ] = 'dead-fence|' . ( time() - 2 * HOUR_IN_SECONDS );
+		Aura_Worker_Rules::enforce( array( array( 'type' => 'site', 'id' => '*' ) ), 'x' ); // runs note_expired() → the sweeps
+		$this->assertArrayNotHasKey( $key, $GLOBALS['_options'] );
+		$this->assertSame( 400, $this->ml->handle_connect( $this->request_for( 'old' ) )->get_status(), 'no transient → refused after the claim is taken' );
+	}
+
+	public function test_a_second_connect_with_the_same_magic_id_after_a_success_is_refused_before_anything_is_written(): void {
+		// The one-time transient is consumed ONLY on success. This is what makes
+		// Aura's variant fallback safe: if a client-bearing connect committed but
+		// its response was lost to a timeout, every later variant for the same
+		// magic_id is refused here — before the token, the binding or the store
+		// is touched — so a weaker variant can never downgrade a binding that
+		// already landed (Task 7).
+		$this->assertSame( 200, $this->ml->handle_connect( $this->request( array( 'client' => 'client-new', 'token' => 'tok-1' ) ) )->get_status() );
+		$GLOBALS['_option_writes'] = array();
+		$res = $this->ml->handle_connect( $this->request( array( 'grant_pubkey' => null, 'token' => 'tok-2' ) ) ); // the bare variant, same magic_id
+		$this->assertSame( 400, $res->get_status() );
+		$this->assertSame( array(), $GLOBALS['_option_writes'], 'Nothing written: the refusal happens at the transient check.' );
+		$this->assertSame( 'client-new', Aura_Worker_Rules::bound_client() );
+		$this->assertSame( Aura_Worker_Security::hash_token( 'tok-1' ), get_option( 'aura_worker_site_token' ) );
+	}
+
+	public function test_legacy_four_and_five_line_signatures_still_validate(): void {
+		$this->assertSame( 200, $this->ml->handle_connect( $this->request( array( 'grant_pubkey' => null ) ) )->get_status() );
+		sa_reset_state();
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 1 ), 600 );
+		$this->assertSame( 200, $this->ml->handle_connect( $this->request() )->get_status() );
 	}
 }

@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.10.1
+Stable tag: 2.10.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -232,6 +232,15 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.10.2 =
+* Fix: a site moved from one Aura client to another while the old client's
+  last push was still in flight could end up holding the old client's ruleset
+  and refuse the new client's rules until it was reconnected. The connect
+  callback now names the client the site belongs to (a signed, optional field
+  — older dashboards keep working unchanged) and writes that binding into the
+  ruleset store itself, so a ruleset for any other client is refused from then
+  on, whatever was in flight.
 
 = 2.10.1 =
 * Fix: `audit_rules` could report zero blocked/warned events for the current
@@ -495,6 +504,15 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Zero frontend performance impact.
 
 == Upgrade Notice ==
+
+= 2.10.2 =
+* Fix: a site moved from one Aura client to another while the old client's
+  last push was still in flight could end up holding the old client's ruleset
+  and refuse the new client's rules until it was reconnected. The connect
+  callback now names the client the site belongs to (a signed, optional field
+  — older dashboards keep working unchanged) and writes that binding into the
+  ruleset store itself, so a ruleset for any other client is refused from then
+  on, whatever was in flight.
 
 = 2.10.1 =
 Fixes audit_rules under-reporting the current hour's block/warn counts on
