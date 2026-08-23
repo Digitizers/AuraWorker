@@ -763,7 +763,10 @@ class Aura_Worker_Rules {
 	 */
 	public static function bound_client( $rec = null ) {
 		$rec = null === $rec ? self::stored_uncached() : $rec;
-		if ( is_wp_error( $rec ) || null === $rec || empty( $rec['client'] ) || empty( $rec['token_hash'] ) ) {
+		// '' === … on the client, not empty(): a client id is opaque, so "0" is
+		// a client — reported as unbound here it would contradict accept(),
+		// whose comparison is strict and would bind it.
+		if ( is_wp_error( $rec ) || null === $rec || '' === (string) ( $rec['client'] ?? '' ) || empty( $rec['token_hash'] ) ) {
 			return ''; // a read failure here is reported by accept(); this is a report-only accessor
 		}
 		$ours = self::site_token_uncached();

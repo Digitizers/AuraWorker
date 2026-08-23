@@ -397,6 +397,12 @@ class Aura_Worker_Magic_Link {
 	 * Orphaned rows are garbage only (their transient is gone, so nobody can
 	 * use the magic link again) and are swept by age in sweep_options().
 	 *
+	 * A falsy add_option() is answered as 409 aura_connect_in_progress whatever
+	 * caused it — a row already there, an INSERT the database refused, or a
+	 * `default_option_*` filter making core think the option exists. This
+	 * handler did not take the claim, so it must not proceed, and "retry" is
+	 * the right client behaviour in every one of those cases.
+	 *
 	 * @since 2.10.2
 	 *
 	 * @param string $claim_key Option name.

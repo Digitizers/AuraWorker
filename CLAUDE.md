@@ -92,8 +92,12 @@ Every REST request passes through three checks in order:
 The public `POST /connect` endpoint is protected by an HMAC handshake instead of being open:
 
 1. When an admin clicks **Connect to Aura**, the plugin mints a one-time `connect_secret`, stores it in the `aura_magic_<id>` transient, and sends it to the dashboard alongside `magic_id` / `site_url`.
-2. The dashboard issues the site token and calls `/connect` with `{ magic_id, token, dashboard_url, timestamp, signature }`, where `signature = HMAC-SHA256(connect_secret, magic_id\ntoken\ndashboard_url\ntimestamp)`.
+2. The dashboard issues the site token and calls `/connect` with `{ magic_id, token, dashboard_url, timestamp, signature }` plus the optional `grant_pubkey` and `client`. The signed message is the newline-joined `magic_id`, `token`, `dashboard_url`, `timestamp`, followed by two optional lines — each appended **iff its parameter is non-empty**, in this order:
+   - the gateway Ed25519 public key, as a **bare** line (the shipped 2.x format, so 4- and 5-line callbacks keep validating unchanged);
+   - the Aura client id, as `client:<id>` — **labelled**, so a public key moved into the `client` field recomputes to a different signature.
 3. The plugin re-derives the signature (`Aura_Worker_Magic_Link::sign_connect_payload()`), rejects stale timestamps (±5 min) and bad signatures, then stores only the **hash** of the token. The dashboard keeps the raw copy.
+4. **One handler per magic link (2.10.2).** Before anything else, the handler claims `aura_magic_claim_<magic_id>` via `add_option()`; a second request for the same magic link is answered `409 aura_connect_in_progress`. There is no timed takeover — the claim is released by its holder on every exit (each refusal, the store-failure 500, and success after the transient is consumed), and a dead handler's orphan row is swept by age after an hour in `Aura_Worker_Rules::note_expired()`.
+5. **The writes are verified, not assumed (2.10.2).** The stored token row is read back from the database; a client-bearing connect then writes a seq-0 **binding sentinel** into `aura_worker_ruleset` (client + the hash of the token just installed) in place of clearing it, and verifies that row too. If either did not land the connect answers `500 aura_connect_store_failed` — the magic link is left unconsumed so the same variant can be retried. A connect that names no client clears the ruleset store exactly as before.
 
 ---
 

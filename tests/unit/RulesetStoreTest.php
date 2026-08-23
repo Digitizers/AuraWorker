@@ -572,6 +572,15 @@ final class RulesetStoreTest extends TestCase {
 		$this->assertSame( 'client-new', Aura_Worker_Rules::bound_client() );
 	}
 
+	public function test_a_client_id_of_zero_is_a_client_not_unbound(): void {
+		// bound_client() answers an id, and "0" is a valid opaque one. Read with
+		// empty() it would report the site as unbound while accept() — whose
+		// comparison is strict — would still refuse every other client.
+		$this->bind( '0' );
+		$this->assertSame( '0', Aura_Worker_Rules::bound_client() );
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, 'client-other' ) )->get_error_code() );
+	}
+
 	public function test_clear_forgets_the_binding_too(): void {
 		$this->bind( 'client-new' );
 		Aura_Worker_Rules::clear();
