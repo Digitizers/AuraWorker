@@ -108,8 +108,9 @@ class Aura_Worker {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'digitizer-site-worker' ) ), 403 );
 		}
 
-		$raw    = wp_generate_password( 48, false );
-		$hashed = Aura_Worker_Security::hash_token( $raw );
+		$previous = (string) get_option( 'aura_worker_site_token', '' );
+		$raw      = wp_generate_password( 48, false );
+		$hashed   = Aura_Worker_Security::hash_token( $raw );
 		update_option( 'aura_worker_site_token', $hashed );
 
 		// Prove the rotation happened before telling anyone it did. A filter that
@@ -119,10 +120,25 @@ class Aura_Worker {
 		// authenticates nowhere and told the old one is revoked (#67). Read the
 		// value back and compare; on a mismatch nothing else is touched and no
 		// token is revealed.
-		if ( ! hash_equals( $hashed, (string) get_option( 'aura_worker_site_token', '' ) ) ) {
+		$stored = (string) get_option( 'aura_worker_site_token', '' );
+		if ( ! hash_equals( $hashed, $stored ) ) {
+			// A filter may REWRITE the value rather than refuse it, in which case
+			// the row now holds a hash matching neither the new token nor the old
+			// one — the site would authenticate nothing at all. Put the previous
+			// value back before reporting, so a failed rotation cannot lock the
+			// site out, and say which of the two states we actually ended in
+			// rather than assuming the store was left untouched.
+			$restored = hash_equals( $previous, $stored );
+			if ( ! $restored ) {
+				update_option( 'aura_worker_site_token', $previous );
+				$restored = hash_equals( $previous, (string) get_option( 'aura_worker_site_token', '' ) );
+			}
+
 			wp_send_json_error(
 				array(
-					'message' => __( 'The new site token could not be saved, so the current token is unchanged. Check for a plugin filtering this option, or for a database write error.', 'digitizer-site-worker' ),
+					'message' => $restored
+						? __( 'The new site token could not be saved, so the current token is unchanged. Check for a plugin filtering this option, or for a database write error.', 'digitizer-site-worker' )
+						: __( 'The new site token could not be saved and the previous one could not be restored, so this site may now accept no token at all. Set the option directly (its value is the SHA-256 of the token) and check for a plugin filtering it.', 'digitizer-site-worker' ),
 				),
 				500
 			);

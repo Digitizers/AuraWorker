@@ -121,14 +121,54 @@ final class TokenRegenerateTest extends TestCase {
 	 * The guard being removed existed for a reason: the token is display-only on
 	 * the settings screen and a submitted value must never reach the option. The
 	 * option is no longer registered to the settings group, so core's allow-list
-	 * refuses it — assert the registration is gone rather than the filter, since
-	 * that is the mechanism now doing the work.
+	 * is what refuses it now — assert that, and the absence of the filter that
+	 * froze every writer, since a regression could reintroduce either.
 	 */
 	public function test_the_token_is_not_a_registered_setting(): void {
+		// The allow-list is the property that matters: options.php writes only
+		// options registered to the group, so a register_setting() call with no
+		// sanitize callback would still expose the token to a crafted submission
+		// while leaving a filter-only assertion green.
+		$this->assertNotContains(
+			'aura_worker_site_token',
+			$GLOBALS['_registered_settings']['aura_worker_settings'] ?? array(),
+			'registering the token adds it to the settings allow-list, so a submission could overwrite it'
+		);
 		$this->assertArrayNotHasKey(
 			'sanitize_option_aura_worker_site_token',
 			$GLOBALS['_filters'],
 			'registering the token as a setting freezes every writer, including regeneration'
 		);
+	}
+
+	/**
+	 * A filter that REWRITES the value must not leave the site tokenless.
+	 *
+	 * Refusing a write and rewriting it fail differently: a rewrite persists, so
+	 * the row ends up matching neither the new token nor the old one and the site
+	 * authenticates nothing. The handler must put the previous value back rather
+	 * than report "unchanged" over a store it has just invalidated.
+	 */
+	public function test_a_rewriting_filter_leaves_the_previous_token_in_place(): void {
+		$previous = Aura_Worker_Security::hash_token( 'the-previous-token' );
+		update_option( 'aura_worker_site_token', $previous );
+
+		// Installed AFTER the seeding write so the seed lands intact.
+		add_filter(
+			'sanitize_option_aura_worker_site_token',
+			static function ( $value ) {
+				return strrev( (string) $value );
+			}
+		);
+
+		$res = $this->regenerate();
+
+		$this->assertFalse( $res->success, 'a rotation that did not persist must report failure' );
+		$this->assertSame(
+			$previous,
+			strrev( (string) get_option( 'aura_worker_site_token', '' ) ),
+			'the previous token must be restored (through the same rewriting filter)'
+		);
+		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ), 'no token may be revealed' );
 	}
 }
