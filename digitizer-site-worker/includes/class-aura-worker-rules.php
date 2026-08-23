@@ -397,38 +397,66 @@ class Aura_Worker_Rules {
 		// The gateway key is shared across clients, so without this a valid
 		// envelope for site A plus site B's token could install A's rules on B
 		// before B's first push — and B's real documents would then be refused
-		// as a client mismatch. Checked before anything about the stored record,
-		// so it holds for the very first document too.
+		// as a client mismatch. Compared below, against the AUTHORITATIVE token
+		// and after the store read (see the ordering note there); it still
+		// holds for the very first document, before anything is stored.
 		$site = isset( $doc['site'] ) && is_string( $doc['site'] ) ? $doc['site'] : '';
-		$ours = (string) get_option( 'aura_worker_site_token', '' );
+
+		// AUTHORITATIVE reads, in the connect's write order reversed: the store
+		// first, then the token — both from the database, never from this
+		// request's option cache (a request paused after authenticating with
+		// the OLD token still has that token cached; read through the cache it
+		// would pass wrong_site, misjudge the new sentinel as stale, and install
+		// the old client's document — Codex round 11). The connect writes token
+		// THEN sentinel, so reading store THEN token leaves exactly three cases:
+		// (old store, old token) → decide, then the swap fails against the
+		// sentinel and re-decides; (old store, new token) → wrong_site below;
+		// (sentinel, new token) → client_mismatch below. There is no fourth.
+		// ONE read of the ONE value this decision is about: the binding lives
+		// inside this record, and the compare-and-swap names exactly it.
+		$current = self::stored_uncached();
+		if ( is_wp_error( $current ) ) {
+			return $current; // the database, not the site: a retryable 500, never wrong_site
+		}
+		if ( isset( $GLOBALS['_sa_after_store_read'] ) && is_callable( $GLOBALS['_sa_after_store_read'] ) ) {
+			call_user_func( $GLOBALS['_sa_after_store_read'] ); // test seam — inert in production
+		}
+		$ours = self::site_token_uncached();
+		if ( is_wp_error( $ours ) ) {
+			return $ours;
+		}
 		if ( '' === $site || '' === $ours || ! hash_equals( $ours, $site ) ) {
 			return new WP_Error( 'aura_ruleset_wrong_site', 'Ruleset refused: not issued for this site', array( 'status' => 403 ) );
 		}
-
-		$current = self::current();
-		if ( null !== $current && isset( $current['envelope'] ) && hash_equals( (string) $current['envelope'], (string) $envelope ) ) {
+		if ( null !== $current && isset( $current['envelope'] ) && '' !== (string) $current['envelope'] && hash_equals( (string) $current['envelope'], (string) $envelope ) ) {
 			// The very document we already hold — a retry after a lost 200.
 			// Delivered is delivered; saying 409 would record it as failed forever.
 			return true;
 		}
-		if ( null !== $current && isset( $current['client'] ) && $client !== (string) $current['client'] ) {
-			// A rebinding goes through connect(), which clears first. Anything
-			// else is a misroute or a replay, and the stored rules are not its
-			// to replace — the seq comparison below would be meaningless across
-			// clients.
+		$stale = null !== $current && self::is_stale( $current, $ours );
+		if ( ! $stale && null !== $current && isset( $current['client'] ) && $client !== (string) $current['client'] ) {
+			// Bound (the sentinel, or a record that followed it) or legacy: the
+			// stored rules — or the binding — are not another client's to
+			// replace. A rebinding goes through connect(). The seq comparison
+			// below would be meaningless across clients.
 			return new WP_Error(
 				'aura_ruleset_client_mismatch',
 				sprintf( 'Ruleset refused: issued for client %s, this site is bound to %s', $client, (string) $current['client'] ),
 				array( 'status' => 409 )
 			);
 		}
-		if ( null !== $current && $doc['seq'] <= (int) $current['seq'] ) {
+		if ( ! $stale && null !== $current && $doc['seq'] <= (int) $current['seq'] ) {
+			// Includes the sentinel's seq 0: the bound client's first document is 1.
 			return new WP_Error(
 				'aura_ruleset_stale',
 				sprintf( 'Ruleset refused: seq %d is not newer than stored seq %d', $doc['seq'], (int) $current['seq'] ),
 				array( 'status' => 409 )
 			);
 		}
+		// A stale record (its token is no longer the site's — two connects
+		// interleaved) binds nobody and bars nothing: this document, which the
+		// wrong_site check above proved is for the site's CURRENT token,
+		// replaces it with no seq comparison. The swap still names it.
 
 		// Compare-and-swap. The seq check above read $current; between that read
 		// and this write another request can install a newer ruleset — a retry
@@ -439,6 +467,11 @@ class Aura_Worker_Rules {
 		$record = array(
 			'envelope'    => (string) $envelope,
 			'client'      => $client,
+			// The authoritative token hash read above — which the wrong_site
+			// check just proved equals the document's own `site`. A real record
+			// carries the binding forward, so the next old-client document meets
+			// the same refusal and the stale check keeps working.
+			'token_hash'  => $ours,
 			'seq'         => (int) $doc['seq'],
 			'issued_at'   => isset( $doc['issued_at'] ) ? (string) $doc['issued_at'] : '',
 			'received_at' => time(),
@@ -630,24 +663,189 @@ class Aura_Worker_Rules {
 	}
 
 	/**
-	 * The stored record, or null when no ruleset has ever been accepted.
+	 * The raw stored record — a real ruleset OR the connect's seq-0 sentinel.
+	 * This is what accept() decides against and names in its compare-and-swap:
+	 * one value, read once.
+	 *
+	 * @since 2.10.2
 	 *
 	 * @return array|null
 	 */
-	public static function current() {
+	public static function stored() {
 		$rec = get_option( self::OPTION, null );
 		return self::is_record( $rec ) ? $rec : null;
 	}
 
 	/**
-	 * Is this value a stored ruleset record? One definition, used by current()
-	 * and by swap() on a value read straight from the database.
+	 * The stored RULESET, or null when there is none — the connect's sentinel
+	 * is a binding, not a ruleset, and reads as null here so no policy exists
+	 * until the bound client's first push. Everything that reports or enforces
+	 * (rules(), audit_rules, the status route) goes through this.
+	 *
+	 * @return array|null
+	 */
+	public static function current() {
+		$rec = self::stored();
+		return ( null === $rec || self::is_sentinel( $rec ) ) ? null : $rec;
+	}
+
+	/**
+	 * Is this value a stored record? One definition, used by stored() and by
+	 * swap() on a value read straight from the database.
 	 *
 	 * @param mixed $rec Candidate.
 	 * @return bool
 	 */
 	private static function is_record( $rec ) {
 		return is_array( $rec ) && isset( $rec['seq'], $rec['rules'] ) && is_array( $rec['rules'] );
+	}
+
+	/**
+	 * The connect's binding record: seq 0, no rules, flagged.
+	 *
+	 * @since 2.10.2
+	 *
+	 * @param array $rec Stored record.
+	 * @return bool
+	 */
+	private static function is_sentinel( array $rec ) {
+		return ! empty( $rec['bound'] ) && 0 === (int) $rec['seq'] && empty( $rec['rules'] );
+	}
+
+	/**
+	 * Write the binding (2.10.2): the ruleset store becomes a seq-0 sentinel
+	 * naming the client and the token this connect installed. Called only by
+	 * Aura_Worker_Magic_Link::handle_connect(), after the token is stored.
+	 *
+	 * @since 2.10.2
+	 *
+	 * @param string $client     Aura client id.
+	 * @param string $token_hash Hash of the site token just installed.
+	 * @return true|WP_Error
+	 */
+	public static function bind( $client, $token_hash ) {
+		$record = array(
+			'envelope'    => '',
+			'client'      => (string) $client,
+			'token_hash'  => (string) $token_hash,
+			'seq'         => 0,
+			'issued_at'   => '',
+			'received_at' => time(),
+			'rules'       => array(),
+			'bound'       => true,
+		);
+		// update_option() answers false both for "unchanged" and for "the write
+		// failed", so the return value alone proves nothing; what proves the
+		// binding is the ROW. Read it back from the database (never this
+		// request's cache) and compare the fields that matter.
+		update_option( self::OPTION, $record, false );
+		$stored = self::stored_uncached();
+		if ( is_wp_error( $stored ) ) {
+			return $stored;
+		}
+		if ( ! is_array( $stored ) || empty( $stored['bound'] ) || (string) $stored['client'] !== (string) $client || (string) $stored['token_hash'] !== (string) $token_hash ) {
+			return new WP_Error( 'aura_connect_store_failed', 'Connect not completed: the client binding could not be stored; retry.', array( 'status' => 500 ) );
+		}
+		return true;
+	}
+
+	/**
+	 * Does the stored record bind this site to a client, for the token the
+	 * site currently holds? A record without a token_hash (2.10.0/2.10.1, or
+	 * an older dashboard's connect) binds nobody; a record whose token_hash is
+	 * not the site's current token is STALE — written by a connect whose token
+	 * a concurrent connect then overwrote — and binds nobody either.
+	 *
+	 * @since 2.10.2
+	 *
+	 * @param array|null $rec Stored record (stored()); read fresh when null.
+	 * @return string The bound client, or ''.
+	 */
+	public static function bound_client( $rec = null ) {
+		$rec = null === $rec ? self::stored_uncached() : $rec;
+		// '' === … on the client, not empty(): a client id is opaque, so "0" is
+		// a client — reported as unbound here it would contradict accept(),
+		// whose comparison is strict and would bind it.
+		if ( is_wp_error( $rec ) || null === $rec || '' === (string) ( $rec['client'] ?? '' ) || empty( $rec['token_hash'] ) ) {
+			return ''; // a read failure here is reported by accept(); this is a report-only accessor
+		}
+		$ours = self::site_token_uncached();
+		return ( ! is_wp_error( $ours ) && '' !== $ours && hash_equals( $ours, (string) $rec['token_hash'] ) ) ? (string) $rec['client'] : '';
+	}
+
+	/**
+	 * Is this stored record for a token that is no longer the site's? $ours is
+	 * the AUTHORITATIVE token (site_token_uncached()), read by the caller AFTER
+	 * the store — never this request's cached copy.
+	 *
+	 * @since 2.10.2
+	 *
+	 * @param array  $rec  Stored record.
+	 * @param string $ours The site's current token hash.
+	 * @return bool
+	 */
+	private static function is_stale( array $rec, $ours ) {
+		if ( empty( $rec['token_hash'] ) ) {
+			return false; // legacy record: no claim about a token, never stale
+		}
+		return '' === (string) $ours || ! hash_equals( (string) $ours, (string) $rec['token_hash'] );
+	}
+
+	/**
+	 * The stored record straight from the database. accept() must not decide
+	 * on this request's option cache: an earlier read in the same request
+	 * (enforce(), audit_rules) may have cached a value a connect has since
+	 * replaced. Same statement swap_raw() uses to classify a lost race.
+	 *
+	 * @since 2.10.2
+	 *
+	 * @return array|null|WP_Error
+	 */
+	public static function stored_uncached() {
+		$raw = self::option_raw( self::OPTION );
+		if ( is_wp_error( $raw ) ) {
+			return $raw;
+		}
+		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		return self::is_record( $rec ) ? $rec : null;
+	}
+
+	/**
+	 * One raw options-table read, with the database's failure told apart from
+	 * an absent row: $wpdb->get_var() answers null for BOTH, and a transient
+	 * database error read as "no token" would turn a valid push into a 403
+	 * wrong_site instead of the retryable store failure it is (Codex round 16).
+	 *
+	 * @since 2.10.2
+	 *
+	 * @param string $name Option name.
+	 * @return string|null|WP_Error Raw value, null when absent, WP_Error on a database error.
+	 */
+	private static function option_raw( $name ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return new WP_Error( 'aura_ruleset_store_failed', 'Ruleset not evaluated: the options table could not be read; retry.', array( 'status' => 500 ) );
+		}
+		return $raw;
+	}
+
+	/**
+	 * The site token hash straight from the database — the value the connect
+	 * writes FIRST, so a request that reads it after the store sees any
+	 * re-home that the store read predates.
+	 *
+	 * @since 2.10.2
+	 *
+	 * @return string|WP_Error
+	 */
+	public static function site_token_uncached() {
+		$raw = self::option_raw( 'aura_worker_site_token' );
+		if ( is_wp_error( $raw ) ) {
+			return $raw;
+		}
+		return null === $raw ? '' : (string) maybe_unserialize( $raw );
 	}
 
 	/**
@@ -677,6 +875,15 @@ class Aura_Worker_Rules {
 
 	/** Prefix for the per-rule-per-day "already announced" claims. */
 	const EXPIRED_NOTICE = 'aura_worker_rule_expired_';
+
+	/**
+	 * Prefix for the per-magic-link connect claims (Aura_Worker_Magic_Link).
+	 * Swept here, by the age inside the value, because this class already runs
+	 * the daily bounded sweep.
+	 *
+	 * @since 2.10.2
+	 */
+	const MAGIC_CLAIM = 'aura_magic_claim_';
 
 	/**
 	 * The rule slot the daily sweep claims for itself.
@@ -778,11 +985,35 @@ class Aura_Worker_Rules {
 	 * day, one bucket per hour — so N statements is not a cost worth a
 	 * correctness hole.
 	 *
-	 * @param string $prefix Option-name prefix.
-	 * @param string $before Delete only names strictly less than this.
+	 * `$parse` moves the bound from the NAME to the stored VALUE, for the one
+	 * family of rows whose age is not in its name: the magic-link claims, named
+	 * after the magic id and dated inside the value. Same closed race — a claim
+	 * is always written with the current time, so no row this sweep reads can be
+	 * recreated below the bound it read it against.
+	 *
+	 * @param string        $prefix Option-name prefix.
+	 * @param string|int    $before Delete only rows strictly below this — a name
+	 *                              when $parse is null, else a parsed value.
+	 * @param callable|null $parse  Given a row's raw value, return the integer
+	 *                              compared against $before. Null = compare names.
 	 */
-	private static function sweep_options( $prefix, $before ) {
+	private static function sweep_options( $prefix, $before, $parse = null ) {
 		global $wpdb;
+		if ( null !== $parse ) {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+					$wpdb->esc_like( $prefix ) . '%'
+				),
+				ARRAY_A
+			);
+			foreach ( (array) $rows as $row ) {
+				if ( isset( $row['option_name'], $row['option_value'] ) && (int) call_user_func( $parse, $row['option_value'] ) < (int) $before ) {
+					delete_option( $row['option_name'] );
+				}
+			}
+			return;
+		}
 		$names = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name < %s",
@@ -901,6 +1132,18 @@ class Aura_Worker_Rules {
 			// statement, because the day leads the name. This is where retired
 			// rules' claims go too: nothing has to know which rules left.
 			self::sweep_stale_claims( $day );
+			// And the magic-link connect claims a dead handler left behind
+			// (2.10.2). Garbage only: the magic transient such a row belonged
+			// to expired fifty minutes before the row is eligible, so sweeping
+			// one admits nobody — the link is refused at the transient check.
+			// Dated inside the value ("<fence>|<unix ts>"), not in the name.
+			self::sweep_options(
+				self::MAGIC_CLAIM,
+				$now - HOUR_IN_SECONDS,
+				static function ( $v ) {
+					return (int) substr( strrchr( '|' . $v, '|' ), 1 );
+				}
+			);
 		}
 		foreach ( self::expired_keys( $now ) as $key ) {
 			$hash  = self::rule_hash( $key );

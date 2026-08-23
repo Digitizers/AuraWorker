@@ -394,6 +394,200 @@ final class RulesetStoreTest extends TestCase {
 		$this->assertSame( 'client-2', Aura_Worker_Rules::current()['client'] );
 	}
 
+	/** What the site-side connect writes (Task 6): the binding IS the stored record, naming the current token. */
+	private function bind( string $client, ?string $token_hash = null ): void {
+		Aura_Worker_Rules::bind( $client, $token_hash ?? $this->site() );
+	}
+
+	public function test_a_bound_site_refuses_another_clients_document_whatever_it_holds(): void {
+		// Aura#378 Ruling C1 / SiteAgent#65. connect() replaced the store with
+		// the NEW client's sentinel. Whatever the old client still has in flight
+		// — its clear (empty) or a late real ruleset — is refused, and the
+		// sentinel stays: the new client's first document (seq 1, even empty)
+		// installs over it, and the inverse race (late old NON-empty document
+		// onto the new client's empty ruleset) is refused too.
+		$this->bind( 'client-new' );
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $this->ruleset( 9, array(), null, 'client-old' ) )->get_error_code() );
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $this->ruleset( 12, array( $this->freeze() ), null, 'client-old' ) )->get_error_code() );
+		$this->assertNull( Aura_Worker_Rules::current() );
+		$this->assertSame( 'client-new', Aura_Worker_Rules::stored()['client'] );
+
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, 'client-new' ) ) );
+		$this->assertSame( 1, Aura_Worker_Rules::current()['seq'] );
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $this->ruleset( 13, array( $this->freeze() ), null, 'client-old' ) )->get_error_code() );
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 2, array( $this->freeze() ), null, 'client-new' ) ) );
+		$this->assertSame( 2, Aura_Worker_Rules::current()['seq'] );
+	}
+
+	public function test_the_old_clients_own_document_is_not_delivered_on_a_re_homed_site(): void {
+		// The identical-envelope shortcut compares against the stored record —
+		// which is now the sentinel, so an old envelope never matches it.
+		$env = $this->ruleset( 5, array( $this->freeze() ), null, 'client-old' );
+		$this->assertTrue( Aura_Worker_Rules::accept( $env ) );
+		$this->bind( 'client-new' );
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $env )->get_error_code() );
+	}
+
+	public function test_an_already_authenticated_old_request_loses_its_swap_to_the_connect_and_re_decides(): void {
+		// The whole point of putting the binding INSIDE the swapped value: the
+		// old request decided against the pre-connect record (or nothing), the
+		// connect replaced that value, the swap names a value that is gone and
+		// fails, and the re-decision meets the sentinel. No second read of any
+		// other option — nothing for WordPress's per-request option cache to
+		// serve stale (Codex round 8).
+		$old_env = $this->ruleset( 6, array( $this->freeze() ), null, 'client-old' );
+		Aura_Worker_Rules::accept( $this->ruleset( 5, array( $this->freeze() ), null, 'client-old' ) );
+		$GLOBALS['_sa_before_swap'] = function () {
+			Aura_Worker_Rules::bind( 'client-new', $this->site() ); // the connect, between the old request's read and its write
+			$GLOBALS['_sa_before_swap'] = null;
+		};
+		$res = Aura_Worker_Rules::accept( $old_env );
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_client_mismatch', $res->get_error_code() );
+		$this->assertSame( 'client-new', Aura_Worker_Rules::stored()['client'] );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_a_paused_old_request_whose_option_cache_still_holds_the_old_token_is_refused_after_one_ordinary_re_home(): void {
+		// Codex round 11 on the plan PR. The request authenticated with token A,
+		// cached it, and was paused; meanwhile one normal connect installed token
+		// B and client B's sentinel. Read through the cache the request would
+		// pass wrong_site, misjudge the sentinel as stale, and install A's
+		// document. accept() reads store and token from the DATABASE.
+		Aura_Worker_Rules::accept( $this->ruleset( 5, array( $this->freeze() ), null, 'client-A' ) ); // site holds A's ruleset under token A
+		$token_a = $this->site();
+		$GLOBALS['_sa_option_cache'] = array( 'aura_worker_site_token' => $token_a ); // what THIS request's cache holds: token A
+		$token_b = hash( 'sha256', 'token-B' );
+		$GLOBALS['_options']['aura_worker_site_token'] = $token_b;        // the re-home: token B …
+		Aura_Worker_Rules::bind( 'client-B', $token_b );                   // … then client B's sentinel (database state)
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 6, array( $this->freeze() ), null, 'client-A', $token_a ) ); // site = token A (the document's own binding)
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_wrong_site', $res->get_error_code(), 'The token is read from the database, after the store.' );
+		$this->assertSame( 'client-B', Aura_Worker_Rules::stored()['client'] );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_a_database_error_on_the_uncached_reads_is_a_retryable_store_failure_not_wrong_site(): void {
+		// $wpdb->get_var() answers null for an absent row AND for a failed query.
+		// Read as "no token", a transient database error would turn a valid push
+		// into 403 wrong_site — Aura would record a binding problem instead of
+		// retrying. The read inspects $wpdb->last_error and says which it was.
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ) ) );
+		$GLOBALS['_sa_wpdb_error'] = '';
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
+		$this->assertSame( 500, $res->get_error_data()['status'] );
+		$this->assertNull( Aura_Worker_Rules::current() );
+	}
+
+	public function test_reads_are_ordered_store_then_token_so_a_connect_between_them_is_caught(): void {
+		// The connect writes token THEN sentinel. A request that read the
+		// pre-connect store and then reads the token sees token B → wrong_site.
+		Aura_Worker_Rules::accept( $this->ruleset( 5, array( $this->freeze() ), null, 'client-A' ) );
+		$GLOBALS['_sa_after_store_read'] = function () {
+			$token_b = hash( 'sha256', 'token-B' );
+			$GLOBALS['_options']['aura_worker_site_token'] = $token_b;
+			Aura_Worker_Rules::bind( 'client-B', $token_b );
+			$GLOBALS['_sa_after_store_read'] = null;
+		};
+		$GLOBALS['_db_queries'] = array();
+		$res = Aura_Worker_Rules::accept( $this->ruleset( 6, array( $this->freeze() ), null, 'client-A' ) );
+		$this->assertSame( 'aura_ruleset_wrong_site', $res->get_error_code() );
+		$this->assertSame( 'client-B', Aura_Worker_Rules::stored()['client'] );
+		// And refused on the FIRST pass, without attempting a write: read
+		// token-then-store, this document would pass wrong_site against the
+		// pre-connect token, swap, lose, and only then re-decide.
+		$this->assertEmpty(
+			array_filter( $GLOBALS['_db_queries'], static fn( $q ) => false !== strpos( $q, 'UPDATE ' ) || false !== strpos( $q, 'INSERT ' ) ),
+			'the token was read before the store: a write was attempted against a value the connect had already replaced'
+		);
+	}
+
+	public function test_an_old_request_that_read_nothing_stored_also_loses_to_the_connect(): void {
+		// A site that never held a ruleset: the old request decided against
+		// "nothing stored" and would INSERT; the connect's sentinel is there
+		// first, the conditional insert reports the row exists, and the
+		// re-decision meets the sentinel.
+		$GLOBALS['_sa_before_swap'] = function () {
+			Aura_Worker_Rules::bind( 'client-new', $this->site() );
+			$GLOBALS['_sa_before_swap'] = null;
+		};
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ), null, 'client-old' ) )->get_error_code() );
+		$this->assertSame( 'client-new', Aura_Worker_Rules::stored()['client'] );
+	}
+
+	public function test_a_sentinel_for_a_token_that_is_no_longer_the_sites_is_stale_and_replaceable(): void {
+		// Two connects at once (Codex round 7): token A, token B, sentinel A.
+		// The sentinel names its token; one written for a token that is no
+		// longer current binds nobody and is replaced by the next document —
+		// never "authenticates B, accepts only A".
+		$this->bind( 'client-A', hash( 'sha256', 'token-A' ) );
+		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'token-B' ); // B's token write landed last
+		$this->assertSame( '', Aura_Worker_Rules::bound_client() );
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ), null, 'client-B', hash( 'sha256', 'token-B' ) ) ) );
+		$this->assertSame( 'client-B', Aura_Worker_Rules::current()['client'] );
+	}
+
+	public function test_a_stale_sentinel_does_not_lower_the_bar_for_the_same_client(): void {
+		// Stale means "replaceable by a document for this site's token" — the
+		// document's own seq rule still applies once a real record is in.
+		$this->bind( 'client-B', hash( 'sha256', 'token-A' ) );
+		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'token-B' );
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 4, array( $this->freeze() ), null, 'client-B', hash( 'sha256', 'token-B' ) ) ) );
+		$this->assertSame( 'aura_ruleset_stale', Aura_Worker_Rules::accept( $this->ruleset( 3, array(), null, 'client-B', hash( 'sha256', 'token-B' ) ) )->get_error_code() );
+	}
+
+	public function test_an_unbound_site_keeps_the_stored_record_comparison(): void {
+		// A site connected by an older Aura has no sentinel: what it holds is a
+		// 2.10.1-shaped record, which makes no claim about a token and is
+		// therefore never stale. Today's behaviour — including the residual
+		// race — until it reconnects (the fleet shows it as
+		// ruleset_wrong_client meanwhile). A record read as stale would let any
+		// client's document replace it, which is the opposite of the fix.
+		$legacy = array( 'envelope' => 'x.y', 'client' => 'client-1', 'seq' => 5, 'issued_at' => '', 'received_at' => time(), 'rules' => array( $this->freeze() ) );
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = $legacy;
+		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ]    = maybe_serialize( $legacy );
+		$this->site(); // this site has a token …
+		$this->assertSame( '', Aura_Worker_Rules::bound_client(), '… which the legacy record says nothing about' );
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, 'client-2' ) )->get_error_code() );
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 6, array() ) ) );
+	}
+
+	public function test_within_a_bound_client_seq_stays_monotonic_from_the_sentinel_up(): void {
+		$this->bind( 'client-new' );
+		$this->assertSame( 'aura_ruleset_stale', Aura_Worker_Rules::accept( $this->ruleset( 0, array(), null, 'client-new' ) )->get_error_code(), 'seq 0 is the sentinel\'s; the first document is 1.' );
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 9, array(), null, 'client-new' ) ) );
+		$this->assertSame( 'aura_ruleset_stale', Aura_Worker_Rules::accept( $this->ruleset( 3, array( $this->freeze() ), null, 'client-new' ) )->get_error_code() );
+	}
+
+	public function test_a_real_record_carries_the_binding_forward(): void {
+		// Once the bound client's document is installed, the record still names
+		// the token (accept() copies the sentinel's token_hash), so a later
+		// old-client document meets the same refusal and a later concurrent
+		// connect's stale check still works.
+		$this->bind( 'client-new' );
+		Aura_Worker_Rules::accept( $this->ruleset( 1, array( $this->freeze() ), null, 'client-new' ) );
+		$this->assertSame( $this->site(), Aura_Worker_Rules::stored()['token_hash'] );
+		$this->assertSame( 'client-new', Aura_Worker_Rules::bound_client() );
+	}
+
+	public function test_a_client_id_of_zero_is_a_client_not_unbound(): void {
+		// bound_client() answers an id, and "0" is a valid opaque one. Read with
+		// empty() it would report the site as unbound while accept() — whose
+		// comparison is strict — would still refuse every other client.
+		$this->bind( '0' );
+		$this->assertSame( '0', Aura_Worker_Rules::bound_client() );
+		$this->assertSame( 'aura_ruleset_client_mismatch', Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, 'client-other' ) )->get_error_code() );
+	}
+
+	public function test_clear_forgets_the_binding_too(): void {
+		$this->bind( 'client-new' );
+		Aura_Worker_Rules::clear();
+		$this->assertNull( Aura_Worker_Rules::stored() );
+		$this->assertSame( '', Aura_Worker_Rules::bound_client() );
+	}
+
 	public function test_a_document_without_a_client_is_refused(): void {
 		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::accept( $this->sign( array( 'v' => 1, 'site' => $this->site(), 'seq' => 1, 'rules' => array() ) ) ) );
 	}
