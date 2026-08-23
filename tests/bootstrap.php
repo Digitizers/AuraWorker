@@ -82,6 +82,8 @@ $GLOBALS['_logged_in']    = false;
 $GLOBALS['_admins']       = array();
 $GLOBALS['_current_user'] = 0;
 $GLOBALS['_did_actions']  = array();
+$GLOBALS['_registered_settings'] = array();
+$GLOBALS['_settings_fields']    = array();
 $GLOBALS['_filters']      = array();
 $GLOBALS['_abilities']    = array();
 $GLOBALS['_ability_categories'] = array();
@@ -376,6 +378,13 @@ if ( ! function_exists( 'update_option' ) ) {
 		if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $option ] ) ) {
 			return false;
 		}
+		// Core sanitises before storing: update_option() calls sanitize_option(),
+		// which applies the `sanitize_option_{$option}` filter that
+		// register_setting() installs for a registered setting. Without this the
+		// harness stores whatever a caller passes, so a filter that rejects or
+		// rewrites the value — the exact shape of the bug in #67, where a
+		// read-only guard silently froze the site token — is invisible to tests.
+		$value = apply_filters( "sanitize_option_{$option}", $value, $option, $value );
 		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
@@ -392,6 +401,99 @@ if ( ! function_exists( 'update_option' ) ) {
 		// here, so a test that empties it sees exactly its own call's writes.
 		$GLOBALS['_option_writes'][] = array( 'set', $option );
 		return true;
+	}
+}
+
+/**
+ * admin-ajax surface used by the token regeneration handler (#67).
+ *
+ * Core's wp_send_json_*() emit and then exit; the handler's code after the call
+ * must not run. A test needs to observe both the payload and that the request
+ * ended there, so these throw a dedicated exception the test catches — an exit
+ * a test can assert on, rather than one that would kill the runner.
+ */
+/**
+ * Settings API, modelled on core closely enough to matter.
+ *
+ * register_setting() does two things that shape behaviour: it adds the option
+ * to the group's allow-list (options.php saves nothing outside it) and, when a
+ * sanitize_callback is supplied, installs it as a `sanitize_option_{$option}`
+ * filter — which update_option() then applies on EVERY write, from any caller.
+ * That second effect is the whole of #67, so the stub must reproduce it.
+ */
+if ( ! function_exists( 'get_current_user_id' ) ) {
+	function get_current_user_id(): int {
+		return (int) ( $GLOBALS['_current_user_id'] ?? 0 );
+	}
+}
+
+if ( ! function_exists( 'register_setting' ) ) {
+	function register_setting( string $group, string $option, $args = array() ): void {
+		$GLOBALS['_registered_settings'][ $group ][] = $option;
+		if ( is_array( $args ) && ! empty( $args['sanitize_callback'] ) ) {
+			add_filter( "sanitize_option_{$option}", $args['sanitize_callback'] );
+		}
+	}
+}
+
+if ( ! function_exists( 'add_settings_section' ) ) {
+	function add_settings_section( $id, $title, $callback, $page, $args = array() ): void {}
+}
+
+if ( ! function_exists( 'add_settings_field' ) ) {
+	function add_settings_field( $id, $title, $callback, $page, $section = 'default', $args = array() ): void {
+		$GLOBALS['_settings_fields'][ $page ][] = $id;
+	}
+}
+
+if ( ! class_exists( 'SA_Json_Response' ) ) {
+	final class SA_Json_Response extends RuntimeException {
+		public bool $success;
+		public $data;
+		public ?int $status;
+		public function __construct( bool $success, $data, ?int $status = null ) {
+			parent::__construct( $success ? 'json_success' : 'json_error' );
+			$this->success = $success;
+			$this->data    = $data;
+			$this->status  = $status;
+		}
+	}
+}
+
+if ( ! function_exists( 'wp_send_json_success' ) ) {
+	function wp_send_json_success( $data = null, ?int $status_code = null ): void {
+		throw new SA_Json_Response( true, $data, $status_code );
+	}
+}
+
+if ( ! function_exists( 'wp_send_json_error' ) ) {
+	function wp_send_json_error( $data = null, ?int $status_code = null ): void {
+		throw new SA_Json_Response( false, $data, $status_code );
+	}
+}
+
+if ( ! function_exists( 'check_ajax_referer' ) ) {
+	// Nonce verification is not what these tests exercise; a test that needs a
+	// failing referer sets $GLOBALS['_sa_ajax_referer_fails'].
+	function check_ajax_referer( $action = -1, $query_arg = false, $stop = true ) {
+		if ( ! empty( $GLOBALS['_sa_ajax_referer_fails'] ) ) {
+			throw new SA_Json_Response( false, array( 'message' => 'bad nonce' ), 403 );
+		}
+		return 1;
+	}
+}
+
+if ( ! function_exists( 'wp_generate_password' ) ) {
+	function wp_generate_password( int $length = 12, bool $special_chars = true, bool $extra_special_chars = false ): string {
+		$chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+		if ( $special_chars ) {
+			$chars .= '!@#$%^&*()';
+		}
+		$out = '';
+		for ( $i = 0; $i < $length; $i++ ) {
+			$out .= $chars[ random_int( 0, strlen( $chars ) - 1 ) ];
+		}
+		return $out;
 	}
 }
 
@@ -1548,6 +1650,9 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-magic-link.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-call-context.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-abilities.php';
+// The plugin's admin/settings class: registers settings and owns the token
+// regeneration handler (#67).
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker.php';
 
 // Load every shipped tool class so tool-level tests can instantiate them
 // directly (the registry auto-loads the same set at construction time).
@@ -1707,6 +1812,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_current_user'] = 0;
 	$GLOBALS['_did_actions']  = array();
 	$GLOBALS['_filters']      = array();
+	$GLOBALS['_registered_settings'] = array();
+	$GLOBALS['_settings_fields']    = array();
 	$GLOBALS['_db_rows']          = array();
 	$GLOBALS['_db_results_queue'] = array();
 	$GLOBALS['_db_var']           = 0;

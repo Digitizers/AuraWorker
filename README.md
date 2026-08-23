@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.10.2-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.10.3-green" alt="Stable" />
 </p>
 
 ---
@@ -151,6 +151,16 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.10.3
+
+**Fix (security):** "Regenerate Token" revealed a new site token without storing it —
+the option was a registered read-only setting, and the callback enforcing that ran on
+every write, discarding the handler's. The old token stayed valid (so rotating a leaked
+token did nothing) and a disconnected site could not be reconnected. The token is no
+longer a registered setting, and regeneration stores the new hash with a single
+compare-and-swap that no option filter can reach — a token is revealed only when that
+statement reports it wrote the row.
 
 ### 2.10.2
 
