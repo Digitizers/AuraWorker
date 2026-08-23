@@ -408,6 +408,13 @@ if ( ! function_exists( 'add_option' ) ) {
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return false;
 		}
+		// …but core's check and its write are TWO statements, and the write is
+		// `INSERT … ON DUPLICATE KEY UPDATE` (option.php): a second caller that
+		// passed the same check in between also "succeeds", and its value
+		// overwrites the first one's. Anything that needs a real mutex must use
+		// a conditional INSERT instead — this seam is how a test shows the
+		// difference (inert when unset).
+		sa_before_swap();
 		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
@@ -1114,7 +1121,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					Aura_Worker_Rules::accept( $racer );
 				}
 				list( , $name, $value, ) = array_map( 'stripslashes', $m );
-				if ( isset( $GLOBALS['_rows'][ $name ] ) ) {
+				// The row as the DATABASE holds it — $_rows, else an $_options
+				// value a test seeded directly (sa_read_option_uncached()).
+				if ( null !== sa_read_option_uncached( $name ) ) {
 					if ( 'duplicate' === $GLOBALS['_db_query_error'] ) {
 						// The race decided by the unique index rather than by
 						// the NOT EXISTS subquery: MySQL 1062, reported by

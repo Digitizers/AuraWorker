@@ -268,6 +268,38 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( array(), $GLOBALS['_option_writes'] );
 	}
 
+	private function claim( string $key ): string {
+		$m = new ReflectionMethod( Aura_Worker_Magic_Link::class, 'claim_magic_link' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		return (string) $m->invoke( null, $key );
+	}
+
+	public function test_two_claims_for_one_magic_link_admit_exactly_one(): void {
+		// Codex round 1 on #66. Two callbacks for one magic link reach the claim
+		// at the same moment. add_option() cannot serialise them: its existence
+		// check and its write are two statements and the write is
+		// `INSERT … ON DUPLICATE KEY UPDATE`, so BOTH callers get true, the
+		// later fence overwrites the earlier one, and both handlers run on past
+		// the still-live transient and interleave their token/binding writes.
+		// A conditional INSERT cannot do that — wp_options' UNIQUE KEY on
+		// option_name decides, and the loser is refused with ''.
+		$key   = Aura_Worker_Rules::MAGIC_CLAIM . 'race';
+		$other = '';
+		// The other handler, running inside this one's window (between the
+		// existence check and the write).
+		$GLOBALS['_sa_before_swap'] = function () use ( $key, &$other ) {
+			$GLOBALS['_sa_before_swap'] = null;
+			$other = $this->claim( $key );
+		};
+		$mine = $this->claim( $key );
+
+		$held = array_values( array_filter( array( $mine, $other ) ) );
+		$this->assertCount( 1, $held, 'exactly one handler may hold the claim' );
+		$this->assertSame( 0, strpos( (string) $GLOBALS['_options'][ $key ], $held[0] . '|' ), "…and the row carries that handler's fence, never the loser's" );
+	}
+
 	public function test_a_release_never_deletes_another_handlers_claim(): void {
 		// The conditional DELETE names this handler's fence; a foreign row is untouched.
 		$key = 'aura_magic_claim_' . $this->magic_id;

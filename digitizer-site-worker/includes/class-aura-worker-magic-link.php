@@ -206,9 +206,10 @@ class Aura_Worker_Magic_Link {
 		// ONE handler per magic link at a time (2.10.2). A second request for
 		// the same magic link — a retry, a double submit, an earlier attempt of
 		// Aura's still in flight — must not run while this one may be past the
-		// transient check and about to write. Serialise on an add_option()
-		// claim (the rules counters' mutex pattern): a second handler is
-		// refused here, before the transient, before any option is touched.
+		// transient check and about to write. Serialise on a conditional
+		// INSERT (the ruleset store's insert_if_absent() pattern — NOT
+		// add_option(), which upserts): a second handler is refused here,
+		// before the transient, before any option is touched.
 		// Released by THIS handler on every exit — each refusal below (the next
 		// variant may then try), the store-failure 500, and success after the
 		// transient is consumed. NEVER taken over by age: a dead handler costs
@@ -381,10 +382,25 @@ class Aura_Worker_Magic_Link {
 	/**
 	 * Take the per-magic-link claim. The value is "<fence>|<unix ts>": the
 	 * FENCE is a random token only this handler knows (its release names it),
-	 * the timestamp is for the orphan sweep. ONE atomic path: a conditional
-	 * INSERT (add_option — "already exists" is a lost race, never confused
-	 * with "inserted" because the value is never empty). An existing row —
-	 * however old — is refused.
+	 * the timestamp is for the orphan sweep. ONE atomic path: a real
+	 * conditional INSERT through $wpdb, decided by wp_options' UNIQUE KEY on
+	 * option_name. An existing row — however old — is refused.
+	 *
+	 * NOT add_option(). Core's add_option() checks for the option (skipping
+	 * that check entirely whenever `notoptions` lists the name) and then runs
+	 * `INSERT … ON DUPLICATE KEY UPDATE` — two statements. Two callbacks for
+	 * one magic link can both pass the check, both be answered true, and the
+	 * later one's fence overwrites the earlier claim; both handlers then run
+	 * on past the still-live transient and interleave their writes, which is
+	 * precisely what this claim exists to prevent (Codex round 1 on #66). It
+	 * is the same hazard insert_if_absent() documents for the ruleset store,
+	 * and the same remedy: let the database decide. The affected-row count is
+	 * the answer directly — 1 inserted (this handler holds the claim),
+	 * 0 a row was already there, false a database error (including the
+	 * duplicate-key/deadlock a concurrent insert is reported as). Anything
+	 * that is not exactly 1 means this handler did not take the claim, so it
+	 * must not proceed: all of them are answered 409 aura_connect_in_progress,
+	 * and retry is the right client behaviour in every one of those cases.
 	 *
 	 * No timed takeover, deliberately. Every takeover rule reviewed for this
 	 * plan (an age, twice the execution limit, fences re-checked before each
@@ -409,8 +425,26 @@ class Aura_Worker_Magic_Link {
 	 * @return string This handler's fence when it holds the claim, else ''.
 	 */
 	private static function claim_magic_link( $claim_key ) {
+		global $wpdb;
 		$fence = bin2hex( random_bytes( 16 ) );
-		return add_option( $claim_key, $fence . '|' . time(), '', false ) ? $fence : '';
+		$rows  = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+				$claim_key,
+				$fence . '|' . time(),
+				'no',
+				$claim_key
+			)
+		);
+		if ( 1 !== (int) $rows || '' !== (string) $wpdb->last_error ) {
+			return ''; // 0: a row is there. false/last_error: nothing was claimed.
+		}
+		// The row was created behind the option cache's back, so evict what
+		// add_option() would have maintained: this name, and the `notoptions`
+		// entry any earlier miss on it left (see insert_if_absent()).
+		wp_cache_delete( $claim_key, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return $fence;
 	}
 
 	/**
