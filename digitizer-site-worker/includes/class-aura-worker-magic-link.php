@@ -36,13 +36,22 @@ class Aura_Worker_Magic_Link {
 		echo '<hr>';
 		echo '<h2>' . esc_html__( 'Aura Dashboard Connection', 'digitizer-site-worker' ) . '</h2>';
 
+		$reconnect = ( '' !== (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) );
 		if ( $dashboard_url && $site_token ) {
-			echo '<p style="color:#2e7d32;">';
-			echo '<span class="dashicons dashicons-yes-alt"></span> ';
+			echo '<p style="color:' . ( $reconnect ? '#b26a00' : '#2e7d32' ) . ';">';
+			echo '<span class="dashicons dashicons-' . ( $reconnect ? 'warning' : 'yes-alt' ) . '"></span> ';
 			echo esc_html__( 'Connected to Aura dashboard:', 'digitizer-site-worker' ) . ' ';
 			echo '<strong>' . esc_html( $dashboard_url ) . '</strong>';
 			echo '</p>';
-			return;
+			if ( ! $reconnect ) {
+				return;
+			}
+			// Deactivating the plugin revoked the Application Password the
+			// builder tools authenticate with (round-19). The token binding
+			// above still works, so this is not a disconnection — but the
+			// credential is gone and only a fresh connect can mint another, so
+			// say so and leave the button below reachable.
+			echo '<p>' . esc_html__( 'The credential the builder tools use was revoked when this plugin was deactivated. Connect again to issue a new one.', 'digitizer-site-worker' ) . '</p>';
 		}
 
 		$nonce = wp_create_nonce( 'aura_magic_link' );
@@ -497,6 +506,10 @@ class Aura_Worker_Magic_Link {
 				500
 			);
 		}
+		// The connect that mints a new Application Password also clears the
+		// "reconnect to restore the builder credential" flag deactivation set
+		// (round-19) — under the claim, like every other install write.
+		Aura_Worker_Rules::delete_option_if_claimed( self::RECONNECT_NEEDED_OPTION, $site_claim_key, $site_fence );
 		// Consumed only now (the round-23 orphan rule still holds: the claim is released with it below).
 		delete_transient( 'aura_magic_' . $magic_id );
 		if ( is_wp_error( $minted ) ) {
@@ -571,6 +584,15 @@ class Aura_Worker_Magic_Link {
 	 * no half state to interpret.
 	 */
 	const APP_PASSWORD_RECORD_OPTION = 'aura_worker_app_password';
+
+	/**
+	 * Set when deactivation revoked the Application Password (round-19). The
+	 * site token binding survives deactivation — Aura still reaches the site
+	 * with it — but the credential the builder tools authenticate with does
+	 * not, and the settings screen would otherwise report an intact connection
+	 * and offer no way to restore it. Cleared by the next successful connect.
+	 */
+	const RECONNECT_NEEDED_OPTION = 'aura_worker_reconnect_needed';
 
 	/**
 	 * Mint the dashboard's Application Password for a user, rotating any

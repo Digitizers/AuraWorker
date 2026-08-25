@@ -383,6 +383,38 @@ function sa_claim_like_matches( string $claim, string $like ): bool {
 	return 0 === strpos( $held, $prefix );
 }
 
+// --- Admin-screen escaping/nonce stubs (render_connect_section) -------------
+if ( ! function_exists( 'esc_html' ) ) {
+	function esc_html( $text ): string {
+		return htmlspecialchars( (string) $text, ENT_QUOTES );
+	}
+}
+if ( ! function_exists( 'esc_html_e' ) ) {
+	function esc_html_e( string $text, string $domain = '' ): void {
+		echo esc_html( $text );
+	}
+}
+if ( ! function_exists( 'esc_url' ) ) {
+	function esc_url( $url ): string {
+		return (string) $url;
+	}
+}
+if ( ! function_exists( 'esc_attr' ) ) {
+	function esc_attr( $text ): string {
+		return htmlspecialchars( (string) $text, ENT_QUOTES );
+	}
+}
+if ( ! function_exists( 'admin_url' ) ) {
+	function admin_url( string $path = '' ): string {
+		return 'https://example.test/wp-admin/' . ltrim( $path, '/' );
+	}
+}
+if ( ! function_exists( 'wp_create_nonce' ) ) {
+	function wp_create_nonce( $action = -1 ): string {
+		return 'nonce-' . md5( (string) $action );
+	}
+}
+
 if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
 		// The database refusing (or a filter short-circuiting) a write:

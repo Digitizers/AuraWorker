@@ -269,7 +269,10 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   other REST/MCP plugins, so "deactivated" would not have meant
   "disconnected". If the revocation fails the owner and UUID are kept, and
   reactivating finishes the job (activation retries a revocation deactivation
-  could not land), as does uninstalling.
+  could not land), as does uninstalling. The site token binding survives
+  deactivation, so the settings screen keeps showing the dashboard it is
+  connected to — with a note that the builder credential was revoked, and the
+  Connect button reachable again to issue a new one.
 
 = 2.10.3 =
 * Fix (security): **"Regenerate Token" revealed a new site token without ever

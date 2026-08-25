@@ -102,9 +102,17 @@ function aura_worker_deactivate() {
 	//    because every write the claim protects re-checks that it still holds
 	//    the claim (Aura_Worker_Magic_Link::holds_site_claim()), so a request
 	//    that resumes after the release writes nothing.
+	$aura_had_password = ( null !== get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null ) );
 	if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: the Aura Application Password could not be revoked while deactivating; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+	} elseif ( $aura_had_password ) {
+		// The token binding survives deactivation, so the settings screen would
+		// go on reporting an intact connection while the credential the builder
+		// tools authenticate with is gone, with no way to restore it from here
+		// (round-19). Flag it; the next successful connect clears the flag as
+		// it mints the replacement.
+		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
 	}
 	Aura_Worker_Magic_Link::forget_site_claim();
 }

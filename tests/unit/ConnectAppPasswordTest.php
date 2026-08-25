@@ -699,6 +699,40 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'and so does the password' );
 	}
 
+	public function test_deactivation_flags_the_revoked_builder_credential_and_a_connect_clears_it(): void {
+		// Round-19: the token binding survives deactivation, so the settings
+		// screen kept reporting an intact connection while the credential the
+		// builder tools authenticate with was gone — and hid the connect
+		// button, leaving no way to restore it from the site.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertNotNull( $this->record() );
+		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
+
+		// Deactivation revokes it and says so.
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false', $main );
+		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
+
+		// The settings screen keeps the connect button reachable and explains why.
+		ob_start();
+		$this->ml->render_connect_section();
+		$html = (string) ob_get_clean();
+		$this->assertStringContainsString( 'was revoked when this plugin was deactivated', $html );
+		$this->assertStringContainsString( 'aura-connect-btn', $html, 'the button is reachable again' );
+
+		// A fresh connect mints a replacement and clears the flag.
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
+
+		// …and with no flag the screen is the plain connected one, no button.
+		ob_start();
+		$this->ml->render_connect_section();
+		$html = (string) ob_get_clean();
+		$this->assertStringNotContainsString( 'aura-connect-btn', $html );
+	}
+
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
 	private function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {

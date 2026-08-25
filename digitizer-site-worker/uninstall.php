@@ -58,4 +58,5 @@ delete_option( 'aura_worker_site_token' );
 delete_option( 'aura_worker_allowed_ips' );
 delete_option( 'aura_worker_allowed_domains' );
 delete_option( 'aura_worker_dashboard_url' );
-delete_option( 'aura_worker_connect_lock' ); // the site-wide connect claim (mirrors Aura_Worker_Magic_Link::SITE_CLAIM)
+delete_option( 'aura_worker_connect_lock' );
+delete_option( 'aura_worker_reconnect_needed' ); // mirrors Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION // the site-wide connect claim (mirrors Aura_Worker_Magic_Link::SITE_CLAIM)
