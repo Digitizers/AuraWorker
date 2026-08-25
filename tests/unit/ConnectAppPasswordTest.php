@@ -86,6 +86,25 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( 'connect_user_unknown', $data['app_password_unavailable'] );
 	}
 
+	public function test_the_whole_install_runs_under_ONE_site_wide_claim_released_on_every_exit(): void {
+		// Another link's handler holds the site — this one is refused before it touches anything.
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'other-fence|' . time();
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_connect_in_progress', $res->get_data()['code'] );
+		$this->assertFalse( get_option( 'aura_worker_site_token', false ) );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), 'the per-link claim is released when the site claim is refused' );
+		// The holder finishes: both claims released.
+		unset( $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] );
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ) );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ) );
+		// The site claim lives under the swept prefix — an orphan ages out like a link's.
+		$this->assertStringStartsWith( Aura_Worker_Rules::MAGIC_CLAIM, Aura_Worker_Magic_Link::SITE_CLAIM );
+	}
+
 	public function test_a_rejected_connect_mints_nothing(): void {
 		$req = $this->request();
 		$req->set_param( 'signature', 'bogus' );

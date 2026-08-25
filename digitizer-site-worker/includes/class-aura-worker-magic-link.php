@@ -222,7 +222,23 @@ class Aura_Worker_Magic_Link {
 		// Release = delete ONLY the value this handler wrote (conditional on its
 		// own fence). Nobody else ever removes a live claim — there is no timed
 		// takeover — so this is belt-and-braces against a double release.
-		$release = static function () use ( $claim_key, $fence ) {
+		// …and ONE claim for the whole SITE (2.11.0): two valid callbacks for
+		// different magic links of the same site overlapped on the per-link
+		// claims alone, and the token write and the Application Password
+		// rotation below could interleave — the callback that won the token
+		// could lose its password to the other's rotation, leaving the two
+		// credentials the dashboard holds split across two responses. Under
+		// this claim the whole install (token, binding, key, password) is one
+		// handler's at a time; the loser answers 409 and the dashboard's next
+		// variant retries. Same mechanism, same prefix, same age sweep.
+		$site_claim_key = self::SITE_CLAIM;
+		$site_fence     = self::claim_magic_link( $site_claim_key );
+		if ( '' === $site_fence ) {
+			self::release_magic_link( $claim_key, $fence );
+			return new WP_REST_Response( array( 'error' => 'A connect for this site is already in progress; retry.', 'code' => 'aura_connect_in_progress' ), 409 );
+		}
+		$release = static function () use ( $claim_key, $fence, $site_claim_key, $site_fence ) {
+			self::release_magic_link( $site_claim_key, $site_fence );
 			self::release_magic_link( $claim_key, $fence );
 		};
 
@@ -362,6 +378,9 @@ class Aura_Worker_Magic_Link {
 
 	/** The fixed name every Aura-minted Application Password carries — the rotation key. */
 	const APP_PASSWORD_NAME = 'Aura SiteAgent';
+
+	/** The site-wide connect claim (2.11.0): one install at a time. Under the swept MAGIC_CLAIM prefix. */
+	const SITE_CLAIM = Aura_Worker_Rules::MAGIC_CLAIM . 'site';
 
 	/**
 	 * Mint the dashboard's Application Password for a user, rotating any
