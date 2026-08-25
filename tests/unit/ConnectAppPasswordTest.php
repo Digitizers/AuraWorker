@@ -138,6 +138,37 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ), 'no owner remains' );
 	}
 
+	public function test_a_revocation_that_did_not_land_mints_nothing_and_says_so(): void {
+		$this->ml->handle_connect( $this->request() ); // admin 7 owns one
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 ); // a new link
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertTrue( $data['success'] );
+		$this->assertSame( 'app_password_revoke_failed', $data['app_password_unavailable'] );
+		$this->assertArrayNotHasKey( 'app_password', $data );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the old one is still there — honestly' );
+		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ), 'the owner is still known for the next rotation' );
+	}
+
+	public function test_an_owner_record_that_did_not_persist_revokes_the_new_password_and_returns_none(): void {
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = true;
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertTrue( $data['success'] );
+		$this->assertSame( 'app_password_owner_unrecorded', $data['app_password_unavailable'] );
+		$this->assertArrayNotHasKey( 'app_password', $data );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password just created is revoked again' );
+	}
+
+	public function test_an_unverified_caller_never_contends_for_the_site_claim(): void {
+		// Someone else holds the site: a BOGUS callback must be refused on its signature (401), not on the claim (409).
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'other-fence|' . time();
+		$req = $this->request();
+		$req->set_param( 'signature', 'bogus' );
+		$res = $this->ml->handle_connect( $req );
+		$this->assertSame( 401, $res->get_status() );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), 'the per-link claim is released' );
+	}
+
 	public function test_a_rejected_connect_mints_nothing(): void {
 		$req = $this->request();
 		$req->set_param( 'signature', 'bogus' );

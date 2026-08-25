@@ -632,6 +632,7 @@ if ( ! function_exists( 'user_can' ) ) {
 // $GLOBALS['_app_passwords_available'] gates wp_is_application_passwords_available_for_user().
 $GLOBALS['_app_passwords']           = array();
 $GLOBALS['_app_passwords_available'] = true;
+$GLOBALS['_app_passwords_delete_fail'] = false;
 if ( ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 	function wp_is_application_passwords_available_for_user( $user ): bool {
 		return (bool) $GLOBALS['_app_passwords_available'];
@@ -658,6 +659,9 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 			return $GLOBALS['_app_passwords'][ $user_id ] ?? array();
 		}
 		public static function delete_application_password( int $user_id, string $uuid ) {
+			if ( ! empty( $GLOBALS['_app_passwords_delete_fail'] ) ) {
+				return new WP_Error( 'db_update_error', 'user meta write failed' );
+			}
 			$before = count( $GLOBALS['_app_passwords'][ $user_id ] ?? array() );
 			$GLOBALS['_app_passwords'][ $user_id ] = array_values( array_filter( $GLOBALS['_app_passwords'][ $user_id ] ?? array(), static fn( $i ) => $i['uuid'] !== $uuid ) );
 			return count( $GLOBALS['_app_passwords'][ $user_id ] ) < $before ? true : new WP_Error( 'application_password_not_found', 'not found' );
@@ -1843,6 +1847,7 @@ if ( ! function_exists( 'sa_register_ability' ) ) {
 function sa_reset_state(): void {
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
+	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();

@@ -231,14 +231,18 @@ class Aura_Worker_Magic_Link {
 		// this claim the whole install (token, binding, key, password) is one
 		// handler's at a time; the loser answers 409 and the dashboard's next
 		// variant retries. Same mechanism, same prefix, same age sweep.
+		// It is taken only AFTER the transient and the HMAC signature have
+		// been verified (round-4): the route is public, and a site-wide claim
+		// taken on unverified input would let anyone win it with junk and
+		// answer a legitimate signed callback 409. Until then the per-link
+		// claim alone serializes; $release covers whichever claims are held.
 		$site_claim_key = self::SITE_CLAIM;
-		$site_fence     = self::claim_magic_link( $site_claim_key );
-		if ( '' === $site_fence ) {
-			self::release_magic_link( $claim_key, $fence );
-			return new WP_REST_Response( array( 'error' => 'A connect for this site is already in progress; retry.', 'code' => 'aura_connect_in_progress' ), 409 );
-		}
-		$release = static function () use ( $claim_key, $fence, $site_claim_key, $site_fence ) {
-			self::release_magic_link( $site_claim_key, $site_fence );
+		$site_fence     = '';
+		$release        = static function () use ( $claim_key, $fence, $site_claim_key, &$site_fence ) {
+			if ( '' !== $site_fence ) {
+				self::release_magic_link( $site_claim_key, $site_fence );
+				$site_fence = '';
+			}
 			self::release_magic_link( $claim_key, $fence );
 		};
 
@@ -286,6 +290,14 @@ class Aura_Worker_Magic_Link {
 		// Persist the connecting administrator so token-only requests can run as
 		// them (an admin context lets current_user_can() pass without an
 		// application password). Falls back to the first admin if absent.
+		// Verified. From here the whole install — token, binding, key, password
+		// — is one handler's: take the site-wide claim now.
+		$site_fence = self::claim_magic_link( $site_claim_key );
+		if ( '' === $site_fence ) {
+			$release();
+			return new WP_REST_Response( array( 'error' => 'A connect for this site is already in progress; retry.', 'code' => 'aura_connect_in_progress' ), 409 );
+		}
+
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			update_option( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'] );
 		}
@@ -405,7 +417,12 @@ class Aura_Worker_Magic_Link {
 		// when no replacement can be minted for this creator (not an admin,
 		// Application Passwords unavailable for them). Rotation is a promise
 		// about the OLD credential, not a side effect of minting a new one.
-		self::revoke_aura_passwords( $user_id );
+		if ( ! self::revoke_aura_passwords( $user_id ) ) {
+			// A revocation that did not land is NOT reported as a rotation
+			// (round-4): the old credential may still be valid, so nothing new
+			// is minted beside it and the dashboard is told why.
+			return new WP_Error( 'app_password_revoke_failed', 'A previous Aura Application Password could not be revoked; no new one was minted.' );
+		}
 		$user = $user_id > 0 ? get_userdata( $user_id ) : false;
 		if ( ! $user || empty( $user->user_login ) ) {
 			return new WP_Error( 'connect_user_unknown', 'The user who created this connect link no longer exists.' );
@@ -423,7 +440,19 @@ class Aura_Worker_Magic_Link {
 		if ( ! is_array( $created ) || empty( $created[0] ) || ! is_string( $created[0] ) ) {
 			return new WP_Error( 'app_password_mint_failed', 'WordPress did not return a new Application Password.' );
 		}
+		// The owner record is what a later rotation revokes by — it must be
+		// DURABLE before the password is handed out (round-4). Verified by a
+		// fresh read, not update_option()'s return (false also means
+		// "unchanged"); if it did not persist, the password just created is
+		// revoked again and the connect stays token-only.
 		update_option( self::APP_PASSWORD_OWNER_OPTION, $user_id );
+		wp_cache_delete( self::APP_PASSWORD_OWNER_OPTION, 'options' );
+		if ( (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 ) !== $user_id ) {
+			if ( isset( $created[1]['uuid'] ) ) {
+				WP_Application_Passwords::delete_application_password( $user_id, (string) $created[1]['uuid'] );
+			}
+			return new WP_Error( 'app_password_owner_unrecorded', 'The Application Password owner could not be recorded; the password was revoked and none was returned.' );
+		}
 		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0] );
 	}
 
@@ -435,17 +464,25 @@ class Aura_Worker_Magic_Link {
 	 * beside (round-2). The owner is recorded per mint, so it is always known.
 	 *
 	 * @param int $user_id The new creator (0 = none).
+	 * @return bool True only when EVERY targeted password was deleted.
 	 */
-	private static function revoke_aura_passwords( int $user_id ): void {
+	private static function revoke_aura_passwords( int $user_id ): bool {
 		$previous_owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
+		$all_gone       = true;
 		foreach ( array_unique( array_filter( array( $user_id, $previous_owner ) ) ) as $owner ) {
 			foreach ( WP_Application_Passwords::get_user_application_passwords( (int) $owner ) as $item ) {
 				if ( isset( $item['name'], $item['uuid'] ) && self::APP_PASSWORD_NAME === $item['name'] ) {
-					WP_Application_Passwords::delete_application_password( (int) $owner, (string) $item['uuid'] );
+					$deleted = WP_Application_Passwords::delete_application_password( (int) $owner, (string) $item['uuid'] );
+					if ( true !== $deleted ) {
+						$all_gone = false;
+					}
 				}
 			}
 		}
-		delete_option( self::APP_PASSWORD_OWNER_OPTION );
+		if ( $all_gone ) {
+			delete_option( self::APP_PASSWORD_OWNER_OPTION );
+		}
+		return $all_gone;
 	}
 
 	/**
