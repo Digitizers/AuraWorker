@@ -539,10 +539,19 @@ class Aura_Worker_Magic_Link {
 	 * aura_worker_deactivate() in digitizer-site-worker.php.
 	 */
 
-	/** The user who owns the CURRENT Aura-minted Application Password — the rotation revokes theirs too, whoever connects next. */
-	const APP_PASSWORD_OWNER_OPTION = 'aura_worker_app_password_user_id';
-	/** The UUID of the CURRENT Aura-minted Application Password — the STABLE identity the rotation deletes by (round-5): the display name is user-chosen, not unique, and renameable. */
-	const APP_PASSWORD_UUID_OPTION = 'aura_worker_app_password_uuid';
+	/**
+	 * The CURRENT Aura-minted Application Password's record: the user who owns
+	 * it (the rotation revokes theirs too, whoever connects next) and its UUID
+	 * — the STABLE identity the rotation deletes by (round-5), since the
+	 * display name is user-chosen, not unique, and renameable.
+	 *
+	 * ONE option holding both halves (round-17). As two options it was two
+	 * writes, and a claim released between them left a half record: the owner
+	 * without its UUID, which no code can act on and which then refused every
+	 * later connect until someone repaired it by hand. One row, one statement,
+	 * no half state to interpret.
+	 */
+	const APP_PASSWORD_RECORD_OPTION = 'aura_worker_app_password';
 
 	/**
 	 * Mint the dashboard's Application Password for a user, rotating any
@@ -562,7 +571,7 @@ class Aura_Worker_Magic_Link {
 		// Application Passwords unavailable for them). Rotation is a promise
 		// about the OLD credential, not a side effect of minting a new one.
 		if ( self::tracking_is_incomplete() ) {
-			return new WP_Error( 'app_password_tracking_incomplete', 'This site records half an Aura Application Password, so another cannot be minted beside it; revoke it by hand in Users → Profile → Application Passwords and delete the aura_worker_app_password_user_id and aura_worker_app_password_uuid options.' );
+			return new WP_Error( 'app_password_tracking_incomplete', 'This site records half an Aura Application Password, so another cannot be minted beside it; revoke it by hand in Users → Profile → Application Passwords and delete the aura_worker_app_password option.' );
 		}
 		if ( ! self::revoke_managed_password( $fence ) ) {
 			// A revocation that did not land is NOT reported as a rotation
@@ -599,7 +608,8 @@ class Aura_Worker_Magic_Link {
 		// "unchanged"); if it did not persist, the password just created is
 		// revoked again and the connect stays token-only.
 		self::persist_password_owner( $user_id, $uuid, $fence );
-		if ( (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 ) !== $user_id || (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' ) !== $uuid ) {
+		$recorded = self::password_record();
+		if ( null === $recorded || $recorded['user_id'] !== $user_id || $recorded['uuid'] !== $uuid ) {
 			// The cleanup is VERIFIED, never assumed (round-7): with option and
 			// user-meta writes both failing, this delete can fail too, and an
 			// ignored result would hand back a token-only success while a live
@@ -608,17 +618,15 @@ class Aura_Worker_Magic_Link {
 			// it is absent from the owner's list.
 			WP_Application_Passwords::delete_application_password( $user_id, $uuid );
 			if ( self::managed_password_gone( $user_id, $uuid ) ) {
-				// A partly-landed pair must not outlive the password it named
-				// (round-14): the credential is gone, so a surviving lone
-				// option would refuse every later magic link as
-				// app_password_tracking_incomplete and make deactivation report
-				// a revocation failure, all for a password that no longer
-				// exists. Logged if even the deletes will not land, so the
-				// operator can find the two options by name.
+				// The record must not outlive the password it named (round-14):
+				// the credential is gone, so a surviving record would make every
+				// later rotation chase a password that no longer exists, and
+				// deactivation report a revocation failure. Logged if even the
+				// delete will not land, so the operator can find the option.
 				self::forget_password_owner( $fence );
 				if ( self::tracking_is_incomplete() ) {
 					// translators: internal log line, not shown to the user.
-					error_log( 'SiteAgent: the Aura Application Password tracking options could not be cleared after the password was revoked; delete aura_worker_app_password_user_id and aura_worker_app_password_uuid by hand.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+					error_log( 'SiteAgent: the Aura Application Password tracking options could not be cleared after the password was revoked; delete aura_worker_app_password by hand.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 				}
 				return new WP_Error( 'app_password_owner_unrecorded', 'The Application Password owner could not be recorded; the password was revoked and none was returned.' );
 			}
@@ -632,7 +640,8 @@ class Aura_Worker_Magic_Link {
 			// recorded, mint again, and every retry would add another live
 			// untracked administrator credential. Two different outcomes, so
 			// two different codes: the caller must not let this one be retried.
-			if ( (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 ) !== $user_id || (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' ) !== $uuid ) {
+			$recovered = self::password_record();
+			if ( null === $recovered || $recovered['user_id'] !== $user_id || $recovered['uuid'] !== $uuid ) {
 				return new WP_Error( 'app_password_orphan_untracked', 'A new Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.' );
 			}
 			return new WP_Error( 'app_password_orphaned', 'A new Application Password could not be revoked after its owner record failed to persist; no connection was completed.' );
@@ -734,9 +743,29 @@ class Aura_Worker_Magic_Link {
 	 * @return bool
 	 */
 	private static function tracking_is_incomplete(): bool {
-		$owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
-		$uuid  = (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' );
-		return ( $owner > 0 ) !== ( '' !== $uuid );
+		$stored = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		if ( null === $stored || false === $stored || '' === $stored ) {
+			return false; // nothing recorded
+		}
+		return null === self::password_record();
+	}
+
+	/**
+	 * The stored owner/UUID record, or null when nothing usable is recorded.
+	 *
+	 * @return array{user_id:int,uuid:string}|null
+	 */
+	private static function password_record() {
+		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		if ( ! is_array( $rec ) ) {
+			return null;
+		}
+		$user_id = (int) ( $rec['user_id'] ?? 0 );
+		$uuid    = (string) ( $rec['uuid'] ?? '' );
+		if ( $user_id <= 0 || '' === $uuid ) {
+			return null;
+		}
+		return array( 'user_id' => $user_id, 'uuid' => $uuid );
 	}
 
 	/**
@@ -748,12 +777,11 @@ class Aura_Worker_Magic_Link {
 	 */
 	private static function forget_password_owner( $fence = '' ) {
 		if ( '' !== (string) $fence ) {
-			Aura_Worker_Rules::delete_option_if_claimed( self::APP_PASSWORD_OWNER_OPTION, self::SITE_CLAIM, $fence );
-			Aura_Worker_Rules::delete_option_if_claimed( self::APP_PASSWORD_UUID_OPTION, self::SITE_CLAIM, $fence );
-			return;
+			return Aura_Worker_Rules::delete_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, self::SITE_CLAIM, $fence );
 		}
-		delete_option( self::APP_PASSWORD_OWNER_OPTION );
-		delete_option( self::APP_PASSWORD_UUID_OPTION );
+		delete_option( self::APP_PASSWORD_RECORD_OPTION );
+		wp_cache_delete( self::APP_PASSWORD_RECORD_OPTION, 'options' );
+		return 1;
 	}
 
 	/**
@@ -774,15 +802,13 @@ class Aura_Worker_Magic_Link {
 	 * @param string $fence   The caller's site-claim fence, when it holds one.
 	 */
 	private static function persist_password_owner( int $user_id, string $uuid, $fence = '' ) {
+		$record = array( 'user_id' => $user_id, 'uuid' => $uuid );
 		if ( '' !== (string) $fence ) {
-			Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_OWNER_OPTION, $user_id, self::SITE_CLAIM, $fence );
-			Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_UUID_OPTION, $uuid, self::SITE_CLAIM, $fence );
+			Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
 			return;
 		}
-		update_option( self::APP_PASSWORD_OWNER_OPTION, $user_id );
-		update_option( self::APP_PASSWORD_UUID_OPTION, $uuid );
-		wp_cache_delete( self::APP_PASSWORD_OWNER_OPTION, 'options' );
-		wp_cache_delete( self::APP_PASSWORD_UUID_OPTION, 'options' );
+		update_option( self::APP_PASSWORD_RECORD_OPTION, $record, false );
+		wp_cache_delete( self::APP_PASSWORD_RECORD_OPTION, 'options' );
 	}
 
 	/**
@@ -825,29 +851,46 @@ class Aura_Worker_Magic_Link {
 	 * @return bool True when nothing dangerous remains.
 	 */
 	public static function revoke_managed_password( $fence = '' ): bool {
-		$owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
-		$uuid  = (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' );
-		if ( $owner <= 0 && '' === $uuid ) {
+		$record = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		if ( null === $record || false === $record || '' === $record ) {
 			return true; // nothing recorded — first mint, or already cleared
 		}
-		if ( $owner <= 0 || '' === $uuid ) {
-			// HALF a record is not "nothing recorded" (round-13): it is what a
-			// mint whose owner/UUID writes only partly landed leaves behind,
-			// and it names a password this code can no longer delete — the
-			// owner without the UUID, or the reverse. Reporting success here
-			// would let the next connect mint another one beside it. Refusing
-			// is all that is left; the operator repairs it by revoking the
-			// password by hand and deleting both options.
+		$rec = self::password_record();
+		if ( null === $rec ) {
+			// SOMETHING is recorded, but not a record this code can act on
+			// (round-13). It names a password that cannot be deleted, so
+			// reporting success would let the next connect mint another one
+			// beside it. Refusing is all that is left; the operator repairs it
+			// by revoking the password by hand and deleting the option.
 			return false;
+		}
+		// Under a claim the record is CONSUMED first, in one conditional
+		// statement, and only a caller that actually removed it goes on to
+		// delete the password (round-17). Checking ownership and then deleting
+		// were two steps: a rotation paused between them, its claim released,
+		// would revoke the Application Password of the connect that replaced
+		// it — the credential that connect had already returned to the
+		// dashboard. Removing the row is the ownership test that cannot be
+		// raced, because the row is the record.
+		if ( '' !== (string) $fence && 1 !== (int) self::forget_password_owner( $fence ) ) {
+			return true; // the record is not this caller's to act on
 		}
 		// By the STORED UUID, never the display name (round-5): the name is
 		// user-chosen, so a stranger's "Aura SiteAgent" must not be nuked, and
 		// a renamed Aura password must still be found.
-		$deleted = WP_Application_Passwords::delete_application_password( $owner, $uuid );
-		if ( true !== $deleted && ! self::managed_password_gone( $owner, $uuid ) ) {
+		$deleted = WP_Application_Passwords::delete_application_password( $rec['user_id'], $rec['uuid'] );
+		if ( true !== $deleted && ! self::managed_password_gone( $rec['user_id'], $rec['uuid'] ) ) {
+			// The credential is still live, so its record must exist for the
+			// next attempt to find. Under a claim it was consumed above — put
+			// it back.
+			if ( '' !== (string) $fence ) {
+				self::persist_password_owner( $rec['user_id'], $rec['uuid'], $fence );
+			}
 			return false; // a genuine delete failure — the credential is still live
 		}
-		self::forget_password_owner( $fence );
+		if ( '' === (string) $fence ) {
+			self::forget_password_owner();
+		}
 		return true;
 	}
 

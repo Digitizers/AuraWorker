@@ -169,12 +169,14 @@ class Aura_Worker {
 		// the site is disconnected. Best-effort: a failure here must not cost
 		// the operator the new token this response is about to reveal, so it
 		// is logged, not fatal.
-		// The revocation cannot be expressed as one conditional statement — it
-		// is a WordPress API call — so it runs only while this request still
-		// demonstrably owns the claim. Having lost it, the password now on the
-		// site belongs to the install that replaced this rotation, and revoking
-		// it would disconnect a connection this request knows nothing about.
-		if ( Aura_Worker_Magic_Link::holds_site_claim( $site_fence ) && ! Aura_Worker_Magic_Link::revoke_managed_password( $site_fence ) ) {
+		// The revocation is handed this request's fence, and takes the record it
+		// revokes by in one conditional statement before touching the password
+		// (round-17). Asking "do I still hold the claim?" and then revoking
+		// were two steps: a rotation paused between them would revoke the
+		// Application Password of the connect that replaced it — a credential
+		// that connect had already returned to the dashboard. Having lost the
+		// claim, this call now removes nothing and reports nothing owed.
+		if ( ! Aura_Worker_Magic_Link::revoke_managed_password( $site_fence ) ) {
 			// translators: internal log line, not shown to the user.
 			error_log( 'SiteAgent: the Aura Application Password could not be revoked while regenerating the site token; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}

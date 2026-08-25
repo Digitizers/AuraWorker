@@ -21,6 +21,43 @@ final class ConnectAppPasswordTest extends TestCase {
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 	}
 
+	/** The stored Application Password record (2.11.0: one option, both halves). */
+	private function record(): ?array {
+		$rec = get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null );
+		return is_array( $rec ) ? $rec : null;
+	}
+
+	private function recordUuid(): string {
+		return (string) ( $this->record()['uuid'] ?? '' );
+	}
+
+	private function recordOwner(): int {
+		return (int) ( $this->record()['user_id'] ?? 0 );
+	}
+
+	/** The same record read from the row rather than the option cache. */
+	private function uncachedRecord(): ?array {
+		$raw = sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
+		if ( is_array( $raw ) ) {
+			return $raw;
+		}
+		if ( ! is_string( $raw ) ) {
+			return null;
+		}
+		$rec = maybe_unserialize( $raw );
+		return is_array( $rec ) ? $rec : null;
+	}
+
+	private function uncachedUuid(): ?string {
+		$rec = $this->uncachedRecord();
+		return null === $rec ? null : (string) ( $rec['uuid'] ?? '' );
+	}
+
+	private function uncachedOwner(): int {
+		$rec = $this->uncachedRecord();
+		return null === $rec ? 0 : (int) ( $rec['user_id'] ?? 0 );
+	}
+
 	private function request(): WP_REST_Request {
 		$token = 'raw-token';
 		$dash  = 'https://dash.example';
@@ -55,7 +92,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		// stored UUID points at it, so rotation must leave it alone (round-5).
 		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) );
 		$this->ml->handle_connect( $this->request() ); // mints Aura's own, stores its uuid
-		$stored_uuid = get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$stored_uuid = $this->recordUuid();
 		$this->assertNotEmpty( $stored_uuid );
 		$this->assertCount( 2, WP_Application_Passwords::get_user_application_passwords( 7 ) ); // the stranger + Aura's
 
@@ -65,21 +102,21 @@ final class ConnectAppPasswordTest extends TestCase {
 		$uuids = array_map( static fn( $i ) => $i['uuid'], WP_Application_Passwords::get_user_application_passwords( 7 ) );
 		$this->assertNotContains( $stored_uuid, $uuids, 'the previous Aura password is gone' );
 		$this->assertCount( 2, $uuids, 'the stranger stays, one fresh Aura password' );
-		$this->assertContains( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ), $uuids );
+		$this->assertContains( $this->recordUuid(), $uuids );
 	}
 
 	public function test_a_reconnect_by_another_admin_revokes_the_previous_creator_s_aura_password(): void {
 		// Admin 7 connected first (this connect); then admin 9 reconnects via a new link.
 		$this->ml->handle_connect( $this->request() );
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
-		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$this->assertSame( 7, (int) ( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION )['user_id'] ?? 0 ) );
 		$GLOBALS['_admins'] = array( 7, 9 );
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 9 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user9', $data['app_password']['user_login'] );
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), "the previous creator's Aura password is revoked" );
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 9 ) );
-		$this->assertSame( 9, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$this->assertSame( 9, $this->recordOwner() );
 	}
 
 	public function test_unavailable_app_passwords_leave_the_connect_token_only_and_name_the_reason(): void {
@@ -144,7 +181,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'connect_user_not_admin', $data['app_password_unavailable'] );
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
-		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ), 'no owner remains' );
+		$this->assertNull( $this->record(), 'no record remains' );
 	}
 
 	public function test_a_revocation_that_did_not_land_is_a_retryable_500_that_keeps_the_transient(): void {
@@ -159,11 +196,11 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the old one is still there — honestly' );
 		// Retryable: the transient survives so the dashboard can try again.
 		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'the transient is kept for the retry' );
-		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ), 'the owner is still known' );
+		$this->assertSame( 7, $this->recordOwner(), 'the owner is still known' );
 	}
 
 	public function test_an_owner_record_that_did_not_persist_revokes_the_new_password_and_returns_none(): void {
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = true;
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertTrue( $data['success'] );
 		$this->assertSame( 'app_password_owner_unrecorded', $data['app_password_unavailable'] );
@@ -206,13 +243,12 @@ final class ConnectAppPasswordTest extends TestCase {
 
 	public function test_regenerating_the_site_token_revokes_the_managed_password(): void {
 		$this->ml->handle_connect( $this->request() );
-		$uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$uuid = $this->recordUuid();
 		$this->assertNotEmpty( $uuid );
 		// The rotation path calls the ONE revocation.
 		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password() );
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
-		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION, false ) );
-		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ) );
+		$this->assertNull( $this->record() );
 		// …and the handler that regenerates the token is wired to it.
 		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker.php' );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password( $site_fence )', $src );
@@ -221,10 +257,10 @@ final class ConnectAppPasswordTest extends TestCase {
 	public function test_uninstall_revokes_the_managed_password_by_uuid_before_deleting_its_options(): void {
 		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/uninstall.php' );
 		$this->assertStringContainsString( "WP_Application_Passwords::delete_application_password( \$aura_pw_owner, \$aura_pw_uuid )", $src );
-		$this->assertStringContainsString( "get_option( 'aura_worker_app_password_uuid', '' )", $src );
+		$this->assertStringContainsString( "get_option( 'aura_worker_app_password', null )", $src );
 		// The revocation precedes the deletion of the options that identify it.
 		$this->assertLessThan(
-			strpos( $src, "delete_option( 'aura_worker_app_password_uuid' )" ),
+			strpos( $src, "delete_option( 'aura_worker_app_password' )" ),
 			strpos( $src, 'delete_application_password' ),
 			'revoke first, then forget'
 		);
@@ -239,7 +275,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		// would find nothing recorded, mint again, and every retry would add
 		// another live untracked administrator credential. The magic link is
 		// consumed to stop that.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = true;
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$res  = $this->ml->handle_connect( $this->request() );
 		$data = $res->get_data();
@@ -263,15 +299,15 @@ final class ConnectAppPasswordTest extends TestCase {
 		// next connect's rotation can revoke it by uuid.
 		// The claim-conditional write is two statements (UPDATE, then INSERT for
 		// an absent row), so refusing two refuses the FIRST persist entirely.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = 2;
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 2;
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 500, $res->get_status() );
 		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'], 'tracked: the next attempt can revoke it, so this one is retryable' );
 		$live = WP_Application_Passwords::get_user_application_passwords( 7 );
 		$this->assertCount( 1, $live );
-		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
-		$this->assertSame( $live[0]['uuid'], (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ), 'the orphan is tracked' );
+		$this->assertSame( 7, (int) ( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION )['user_id'] ?? 0 ) );
+		$this->assertSame( $live[0]['uuid'], $this->recordUuid(), 'the orphan is tracked' );
 		// …and the rotation can now kill it once the store recovers.
 		$GLOBALS['_app_passwords_delete_fail'] = false;
 		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password() );
@@ -282,20 +318,19 @@ final class ConnectAppPasswordTest extends TestCase {
 		// Round-7 P1: deleting owner+uuid after a FAILED delete would leave an
 		// administrator password alive with its identity irrecoverably forgotten.
 		$this->ml->handle_connect( $this->request() );
-		$uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$uuid = $this->recordUuid();
 		$this->assertNotEmpty( $uuid );
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$this->run_uninstall();
-		$this->assertSame( 7, (int) get_option( 'aura_worker_app_password_user_id' ), 'the owner is still recorded' );
-		$this->assertSame( $uuid, (string) get_option( 'aura_worker_app_password_uuid' ), 'the uuid is still recorded' );
+		$this->assertSame( 7, $this->recordOwner(), 'the owner is still recorded' );
+		$this->assertSame( $uuid, $this->recordUuid(), 'the uuid is still recorded' );
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
 
 		// …and when the revocation DOES land, the tracking is forgotten.
 		$GLOBALS['_app_passwords_delete_fail'] = false;
 		$this->run_uninstall();
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
-		$this->assertFalse( get_option( 'aura_worker_app_password_user_id', false ) );
-		$this->assertFalse( get_option( 'aura_worker_app_password_uuid', false ) );
+		$this->assertNull( $this->record() );
 	}
 
 	public function test_regenerating_the_token_is_refused_while_a_connect_holds_the_site(): void {
@@ -396,11 +431,11 @@ final class ConnectAppPasswordTest extends TestCase {
 		// A revocation that did not land keeps the owner/uuid, so a
 		// reactivation or the uninstall can finish the job.
 		$this->ml->handle_connect( $this->request() );
-		$uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$uuid = $this->recordUuid();
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password() );
-		$this->assertSame( $uuid, (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
-		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$this->assertSame( $uuid, $this->recordUuid() );
+		$this->assertSame( 7, (int) ( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION )['user_id'] ?? 0 ) );
 	}
 
 	public function test_the_token_write_is_conditional_on_the_claim_not_merely_preceded_by_a_check(): void {
@@ -487,13 +522,13 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
 	}
 
-	public function test_tracking_writes_are_conditional_on_the_claim_too(): void {
+	public function test_the_tracking_record_is_written_conditionally_on_the_claim(): void {
 		// Round-12: unfenced, a handler that lost the site would overwrite the
 		// winner's owner/UUID with its own and then delete only its OWN
 		// password — leaving the winner's administrator credential live and the
 		// site's record of it pointing at a password that no longer exists.
 		$this->ml->handle_connect( $this->request() ); // the winner's install
-		$winner_uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$winner_uuid = $this->recordUuid();
 		$this->assertNotEmpty( $winner_uuid );
 		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
 		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
@@ -503,19 +538,19 @@ final class ConnectAppPasswordTest extends TestCase {
 			$mint->setAccessible( true );
 		}
 		$mint->invoke( null, 99, 'loser-uuid', 'loser-fence' );
-		$this->assertSame( $winner_uuid, sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
-		$this->assertSame( '7', (string) sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$this->assertSame( $winner_uuid, $this->uncachedUuid() );
+		$this->assertSame( '7', (string) $this->uncachedOwner() );
 
 		$mint->invoke( null, 99, 'winner-second-uuid', 'winner-fence' );
-		$this->assertSame( 'winner-second-uuid', sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
+		$this->assertSame( 'winner-second-uuid', $this->uncachedUuid() );
 	}
 
-	public function test_half_a_tracking_record_refuses_every_further_mint(): void {
+	public function test_an_unusable_tracking_record_refuses_every_further_mint(): void {
 		// Round-13: a mint whose owner/UUID writes only partly landed leaves a
 		// lone option behind. Read as "nothing recorded", the NEXT link — a new
 		// one, so consuming the old transient does not help — would mint a
 		// second live administrator credential beside the orphan.
-		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, 7 );
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7 ) ); // a record with no uuid: present but unusable
 		$res  = $this->ml->handle_connect( $this->request() );
 		$data = $res->get_data();
 		$this->assertSame( 500, $res->get_status() );
@@ -525,49 +560,48 @@ final class ConnectAppPasswordTest extends TestCase {
 		// The revocation cannot report success on half a record either — the
 		// deactivation and uninstall paths must log it, not clear it silently.
 		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password() );
-		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$this->assertSame( 7, (int) ( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION )['user_id'] ?? 0 ) );
 
 		// Cleared by hand, the next connect mints again (a fresh link: the
 		// terminal refusal consumed the previous one).
-		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION );
+		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
 	}
 
-	public function test_a_partly_recorded_pair_does_not_outlive_the_password_it_named(): void {
+	public function test_a_record_does_not_outlive_the_password_it_named(): void {
 		// Round-14: with only the UUID write refused, the cleanup deletes the
 		// password successfully — so the owner option left behind names nothing.
 		// It would refuse every later magic link and make deactivation report a
 		// revocation failure, for a credential that no longer exists.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ] = true;
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertTrue( $data['success'] );
 		$this->assertSame( 'app_password_owner_unrecorded', $data['app_password_unavailable'] );
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password was revoked' );
-		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ), '…and its half-record with it' );
+		$this->assertNull( $this->record(), '…and its record with it' );
 		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password(), 'nothing is recorded, so nothing is owed' );
 
 		// The next connect is not refused.
-		unset( $GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ] );
+		unset( $GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] );
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
 	}
 
-	public function test_uninstall_keeps_half_a_tracking_record(): void {
+	public function test_uninstall_keeps_an_unusable_tracking_record(): void {
 		// Round-15: an incomplete pair names a password uninstall cannot delete
 		// but that may still authenticate. The surviving option is the only
 		// thing left pointing at it, so it outlives the plugin.
-		update_option( 'aura_worker_app_password_user_id', 7 );
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7 ) );
 		$this->run_uninstall();
-		$this->assertSame( 7, (int) get_option( 'aura_worker_app_password_user_id' ) );
+		$this->assertSame( array( 'user_id' => 7 ), $this->record(), 'an unusable record outlives the plugin' );
 
-		// The mirror case, and the empty one: nothing recorded, nothing kept.
-		delete_option( 'aura_worker_app_password_user_id' );
-		update_option( 'aura_worker_app_password_uuid', 'lonely-uuid' );
+		// The mirror case: a uuid with no owner is just as unusable.
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'uuid' => 'lonely-uuid' ) );
 		$this->run_uninstall();
-		$this->assertSame( 'lonely-uuid', (string) get_option( 'aura_worker_app_password_uuid' ) );
+		$this->assertSame( array( 'uuid' => 'lonely-uuid' ), $this->record() );
 	}
 
 	public function test_the_rotation_forgets_the_record_only_while_it_owns_the_claim(): void {
@@ -576,16 +610,75 @@ final class ConnectAppPasswordTest extends TestCase {
 		// would erase the WINNING install's record — leaving that install's
 		// administrator credential live and beyond every later rotation.
 		$this->ml->handle_connect( $this->request() ); // the winner's install
-		$winner_uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$winner_uuid = $this->recordUuid();
 		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
 		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
 
 		Aura_Worker_Magic_Link::revoke_managed_password( 'loser-fence' );
-		$this->assertSame( $winner_uuid, sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ), "the winner's record survives" );
-		$this->assertSame( '7', (string) sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$this->assertSame( $winner_uuid, $this->uncachedUuid(), "the winner's record survives" );
+		$this->assertSame( '7', (string) $this->uncachedOwner() );
 
 		Aura_Worker_Magic_Link::revoke_managed_password( 'winner-fence' );
-		$this->assertNull( sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
+		$this->assertNull( $this->uncachedUuid() );
+	}
+
+	public function test_the_record_is_one_option_so_a_lost_claim_cannot_leave_half_of_it(): void {
+		// Round-17: as two claim-conditional statements, a claim released
+		// between them wrote the owner and skipped the UUID — a record no code
+		// can act on, which then refused every later connect until an operator
+		// repaired it. One option, one statement: either the whole record lands
+		// or none of it does.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'winner-fence|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		$persist = new ReflectionMethod( Aura_Worker_Magic_Link::class, 'persist_password_owner' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$persist->setAccessible( true );
+		}
+		$persist->invoke( null, 9, 'loser-uuid', 'loser-fence' );
+		$this->assertNull( $this->uncachedRecord(), 'a superseded fence writes nothing at all' );
+
+		$persist->invoke( null, 9, 'winner-uuid', 'winner-fence' );
+		$this->assertSame( array( 'user_id' => 9, 'uuid' => 'winner-uuid' ), $this->uncachedRecord() );
+	}
+
+	public function test_the_rotation_takes_the_record_before_it_deletes_the_password(): void {
+		// Round-17: the regeneration checked "do I still hold the claim?" and
+		// then revoked — two steps. Paused between them it would delete the
+		// Application Password of the connect that replaced it, one the
+		// dashboard already holds. Removing the record IS the ownership test
+		// now, and it cannot be raced: only the caller whose statement removed
+		// the row goes on to delete the password.
+		$this->ml->handle_connect( $this->request() ); // the winner's install
+		$winner_uuid = $this->recordUuid();
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'winner-fence|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password( 'loser-fence' ), 'nothing is owed by a caller that owns nothing' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), "the winner's password survives" );
+		$this->assertSame( $winner_uuid, $this->uncachedUuid(), '…and so does its record' );
+
+		// The holder's own revocation takes both.
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password( 'winner-fence' ) );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertNull( $this->uncachedRecord() );
+	}
+
+	public function test_a_revocation_that_fails_puts_the_record_back(): void {
+		// The record is consumed BEFORE the password is deleted, so a delete
+		// that does not land must restore it — otherwise the live credential
+		// would be left with nothing naming it.
+		$this->ml->handle_connect( $this->request() );
+		$uuid  = $this->recordUuid();
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'mine|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+
+		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
+		$this->assertSame( array( 'user_id' => 7, 'uuid' => $uuid ), $this->uncachedRecord(), 'the record is restored' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */

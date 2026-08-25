@@ -780,13 +780,16 @@ class Aura_Worker_Rules {
 	 * @param string $option Option name.
 	 * @param string $claim  The claim option's name.
 	 * @param string $fence  The caller's fence.
+	 * @return int Rows removed: 1 when this caller took the row, else 0. The
+	 *             count is the only proof of WHO removed it, so a caller that
+	 *             must own what it deletes reads it (round-17).
 	 */
 	public static function delete_option_if_claimed( $option, $claim, $fence ) {
 		global $wpdb;
 		if ( '' === (string) $fence || '' === (string) $claim ) {
-			return;
+			return 0;
 		}
-		$wpdb->query(
+		$rows = $wpdb->query(
 			$wpdb->prepare(
 				"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name = %s",
 				$claim,
@@ -795,6 +798,7 @@ class Aura_Worker_Rules {
 			)
 		);
 		self::forget_option_cache( $option );
+		return (int) $rows;
 	}
 
 	/**
