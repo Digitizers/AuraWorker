@@ -337,7 +337,67 @@ class Aura_Worker_Magic_Link {
 		// and leave one orphan row per connect (Codex round 23).
 		$release();
 
-		return new WP_REST_Response( array( 'success' => true ), 200 );
+		// 2.11.0: the callback also mints an Application Password for the admin
+		// who created the link, so a magic-link connection can run the
+		// builder tools (Elementor MCP etc.) that authenticate with WordPress
+		// Basic auth — until now only a manual connect could. Returned ONCE, in
+		// this response to the signed request, over the same TLS the token
+		// travelled; the dashboard stores it encrypted beside the site token.
+		// Every connect rotates it: earlier passwords under the fixed name are
+		// deleted first, so the site never accumulates them and the previous
+		// one dies with the previous token. Unavailable (no HTTPS, disabled,
+		// no admin user, pre-5.6 core) is not a failure of the connect — the
+		// field is omitted and the reason is named, and the connection stays
+		// token-only exactly as before.
+		$body   = array( 'success' => true );
+		$minted = self::mint_app_password( (int) ( $stored['connect_user_id'] ?? 0 ) );
+		if ( is_wp_error( $minted ) ) {
+			$body['app_password_unavailable'] = $minted->get_error_code();
+		} else {
+			$body['app_password'] = $minted;
+		}
+
+		return new WP_REST_Response( $body, 200 );
+	}
+
+	/** The fixed name every Aura-minted Application Password carries — the rotation key. */
+	const APP_PASSWORD_NAME = 'Aura SiteAgent';
+
+	/**
+	 * Mint the dashboard's Application Password for a user, rotating any
+	 * earlier one Aura minted (2.11.0).
+	 *
+	 * @param int $user_id The admin who created the magic link.
+	 * @return array{user_login:string,password:string}|WP_Error
+	 */
+	public static function mint_app_password( int $user_id ) {
+		if ( ! class_exists( 'WP_Application_Passwords' ) || ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
+			return new WP_Error( 'app_passwords_unsupported', 'This WordPress does not support Application Passwords.' );
+		}
+		$user = $user_id > 0 ? get_userdata( $user_id ) : false;
+		if ( ! $user || empty( $user->user_login ) ) {
+			return new WP_Error( 'connect_user_unknown', 'The user who created this connect link no longer exists.' );
+		}
+		if ( ! user_can( $user_id, 'manage_options' ) ) {
+			return new WP_Error( 'connect_user_not_admin', 'Only an administrator\'s connect link can mint an Application Password.' );
+		}
+		if ( ! wp_is_application_passwords_available_for_user( $user ) ) {
+			return new WP_Error( 'app_passwords_unavailable', 'Application Passwords are unavailable for this user (HTTPS required, or disabled by a filter).' );
+		}
+		// Rotate: the fixed name is the key. Anything Aura minted before dies here.
+		foreach ( WP_Application_Passwords::get_user_application_passwords( $user_id ) as $item ) {
+			if ( isset( $item['name'], $item['uuid'] ) && self::APP_PASSWORD_NAME === $item['name'] ) {
+				WP_Application_Passwords::delete_application_password( $user_id, (string) $item['uuid'] );
+			}
+		}
+		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME ) );
+		if ( is_wp_error( $created ) ) {
+			return $created;
+		}
+		if ( ! is_array( $created ) || empty( $created[0] ) || ! is_string( $created[0] ) ) {
+			return new WP_Error( 'app_password_mint_failed', 'WordPress did not return a new Application Password.' );
+		}
+		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0] );
 	}
 
 	/**

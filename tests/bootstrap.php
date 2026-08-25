@@ -627,6 +627,42 @@ if ( ! function_exists( 'user_can' ) ) {
 	}
 }
 
+// --- Application Passwords (2.11.0: the /connect callback mints one) --------
+// $GLOBALS['_app_passwords'][user_id] = list of items { uuid, name, created };
+// $GLOBALS['_app_passwords_available'] gates wp_is_application_passwords_available_for_user().
+$GLOBALS['_app_passwords']           = array();
+$GLOBALS['_app_passwords_available'] = true;
+if ( ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
+	function wp_is_application_passwords_available_for_user( $user ): bool {
+		return (bool) $GLOBALS['_app_passwords_available'];
+	}
+}
+if ( ! function_exists( 'get_userdata' ) ) {
+	function get_userdata( int $user_id ) {
+		if ( $user_id <= 0 ) {
+			return false;
+		}
+		return (object) array( 'ID' => $user_id, 'user_login' => 'user' . $user_id );
+	}
+}
+if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+	class WP_Application_Passwords {
+		public static function create_new_application_password( int $user_id, array $args = array() ) {
+			$item = array( 'uuid' => 'uuid-' . bin2hex( random_bytes( 4 ) ), 'name' => (string) ( $args['name'] ?? '' ), 'created' => time() );
+			$GLOBALS['_app_passwords'][ $user_id ][] = $item;
+			return array( 'pw-' . bin2hex( random_bytes( 8 ) ), $item );
+		}
+		public static function get_user_application_passwords( int $user_id ): array {
+			return $GLOBALS['_app_passwords'][ $user_id ] ?? array();
+		}
+		public static function delete_application_password( int $user_id, string $uuid ) {
+			$before = count( $GLOBALS['_app_passwords'][ $user_id ] ?? array() );
+			$GLOBALS['_app_passwords'][ $user_id ] = array_values( array_filter( $GLOBALS['_app_passwords'][ $user_id ] ?? array(), static fn( $i ) => $i['uuid'] !== $uuid ) );
+			return count( $GLOBALS['_app_passwords'][ $user_id ] ) < $before ? true : new WP_Error( 'application_password_not_found', 'not found' );
+		}
+	}
+}
+
 if ( ! function_exists( 'get_users' ) ) {
 	function get_users( array $args = array() ): array {
 		return $GLOBALS['_admins'];
@@ -1803,6 +1839,8 @@ if ( ! function_exists( 'sa_register_ability' ) ) {
 }
 
 function sa_reset_state(): void {
+	$GLOBALS['_app_passwords']           = array();
+	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();

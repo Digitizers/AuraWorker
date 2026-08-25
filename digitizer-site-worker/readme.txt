@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.10.3
+Stable tag: 2.11.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -232,6 +232,19 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.11.0 =
+* Feature: **the magic-link connect now mints an Application Password for
+  the dashboard.** A magic-link connection could run SiteAgent's own tools
+  but not the builder tools (Elementor MCP and friends) that authenticate
+  with WordPress Basic auth — only a manual connect, which never provisions
+  the gateway key, could. The signed /connect callback now also mints an
+  Application Password named "Aura SiteAgent" for the administrator who
+  created the link and returns it once, in the callback's response, so the
+  dashboard stores it encrypted beside the site token. Every connect rotates
+  it (earlier ones under that name are deleted first). Where Application
+  Passwords are unavailable (no HTTPS, disabled by a filter, no admin user)
+  the connect succeeds token-only as before and names the reason.
 
 = 2.10.3 =
 * Fix (security): **"Regenerate Token" revealed a new site token without ever

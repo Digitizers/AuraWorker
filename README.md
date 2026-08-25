@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.10.3-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.11.0-green" alt="Stable" />
 </p>
 
 ---
@@ -151,6 +151,14 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.11.0
+
+**Feature:** the magic-link connect mints an Application Password ("Aura SiteAgent")
+for the administrator who created the link and returns it once in the signed callback's
+response, so a magic-link connection can run the builder tools that authenticate with
+WordPress Basic auth. Every connect rotates it; where Application Passwords are
+unavailable the connect stays token-only and names the reason.
 
 ### 2.10.3
 
