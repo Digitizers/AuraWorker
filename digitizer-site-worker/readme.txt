@@ -250,9 +250,18 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   same site cannot split the credentials the dashboard ends up holding.
   "Regenerate Token" takes the same claim (it is refused while a connect is
   installing). The claim is never taken over by age: a callback the dashboard
-  timed out on may still be running. If one is ever left behind by a killed
-  request, every later connect is refused until an administrator deactivates
-  and reactivates the plugin, which releases it.
+  timed out on may still be running. Every write the claim protects re-checks
+  that it still holds it, so a claim that goes away mid-request costs that
+  request its connect (retryable) rather than splitting two installs. If a
+  killed request ever leaves a claim behind, every later connect is refused
+  until an administrator deactivates and reactivates the plugin, which
+  releases it.
+* Deactivating the plugin now also revokes the Application Password Aura
+  minted. Unregistering SiteAgent's routes does not stop an
+  administrator-level credential from authenticating to WordPress core and to
+  other REST/MCP plugins, so "deactivated" would not have meant
+  "disconnected". If the revocation fails the owner and UUID are kept, and
+  reactivating or uninstalling finishes the job.
 
 = 2.10.3 =
 * Fix (security): **"Regenerate Token" revealed a new site token without ever

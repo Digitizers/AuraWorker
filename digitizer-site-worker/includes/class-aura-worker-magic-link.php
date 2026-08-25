@@ -302,6 +302,14 @@ class Aura_Worker_Magic_Link {
 			return new WP_REST_Response( array( 'error' => 'A connect for this site is already in progress; retry.', 'code' => 'aura_connect_in_progress' ), 409 );
 		}
 
+		// Nothing this handler writes runs without the claim still being its own
+		// (round-8): a connect the dashboard timed out on keeps executing, and
+		// an operator releasing what looks like a stuck claim must not let it
+		// interleave with the install that follows.
+		if ( ! self::holds_site_claim( $site_fence ) ) {
+			$release();
+			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
+		}
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			update_option( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'] );
 		}
@@ -384,7 +392,11 @@ class Aura_Worker_Magic_Link {
 		// (creator not an admin, Application Passwords unavailable, the owner
 		// record not persisting — which revokes its own fresh password inside
 		// mint) leaves nothing dangerous and completes token-only.
-		$body   = array( 'success' => true );
+		$body = array( 'success' => true );
+		if ( ! self::holds_site_claim( $site_fence ) ) {
+			$release();
+			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
+		}
 		$minted = self::mint_app_password( (int) ( $stored['connect_user_id'] ?? 0 ) );
 		// Two mint outcomes leave an administrator-level credential live on the
 		// site: a previous password that would not die (app_password_revoke_failed)
@@ -403,12 +415,22 @@ class Aura_Worker_Magic_Link {
 				500
 			);
 		}
+		// The mint is the last protected write, and the only one that hands a
+		// credential back — so it is verified after the fact too (round-8). A
+		// handler that lost the site here revokes what it just created rather
+		// than returning a password beside another install's token.
+		if ( ! is_wp_error( $minted ) && ! self::holds_site_claim( $site_fence ) ) {
+			WP_Application_Passwords::delete_application_password( (int) ( $stored['connect_user_id'] ?? 0 ), $minted['uuid'] );
+			$release();
+			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
+		}
 		// Consumed only now (the round-23 orphan rule still holds: the claim is released with it below).
 		delete_transient( 'aura_magic_' . $magic_id );
 		if ( is_wp_error( $minted ) ) {
 			$body['app_password_unavailable'] = $minted->get_error_code();
 		} else {
-			$body['app_password'] = $minted;
+			// The uuid is the site's own bookkeeping — never part of the response.
+			$body['app_password'] = array( 'user_login' => $minted['user_login'], 'password' => $minted['password'] );
 		}
 		// Released only NOW (round-3): the site-wide claim exists to make token
 		// and password one handler's; released before the mint, a paused
@@ -422,8 +444,19 @@ class Aura_Worker_Magic_Link {
 	/** The fixed name every Aura-minted Application Password carries — the rotation key. */
 	const APP_PASSWORD_NAME = 'Aura SiteAgent';
 
-	/** The site-wide connect claim (2.11.0): one install at a time. Under the swept MAGIC_CLAIM prefix. */
-	const SITE_CLAIM = Aura_Worker_Rules::MAGIC_CLAIM . 'site';
+	/**
+	 * The site-wide connect claim (2.11.0): one install at a time.
+	 *
+	 * Deliberately NOT under Aura_Worker_Rules::MAGIC_CLAIM (round-8): every
+	 * option under that prefix is deleted by the hourly sweep once it is an
+	 * hour old. For a per-link claim that is harmless — the magic transient it
+	 * belongs to expired fifty minutes earlier, so the link is refused at the
+	 * transient check anyway. For this one it would be an age-based takeover
+	 * by another name, admitting a second install beside a handler that may
+	 * still resume — the exact mechanism this claim exists to prevent, and the
+	 * one the owner ruled out. Its own name keeps it out of every sweep.
+	 */
+	const SITE_CLAIM = 'aura_worker_connect_lock';
 	/**
 	 * The site claim has NO timed takeover (round-7, owner decision). A
 	 * connect handler that a client timeout abandoned is not a handler that
@@ -445,7 +478,7 @@ class Aura_Worker_Magic_Link {
 	 * earlier one Aura minted (2.11.0).
 	 *
 	 * @param int $user_id The admin who created the magic link.
-	 * @return array{user_login:string,password:string}|WP_Error
+	 * @return array{user_login:string,password:string,uuid:string}|WP_Error
 	 */
 	public static function mint_app_password( int $user_id ) {
 		if ( ! class_exists( 'WP_Application_Passwords' ) || ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
@@ -504,7 +537,33 @@ class Aura_Worker_Magic_Link {
 			self::persist_password_owner( $user_id, $uuid );
 			return new WP_Error( 'app_password_orphaned', 'A new Application Password could not be revoked after its owner record failed to persist; no connection was completed.' );
 		}
-		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0] );
+		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0], 'uuid' => $uuid );
+	}
+
+	/**
+	 * Does this handler still hold the site-wide claim? Read from the row, not
+	 * the option cache — the claim is written and deleted with raw SQL, so the
+	 * cache can hold a copy from before either.
+	 *
+	 * Every write the claim protects checks this first (round-8). The claim's
+	 * release policy is then no longer what keeps two installs apart: an
+	 * operator releasing a stuck claim (or anything else removing it) cannot
+	 * corrupt a handler that resumes afterwards, because that handler's next
+	 * protected write refuses to run. Residual, and unavoidable in an option
+	 * store with no compare-and-set: a handler descheduled between this check
+	 * and the write it guards can still land one write. The window is
+	 * microseconds rather than the whole length of a request.
+	 *
+	 * @param string $fence The value claim_magic_link() returned.
+	 * @return bool
+	 */
+	private static function holds_site_claim( $fence ) {
+		global $wpdb;
+		if ( '' === (string) $fence ) {
+			return false;
+		}
+		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::SITE_CLAIM ) );
+		return is_string( $held ) && 0 === strpos( $held, $fence . '|' );
 	}
 
 	/**

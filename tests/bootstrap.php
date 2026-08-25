@@ -656,7 +656,12 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 	class WP_Application_Passwords {
 		public static function create_new_application_password( int $user_id, array $args = array() ) {
 			// Witness for the connect tests: was the site-wide claim still held at mint time?
-			$GLOBALS['_sa_site_claim_during_mint'] = get_option( 'aura_magic_claim_site', false );
+			$GLOBALS['_sa_site_claim_during_mint'] = get_option( 'aura_worker_connect_lock', false );
+			// A test can model losing the site to another install while this
+			// mint runs (round-8): the claim vanishes mid-handler.
+			if ( ! empty( $GLOBALS['_sa_steal_site_claim_during_mint'] ) ) {
+				unset( $GLOBALS['_options']['aura_worker_connect_lock'], $GLOBALS['_rows']['aura_worker_connect_lock'] );
+			}
 			$item = array( 'uuid' => 'uuid-' . bin2hex( random_bytes( 4 ) ), 'name' => (string) ( $args['name'] ?? '' ), 'created' => time() );
 			$GLOBALS['_app_passwords'][ $user_id ][] = $item;
 			return array( 'pw-' . bin2hex( random_bytes( 8 ) ), $item );
@@ -1854,6 +1859,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
+	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();

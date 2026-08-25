@@ -122,8 +122,10 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( 200, $res->get_status() );
 		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ) );
 		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ) );
-		// The site claim lives under the swept prefix — an orphan ages out like a link's.
-		$this->assertStringStartsWith( Aura_Worker_Rules::MAGIC_CLAIM, Aura_Worker_Magic_Link::SITE_CLAIM );
+		// It must NOT live under the swept prefix (round-8): the hourly sweep
+		// deletes everything there once it is an hour old, which is an
+		// age-based takeover of the site claim by another name.
+		$this->assertStringStartsNotWith( Aura_Worker_Rules::MAGIC_CLAIM, Aura_Worker_Magic_Link::SITE_CLAIM );
 	}
 
 	public function test_the_password_is_minted_while_the_site_claim_is_still_held(): void {
@@ -311,6 +313,60 @@ final class ConnectAppPasswordTest extends TestCase {
 			$this->assertTrue( $res->success );
 		}
 		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), 'the rotation released the claim' );
+	}
+
+	public function test_the_hourly_magic_claim_sweep_never_removes_the_site_claim(): void {
+		// Round-8: under the swept MAGIC_CLAIM prefix, an hour-old site claim
+		// would be deleted by any request that runs daily rules enforcement —
+		// an age-based takeover by another name.
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'live-fence|' . ( time() - 6 * HOUR_IN_SECONDS );
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
+		$stale = Aura_Worker_Rules::MAGIC_CLAIM . 'someLink';
+		$GLOBALS['_options'][ $stale ] = 'dead-fence|' . ( time() - 6 * HOUR_IN_SECONDS );
+		$GLOBALS['_rows'][ $stale ]    = $GLOBALS['_options'][ $stale ];
+
+		Aura_Worker_Rules::enforce( array( array( 'type' => 'site', 'id' => '*' ) ), 'x' );
+
+		$this->assertFalse( get_option( $stale, false ), 'a per-link orphan still ages out' );
+		$this->assertStringStartsWith( 'live-fence|', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM ), 'the site claim is not swept' );
+	}
+
+	public function test_a_connect_that_loses_the_site_mid_mint_returns_nothing_and_revokes_what_it_created(): void {
+		// Round-8: every write the claim protects re-checks that the claim is
+		// still this handler's, so a release (an operator's, anyone's) cannot
+		// let a resumed handler hand back a password beside another install.
+		$GLOBALS['_sa_steal_site_claim_during_mint'] = true;
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_connect_lost_claim', $res->get_data()['code'] );
+		$this->assertArrayNotHasKey( 'app_password', $res->get_data() );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password it minted is revoked' );
+		$this->assertNotEmpty( get_transient( 'aura_magic_' . $this->magic_id ), 'the transient survives — the dashboard retries' );
+	}
+
+	public function test_the_returned_app_password_never_carries_the_sites_own_uuid(): void {
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( array( 'user_login', 'password' ), array_keys( $data['app_password'] ) );
+	}
+
+	public function test_deactivating_the_plugin_revokes_the_managed_password_and_keeps_tracking_on_failure(): void {
+		// Round-8: deactivation is the documented way to disconnect Aura, but
+		// unregistering the routes leaves an administrator credential that core
+		// and every other REST/MCP plugin still accept.
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$deactivate = substr( $main, strpos( $main, 'function aura_worker_deactivate()' ) );
+		$deactivate = substr( $deactivate, 0, strpos( $deactivate, "\nregister_deactivation_hook" ) );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $deactivate );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::forget_site_claim();', $deactivate );
+
+		// A revocation that did not land keeps the owner/uuid, so a
+		// reactivation or the uninstall can finish the job.
+		$this->ml->handle_connect( $this->request() );
+		$uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password() );
+		$this->assertSame( $uuid, (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
+		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
