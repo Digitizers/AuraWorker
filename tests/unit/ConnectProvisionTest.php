@@ -151,20 +151,57 @@ final class ConnectProvisionTest extends TestCase {
 		// not be followed by a sentinel for the requested hash (it would read as
 		// stale: unbound behind a 200) nor by a consumed transient.
 		// Since round-9 the token is written with one claim-conditional
-		// statement, so an option filter can no longer rewrite it (that is the
-		// point). What can still fail is the database itself.
+		// statement, so an option FILTER can no longer rewrite it (that is the
+		// point). What can still fail is the write itself.
 		$GLOBALS['_options']['aura_worker_site_token'] = Aura_Worker_Security::hash_token( 'old-token' );
 		$GLOBALS['_rows']['aura_worker_site_token']    = $GLOBALS['_options']['aura_worker_site_token'];
-		$GLOBALS['_sa_token_write_fail'] = true;
+		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_site_token' => true );
 		$GLOBALS['_option_writes'] = array();
 		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'client-new', 'token' => 'new-token' ) ) );
-		$GLOBALS['_sa_token_write_fail'] = false;
+		$GLOBALS['_sa_option_write_fail'] = array();
 		$this->assertSame( 500, $res->get_status() );
 		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
 		$this->assertNotContains( array( 'set', 'aura_worker_ruleset' ), $GLOBALS['_option_writes'], 'No sentinel for a token that is not there.' );
 		$this->assertSame( Aura_Worker_Security::hash_token( 'old-token' ), get_option( 'aura_worker_site_token' ) );
 		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ) );
 		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ) );
+	}
+
+	public function test_every_install_write_is_conditional_on_the_site_claim(): void {
+		// Codex round-10: fencing only the token left the rest of the install
+		// unconditional. A handler resuming after its claim was released could
+		// overwrite the winner's binding with one naming its own superseded
+		// token (which binds nobody — the site goes UNBOUND behind the
+		// winner's 200), and replace the winner's dashboard URL and gateway
+		// key, so grants signed for the winner's key fail closed.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'winner-fence|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		$winner_url = 'https://winner.example';
+		$GLOBALS['_options']['aura_worker_dashboard_url'] = $winner_url;
+		$GLOBALS['_rows']['aura_worker_dashboard_url']    = $winner_url;
+		$GLOBALS['_options']['aura_worker_grant_pubkey']  = 'winner-key';
+		$GLOBALS['_rows']['aura_worker_grant_pubkey']     = 'winner-key';
+
+		$bound = Aura_Worker_Rules::bind( 'client-loser', Aura_Worker_Security::hash_token( 'losers-token' ), $claim, 'loser-fence' );
+		$this->assertInstanceOf( WP_Error::class, $bound, 'a superseded handler cannot bind' );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Rules::OPTION ) );
+
+		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_dashboard_url', 'https://loser.example', $claim, 'loser-fence' );
+		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_grant_pubkey', 'loser-key', $claim, 'loser-fence' );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_grant_pubkey', $claim, 'loser-fence' );
+		Aura_Worker_Rules::clear( $claim, 'loser-fence' );
+		$this->assertSame( $winner_url, sa_read_option_uncached( 'aura_worker_dashboard_url' ) );
+		$this->assertSame( 'winner-key', sa_read_option_uncached( 'aura_worker_grant_pubkey' ) );
+
+		// The holder's own writes land, including the delete and the clear.
+		$this->assertTrue( Aura_Worker_Rules::bind( 'client-winner', Aura_Worker_Security::hash_token( 'winners-token' ), $claim, 'winner-fence' ) );
+		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_dashboard_url', 'https://winner2.example', $claim, 'winner-fence' );
+		$this->assertSame( 'https://winner2.example', sa_read_option_uncached( 'aura_worker_dashboard_url' ) );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_grant_pubkey', $claim, 'winner-fence' );
+		$this->assertNull( sa_read_option_uncached( 'aura_worker_grant_pubkey' ) );
+		Aura_Worker_Rules::clear( $claim, 'winner-fence' );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Rules::OPTION ) );
 	}
 
 	public function test_a_binding_that_does_not_land_fails_the_connect_without_consuming_the_magic_link(): void {

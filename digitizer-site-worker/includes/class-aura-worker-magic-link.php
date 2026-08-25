@@ -311,7 +311,7 @@ class Aura_Worker_Magic_Link {
 			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
 		}
 		if ( ! empty( $stored['connect_user_id'] ) ) {
-			update_option( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'] );
+			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
 		}
 		$token_hash = Aura_Worker_Security::hash_token( $token );
 		// The token is the ONE write whose loss the dashboard cannot see: a
@@ -354,7 +354,7 @@ class Aura_Worker_Magic_Link {
 			// policy until the new client's first push) and it names its token,
 			// so a sentinel from a connect whose token was then overwritten by a
 			// concurrent connect is stale, never a lock-out.
-			$bound = Aura_Worker_Rules::bind( $client, $token_hash );
+			$bound = Aura_Worker_Rules::bind( $client, $token_hash, $site_claim_key, $site_fence );
 			if ( is_wp_error( $bound ) ) {
 				// The token is stored but the binding is not (Codex round 19). Do
 				// NOT consume the magic transient and do NOT report success: Aura
@@ -370,20 +370,25 @@ class Aura_Worker_Magic_Link {
 			// An older dashboard names no client: clear, exactly as before. The
 			// old client's rules are not this site's to keep, and the new
 			// client's seq starts wherever it starts.
-			Aura_Worker_Rules::clear();
+			Aura_Worker_Rules::clear( $site_claim_key, $site_fence );
 		}
-		update_option( 'aura_worker_dashboard_url', $dashboard_url );
+		// Every remaining install write is conditional on the claim too
+		// (round-10). A handler that lost it would otherwise leave the winner's
+		// install carrying this handler's dashboard URL and gateway key —
+		// grants signed for the winner's key would then fail closed, behind a
+		// 200 the winner already returned.
+		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_dashboard_url', $dashboard_url, $site_claim_key, $site_fence );
 		if ( '' !== $grant_pubkey ) {
 			// Provision the gateway key → turns on approval-grant enforcement
 			// (Aura_Worker_Grant::is_enforced()).
-			update_option( 'aura_worker_grant_pubkey', $grant_pubkey );
+			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_grant_pubkey', $grant_pubkey, $site_claim_key, $site_fence );
 		} else {
 			// Keyless (re)connect: clear any previously provisioned key so a fresh
 			// dashboard that doesn't use grants isn't left unable to run writes
 			// against a stale key it can't sign for. Enforcement follows the key.
-			delete_option( 'aura_worker_grant_pubkey' );
+			Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_grant_pubkey', $site_claim_key, $site_fence );
 			if ( '' === $client ) {
-				Aura_Worker_Rules::clear(); // keyless AND clientless: an older dashboard — clear as before
+				Aura_Worker_Rules::clear( $site_claim_key, $site_fence ); // keyless AND clientless: an older dashboard — clear as before
 			}
 		}
 		// 2.11.0: the callback also mints an Application Password for the admin
@@ -556,52 +561,19 @@ class Aura_Worker_Magic_Link {
 	}
 
 	/**
-	 * Store the site token ONLY while this handler still holds the site claim,
-	 * in a single statement (round-9). A check followed by a write is two
-	 * statements: a handler paused between them resumes and writes anyway, and
-	 * a check cannot be retried into atomicity. Joining the claim row into the
-	 * UPDATE makes ownership part of the write's own predicate, so a handler
-	 * that lost the claim matches no row.
+	 * Store the site token ONLY while this handler still holds the site claim
+	 * (round-9). One implementation for every claim-conditional install write
+	 * lives in Aura_Worker_Rules; this names the option and the claim.
 	 *
 	 * The caller verifies the result by reading the row back (it already did,
 	 * for the filter-rewrite case): 0 rows affected also means "the value was
-	 * already this", and a site whose token row does not exist yet needs the
-	 * INSERT below, likewise conditional on the claim.
+	 * already this".
 	 *
 	 * @param string $token_hash The hash to store.
 	 * @param string $fence      This handler's claim fence.
 	 */
 	private static function write_token_under_claim( $token_hash, $fence ) {
-		global $wpdb;
-		if ( '' === (string) $fence ) {
-			return;
-		}
-		$like = $wpdb->esc_like( $fence . '|' ) . '%';
-		$wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s",
-				self::SITE_CLAIM,
-				$like,
-				$token_hash,
-				'aura_worker_site_token'
-			)
-		);
-		$wpdb->query(
-			$wpdb->prepare(
-				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
-				'aura_worker_site_token',
-				$token_hash,
-				'yes',
-				self::SITE_CLAIM,
-				$like,
-				'aura_worker_site_token'
-			)
-		);
-		// Both statements went round the option cache; evict what update_option()
-		// would have maintained, including the autoloaded bundle.
-		wp_cache_delete( 'aura_worker_site_token', 'options' );
-		wp_cache_delete( 'alloptions', 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
+		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_site_token', $token_hash, self::SITE_CLAIM, $fence );
 	}
 
 	/**

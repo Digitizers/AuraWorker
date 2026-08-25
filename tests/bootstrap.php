@@ -1276,13 +1276,22 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
+			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
+				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
+				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ] );
+				$GLOBALS['_option_writes'][] = array( 'delete', $name );
+				return 1;
+			}
 			// The site token written CONDITIONALLY on the site claim (2.11.0,
 			// round-9): one UPDATE joined to the claim row, and its INSERT
 			// counterpart for a site whose token row does not exist yet. A
 			// caller that no longer owns the claim matches no row.
 			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
 				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', $m );
-				if ( ! empty( $GLOBALS['_sa_token_write_fail'] ) ) {
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
 					return false; // the database refusing the statement outright
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
@@ -1290,11 +1299,12 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
 				return 1;
 			}
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM \S+ c WHERE c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' AND NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
 				list( , $name, $value, , $claim, $like ) = array_map( 'stripslashes', $m );
-				if ( ! empty( $GLOBALS['_sa_token_write_fail'] ) ) {
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
 					return false; // the database refusing the statement outright
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null !== sa_read_option_uncached( $name ) ) {
@@ -1302,6 +1312,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
 				return 1;
 			}
 
@@ -1903,7 +1914,6 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
-	$GLOBALS['_sa_token_write_fail']             = false; // the DB refusing the claim-conditional token write
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();
