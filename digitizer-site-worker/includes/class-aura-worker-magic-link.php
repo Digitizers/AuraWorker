@@ -417,12 +417,29 @@ class Aura_Worker_Magic_Link {
 			$release();
 			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
 		}
-		$minted = self::mint_app_password( (int) ( $stored['connect_user_id'] ?? 0 ) );
-		// Two mint outcomes leave an administrator-level credential live on the
-		// site: a previous password that would not die (app_password_revoke_failed)
-		// and a fresh one that could neither be recorded nor deleted
-		// (app_password_orphaned, round-7). Both are retryable 500s that keep
-		// the transient and the claim — never a token-only "success".
+		$minted = self::mint_app_password( (int) ( $stored['connect_user_id'] ?? 0 ), $site_fence );
+		// The mint is the last protected step, and the only one that hands a
+		// credential back — so the claim is verified after it too, whatever it
+		// returned (round-12). A handler that lost the site revokes what it
+		// created and reports nothing; every other outcome below assumes this
+		// handler is still the install.
+		if ( ! self::holds_site_claim( $site_fence ) ) {
+			if ( ! is_wp_error( $minted ) ) {
+				WP_Application_Passwords::delete_application_password( (int) ( $stored['connect_user_id'] ?? 0 ), $minted['uuid'] );
+			}
+			$release();
+			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
+		}
+		// Three mint outcomes must be retried rather than completed token-only.
+		// Two leave an administrator-level credential live on the site: a
+		// previous password that would not die (app_password_revoke_failed) and
+		// a fresh one that could neither be recorded nor deleted
+		// (app_password_orphaned, round-7). The third leaves none, but is an
+		// operational failure of the site's own store rather than one of the
+		// supported "this site cannot have one" cases (app_password_mint_failed,
+		// round-12) — completing there would finish onboarding without the
+		// credential the builder tools need and give the dashboard no way to
+		// ask again. All three are retryable 500s that keep the transient.
 		if ( is_wp_error( $minted ) && 'app_password_orphan_untracked' === $minted->get_error_code() ) {
 			// The one outcome that must NOT be retried (round-11): a live
 			// administrator credential exists that nothing on the site records,
@@ -435,26 +452,15 @@ class Aura_Worker_Magic_Link {
 			error_log( 'SiteAgent: an Aura Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			return new WP_REST_Response( array( 'error' => $minted->get_error_message(), 'code' => 'app_password_orphan_untracked' ), 500 );
 		}
-		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_revoke_failed', 'app_password_orphaned' ), true ) ) {
+		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_revoke_failed', 'app_password_orphaned', 'app_password_mint_failed' ), true ) ) {
 			$release(); // keep the transient — this connect is retryable
 			return new WP_REST_Response(
 				array(
-					'error' => 'app_password_orphaned' === $minted->get_error_code()
-						? 'A new Application Password could not be recorded or revoked; retry.'
-						: 'A previous Application Password could not be revoked; retry.',
+					'error' => self::retryable_mint_message( $minted->get_error_code() ),
 					'code'  => $minted->get_error_code(),
 				),
 				500
 			);
-		}
-		// The mint is the last protected write, and the only one that hands a
-		// credential back — so it is verified after the fact too (round-8). A
-		// handler that lost the site here revokes what it just created rather
-		// than returning a password beside another install's token.
-		if ( ! is_wp_error( $minted ) && ! self::holds_site_claim( $site_fence ) ) {
-			WP_Application_Passwords::delete_application_password( (int) ( $stored['connect_user_id'] ?? 0 ), $minted['uuid'] );
-			$release();
-			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
 		}
 		// Consumed only now (the round-23 orphan rule still holds: the claim is released with it below).
 		delete_transient( 'aura_magic_' . $magic_id );
@@ -471,6 +477,23 @@ class Aura_Worker_Magic_Link {
 		$release();
 
 		return new WP_REST_Response( $body, 200 );
+	}
+
+	/**
+	 * The operator-facing message for a mint outcome that must be retried.
+	 * One place, so the three codes and their wording cannot drift apart.
+	 *
+	 * @param string $code The WP_Error code mint_app_password() returned.
+	 * @return string
+	 */
+	private static function retryable_mint_message( $code ) {
+		if ( 'app_password_orphaned' === $code ) {
+			return 'A new Application Password could not be recorded or revoked; retry.';
+		}
+		if ( 'app_password_mint_failed' === $code ) {
+			return 'An Application Password could not be created on this site; retry.';
+		}
+		return 'A previous Application Password could not be revoked; retry.';
 	}
 
 	/** The fixed name every Aura-minted Application Password carries — the rotation key. */
@@ -509,10 +532,11 @@ class Aura_Worker_Magic_Link {
 	 * Mint the dashboard's Application Password for a user, rotating any
 	 * earlier one Aura minted (2.11.0).
 	 *
-	 * @param int $user_id The admin who created the magic link.
+	 * @param int    $user_id The admin who created the magic link.
+	 * @param string $fence   The caller's site-claim fence, when it holds one.
 	 * @return array{user_login:string,password:string,uuid:string}|WP_Error
 	 */
-	public static function mint_app_password( int $user_id ) {
+	public static function mint_app_password( int $user_id, $fence = '' ) {
 		if ( ! class_exists( 'WP_Application_Passwords' ) || ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 			return new WP_Error( 'app_passwords_unsupported', 'This WordPress does not support Application Passwords.' );
 		}
@@ -539,7 +563,12 @@ class Aura_Worker_Magic_Link {
 		}
 		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME ) );
 		if ( is_wp_error( $created ) ) {
-			return $created;
+			// Core refusing to write the password — a failing user-meta write,
+			// a database error — is an OPERATIONAL failure, not one of the
+			// token-only cases (round-12). Given its own code so the caller
+			// retries instead of completing onboarding without the credential
+			// the builder tools need.
+			return new WP_Error( 'app_password_mint_failed', $created->get_error_message() );
 		}
 		if ( ! is_array( $created ) || empty( $created[0] ) || ! is_string( $created[0] ) || empty( $created[1]['uuid'] ) ) {
 			return new WP_Error( 'app_password_mint_failed', 'WordPress did not return a new Application Password.' );
@@ -550,7 +579,7 @@ class Aura_Worker_Magic_Link {
 		// fresh read, not update_option()'s return (false also means
 		// "unchanged"); if it did not persist, the password just created is
 		// revoked again and the connect stays token-only.
-		self::persist_password_owner( $user_id, $uuid );
+		self::persist_password_owner( $user_id, $uuid, $fence );
 		if ( (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 ) !== $user_id || (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' ) !== $uuid ) {
 			// The cleanup is VERIFIED, never assumed (round-7): with option and
 			// user-meta writes both failing, this delete can fail too, and an
@@ -566,7 +595,7 @@ class Aura_Worker_Magic_Link {
 			// what a later rotation revokes by, so recovering it is worth more
 			// than the failed delete — and fail RETRYABLY either way, so the
 			// connect is not reported as completed beside an orphan credential.
-			self::persist_password_owner( $user_id, $uuid );
+			self::persist_password_owner( $user_id, $uuid, $fence );
 			// …and the recovery is verified too (round-11). If the pair still
 			// did not persist, the NEXT attempt's rotation would find nothing
 			// recorded, mint again, and every retry would add another live
@@ -670,10 +699,23 @@ class Aura_Worker_Magic_Link {
 	 * ONE implementation — the mint's first attempt and its recovery attempt
 	 * must not drift apart.
 	 *
+	 * Under a connect's site claim the pair is written conditionally on it
+	 * (round-12), like every other install write: a handler that lost the claim
+	 * would otherwise overwrite the winning install's owner/UUID with its own,
+	 * then delete its own password — leaving the winner's administrator
+	 * credential live and the site's record of it pointing at a password that
+	 * no longer exists.
+	 *
 	 * @param int    $user_id Owner of the password.
 	 * @param string $uuid    Its UUID.
+	 * @param string $fence   The caller's site-claim fence, when it holds one.
 	 */
-	private static function persist_password_owner( int $user_id, string $uuid ) {
+	private static function persist_password_owner( int $user_id, string $uuid, $fence = '' ) {
+		if ( '' !== (string) $fence ) {
+			Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_OWNER_OPTION, $user_id, self::SITE_CLAIM, $fence );
+			Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_UUID_OPTION, $uuid, self::SITE_CLAIM, $fence );
+			return;
+		}
 		update_option( self::APP_PASSWORD_OWNER_OPTION, $user_id );
 		update_option( self::APP_PASSWORD_UUID_OPTION, $uuid );
 		wp_cache_delete( self::APP_PASSWORD_OWNER_OPTION, 'options' );

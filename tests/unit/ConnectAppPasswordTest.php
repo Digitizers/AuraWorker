@@ -261,7 +261,9 @@ final class ConnectAppPasswordTest extends TestCase {
 		// Same round-7 P1, with the option store refusing only the FIRST write:
 		// the orphan the cleanup could not delete is recorded after all, so the
 		// next connect's rotation can revoke it by uuid.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = 1;
+		// The claim-conditional write is two statements (UPDATE, then INSERT for
+		// an absent row), so refusing two refuses the FIRST persist entirely.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = 2;
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 500, $res->get_status() );
@@ -446,6 +448,50 @@ final class ConnectAppPasswordTest extends TestCase {
 		}
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), "the winner's password is untouched" );
 		$this->assertNotEmpty( get_option( 'aura_worker_dashboard_url' ), "…and so is its dashboard URL" );
+	}
+
+	public function test_a_password_wordpress_refuses_to_create_is_retried_not_completed_token_only(): void {
+		// Round-12: a WP_Error out of create_new_application_password() is an
+		// operational failure of the site's own store — a failing user-meta
+		// write — not one of the supported "this site cannot have one" cases.
+		// Completing there finishes onboarding without the credential the
+		// builder tools need, and gives the dashboard no way to ask again.
+		$GLOBALS['_sa_app_password_create_fails'] = true;
+		$res  = $this->ml->handle_connect( $this->request() );
+		$data = $res->get_data();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_mint_failed', $data['code'] );
+		$this->assertArrayNotHasKey( 'success', $data );
+		$this->assertNotEmpty( get_transient( 'aura_magic_' . $this->magic_id ), 'the same callback can be retried' );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), 'the claim is released so the retry is not refused' );
+
+		// The retry, with the store working again, completes with a password.
+		$GLOBALS['_sa_app_password_create_fails'] = false;
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+	}
+
+	public function test_tracking_writes_are_conditional_on_the_claim_too(): void {
+		// Round-12: unfenced, a handler that lost the site would overwrite the
+		// winner's owner/UUID with its own and then delete only its OWN
+		// password — leaving the winner's administrator credential live and the
+		// site's record of it pointing at a password that no longer exists.
+		$this->ml->handle_connect( $this->request() ); // the winner's install
+		$winner_uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$this->assertNotEmpty( $winner_uuid );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
+
+		$mint = new ReflectionMethod( Aura_Worker_Magic_Link::class, 'persist_password_owner' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$mint->setAccessible( true );
+		}
+		$mint->invoke( null, 99, 'loser-uuid', 'loser-fence' );
+		$this->assertSame( $winner_uuid, sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
+		$this->assertSame( '7', (string) sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+
+		$mint->invoke( null, 99, 'winner-second-uuid', 'winner-fence' );
+		$this->assertSame( 'winner-second-uuid', sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */

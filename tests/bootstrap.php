@@ -669,6 +669,10 @@ if ( ! function_exists( 'get_userdata' ) ) {
 if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 	class WP_Application_Passwords {
 		public static function create_new_application_password( int $user_id, array $args = array() ) {
+			if ( ! empty( $GLOBALS['_sa_app_password_create_fails'] ) ) {
+				// Core's own failure mode: the user-meta write did not land.
+				return new WP_Error( 'db_error', 'Could not save application password.' );
+			}
 			// Witness for the connect tests: was the site-wide claim still held at mint time?
 			$GLOBALS['_sa_site_claim_during_mint'] = get_option( 'aura_worker_connect_lock', false );
 			// A test can model losing the site to another install while this
@@ -1292,6 +1296,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
 				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', $m );
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					// `true` fails every write; a positive INT fails that many
+					// and then lets it through, as update_option() does.
+					if ( is_int( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+						--$GLOBALS['_sa_option_write_fail'][ $name ];
+					}
 					return false; // the database refusing the statement outright
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
@@ -1305,6 +1314,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM \S+ c WHERE c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' AND NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
 				list( , $name, $value, , $claim, $like ) = array_map( 'stripslashes', $m );
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					// `true` fails every write; a positive INT fails that many
+					// and then lets it through, as update_option() does.
+					if ( is_int( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+						--$GLOBALS['_sa_option_write_fail'][ $name ];
+					}
 					return false; // the database refusing the statement outright
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null !== sa_read_option_uncached( $name ) ) {
@@ -1914,6 +1928,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
+	$GLOBALS['_sa_app_password_create_fails']    = false;
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();
