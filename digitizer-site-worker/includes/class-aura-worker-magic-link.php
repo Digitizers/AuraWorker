@@ -313,8 +313,15 @@ class Aura_Worker_Magic_Link {
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			update_option( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'] );
 		}
-		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( $token ) );
-		$token_hash = Aura_Worker_Security::hash_token( $token ); // the value stored one statement above
+		$token_hash = Aura_Worker_Security::hash_token( $token );
+		// The token is the ONE write whose loss the dashboard cannot see: a
+		// handler resuming after its claim was released could otherwise
+		// overwrite the winner's token AFTER the winner answered 200, leaving
+		// Aura holding a token the site rejects and no error anywhere
+		// (round-9). So it is not merely preceded by a check — it is
+		// CONDITIONAL on the claim, in one statement, and a handler that no
+		// longer owns the claim writes nothing at all.
+		self::write_token_under_claim( $token_hash, $site_fence );
 		// The token write is verified the same way the binding's is: read the row
 		// back from the database and compare (Codex round 30). update_option()
 		// answers false for "unchanged" as well as "failed", and a filter or a
@@ -324,7 +331,15 @@ class Aura_Worker_Magic_Link {
 		// 500, claim released, transient kept.
 		$stored_token = Aura_Worker_Rules::site_token_uncached();
 		if ( is_wp_error( $stored_token ) || '' === $stored_token || ! hash_equals( $token_hash, $stored_token ) ) {
+			// Asked BEFORE the release, which deletes the very row the question
+			// is about. A lost claim is the one cause that is not a store
+			// failure: this handler was superseded, and its 409 tells the
+			// dashboard to retry rather than blaming the site's database.
+			$superseded = ! self::holds_site_claim( $site_fence );
 			$release();
+			if ( $superseded ) {
+				return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
+			}
 			return new WP_REST_Response( array( 'error' => 'Connect not completed: the site token could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
 		}
 		if ( '' !== $client ) {
@@ -538,6 +553,55 @@ class Aura_Worker_Magic_Link {
 			return new WP_Error( 'app_password_orphaned', 'A new Application Password could not be revoked after its owner record failed to persist; no connection was completed.' );
 		}
 		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0], 'uuid' => $uuid );
+	}
+
+	/**
+	 * Store the site token ONLY while this handler still holds the site claim,
+	 * in a single statement (round-9). A check followed by a write is two
+	 * statements: a handler paused between them resumes and writes anyway, and
+	 * a check cannot be retried into atomicity. Joining the claim row into the
+	 * UPDATE makes ownership part of the write's own predicate, so a handler
+	 * that lost the claim matches no row.
+	 *
+	 * The caller verifies the result by reading the row back (it already did,
+	 * for the filter-rewrite case): 0 rows affected also means "the value was
+	 * already this", and a site whose token row does not exist yet needs the
+	 * INSERT below, likewise conditional on the claim.
+	 *
+	 * @param string $token_hash The hash to store.
+	 * @param string $fence      This handler's claim fence.
+	 */
+	private static function write_token_under_claim( $token_hash, $fence ) {
+		global $wpdb;
+		if ( '' === (string) $fence ) {
+			return;
+		}
+		$like = $wpdb->esc_like( $fence . '|' ) . '%';
+		$wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s",
+				self::SITE_CLAIM,
+				$like,
+				$token_hash,
+				'aura_worker_site_token'
+			)
+		);
+		$wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+				'aura_worker_site_token',
+				$token_hash,
+				'yes',
+				self::SITE_CLAIM,
+				$like,
+				'aura_worker_site_token'
+			)
+		);
+		// Both statements went round the option cache; evict what update_option()
+		// would have maintained, including the autoloaded bundle.
+		wp_cache_delete( 'aura_worker_site_token', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
 	}
 
 	/**

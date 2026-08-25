@@ -369,6 +369,20 @@ if ( ! function_exists( 'get_option' ) ) {
 	}
 }
 
+/**
+ * Does the claim row named $claim exist with a value matching the LIKE pattern
+ * the caller built from its fence? Mirrors MySQL's LIKE for the one shape the
+ * plugin issues: an esc_like()'d prefix followed by '%'.
+ */
+function sa_claim_like_matches( string $claim, string $like ): bool {
+	$held = sa_read_option_uncached( $claim );
+	if ( ! is_string( $held ) ) {
+		return false;
+	}
+	$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), rtrim( $like, '%' ) );
+	return 0 === strpos( $held, $prefix );
+}
+
 if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
 		// The database refusing (or a filter short-circuiting) a write:
@@ -1262,6 +1276,35 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
+			// The site token written CONDITIONALLY on the site claim (2.11.0,
+			// round-9): one UPDATE joined to the claim row, and its INSERT
+			// counterpart for a site whose token row does not exist yet. A
+			// caller that no longer owns the claim matches no row.
+			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
+				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_token_write_fail'] ) ) {
+					return false; // the database refusing the statement outright
+				}
+				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				return 1;
+			}
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM \S+ c WHERE c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' AND NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
+				list( , $name, $value, , $claim, $like ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_token_write_fail'] ) ) {
+					return false; // the database refusing the statement outright
+				}
+				if ( ! sa_claim_like_matches( $claim, $like ) || null !== sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				return 1;
+			}
+
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
 				if ( true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
@@ -1860,6 +1903,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
+	$GLOBALS['_sa_token_write_fail']             = false; // the DB refusing the claim-conditional token write
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();

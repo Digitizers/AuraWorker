@@ -250,9 +250,10 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   same site cannot split the credentials the dashboard ends up holding.
   "Regenerate Token" takes the same claim (it is refused while a connect is
   installing). The claim is never taken over by age: a callback the dashboard
-  timed out on may still be running. Every write the claim protects re-checks
-  that it still holds it, so a claim that goes away mid-request costs that
-  request its connect (retryable) rather than splitting two installs. If a
+  timed out on may still be running. The site token is written by a statement
+  that is itself conditional on holding the claim, and the remaining protected
+  writes re-check it, so a claim that goes away mid-request costs that request
+  its connect (retryable) rather than splitting two installs. If a
   killed request ever leaves a claim behind, every later connect is refused
   until an administrator deactivates and reactivates the plugin, which
   releases it.

@@ -161,9 +161,10 @@ WordPress Basic auth. Every connect rotates it; where Application Passwords are
 unavailable the connect stays token-only and names the reason. The whole install runs
 under one site-wide connect claim — "Regenerate Token" takes it too — and that claim is
 never taken over by age, because a callback the dashboard timed out on may still be
-running; every write it protects re-checks that the claim is still the writer's, so a
-claim that disappears mid-request costs that request its connect rather than splitting
-two installs. A claim left behind by a killed request is released by deactivating and
+running. The site token — the one write whose loss the dashboard cannot see — is stored
+by a statement conditional on holding the claim, and the other protected writes re-check
+it, so a claim that disappears mid-request costs that request its connect rather than
+splitting two installs. A claim left behind by a killed request is released by deactivating and
 reactivating the plugin — which also revokes the Application Password, since
 unregistering the routes would otherwise leave an administrator credential that
 WordPress core and other REST/MCP plugins still accept.

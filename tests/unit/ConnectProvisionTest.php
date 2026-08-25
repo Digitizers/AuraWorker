@@ -150,11 +150,15 @@ final class ConnectProvisionTest extends TestCase {
 		// read back from the database. A refused or filtered token write must
 		// not be followed by a sentinel for the requested hash (it would read as
 		// stale: unbound behind a 200) nor by a consumed transient.
+		// Since round-9 the token is written with one claim-conditional
+		// statement, so an option filter can no longer rewrite it (that is the
+		// point). What can still fail is the database itself.
 		$GLOBALS['_options']['aura_worker_site_token'] = Aura_Worker_Security::hash_token( 'old-token' );
-		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_site_token' => true );
+		$GLOBALS['_rows']['aura_worker_site_token']    = $GLOBALS['_options']['aura_worker_site_token'];
+		$GLOBALS['_sa_token_write_fail'] = true;
 		$GLOBALS['_option_writes'] = array();
 		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'client-new', 'token' => 'new-token' ) ) );
-		$GLOBALS['_sa_option_write_fail'] = array();
+		$GLOBALS['_sa_token_write_fail'] = false;
 		$this->assertSame( 500, $res->get_status() );
 		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
 		$this->assertNotContains( array( 'set', 'aura_worker_ruleset' ), $GLOBALS['_option_writes'], 'No sentinel for a token that is not there.' );

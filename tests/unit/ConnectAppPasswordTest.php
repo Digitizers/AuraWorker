@@ -369,6 +369,37 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
 	}
 
+	public function test_the_token_write_is_conditional_on_the_claim_not_merely_preceded_by_a_check(): void {
+		// Round-9: a handler paused between a check and the write resumes and
+		// writes anyway — overwriting the winner's token AFTER the winner
+		// answered 200, so the dashboard holds a token the site rejects and
+		// nothing anywhere reports it. Ownership is part of the statement.
+		$winner = Aura_Worker_Security::hash_token( 'the-winners-token' );
+		$GLOBALS['_options']['aura_worker_site_token'] = $winner;
+		$GLOBALS['_rows']['aura_worker_site_token']    = $winner;
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
+
+		$write = new ReflectionMethod( Aura_Worker_Magic_Link::class, 'write_token_under_claim' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$write->setAccessible( true );
+		}
+		$write->invoke( null, Aura_Worker_Security::hash_token( 'the-losers-token' ), 'loser-fence' );
+		$this->assertSame( $winner, sa_read_option_uncached( 'aura_worker_site_token' ), 'a handler that lost the claim writes nothing' );
+
+		// The holder's own write lands.
+		$mine = Aura_Worker_Security::hash_token( 'the-winners-second-token' );
+		$write->invoke( null, $mine, 'winner-fence' );
+		$this->assertSame( $mine, sa_read_option_uncached( 'aura_worker_site_token' ) );
+
+		// …and on a site with no token row yet, likewise only for the holder.
+		unset( $GLOBALS['_options']['aura_worker_site_token'], $GLOBALS['_rows']['aura_worker_site_token'] );
+		$write->invoke( null, Aura_Worker_Security::hash_token( 'x' ), 'loser-fence' );
+		$this->assertNull( sa_read_option_uncached( 'aura_worker_site_token' ) );
+		$write->invoke( null, $mine, 'winner-fence' );
+		$this->assertSame( $mine, sa_read_option_uncached( 'aura_worker_site_token' ) );
+	}
+
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
 	private function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
