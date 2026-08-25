@@ -50,15 +50,22 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertNotEmpty( get_option( 'aura_worker_site_token' ) );
 	}
 
-	public function test_every_connect_rotates_deleting_earlier_aura_passwords_only(): void {
+	public function test_rotation_deletes_only_the_STORED_password_by_uuid_never_a_same_named_stranger(): void {
+		// A password the operator happens to name "Aura SiteAgent" by hand — no
+		// stored UUID points at it, so rotation must leave it alone (round-5).
 		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) );
-		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) );
-		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => 'Something else' ) );
-		$res = $this->ml->handle_connect( $this->request() );
-		$this->assertSame( 200, $res->get_status() );
-		$names = array_map( static fn( $i ) => $i['name'], WP_Application_Passwords::get_user_application_passwords( 7 ) );
-		sort( $names );
-		$this->assertSame( array( Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'Something else' ), $names ); // one Aura password, the stranger untouched
+		$this->ml->handle_connect( $this->request() ); // mints Aura's own, stores its uuid
+		$stored_uuid = get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$this->assertNotEmpty( $stored_uuid );
+		$this->assertCount( 2, WP_Application_Passwords::get_user_application_passwords( 7 ) ); // the stranger + Aura's
+
+		// A second connect rotates ONLY the stored one; the stranger survives, and the stored uuid moves.
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$this->ml->handle_connect( $this->request() );
+		$uuids = array_map( static fn( $i ) => $i['uuid'], WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertNotContains( $stored_uuid, $uuids, 'the previous Aura password is gone' );
+		$this->assertCount( 2, $uuids, 'the stranger stays, one fresh Aura password' );
+		$this->assertContains( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ), $uuids );
 	}
 
 	public function test_a_reconnect_by_another_admin_revokes_the_previous_creator_s_aura_password(): void {
@@ -138,16 +145,19 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ), 'no owner remains' );
 	}
 
-	public function test_a_revocation_that_did_not_land_mints_nothing_and_says_so(): void {
-		$this->ml->handle_connect( $this->request() ); // admin 7 owns one
+	public function test_a_revocation_that_did_not_land_is_a_retryable_500_that_keeps_the_transient(): void {
+		$this->ml->handle_connect( $this->request() ); // admin 7 owns one, uuid stored
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 ); // a new link
 		$GLOBALS['_app_passwords_delete_fail'] = true;
-		$data = $this->ml->handle_connect( $this->request() )->get_data();
-		$this->assertTrue( $data['success'] );
-		$this->assertSame( 'app_password_revoke_failed', $data['app_password_unavailable'] );
-		$this->assertArrayNotHasKey( 'app_password', $data );
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_revoke_failed', $res->get_data()['code'] );
+		$this->assertArrayNotHasKey( 'success', $res->get_data() );
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the old one is still there — honestly' );
-		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ), 'the owner is still known for the next rotation' );
+		// Retryable: the transient survives so the dashboard can try again.
+		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'the transient is kept for the retry' );
+		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ), 'the owner is still known' );
 	}
 
 	public function test_an_owner_record_that_did_not_persist_revokes_the_new_password_and_returns_none(): void {
