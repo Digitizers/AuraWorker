@@ -174,7 +174,7 @@ class Aura_Worker {
 		// demonstrably owns the claim. Having lost it, the password now on the
 		// site belongs to the install that replaced this rotation, and revoking
 		// it would disconnect a connection this request knows nothing about.
-		if ( Aura_Worker_Magic_Link::holds_site_claim( $site_fence ) && ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
+		if ( Aura_Worker_Magic_Link::holds_site_claim( $site_fence ) && ! Aura_Worker_Magic_Link::revoke_managed_password( $site_fence ) ) {
 			// translators: internal log line, not shown to the user.
 			error_log( 'SiteAgent: the Aura Application Password could not be revoked while regenerating the site token; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}

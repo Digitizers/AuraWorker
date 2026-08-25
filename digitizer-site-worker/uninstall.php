@@ -23,7 +23,14 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 $aura_pw_owner = (int) get_option( 'aura_worker_app_password_user_id', 0 );
 $aura_pw_uuid  = (string) get_option( 'aura_worker_app_password_uuid', '' );
 $aura_pw_tracked = ( $aura_pw_owner > 0 && '' !== $aura_pw_uuid );
-$aura_pw_gone    = ! $aura_pw_tracked;
+// HALF a record — one option, not both — names a password this code cannot
+// delete, and the connect path treats it as a possibly live orphan (round-13).
+// Uninstall must not discard it either (round-15): the surviving option is the
+// only thing left pointing at an administrator credential that may still work,
+// so it stays behind for manual recovery. Nothing is recorded at all → nothing
+// to keep.
+$aura_pw_partial = ( ! $aura_pw_tracked && ( $aura_pw_owner > 0 || '' !== $aura_pw_uuid ) );
+$aura_pw_gone    = ! $aura_pw_tracked && ! $aura_pw_partial;
 if ( $aura_pw_tracked && class_exists( 'WP_Application_Passwords' ) ) {
 	WP_Application_Passwords::delete_application_password( $aura_pw_owner, $aura_pw_uuid );
 	// The revocation is PROVEN by the owner's list, not by the delete's return

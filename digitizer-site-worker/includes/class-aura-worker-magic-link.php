@@ -548,7 +548,7 @@ class Aura_Worker_Magic_Link {
 		if ( self::tracking_is_incomplete() ) {
 			return new WP_Error( 'app_password_tracking_incomplete', 'This site records half an Aura Application Password, so another cannot be minted beside it; revoke it by hand in Users → Profile → Application Passwords and delete the aura_worker_app_password_user_id and aura_worker_app_password_uuid options.' );
 		}
-		if ( ! self::revoke_managed_password() ) {
+		if ( ! self::revoke_managed_password( $fence ) ) {
 			// A revocation that did not land is NOT reported as a rotation
 			// (round-4): the old credential may still be valid, so nothing new
 			// is minted beside it and the dashboard is told why.
@@ -801,9 +801,14 @@ class Aura_Worker_Magic_Link {
 	 * administrator-level credential never outlives the token it was minted
 	 * beside.
 	 *
+	 * @param string $fence The caller's site-claim fence, when it holds one —
+	 *                      the record is then forgotten conditionally on it
+	 *                      (round-15), so a handler that lost the claim cannot
+	 *                      delete the WINNING install's owner/UUID and leave
+	 *                      its administrator credential untracked.
 	 * @return bool True when nothing dangerous remains.
 	 */
-	public static function revoke_managed_password(): bool {
+	public static function revoke_managed_password( $fence = '' ): bool {
 		$owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
 		$uuid  = (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' );
 		if ( $owner <= 0 && '' === $uuid ) {
@@ -826,7 +831,7 @@ class Aura_Worker_Magic_Link {
 		if ( true !== $deleted && ! self::managed_password_gone( $owner, $uuid ) ) {
 			return false; // a genuine delete failure — the credential is still live
 		}
-self::forget_password_owner();
+		self::forget_password_owner( $fence );
 		return true;
 	}
 

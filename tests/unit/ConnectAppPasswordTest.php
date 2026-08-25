@@ -215,7 +215,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ) );
 		// …and the handler that regenerates the token is wired to it.
 		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker.php' );
-		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $src );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password( $site_fence )', $src );
 	}
 
 	public function test_uninstall_revokes_the_managed_password_by_uuid_before_deleting_its_options(): void {
@@ -537,6 +537,39 @@ final class ConnectAppPasswordTest extends TestCase {
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+	}
+
+	public function test_uninstall_keeps_half_a_tracking_record(): void {
+		// Round-15: an incomplete pair names a password uninstall cannot delete
+		// but that may still authenticate. The surviving option is the only
+		// thing left pointing at it, so it outlives the plugin.
+		update_option( 'aura_worker_app_password_user_id', 7 );
+		$this->run_uninstall();
+		$this->assertSame( 7, (int) get_option( 'aura_worker_app_password_user_id' ) );
+
+		// The mirror case, and the empty one: nothing recorded, nothing kept.
+		delete_option( 'aura_worker_app_password_user_id' );
+		update_option( 'aura_worker_app_password_uuid', 'lonely-uuid' );
+		$this->run_uninstall();
+		$this->assertSame( 'lonely-uuid', (string) get_option( 'aura_worker_app_password_uuid' ) );
+	}
+
+	public function test_the_rotation_forgets_the_record_only_while_it_owns_the_claim(): void {
+		// Round-15: revoke_managed_password() deleted the owner/UUID pair
+		// unconditionally, so a connect resuming after its claim was released
+		// would erase the WINNING install's record — leaving that install's
+		// administrator credential live and beyond every later rotation.
+		$this->ml->handle_connect( $this->request() ); // the winner's install
+		$winner_uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
+
+		Aura_Worker_Magic_Link::revoke_managed_password( 'loser-fence' );
+		$this->assertSame( $winner_uuid, sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ), "the winner's record survives" );
+		$this->assertSame( '7', (string) sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+
+		Aura_Worker_Magic_Link::revoke_managed_password( 'winner-fence' );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
