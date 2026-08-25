@@ -440,7 +440,7 @@ class Aura_Worker_Magic_Link {
 		// round-12) — completing there would finish onboarding without the
 		// credential the builder tools need and give the dashboard no way to
 		// ask again. All three are retryable 500s that keep the transient.
-		if ( is_wp_error( $minted ) && 'app_password_orphan_untracked' === $minted->get_error_code() ) {
+		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_orphan_untracked', 'app_password_tracking_incomplete' ), true ) ) {
 			// The one outcome that must NOT be retried (round-11): a live
 			// administrator credential exists that nothing on the site records,
 			// so another attempt would mint a second one beside it. The magic
@@ -450,7 +450,7 @@ class Aura_Worker_Magic_Link {
 			$release();
 			// translators: internal log line, not shown to the user.
 			error_log( 'SiteAgent: an Aura Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			return new WP_REST_Response( array( 'error' => $minted->get_error_message(), 'code' => 'app_password_orphan_untracked' ), 500 );
+			return new WP_REST_Response( array( 'error' => $minted->get_error_message(), 'code' => $minted->get_error_code() ), 500 );
 		}
 		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_revoke_failed', 'app_password_orphaned', 'app_password_mint_failed' ), true ) ) {
 			$release(); // keep the transient — this connect is retryable
@@ -545,6 +545,9 @@ class Aura_Worker_Magic_Link {
 		// when no replacement can be minted for this creator (not an admin,
 		// Application Passwords unavailable for them). Rotation is a promise
 		// about the OLD credential, not a side effect of minting a new one.
+		if ( self::tracking_is_incomplete() ) {
+			return new WP_Error( 'app_password_tracking_incomplete', 'This site records half an Aura Application Password, so another cannot be minted beside it; revoke it by hand in Users → Profile → Application Passwords and delete the aura_worker_app_password_user_id and aura_worker_app_password_uuid options.' );
+		}
 		if ( ! self::revoke_managed_password() ) {
 			// A revocation that did not land is NOT reported as a rotation
 			// (round-4): the old credential may still be valid, so nothing new
@@ -694,6 +697,21 @@ class Aura_Worker_Magic_Link {
 	}
 
 	/**
+	 * Does the site record HALF an Aura Application Password? That is what a
+	 * mint whose tracking writes only partly landed leaves behind, and it names
+	 * a password nothing here can delete. Minting beside it would add a second
+	 * live administrator credential, so it is refused until an operator clears
+	 * it (round-13).
+	 *
+	 * @return bool
+	 */
+	private static function tracking_is_incomplete(): bool {
+		$owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
+		$uuid  = (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' );
+		return ( $owner > 0 ) !== ( '' !== $uuid );
+	}
+
+	/**
 	 * Write the owner/UUID pair a later rotation revokes by, evicting the
 	 * option cache so the verifying read that follows sees the database.
 	 * ONE implementation — the mint's first attempt and its recovery attempt
@@ -759,8 +777,18 @@ class Aura_Worker_Magic_Link {
 	public static function revoke_managed_password(): bool {
 		$owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
 		$uuid  = (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' );
-		if ( $owner <= 0 || '' === $uuid ) {
+		if ( $owner <= 0 && '' === $uuid ) {
 			return true; // nothing recorded — first mint, or already cleared
+		}
+		if ( $owner <= 0 || '' === $uuid ) {
+			// HALF a record is not "nothing recorded" (round-13): it is what a
+			// mint whose owner/UUID writes only partly landed leaves behind,
+			// and it names a password this code can no longer delete — the
+			// owner without the UUID, or the reverse. Reporting success here
+			// would let the next connect mint another one beside it. Refusing
+			// is all that is left; the operator repairs it by revoking the
+			// password by hand and deleting both options.
+			return false;
 		}
 		// By the STORED UUID, never the display name (round-5): the name is
 		// user-chosen, so a stranger's "Aura SiteAgent" must not be nuked, and

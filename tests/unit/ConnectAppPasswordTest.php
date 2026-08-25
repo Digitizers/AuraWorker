@@ -494,6 +494,31 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( 'winner-second-uuid', sa_read_option_uncached( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ) );
 	}
 
+	public function test_half_a_tracking_record_refuses_every_further_mint(): void {
+		// Round-13: a mint whose owner/UUID writes only partly landed leaves a
+		// lone option behind. Read as "nothing recorded", the NEXT link — a new
+		// one, so consuming the old transient does not help — would mint a
+		// second live administrator credential beside the orphan.
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, 7 );
+		$res  = $this->ml->handle_connect( $this->request() );
+		$data = $res->get_data();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_tracking_incomplete', $data['code'] );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'nothing new was minted' );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ) );
+		// The revocation cannot report success on half a record either — the
+		// deactivation and uninstall paths must log it, not clear it silently.
+		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password() );
+		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+
+		// Cleared by hand, the next connect mints again (a fresh link: the
+		// terminal refusal consumed the previous one).
+		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION );
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+	}
+
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
 	private function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
