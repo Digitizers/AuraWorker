@@ -258,6 +258,11 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   killed request ever leaves a claim behind, every later connect is refused
   until an administrator deactivates and reactivates the plugin, which
   releases it.
+  "Regenerate Token" issues its cleanup the same way, and skips revoking the
+  Application Password when it no longer owns the claim — the password on the
+  site then belongs to whichever connect replaced it. It still reveals the
+  token it stored: refusing to would revoke the old token while showing no
+  replacement.
 * Deactivating the plugin now also revokes the Application Password Aura
   minted. Unregistering SiteAgent's routes does not stop an
   administrator-level credential from authenticating to WordPress core and to

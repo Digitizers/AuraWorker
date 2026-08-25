@@ -230,21 +230,31 @@ final class ConnectAppPasswordTest extends TestCase {
 		);
 	}
 
-	public function test_a_fresh_password_that_can_be_neither_recorded_nor_revoked_is_a_retryable_500(): void {
+	public function test_a_fresh_password_that_can_be_neither_recorded_nor_revoked_is_terminal_not_retryable(): void {
 		// Round-7 P1: with option writes AND the delete failing, the cleanup of
 		// the untracked password does not land. Reporting a token-only success
 		// there would leave a live administrator credential on the site with
 		// nothing recording it.
+		// Round-11 P1: and it must not be RETRIED either — the next attempt
+		// would find nothing recorded, mint again, and every retry would add
+		// another live untracked administrator credential. The magic link is
+		// consumed to stop that.
 		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = true;
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$res  = $this->ml->handle_connect( $this->request() );
 		$data = $res->get_data();
 		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_orphaned', $data['code'] );
+		$this->assertSame( 'app_password_orphan_untracked', $data['code'] );
 		$this->assertArrayNotHasKey( 'success', $data );
-		$this->assertNotEmpty( get_transient( 'aura_magic_' . $this->magic_id ), 'the transient survives — the connect is retryable' );
-		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), 'the claim is released so the retry is not refused' );
+		$this->assertFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'the magic link is consumed: no second mint beside the orphan' );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), 'the claim is released' );
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password really is still live' );
+
+		// A retry of the same link mints nothing at all — it is refused at the
+		// consumed transient, before any credential work.
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 400, $res->get_status() );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'still exactly one orphan' );
 	}
 
 	public function test_a_password_that_could_not_be_revoked_has_its_tracking_recovered(): void {
@@ -255,7 +265,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'] );
+		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'], 'tracked: the next attempt can revoke it, so this one is retryable' );
 		$live = WP_Application_Passwords::get_user_application_passwords( 7 );
 		$this->assertCount( 1, $live );
 		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
@@ -398,6 +408,38 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertNull( sa_read_option_uncached( 'aura_worker_site_token' ) );
 		$write->invoke( null, $mine, 'winner-fence' );
 		$this->assertSame( $mine, sa_read_option_uncached( 'aura_worker_site_token' ) );
+	}
+
+	public function test_a_regeneration_that_lost_the_site_revokes_nothing_and_still_reveals_its_token(): void {
+		// Round-11 P2: a rotation paused after its swap, its claim released by
+		// an operator, must not revoke the Application Password of the connect
+		// that replaced it, nor delete that connect's dashboard URL — and must
+		// still hand its own token to the admin (refusing that is the #67
+		// defect).
+		$this->ml->handle_connect( $this->request() ); // a connection exists: password + dashboard URL
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertNotEmpty( get_option( 'aura_worker_dashboard_url' ) );
+
+		// The claim goes away between this rotation's read and its swap. (The
+		// hook also fires for the conditional INSERT that TAKES the claim, so
+		// it waits until the row is actually there before removing it.)
+		$GLOBALS['_sa_before_swap'] = static function () {
+			if ( ! isset( $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] ) ) {
+				return;
+			}
+			unset( $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ], $GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ] );
+			$GLOBALS['_sa_before_swap'] = null;
+		};
+		$plugin = new Aura_Worker();
+		try {
+			$plugin->ajax_regenerate_token();
+			$this->fail( 'the handler returned without sending a JSON response' );
+		} catch ( SA_Json_Response $res ) {
+			$this->assertTrue( $res->success, 'the token is still revealed' );
+			$this->assertNotSame( '', (string) ( $res->data['token'] ?? '' ) );
+		}
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), "the winner's password is untouched" );
+		$this->assertNotEmpty( get_option( 'aura_worker_dashboard_url' ), "…and so is its dashboard URL" );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */

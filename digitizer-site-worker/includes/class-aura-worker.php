@@ -153,8 +153,15 @@ class Aura_Worker {
 		// transient database error, a stale autoloaded copy — and failing here
 		// would revoke the previous token while revealing no replacement, which
 		// is worse than the defect this rotation exists to fix.
-		update_option( 'aura_worker_connect_user_id', get_current_user_id() );
-		delete_option( 'aura_worker_dashboard_url' );
+		// The cleanup that follows is this rotation's half of the same install
+		// the connect callback writes, so it is issued under the same claim and
+		// with the same conditional statements (round-11). A rotation paused
+		// here while an operator released its claim would otherwise delete the
+		// dashboard URL of the connect that replaced it and revoke that
+		// connect's Application Password.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', get_current_user_id(), $claim, $site_fence );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_dashboard_url', $claim, $site_fence );
 		// The dashboard's binding is what this rotation invalidates, and the
 		// Application Password minted beside the old token is part of it
 		// (2.11.0, round-6): left alone it would keep authenticating to
@@ -162,10 +169,21 @@ class Aura_Worker {
 		// the site is disconnected. Best-effort: a failure here must not cost
 		// the operator the new token this response is about to reveal, so it
 		// is logged, not fatal.
-		if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
+		// The revocation cannot be expressed as one conditional statement — it
+		// is a WordPress API call — so it runs only while this request still
+		// demonstrably owns the claim. Having lost it, the password now on the
+		// site belongs to the install that replaced this rotation, and revoking
+		// it would disconnect a connection this request knows nothing about.
+		if ( Aura_Worker_Magic_Link::holds_site_claim( $site_fence ) && ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
 			// translators: internal log line, not shown to the user.
 			error_log( 'SiteAgent: the Aura Application Password could not be revoked while regenerating the site token; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}
+		// The RESPONSE is deliberately not conditioned on the claim as well. The
+		// swap matched a row, so the token it revealed was the site's when this
+		// request wrote it; refusing to reveal it afterwards — because the row
+		// has since moved on — would revoke the old token while showing no
+		// replacement, which is the #67 defect this handler exists to remove.
+		// Losing the claim costs this rotation its cleanup, never its token.
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
 		Aura_Worker_Magic_Link::release_site( $site_fence );
 

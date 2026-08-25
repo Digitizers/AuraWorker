@@ -423,6 +423,18 @@ class Aura_Worker_Magic_Link {
 		// and a fresh one that could neither be recorded nor deleted
 		// (app_password_orphaned, round-7). Both are retryable 500s that keep
 		// the transient and the claim — never a token-only "success".
+		if ( is_wp_error( $minted ) && 'app_password_orphan_untracked' === $minted->get_error_code() ) {
+			// The one outcome that must NOT be retried (round-11): a live
+			// administrator credential exists that nothing on the site records,
+			// so another attempt would mint a second one beside it. The magic
+			// link is consumed here precisely to stop that, and the operator is
+			// told what to revoke by hand.
+			delete_transient( 'aura_magic_' . $magic_id );
+			$release();
+			// translators: internal log line, not shown to the user.
+			error_log( 'SiteAgent: an Aura Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			return new WP_REST_Response( array( 'error' => $minted->get_error_message(), 'code' => 'app_password_orphan_untracked' ), 500 );
+		}
 		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_revoke_failed', 'app_password_orphaned' ), true ) ) {
 			$release(); // keep the transient — this connect is retryable
 			return new WP_REST_Response(
@@ -555,6 +567,14 @@ class Aura_Worker_Magic_Link {
 			// than the failed delete — and fail RETRYABLY either way, so the
 			// connect is not reported as completed beside an orphan credential.
 			self::persist_password_owner( $user_id, $uuid );
+			// …and the recovery is verified too (round-11). If the pair still
+			// did not persist, the NEXT attempt's rotation would find nothing
+			// recorded, mint again, and every retry would add another live
+			// untracked administrator credential. Two different outcomes, so
+			// two different codes: the caller must not let this one be retried.
+			if ( (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 ) !== $user_id || (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' ) !== $uuid ) {
+				return new WP_Error( 'app_password_orphan_untracked', 'A new Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.' );
+			}
 			return new WP_Error( 'app_password_orphaned', 'A new Application Password could not be revoked after its owner record failed to persist; no connection was completed.' );
 		}
 		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0], 'uuid' => $uuid );
@@ -593,7 +613,7 @@ class Aura_Worker_Magic_Link {
 	 * @param string $fence The value claim_magic_link() returned.
 	 * @return bool
 	 */
-	private static function holds_site_claim( $fence ) {
+	public static function holds_site_claim( $fence ) {
 		global $wpdb;
 		if ( '' === (string) $fence ) {
 			return false;
