@@ -852,7 +852,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		ob_start();
 		$this->ml->render_connect_section();
 		$html = (string) ob_get_clean();
-		$this->assertStringContainsString( 'was revoked when this plugin was deactivated', $html );
+		$this->assertStringContainsString( 'could not deliver the credential', $html );
 		$this->assertStringContainsString( 'aura-connect-btn', $html, 'the way back stays reachable' );
 		$this->assertSame( '1', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
 
@@ -861,6 +861,47 @@ final class ConnectAppPasswordTest extends TestCase {
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
 		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
+	}
+
+	public function test_an_undelivered_record_asks_for_a_reconnect_with_no_marker_at_all(): void {
+		// Round-24: a FIRST connect that ends undelivered wrote the dashboard
+		// URL and token but handed over no credential, and deactivation — the
+		// only thing that sets the marker — never happened. Without the record
+		// speaking for itself the screen reported a completed connection and
+		// hid the button, so a retry that stopped left no local way back.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 2;
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$res = $this->ml->handle_connect( $this->request() );
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'] );
+		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ), 'no marker: nothing was deactivated' );
+		$this->assertNotEmpty( get_option( 'aura_worker_dashboard_url' ) );
+
+		ob_start();
+		$this->ml->render_connect_section();
+		$html = (string) ob_get_clean();
+		$this->assertStringContainsString( 'could not deliver the credential', $html );
+		$this->assertStringContainsString( 'aura-connect-btn', $html );
+	}
+
+	public function test_restoring_a_consumed_record_keeps_its_delivery_state(): void {
+		// Round-24: the revocation consumes the record before deleting the
+		// password and restores it when the delete fails. Restored without its
+		// undelivered mark, a credential the dashboard never received would read
+		// as one it did.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'mine|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) );
+		$items = WP_Application_Passwords::get_user_application_passwords( 7 );
+		$rec   = array( 'user_id' => 7, 'uuid' => $items[0]['uuid'], 'undelivered' => true );
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, $rec, false );
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = serialize( $rec );
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+
+		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
+		$this->assertSame( $rec, $this->uncachedRecord(), 'the record comes back exactly as it was' );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */

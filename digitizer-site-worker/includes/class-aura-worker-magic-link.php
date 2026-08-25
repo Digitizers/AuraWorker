@@ -43,11 +43,18 @@ class Aura_Worker_Magic_Link {
 		// would be worse: the credential is already in the dashboard's hands,
 		// and a retry would rotate it away. So a marker standing beside a
 		// usable password record is stale, and is cleared on sight.
-		$reconnect = ( '' !== (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) );
 		$installed = self::password_record();
+		$reconnect = ( '' !== (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) );
 		if ( $reconnect && null !== $installed && empty( $installed['undelivered'] ) ) {
 			delete_option( self::RECONNECT_NEEDED_OPTION );
 			$reconnect = false;
+		}
+		// A record for a password the dashboard never received asks for a
+		// reconnect on its own (round-24), marker or not: a FIRST connect that
+		// ends that way wrote the URL and token but delivered no credential,
+		// and deactivation — which is what sets the marker — never happened.
+		if ( null !== $installed && ! empty( $installed['undelivered'] ) ) {
+			$reconnect = true;
 		}
 		if ( $dashboard_url && $site_token ) {
 			echo '<p style="color:' . ( $reconnect ? '#b26a00' : '#2e7d32' ) . ';">';
@@ -63,7 +70,11 @@ class Aura_Worker_Magic_Link {
 			// above still works, so this is not a disconnection — but the
 			// credential is gone and only a fresh connect can mint another, so
 			// say so and leave the button below reachable.
-			echo '<p>' . esc_html__( 'The credential the builder tools use was revoked when this plugin was deactivated. Connect again to issue a new one.', 'digitizer-site-worker' ) . '</p>';
+			echo '<p>' . esc_html(
+				( null !== $installed && ! empty( $installed['undelivered'] ) )
+					? __( 'The last connect could not deliver the credential the builder tools use. Connect again to issue a new one.', 'digitizer-site-worker' )
+					: __( 'The credential the builder tools use was revoked when this plugin was deactivated. Connect again to issue a new one.', 'digitizer-site-worker' )
+			) . '</p>';
 		}
 
 		$nonce = wp_create_nonce( 'aura_magic_link' );
@@ -996,7 +1007,10 @@ class Aura_Worker_Magic_Link {
 			// next attempt to find. Under a claim it was consumed above — put
 			// it back.
 			if ( '' !== (string) $fence ) {
-				self::persist_password_owner( $rec['user_id'], $rec['uuid'], $fence );
+				// …with its delivery state intact (round-24): rewriting an
+				// undelivered record as delivered would tell the settings screen
+				// a credential reached the dashboard when none did.
+				self::persist_password_owner( $rec['user_id'], $rec['uuid'], $fence, ! empty( $rec['undelivered'] ) );
 			}
 			return false; // a genuine delete failure — the credential is still live
 		}
