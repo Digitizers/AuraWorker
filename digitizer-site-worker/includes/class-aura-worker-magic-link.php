@@ -351,7 +351,6 @@ class Aura_Worker_Magic_Link {
 		// The transient is consumed, so a replay is now the documented 400. Only
 		// then is the claim released — a retained claim would answer 409 instead
 		// and leave one orphan row per connect (Codex round 23).
-		$release();
 
 		// 2.11.0: the callback also mints an Application Password for the admin
 		// who created the link, so a magic-link connection can run the
@@ -372,6 +371,11 @@ class Aura_Worker_Magic_Link {
 		} else {
 			$body['app_password'] = $minted;
 		}
+		// Released only NOW (round-3): the site-wide claim exists to make token
+		// and password one handler's; released before the mint, a paused
+		// handler could resume and rotate away the password the winner just
+		// returned.
+		$release();
 
 		return new WP_REST_Response( $body, 200 );
 	}
@@ -396,6 +400,12 @@ class Aura_Worker_Magic_Link {
 		if ( ! class_exists( 'WP_Application_Passwords' ) || ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 			return new WP_Error( 'app_passwords_unsupported', 'This WordPress does not support Application Passwords.' );
 		}
+		// REVOKE FIRST, whatever happens next (round-3): the token was just
+		// replaced, so the previous owner's Aura password must die with it even
+		// when no replacement can be minted for this creator (not an admin,
+		// Application Passwords unavailable for them). Rotation is a promise
+		// about the OLD credential, not a side effect of minting a new one.
+		self::revoke_aura_passwords( $user_id );
 		$user = $user_id > 0 ? get_userdata( $user_id ) : false;
 		if ( ! $user || empty( $user->user_login ) ) {
 			return new WP_Error( 'connect_user_unknown', 'The user who created this connect link no longer exists.' );
@@ -406,20 +416,6 @@ class Aura_Worker_Magic_Link {
 		if ( ! wp_is_application_passwords_available_for_user( $user ) ) {
 			return new WP_Error( 'app_passwords_unavailable', 'Application Passwords are unavailable for this user (HTTPS required, or disabled by a filter).' );
 		}
-		// Rotate: the fixed name is the key. Anything Aura minted before dies
-		// here — for THIS user and for the PREVIOUS owner (round-2): admin B
-		// reconnecting a site admin A connected must revoke A's Aura password
-		// too, or an administrator-level REST credential outlives the token it
-		// was minted beside. The owner is recorded per mint, so the previous
-		// one is always known.
-		$previous_owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
-		foreach ( array_unique( array_filter( array( $user_id, $previous_owner ) ) ) as $owner ) {
-			foreach ( WP_Application_Passwords::get_user_application_passwords( (int) $owner ) as $item ) {
-				if ( isset( $item['name'], $item['uuid'] ) && self::APP_PASSWORD_NAME === $item['name'] ) {
-					WP_Application_Passwords::delete_application_password( (int) $owner, (string) $item['uuid'] );
-				}
-			}
-		}
 		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME ) );
 		if ( is_wp_error( $created ) ) {
 			return $created;
@@ -429,6 +425,27 @@ class Aura_Worker_Magic_Link {
 		}
 		update_option( self::APP_PASSWORD_OWNER_OPTION, $user_id );
 		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0] );
+	}
+
+	/**
+	 * Delete every Aura-minted Application Password (the fixed name is the
+	 * key) of the new creator AND the previous owner, and forget the owner.
+	 * Admin B reconnecting a site admin A connected must revoke A's too, or an
+	 * administrator-level REST credential outlives the token it was minted
+	 * beside (round-2). The owner is recorded per mint, so it is always known.
+	 *
+	 * @param int $user_id The new creator (0 = none).
+	 */
+	private static function revoke_aura_passwords( int $user_id ): void {
+		$previous_owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
+		foreach ( array_unique( array_filter( array( $user_id, $previous_owner ) ) ) as $owner ) {
+			foreach ( WP_Application_Passwords::get_user_application_passwords( (int) $owner ) as $item ) {
+				if ( isset( $item['name'], $item['uuid'] ) && self::APP_PASSWORD_NAME === $item['name'] ) {
+					WP_Application_Passwords::delete_application_password( (int) $owner, (string) $item['uuid'] );
+				}
+			}
+		}
+		delete_option( self::APP_PASSWORD_OWNER_OPTION );
 	}
 
 	/**

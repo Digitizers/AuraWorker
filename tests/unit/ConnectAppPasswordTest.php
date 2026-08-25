@@ -119,6 +119,25 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringStartsWith( Aura_Worker_Rules::MAGIC_CLAIM, Aura_Worker_Magic_Link::SITE_CLAIM );
 	}
 
+	public function test_the_password_is_minted_while_the_site_claim_is_still_held(): void {
+		unset( $GLOBALS['_sa_site_claim_during_mint'] );
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNotFalse( $GLOBALS['_sa_site_claim_during_mint'] ?? false, 'the site-wide claim must cover the mint' );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), '…and be released after it' );
+	}
+
+	public function test_a_reconnect_that_can_mint_nothing_still_revokes_the_previous_owner_s_password(): void {
+		$this->ml->handle_connect( $this->request() ); // admin 7 owns the Aura password
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		// User 9 reconnects but is NOT an administrator: no replacement — the old credential still dies with the old token.
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 9 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'connect_user_not_admin', $data['app_password_unavailable'] );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ), 'no owner remains' );
+	}
+
 	public function test_a_rejected_connect_mints_nothing(): void {
 		$req = $this->request();
 		$req->set_param( 'signature', 'bogus' );

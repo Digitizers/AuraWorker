@@ -648,6 +648,8 @@ if ( ! function_exists( 'get_userdata' ) ) {
 if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 	class WP_Application_Passwords {
 		public static function create_new_application_password( int $user_id, array $args = array() ) {
+			// Witness for the connect tests: was the site-wide claim still held at mint time?
+			$GLOBALS['_sa_site_claim_during_mint'] = get_option( 'aura_magic_claim_site', false );
 			$item = array( 'uuid' => 'uuid-' . bin2hex( random_bytes( 4 ) ), 'name' => (string) ( $args['name'] ?? '' ), 'created' => time() );
 			$GLOBALS['_app_passwords'][ $user_id ][] = $item;
 			return array( 'pw-' . bin2hex( random_bytes( 8 ) ), $item );
