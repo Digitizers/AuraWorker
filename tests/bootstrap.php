@@ -376,6 +376,12 @@ if ( ! function_exists( 'update_option' ) ) {
 		// prove a value landed cannot use the return value alone — it reads
 		// the row back.
 		if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $option ] ) ) {
+			// `true` fails every write; a positive INT fails that many writes
+			// and then lets the option through — a transient database refusal,
+			// which is what a recovery path is for.
+			if ( is_int( $GLOBALS['_sa_option_write_fail'][ $option ] ) ) {
+				--$GLOBALS['_sa_option_write_fail'][ $option ];
+			}
 			return false;
 		}
 		// Core sanitises before storing: update_option() calls sanitize_option(),

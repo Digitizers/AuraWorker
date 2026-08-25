@@ -108,6 +108,19 @@ class Aura_Worker {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'digitizer-site-worker' ) ), 403 );
 		}
 
+		// Serialised against a connect callback (round-7): this rotation and a
+		// connect write the same binding — the token, the dashboard URL and the
+		// Application Password minted beside them — and a rotation landing
+		// between a callback's revocation and its mint would revoke nothing and
+		// still report the site disconnected, leaving the callback's fresh
+		// administrator credential live behind a UI that says otherwise. Taken
+		// BEFORE the token swap, so a refused claim costs nothing; released on
+		// every exit below.
+		$site_fence = Aura_Worker_Magic_Link::claim_site();
+		if ( '' === $site_fence ) {
+			wp_send_json_error( array( 'message' => __( 'A connection to Aura is being installed right now, so the token was not changed. Try again in a moment.', 'digitizer-site-worker' ) ), 409 );
+		}
+
 		$previous = $this->stored_token();
 		$raw      = wp_generate_password( 48, false );
 		$hashed   = Aura_Worker_Security::hash_token( $raw );
@@ -124,6 +137,7 @@ class Aura_Worker {
 		// Raw SQL also puts the write out of reach of any option filter, which is
 		// the failure this whole change exists to remove (#67).
 		if ( ! $this->swap_token( $previous, $hashed ) ) {
+			Aura_Worker_Magic_Link::release_site( $site_fence );
 			$current = $this->stored_token();
 			$message = hash_equals( $previous, $current )
 				? __( 'The new site token could not be saved, so the current token is unchanged. Check the database for write errors and try again.', 'digitizer-site-worker' )
@@ -153,6 +167,7 @@ class Aura_Worker {
 			error_log( 'SiteAgent: the Aura Application Password could not be revoked while regenerating the site token; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
+		Aura_Worker_Magic_Link::release_site( $site_fence );
 
 		wp_send_json_success( array( 'token' => $raw ) );
 	}

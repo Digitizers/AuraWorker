@@ -223,6 +223,99 @@ final class ConnectAppPasswordTest extends TestCase {
 		);
 	}
 
+	public function test_a_fresh_password_that_can_be_neither_recorded_nor_revoked_is_a_retryable_500(): void {
+		// Round-7 P1: with option writes AND the delete failing, the cleanup of
+		// the untracked password does not land. Reporting a token-only success
+		// there would leave a live administrator credential on the site with
+		// nothing recording it.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = true;
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$res  = $this->ml->handle_connect( $this->request() );
+		$data = $res->get_data();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_orphaned', $data['code'] );
+		$this->assertArrayNotHasKey( 'success', $data );
+		$this->assertNotEmpty( get_transient( 'aura_magic_' . $this->magic_id ), 'the transient survives — the connect is retryable' );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), 'the claim is released so the retry is not refused' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password really is still live' );
+	}
+
+	public function test_a_password_that_could_not_be_revoked_has_its_tracking_recovered(): void {
+		// Same round-7 P1, with the option store refusing only the FIRST write:
+		// the orphan the cleanup could not delete is recorded after all, so the
+		// next connect's rotation can revoke it by uuid.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ] = 1;
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'] );
+		$live = WP_Application_Passwords::get_user_application_passwords( 7 );
+		$this->assertCount( 1, $live );
+		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$this->assertSame( $live[0]['uuid'], (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ), 'the orphan is tracked' );
+		// …and the rotation can now kill it once the store recovers.
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password() );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+	}
+
+	public function test_uninstall_keeps_the_tracking_options_when_the_revocation_does_not_land(): void {
+		// Round-7 P1: deleting owner+uuid after a FAILED delete would leave an
+		// administrator password alive with its identity irrecoverably forgotten.
+		$this->ml->handle_connect( $this->request() );
+		$uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$this->assertNotEmpty( $uuid );
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$this->run_uninstall();
+		$this->assertSame( 7, (int) get_option( 'aura_worker_app_password_user_id' ), 'the owner is still recorded' );
+		$this->assertSame( $uuid, (string) get_option( 'aura_worker_app_password_uuid' ), 'the uuid is still recorded' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
+
+		// …and when the revocation DOES land, the tracking is forgotten.
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$this->run_uninstall();
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertFalse( get_option( 'aura_worker_app_password_user_id', false ) );
+		$this->assertFalse( get_option( 'aura_worker_app_password_uuid', false ) );
+	}
+
+	public function test_regenerating_the_token_is_refused_while_a_connect_holds_the_site(): void {
+		// Round-7 P2: a regeneration that lands between a callback's revocation
+		// and its mint revokes nothing and still reports the site disconnected,
+		// while the callback hands out a fresh administrator credential. It takes
+		// the same site-wide claim a connect does.
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'live-fence|' . time();
+		$plugin = new Aura_Worker();
+		$before = get_option( 'aura_worker_site_token' );
+		try {
+			$plugin->ajax_regenerate_token();
+			$this->fail( 'the handler returned without sending a JSON response' );
+		} catch ( SA_Json_Response $res ) {
+			$this->assertFalse( $res->success );
+			$this->assertSame( 409, $res->status );
+		}
+		$this->assertSame( $before, get_option( 'aura_worker_site_token' ), 'nothing was rotated' );
+		$this->assertStringStartsWith( 'live-fence|', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM ), "the connect's claim is untouched" );
+
+		// With the site free, the rotation runs and releases the claim it took.
+		delete_option( Aura_Worker_Magic_Link::SITE_CLAIM );
+		try {
+			$plugin->ajax_regenerate_token();
+			$this->fail( 'the handler returned without sending a JSON response' );
+		} catch ( SA_Json_Response $res ) {
+			$this->assertTrue( $res->success );
+		}
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), 'the rotation released the claim' );
+	}
+
+	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
+	private function run_uninstall(): void {
+		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
+			define( 'WP_UNINSTALL_PLUGIN', 'digitizer-site-worker/digitizer-site-worker.php' );
+		}
+		include __DIR__ . '/../../digitizer-site-worker/uninstall.php';
+	}
+
 	public function test_a_rejected_connect_mints_nothing(): void {
 		$req = $this->request();
 		$req->set_param( 'signature', 'bogus' );
