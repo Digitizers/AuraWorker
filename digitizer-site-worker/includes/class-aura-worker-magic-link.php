@@ -292,6 +292,11 @@ class Aura_Worker_Magic_Link {
 		// application password). Falls back to the first admin if absent.
 		// Verified. From here the whole install — token, binding, key, password
 		// — is one handler's: take the site-wide claim now.
+		// A dead handler's site claim would otherwise refuse every future
+		// connect (round-6): reap one older than the stale window first, then
+		// claim. The reap is a conditional DELETE by the timestamp inside the
+		// value, so a LIVE claim (always younger) is never touched.
+		self::reap_stale_site_claim();
 		$site_fence = self::claim_magic_link( $site_claim_key );
 		if ( '' === $site_fence ) {
 			$release();
@@ -407,6 +412,17 @@ class Aura_Worker_Magic_Link {
 
 	/** The site-wide connect claim (2.11.0): one install at a time. Under the swept MAGIC_CLAIM prefix. */
 	const SITE_CLAIM = Aura_Worker_Rules::MAGIC_CLAIM . 'site';
+	/**
+	 * How old a site-wide claim must be before a later connect may take it
+	 * over (round-6). The per-link claim deliberately has NO timed takeover —
+	 * a dead handler costs that ONE link. An orphaned site claim costs every
+	 * reconnect the site will ever attempt, and the daily sweep runs from
+	 * rules enforcement, which a disconnected site never reaches. 120 s is far
+	 * past any real handler (the dashboard gives each attempt 15 s and the
+	 * whole connect 40 s; PHP's own max_execution_time is 30-60 s), so a
+	 * takeover cannot land beside a live install.
+	 */
+	const SITE_CLAIM_STALE_SECONDS = 120;
 
 	/** The user who owns the CURRENT Aura-minted Application Password — the rotation revokes theirs too, whoever connects next. */
 	const APP_PASSWORD_OWNER_OPTION = 'aura_worker_app_password_user_id';
@@ -429,7 +445,7 @@ class Aura_Worker_Magic_Link {
 		// when no replacement can be minted for this creator (not an admin,
 		// Application Passwords unavailable for them). Rotation is a promise
 		// about the OLD credential, not a side effect of minting a new one.
-		if ( ! self::revoke_previous_password() ) {
+		if ( ! self::revoke_managed_password() ) {
 			// A revocation that did not land is NOT reported as a rotation
 			// (round-4): the old credential may still be valid, so nothing new
 			// is minted beside it and the dashboard is told why.
@@ -476,9 +492,14 @@ class Aura_Worker_Magic_Link {
 	 * administrator-level REST credential outlives the token it was minted
 	 * beside (round-2). The owner is recorded per mint, so it is always known.
 	 *
+	 * Called by every path that invalidates the dashboard's binding — this
+	 * rotation, "Regenerate Token", and uninstall (round-6) — so an
+	 * administrator-level credential never outlives the token it was minted
+	 * beside.
+	 *
 	 * @return bool True when nothing dangerous remains.
 	 */
-	private static function revoke_previous_password(): bool {
+	public static function revoke_managed_password(): bool {
 		$owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
 		$uuid  = (string) get_option( self::APP_PASSWORD_UUID_OPTION, '' );
 		if ( $owner <= 0 || '' === $uuid ) {
@@ -605,6 +626,25 @@ class Aura_Worker_Magic_Link {
 		wp_cache_delete( $claim_key, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		return $fence;
+	}
+
+	/**
+	 * Delete the site-wide claim if it is older than SITE_CLAIM_STALE_SECONDS
+	 * (round-6) — a handler killed mid-connect (OOM, timeout, fatal) leaves
+	 * one behind, and unlike a per-link orphan it blocks EVERY later connect.
+	 * Conditional on the timestamp inside the value ("<fence>|<unix ts>"), so
+	 * a live claim — always younger than the window — is never removed.
+	 */
+	private static function reap_stale_site_claim() {
+		global $wpdb;
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND CAST(SUBSTRING_INDEX(option_value, '|', -1) AS UNSIGNED) < %d",
+				self::SITE_CLAIM,
+				time() - self::SITE_CLAIM_STALE_SECONDS
+			)
+		);
+		wp_cache_delete( self::SITE_CLAIM, 'options' );
 	}
 
 	/**

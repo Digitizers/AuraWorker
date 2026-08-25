@@ -141,6 +141,17 @@ class Aura_Worker {
 		// is worse than the defect this rotation exists to fix.
 		update_option( 'aura_worker_connect_user_id', get_current_user_id() );
 		delete_option( 'aura_worker_dashboard_url' );
+		// The dashboard's binding is what this rotation invalidates, and the
+		// Application Password minted beside the old token is part of it
+		// (2.11.0, round-6): left alone it would keep authenticating to
+		// WordPress — and to every other REST/MCP plugin — while the UI says
+		// the site is disconnected. Best-effort: a failure here must not cost
+		// the operator the new token this response is about to reveal, so it
+		// is logged, not fatal.
+		if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
+			// translators: internal log line, not shown to the user.
+			error_log( 'SiteAgent: the Aura Application Password could not be revoked while regenerating the site token; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		}
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
 
 		wp_send_json_success( array( 'token' => $raw ) );

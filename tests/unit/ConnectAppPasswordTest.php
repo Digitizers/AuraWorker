@@ -179,6 +179,50 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), 'the per-link claim is released' );
 	}
 
+	public function test_an_orphaned_site_claim_is_taken_over_after_the_stale_window_but_a_live_one_never_is(): void {
+		// A handler killed mid-connect leaves the site claim behind; unlike a
+		// per-link orphan it would refuse EVERY later connect (round-6).
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'dead-fence|' . ( time() - Aura_Worker_Magic_Link::SITE_CLAIM_STALE_SECONDS - 10 );
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 200, $res->get_status(), 'a stale site claim is reaped and the connect proceeds' );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ) );
+
+		// …but a LIVE one (younger than the window) still refuses.
+		sa_reset_state();
+		$GLOBALS['_admins'] = array( 7 );
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'live-fence|' . time();
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertStringStartsWith( 'live-fence|', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM ), 'the live claim is untouched' );
+	}
+
+	public function test_regenerating_the_site_token_revokes_the_managed_password(): void {
+		$this->ml->handle_connect( $this->request() );
+		$uuid = (string) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION );
+		$this->assertNotEmpty( $uuid );
+		// The rotation path calls the ONE revocation.
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password() );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION, false ) );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ) );
+		// …and the handler that regenerates the token is wired to it.
+		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker.php' );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $src );
+	}
+
+	public function test_uninstall_revokes_the_managed_password_by_uuid_before_deleting_its_options(): void {
+		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/uninstall.php' );
+		$this->assertStringContainsString( "WP_Application_Passwords::delete_application_password( \$aura_pw_owner, \$aura_pw_uuid )", $src );
+		$this->assertStringContainsString( "get_option( 'aura_worker_app_password_uuid', '' )", $src );
+		// The revocation precedes the deletion of the options that identify it.
+		$this->assertLessThan(
+			strpos( $src, "delete_option( 'aura_worker_app_password_uuid' )" ),
+			strpos( $src, 'delete_application_password' ),
+			'revoke first, then forget'
+		);
+	}
+
 	public function test_a_rejected_connect_mints_nothing(): void {
 		$req = $this->request();
 		$req->set_param( 'signature', 'bogus' );

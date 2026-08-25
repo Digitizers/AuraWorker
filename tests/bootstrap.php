@@ -1341,6 +1341,19 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return 0;
 			}
+			// The site-wide connect claim's age-based reap (2.11.0): the row goes
+			// only when the timestamp inside its value is older than the window.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)' AND CAST\(SUBSTRING_INDEX\(option_value, '\|', -1\) AS UNSIGNED\) < (\d+)$/", $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				if ( isset( $GLOBALS['_options'][ $name ] ) ) {
+					$ts = (int) substr( strrchr( '|' . $GLOBALS['_options'][ $name ], '|' ), 1 );
+					if ( $ts < (int) $m[2] ) {
+						unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ] );
+						return 1;
+					}
+				}
+				return 0;
+			}
 			// Used by the counters AND by the expired-notice claim sweep.
 			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", $query, $m ) ) {
 				// Two layers of escaping to undo, or nothing matches: prepare()
