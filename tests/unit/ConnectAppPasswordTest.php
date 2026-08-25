@@ -681,6 +681,24 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
 	}
 
+	public function test_a_failed_record_delete_is_a_failed_revocation_not_a_lost_claim(): void {
+		// Round-18: delete_option_if_claimed() answering false (the statement
+		// failed) read as 0 rows would mean "the record is not mine", the
+		// revocation would report nothing owed, and the mint would write a
+		// replacement record over one whose password is still live — and now
+		// untracked.
+		$this->ml->handle_connect( $this->request() );
+		$uuid  = $this->recordUuid();
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'mine|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+
+		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
+		$this->assertSame( $uuid, $this->uncachedUuid(), 'the record survives a failed delete' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'and so does the password' );
+	}
+
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
 	private function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {

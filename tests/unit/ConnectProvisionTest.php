@@ -204,6 +204,32 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertNull( sa_read_option_uncached( Aura_Worker_Rules::OPTION ) );
 	}
 
+	public function test_a_grant_key_that_does_not_land_fails_the_connect(): void {
+		// Round-18: Aura_Worker_Grant::is_enforced() follows the key. A write
+		// that silently did not land leaves enforcement OFF while the dashboard
+		// believes the site is protected — every approval-required and mutating
+		// tool reachable with the site token alone, behind a 200.
+		$key = base64_encode( str_repeat( 'k', 32 ) );
+		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_grant_pubkey' => true );
+		$res = $this->ml->handle_connect( $this->request( array( 'grant_pubkey' => $key ) ) );
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
+		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'retryable: the same callback can be repeated' );
+		$this->assertFalse( get_option( 'aura_worker_grant_pubkey', false ) );
+
+		// The mirror case: a keyless connect that cannot CLEAR a previous key
+		// would leave the site failing every write closed against a key this
+		// dashboard cannot sign for.
+		$GLOBALS['_options']['aura_worker_grant_pubkey'] = 'old-key';
+		$GLOBALS['_rows']['aura_worker_grant_pubkey']    = 'old-key';
+		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_grant_pubkey' => true );
+		$res = $this->ml->handle_connect( $this->request() );
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
+	}
+
 	public function test_a_binding_that_does_not_land_fails_the_connect_without_consuming_the_magic_link(): void {
 		// update_option() can fail (or be a no-op) after the token was stored.
 		// The connect must not report success unbound, and must leave the

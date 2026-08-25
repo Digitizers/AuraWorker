@@ -382,11 +382,30 @@ class Aura_Worker_Magic_Link {
 			// Provision the gateway key → turns on approval-grant enforcement
 			// (Aura_Worker_Grant::is_enforced()).
 			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_grant_pubkey', $grant_pubkey, $site_claim_key, $site_fence );
+			// …and it is VERIFIED before this connect can succeed (round-18).
+			// is_enforced() follows the key: a write that silently did not land
+			// leaves enforcement OFF while the dashboard believes the site is
+			// protected, so every approval-required and mutating tool stays
+			// reachable with the site token alone. Retryable 500, transient
+			// kept — never a 200 over an unprotected site.
+			$stored_key = Aura_Worker_Rules::read_option_uncached( 'aura_worker_grant_pubkey' );
+			if ( is_wp_error( $stored_key ) || ! is_string( $stored_key ) || ! hash_equals( $grant_pubkey, $stored_key ) ) {
+				$release();
+				return new WP_REST_Response( array( 'error' => 'Connect not completed: the approval-grant key could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
+			}
 		} else {
 			// Keyless (re)connect: clear any previously provisioned key so a fresh
 			// dashboard that doesn't use grants isn't left unable to run writes
 			// against a stale key it can't sign for. Enforcement follows the key.
 			Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_grant_pubkey', $site_claim_key, $site_fence );
+			// Verified the same way, and for the mirror reason: a key this
+			// dashboard cannot sign for, left in place, fails every write
+			// closed. Enforcement follows the key in both directions.
+			$stored_key = Aura_Worker_Rules::read_option_uncached( 'aura_worker_grant_pubkey' );
+			if ( is_wp_error( $stored_key ) || ( is_string( $stored_key ) && '' !== $stored_key ) ) {
+				$release();
+				return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous approval-grant key could not be cleared; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
+			}
 			if ( '' === $client ) {
 				Aura_Worker_Rules::clear( $site_claim_key, $site_fence ); // keyless AND clientless: an older dashboard — clear as before
 			}
@@ -872,8 +891,18 @@ class Aura_Worker_Magic_Link {
 		// it — the credential that connect had already returned to the
 		// dashboard. Removing the row is the ownership test that cannot be
 		// raced, because the row is the record.
-		if ( '' !== (string) $fence && 1 !== (int) self::forget_password_owner( $fence ) ) {
-			return true; // the record is not this caller's to act on
+		if ( '' !== (string) $fence ) {
+			$taken = self::forget_password_owner( $fence );
+			if ( false === $taken ) {
+				// The statement itself failed. Read as "0 rows — not mine" this
+				// would report nothing owed, and the mint would then create a
+				// replacement over a record whose password is still live and
+				// about to become untracked (round-18). A failure is a failure.
+				return false;
+			}
+			if ( 1 !== (int) $taken ) {
+				return true; // the record is not this caller's to act on
+			}
 		}
 		// By the STORED UUID, never the display name (round-5): the name is
 		// user-chosen, so a stranger's "Aura SiteAgent" must not be nuked, and

@@ -780,15 +780,19 @@ class Aura_Worker_Rules {
 	 * @param string $option Option name.
 	 * @param string $claim  The claim option's name.
 	 * @param string $fence  The caller's fence.
-	 * @return int Rows removed: 1 when this caller took the row, else 0. The
-	 *             count is the only proof of WHO removed it, so a caller that
-	 *             must own what it deletes reads it (round-17).
+	 * @return int|false Rows removed: 1 when this caller took the row, 0 when
+	 *                   it did not own the claim (or the row was already gone),
+	 *                   and FALSE when the statement itself failed. A database
+	 *                   error read as "0 rows" would be read as "not mine" and
+	 *                   let the caller carry on as though nothing were owed
+	 *                   (round-18), so the two are kept apart.
 	 */
 	public static function delete_option_if_claimed( $option, $claim, $fence ) {
 		global $wpdb;
 		if ( '' === (string) $fence || '' === (string) $claim ) {
 			return 0;
 		}
+		$wpdb->last_error = '';
 		$rows = $wpdb->query(
 			$wpdb->prepare(
 				"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name = %s",
@@ -798,7 +802,23 @@ class Aura_Worker_Rules {
 			)
 		);
 		self::forget_option_cache( $option );
+		if ( false === $rows || '' !== (string) $wpdb->last_error ) {
+			return false;
+		}
 		return (int) $rows;
+	}
+
+	/**
+	 * One raw options-table read for callers outside this class — the row, not
+	 * the option cache. Used to VERIFY a claim-conditional write landed
+	 * (round-18): those statements go round the cache, and a write that failed
+	 * is indistinguishable from one that changed nothing without reading back.
+	 *
+	 * @param string $name Option name.
+	 * @return string|null|WP_Error Raw value, null when absent, WP_Error on a database error.
+	 */
+	public static function read_option_uncached( $name ) {
+		return self::option_raw( $name );
 	}
 
 	/**

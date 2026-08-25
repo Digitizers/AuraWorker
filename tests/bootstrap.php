@@ -1282,6 +1282,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 
 			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
 				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					// The statement itself failing — NOT "no row matched".
+					$this->last_error = 'delete failed';
+					return false;
+				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
 				}
