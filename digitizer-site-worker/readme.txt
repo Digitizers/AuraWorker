@@ -268,7 +268,8 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   administrator-level credential from authenticating to WordPress core and to
   other REST/MCP plugins, so "deactivated" would not have meant
   "disconnected". If the revocation fails the owner and UUID are kept, and
-  reactivating or uninstalling finishes the job.
+  reactivating finishes the job (activation retries a revocation deactivation
+  could not land), as does uninstalling.
 
 = 2.10.3 =
 * Fix (security): **"Regenerate Token" revealed a new site token without ever

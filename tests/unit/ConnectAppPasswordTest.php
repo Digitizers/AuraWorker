@@ -368,6 +368,12 @@ final class ConnectAppPasswordTest extends TestCase {
 		$deactivate = substr( $deactivate, 0, strpos( $deactivate, "\nregister_deactivation_hook" ) );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $deactivate );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::forget_site_claim();', $deactivate );
+		// …and activation finishes a revocation deactivation could not land
+		// (round-11): reaching it with a record still present means exactly
+		// that, since a successful revocation clears the record.
+		$activate = substr( $main, strpos( $main, 'function aura_worker_activate()' ) );
+		$activate = substr( $activate, 0, strpos( $activate, "\nregister_activation_hook" ) );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $activate );
 
 		// A revocation that did not land keeps the owner/uuid, so a
 		// reactivation or the uninstall can finish the job.
