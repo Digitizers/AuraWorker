@@ -592,6 +592,18 @@ class Aura_Worker_Magic_Link {
 			// it is absent from the owner's list.
 			WP_Application_Passwords::delete_application_password( $user_id, $uuid );
 			if ( self::managed_password_gone( $user_id, $uuid ) ) {
+				// A partly-landed pair must not outlive the password it named
+				// (round-14): the credential is gone, so a surviving lone
+				// option would refuse every later magic link as
+				// app_password_tracking_incomplete and make deactivation report
+				// a revocation failure, all for a password that no longer
+				// exists. Logged if even the deletes will not land, so the
+				// operator can find the two options by name.
+				self::forget_password_owner( $fence );
+				if ( self::tracking_is_incomplete() ) {
+					// translators: internal log line, not shown to the user.
+					error_log( 'SiteAgent: the Aura Application Password tracking options could not be cleared after the password was revoked; delete aura_worker_app_password_user_id and aura_worker_app_password_uuid by hand.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				}
 				return new WP_Error( 'app_password_owner_unrecorded', 'The Application Password owner could not be recorded; the password was revoked and none was returned.' );
 			}
 			// Still live and untracked. Try once more to record it — tracking is
@@ -712,6 +724,23 @@ class Aura_Worker_Magic_Link {
 	}
 
 	/**
+	 * Forget the owner/UUID pair — ONE implementation, used wherever the
+	 * password it named is provably gone. Under a connect's site claim the
+	 * deletes are conditional on it, like every other install write.
+	 *
+	 * @param string $fence The caller's site-claim fence, when it holds one.
+	 */
+	private static function forget_password_owner( $fence = '' ) {
+		if ( '' !== (string) $fence ) {
+			Aura_Worker_Rules::delete_option_if_claimed( self::APP_PASSWORD_OWNER_OPTION, self::SITE_CLAIM, $fence );
+			Aura_Worker_Rules::delete_option_if_claimed( self::APP_PASSWORD_UUID_OPTION, self::SITE_CLAIM, $fence );
+			return;
+		}
+		delete_option( self::APP_PASSWORD_OWNER_OPTION );
+		delete_option( self::APP_PASSWORD_UUID_OPTION );
+	}
+
+	/**
 	 * Write the owner/UUID pair a later rotation revokes by, evicting the
 	 * option cache so the verifying read that follows sees the database.
 	 * ONE implementation — the mint's first attempt and its recovery attempt
@@ -797,8 +826,7 @@ class Aura_Worker_Magic_Link {
 		if ( true !== $deleted && ! self::managed_password_gone( $owner, $uuid ) ) {
 			return false; // a genuine delete failure — the credential is still live
 		}
-		delete_option( self::APP_PASSWORD_OWNER_OPTION );
-		delete_option( self::APP_PASSWORD_UUID_OPTION );
+self::forget_password_owner();
 		return true;
 	}
 

@@ -519,6 +519,26 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
 	}
 
+	public function test_a_partly_recorded_pair_does_not_outlive_the_password_it_named(): void {
+		// Round-14: with only the UUID write refused, the cleanup deletes the
+		// password successfully — so the owner option left behind names nothing.
+		// It would refuse every later magic link and make deactivation report a
+		// revocation failure, for a credential that no longer exists.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ] = true;
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertTrue( $data['success'] );
+		$this->assertSame( 'app_password_owner_unrecorded', $data['app_password_unavailable'] );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password was revoked' );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION, false ), '…and its half-record with it' );
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password(), 'nothing is recorded, so nothing is owed' );
+
+		// The next connect is not refused.
+		unset( $GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_UUID_OPTION ] );
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+	}
+
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
 	private function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
