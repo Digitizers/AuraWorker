@@ -72,7 +72,7 @@ function aura_worker_activate() {
 		// deactivation could not set belongs here too (round-20) — without it
 		// the settings screen reports an intact connection over a credential
 		// this call has just revoked.
-		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
+		Aura_Worker_Magic_Link::flag_reconnect_needed();
 	}
 	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
 
@@ -119,7 +119,7 @@ function aura_worker_deactivate() {
 		// tools authenticate with is gone, with no way to restore it from here
 		// (round-19). Flag it; the next successful connect clears the flag as
 		// it mints the replacement.
-		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
+		Aura_Worker_Magic_Link::flag_reconnect_needed();
 	}
 	Aura_Worker_Magic_Link::forget_site_claim();
 }

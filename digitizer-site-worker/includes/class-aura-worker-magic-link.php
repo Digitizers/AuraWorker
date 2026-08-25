@@ -506,10 +506,6 @@ class Aura_Worker_Magic_Link {
 				500
 			);
 		}
-		// The connect that mints a new Application Password also clears the
-		// "reconnect to restore the builder credential" flag deactivation set
-		// (round-19) — under the claim, like every other install write.
-		Aura_Worker_Rules::delete_option_if_claimed( self::RECONNECT_NEEDED_OPTION, $site_claim_key, $site_fence );
 		// Consumed only now (the round-23 orphan rule still holds: the claim is released with it below).
 		delete_transient( 'aura_magic_' . $magic_id );
 		if ( is_wp_error( $minted ) ) {
@@ -517,6 +513,13 @@ class Aura_Worker_Magic_Link {
 		} else {
 			// The uuid is the site's own bookkeeping — never part of the response.
 			$body['app_password'] = array( 'user_login' => $minted['user_login'], 'password' => $minted['password'] );
+			// Only a connect that actually issued a credential clears the
+			// "reconnect to restore the builder credential" marker (round-21).
+			// A token-only completion leaves the site exactly as the marker
+			// describes it, and clearing it there would hide the one local
+			// control that can still fix it. Under the claim, like every other
+			// install write.
+			Aura_Worker_Rules::delete_option_if_claimed( self::RECONNECT_NEEDED_OPTION, $site_claim_key, $site_fence );
 		}
 		// Released only NOW (round-3): the site-wide claim exists to make token
 		// and password one handler's; released before the mint, a paused
@@ -740,6 +743,29 @@ class Aura_Worker_Magic_Link {
 		}
 		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::SITE_CLAIM ) );
 		return is_string( $held ) && 0 === strpos( $held, $fence . '|' );
+	}
+
+	/**
+	 * Record that the Application Password was revoked and a fresh connect is
+	 * needed to issue another — and VERIFY the record landed (round-21).
+	 *
+	 * The marker is the only thing that tells the settings screen to explain
+	 * itself and to keep the Connect button reachable; the password record it
+	 * replaces has already been deleted by then. A write refused by a filter or
+	 * a transient database error would leave the screen reporting a healthy
+	 * connection over a credential that is gone, with no local way back. So
+	 * when the marker will not persist, the dashboard URL goes instead: the
+	 * screen then shows the site as unconnected — understating a token binding
+	 * that still works, but never hiding the way back.
+	 *
+	 * Called from the plugin's activation and deactivation hooks only.
+	 */
+	public static function flag_reconnect_needed() {
+		update_option( self::RECONNECT_NEEDED_OPTION, 1, false );
+		wp_cache_delete( self::RECONNECT_NEEDED_OPTION, 'options' );
+		if ( '' === (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) ) {
+			delete_option( 'aura_worker_dashboard_url' );
+		}
 	}
 
 	/**
