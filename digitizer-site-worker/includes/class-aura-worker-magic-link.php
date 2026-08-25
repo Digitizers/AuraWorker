@@ -418,14 +418,42 @@ class Aura_Worker_Magic_Link {
 			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
 		}
 		$minted = self::mint_app_password( (int) ( $stored['connect_user_id'] ?? 0 ), $site_fence );
+		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_orphan_untracked', 'app_password_tracking_incomplete' ), true ) ) {
+			// The one outcome that must NOT be retried (round-11): a live
+			// administrator credential exists that nothing on the site records,
+			// so another attempt would mint a second one beside it. The magic
+			// link is consumed here precisely to stop that, and the operator is
+			// told what to revoke by hand.
+			delete_transient( 'aura_magic_' . $magic_id );
+			$release();
+			// translators: internal log line, not shown to the user.
+			error_log( 'SiteAgent: an Aura Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			return new WP_REST_Response( array( 'error' => $minted->get_error_message(), 'code' => $minted->get_error_code() ), 500 );
+		}
 		// The mint is the last protected step, and the only one that hands a
 		// credential back — so the claim is verified after it too, whatever it
 		// returned (round-12). A handler that lost the site revokes what it
 		// created and reports nothing; every other outcome below assumes this
 		// handler is still the install.
 		if ( ! self::holds_site_claim( $site_fence ) ) {
+			$creator = (int) ( $stored['connect_user_id'] ?? 0 );
 			if ( ! is_wp_error( $minted ) ) {
-				WP_Application_Passwords::delete_application_password( (int) ( $stored['connect_user_id'] ?? 0 ), $minted['uuid'] );
+				// Verified, never assumed (round-16). This handler's tracking
+				// writes were refused with the claim, so the password it just
+				// created is recorded nowhere — and the record that IS on the
+				// site belongs to the install that replaced it, so this handler
+				// must not write its own over it. If the revocation will not
+				// land, the credential is a live orphan: the link is consumed
+				// so retries cannot mint more beside it, and the operator is
+				// told what to revoke.
+				WP_Application_Passwords::delete_application_password( $creator, $minted['uuid'] );
+				if ( ! self::managed_password_gone( $creator, $minted['uuid'] ) ) {
+					delete_transient( 'aura_magic_' . $magic_id );
+					$release();
+					// translators: internal log line, not shown to the user.
+					error_log( 'SiteAgent: an Aura Application Password minted by a superseded connect could not be revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+					return new WP_REST_Response( array( 'error' => 'A new Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.', 'code' => 'app_password_orphan_untracked' ), 500 );
+				}
 			}
 			$release();
 			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
@@ -440,18 +468,6 @@ class Aura_Worker_Magic_Link {
 		// round-12) — completing there would finish onboarding without the
 		// credential the builder tools need and give the dashboard no way to
 		// ask again. All three are retryable 500s that keep the transient.
-		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_orphan_untracked', 'app_password_tracking_incomplete' ), true ) ) {
-			// The one outcome that must NOT be retried (round-11): a live
-			// administrator credential exists that nothing on the site records,
-			// so another attempt would mint a second one beside it. The magic
-			// link is consumed here precisely to stop that, and the operator is
-			// told what to revoke by hand.
-			delete_transient( 'aura_magic_' . $magic_id );
-			$release();
-			// translators: internal log line, not shown to the user.
-			error_log( 'SiteAgent: an Aura Application Password could be neither recorded nor revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			return new WP_REST_Response( array( 'error' => $minted->get_error_message(), 'code' => $minted->get_error_code() ), 500 );
-		}
 		if ( is_wp_error( $minted ) && in_array( $minted->get_error_code(), array( 'app_password_revoke_failed', 'app_password_orphaned', 'app_password_mint_failed' ), true ) ) {
 			$release(); // keep the transient — this connect is retryable
 			return new WP_REST_Response(

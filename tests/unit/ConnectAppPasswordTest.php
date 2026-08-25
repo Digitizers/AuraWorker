@@ -343,6 +343,22 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringStartsWith( 'live-fence|', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM ), 'the site claim is not swept' );
 	}
 
+	public function test_a_superseded_connect_whose_password_will_not_die_is_terminal(): void {
+		// Round-16: losing the claim mid-mint leaves the fresh password
+		// untracked (the tracking writes went with the claim), and the record on
+		// the site belongs to the install that replaced this one — so nothing
+		// here may write over it. A revocation that then fails leaves a live
+		// orphan, and retrying would mint more beside it.
+		$GLOBALS['_sa_steal_site_claim_during_mint'] = true;
+		$GLOBALS['_app_passwords_delete_fail']       = true;
+		$res  = $this->ml->handle_connect( $this->request() );
+		$data = $res->get_data();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_orphan_untracked', $data['code'] );
+		$this->assertFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'the link is consumed: no second mint beside the orphan' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
+	}
+
 	public function test_a_connect_that_loses_the_site_mid_mint_returns_nothing_and_revokes_what_it_created(): void {
 		// Round-8: every write the claim protects re-checks that the claim is
 		// still this handler's, so a release (an operator's, anyone's) cannot
