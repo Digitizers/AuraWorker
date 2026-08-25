@@ -829,6 +829,40 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'was revoked when this plugin was deactivated', $html );
 	}
 
+	public function test_a_record_for_an_undelivered_password_keeps_the_repair_marker(): void {
+		// Round-23: app_password_orphaned leaves a valid record — the rotation
+		// must find that password — but the dashboard never received it. Read
+		// as proof that a connection completed, it cleared the repair marker
+		// and hid the connect button over a site with no working credential.
+		$this->ml->handle_connect( $this->request() );
+		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
+		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
+
+		// A connect whose first tracking write and cleanup both fail, but whose
+		// recovery write lands: retryable 500, record kept, nothing delivered.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 2;
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$res = $this->ml->handle_connect( $this->request() );
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'] );
+		$this->assertNotNull( $this->record(), 'the orphan is tracked so it can be revoked' );
+
+		ob_start();
+		$this->ml->render_connect_section();
+		$html = (string) ob_get_clean();
+		$this->assertStringContainsString( 'was revoked when this plugin was deactivated', $html );
+		$this->assertStringContainsString( 'aura-connect-btn', $html, 'the way back stays reachable' );
+		$this->assertSame( '1', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
+
+		// A connect that DOES deliver clears it.
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
+	}
+
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
 	private function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {

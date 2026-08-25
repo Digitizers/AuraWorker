@@ -44,7 +44,8 @@ class Aura_Worker_Magic_Link {
 		// and a retry would rotate it away. So a marker standing beside a
 		// usable password record is stale, and is cleared on sight.
 		$reconnect = ( '' !== (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) );
-		if ( $reconnect && null !== self::password_record() ) {
+		$installed = self::password_record();
+		if ( $reconnect && null !== $installed && empty( $installed['undelivered'] ) ) {
 			delete_option( self::RECONNECT_NEEDED_OPTION );
 			$reconnect = false;
 		}
@@ -699,7 +700,7 @@ class Aura_Worker_Magic_Link {
 			// what a later rotation revokes by, so recovering it is worth more
 			// than the failed delete — and fail RETRYABLY either way, so the
 			// connect is not reported as completed beside an orphan credential.
-			self::persist_password_owner( $user_id, $uuid, $fence );
+			self::persist_password_owner( $user_id, $uuid, $fence, true );
 			// …and the recovery is verified too (round-11). If the pair still
 			// did not persist, the NEXT attempt's rotation would find nothing
 			// recorded, mint again, and every retry would add another live
@@ -844,7 +845,8 @@ class Aura_Worker_Magic_Link {
 	 * @return array{user_id:int,uuid:string}|null
 	 */
 	private static function password_record() {
-		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		$rec_raw = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		$rec     = $rec_raw;
 		if ( ! is_array( $rec ) ) {
 			return null;
 		}
@@ -853,7 +855,11 @@ class Aura_Worker_Magic_Link {
 		if ( $user_id <= 0 || '' === $uuid ) {
 			return null;
 		}
-		return array( 'user_id' => $user_id, 'uuid' => $uuid );
+		$rec = array( 'user_id' => $user_id, 'uuid' => $uuid );
+		if ( ! empty( $rec_raw['undelivered'] ) ) {
+			$rec['undelivered'] = true;
+		}
+		return $rec;
 	}
 
 	/**
@@ -889,8 +895,16 @@ class Aura_Worker_Magic_Link {
 	 * @param string $uuid    Its UUID.
 	 * @param string $fence   The caller's site-claim fence, when it holds one.
 	 */
-	private static function persist_password_owner( int $user_id, string $uuid, $fence = '' ) {
+	private static function persist_password_owner( int $user_id, string $uuid, $fence = '', $undelivered = false ) {
 		$record = array( 'user_id' => $user_id, 'uuid' => $uuid );
+		if ( $undelivered ) {
+			// The password this record names was minted but never returned to
+			// the dashboard (round-23). It exists, so the rotation must find
+			// and revoke it — but the connection it was minted for did not
+			// complete, and the settings screen must not read it as proof that
+			// one did.
+			$record['undelivered'] = true;
+		}
 		if ( '' !== (string) $fence ) {
 			Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
 			return;
