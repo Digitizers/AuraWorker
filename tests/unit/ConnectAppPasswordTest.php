@@ -61,6 +61,20 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( array( Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'Something else' ), $names ); // one Aura password, the stranger untouched
 	}
 
+	public function test_a_reconnect_by_another_admin_revokes_the_previous_creator_s_aura_password(): void {
+		// Admin 7 connected first (this connect); then admin 9 reconnects via a new link.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertSame( 7, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+		$GLOBALS['_admins'] = array( 7, 9 );
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 9 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user9', $data['app_password']['user_login'] );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), "the previous creator's Aura password is revoked" );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 9 ) );
+		$this->assertSame( 9, (int) get_option( Aura_Worker_Magic_Link::APP_PASSWORD_OWNER_OPTION ) );
+	}
+
 	public function test_unavailable_app_passwords_leave_the_connect_token_only_and_name_the_reason(): void {
 		$GLOBALS['_app_passwords_available'] = false;
 		$res  = $this->ml->handle_connect( $this->request() );

@@ -382,6 +382,9 @@ class Aura_Worker_Magic_Link {
 	/** The site-wide connect claim (2.11.0): one install at a time. Under the swept MAGIC_CLAIM prefix. */
 	const SITE_CLAIM = Aura_Worker_Rules::MAGIC_CLAIM . 'site';
 
+	/** The user who owns the CURRENT Aura-minted Application Password — the rotation revokes theirs too, whoever connects next. */
+	const APP_PASSWORD_OWNER_OPTION = 'aura_worker_app_password_user_id';
+
 	/**
 	 * Mint the dashboard's Application Password for a user, rotating any
 	 * earlier one Aura minted (2.11.0).
@@ -403,10 +406,18 @@ class Aura_Worker_Magic_Link {
 		if ( ! wp_is_application_passwords_available_for_user( $user ) ) {
 			return new WP_Error( 'app_passwords_unavailable', 'Application Passwords are unavailable for this user (HTTPS required, or disabled by a filter).' );
 		}
-		// Rotate: the fixed name is the key. Anything Aura minted before dies here.
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $user_id ) as $item ) {
-			if ( isset( $item['name'], $item['uuid'] ) && self::APP_PASSWORD_NAME === $item['name'] ) {
-				WP_Application_Passwords::delete_application_password( $user_id, (string) $item['uuid'] );
+		// Rotate: the fixed name is the key. Anything Aura minted before dies
+		// here — for THIS user and for the PREVIOUS owner (round-2): admin B
+		// reconnecting a site admin A connected must revoke A's Aura password
+		// too, or an administrator-level REST credential outlives the token it
+		// was minted beside. The owner is recorded per mint, so the previous
+		// one is always known.
+		$previous_owner = (int) get_option( self::APP_PASSWORD_OWNER_OPTION, 0 );
+		foreach ( array_unique( array_filter( array( $user_id, $previous_owner ) ) ) as $owner ) {
+			foreach ( WP_Application_Passwords::get_user_application_passwords( (int) $owner ) as $item ) {
+				if ( isset( $item['name'], $item['uuid'] ) && self::APP_PASSWORD_NAME === $item['name'] ) {
+					WP_Application_Passwords::delete_application_password( (int) $owner, (string) $item['uuid'] );
+				}
 			}
 		}
 		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME ) );
@@ -416,6 +427,7 @@ class Aura_Worker_Magic_Link {
 		if ( ! is_array( $created ) || empty( $created[0] ) || ! is_string( $created[0] ) ) {
 			return new WP_Error( 'app_password_mint_failed', 'WordPress did not return a new Application Password.' );
 		}
+		update_option( self::APP_PASSWORD_OWNER_OPTION, $user_id );
 		return array( 'user_login' => (string) $user->user_login, 'password' => $created[0] );
 	}
 
