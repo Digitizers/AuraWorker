@@ -53,6 +53,9 @@ add_action( 'plugins_loaded', 'aura_worker_init' );
 function aura_worker_activate() {
 	// Store activation timestamp.
 	update_option( 'aura_worker_activated', time() );
+	// Belt and braces for the deactivation release below: a claim that outlived
+	// a crash during deactivation would otherwise still block every connect.
+	Aura_Worker_Magic_Link::forget_site_claim();
 	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
 
 	// Generate a unique site token if not exists. Only the SHA-256 hash is
@@ -71,6 +74,15 @@ register_activation_hook( __FILE__, 'aura_worker_activate' );
  * Deactivation hook.
  */
 function aura_worker_deactivate() {
-	// Nothing to clean up on deactivation; options are removed on uninstall.
+	// Options are removed on uninstall, not here — with ONE exception. The
+	// site-wide connect claim (2.11.0) has no timed takeover: a claim is only
+	// ever released by the handler that took it, so nothing can start a second
+	// install beside a handler that might still resume. The cost is that a
+	// handler killed mid-connect (OOM, fatal, a killed worker) leaves a claim
+	// that refuses every later connect, and the site has no clock that may
+	// clear it. Deactivating the plugin is the operator's explicit release:
+	// no connect handler survives it, so removing the claim here opens no
+	// race. Reconnect after reactivating.
+	Aura_Worker_Magic_Link::forget_site_claim();
 }
 register_deactivation_hook( __FILE__, 'aura_worker_deactivate' );

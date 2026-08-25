@@ -245,6 +245,14 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   it (earlier ones under that name are deleted first). Where Application
   Passwords are unavailable (no HTTPS, disabled by a filter, no admin user)
   the connect succeeds token-only as before and names the reason.
+* The whole install — token, client binding, gateway key, Application
+  Password — runs under one site-wide connect claim, so two callbacks for the
+  same site cannot split the credentials the dashboard ends up holding.
+  "Regenerate Token" takes the same claim (it is refused while a connect is
+  installing). The claim is never taken over by age: a callback the dashboard
+  timed out on may still be running. If one is ever left behind by a killed
+  request, every later connect is refused until an administrator deactivates
+  and reactivates the plugin, which releases it.
 
 = 2.10.3 =
 * Fix (security): **"Regenerate Token" revealed a new site token without ever

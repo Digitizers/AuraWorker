@@ -179,22 +179,27 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), 'the per-link claim is released' );
 	}
 
-	public function test_an_orphaned_site_claim_is_taken_over_after_the_stale_window_but_a_live_one_never_is(): void {
-		// A handler killed mid-connect leaves the site claim behind; unlike a
-		// per-link orphan it would refuse EVERY later connect (round-6).
-		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'dead-fence|' . ( time() - Aura_Worker_Magic_Link::SITE_CLAIM_STALE_SECONDS - 10 );
-		$res = $this->ml->handle_connect( $this->request() );
-		$this->assertSame( 200, $res->get_status(), 'a stale site claim is reaped and the connect proceeds' );
-		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ) );
-
-		// …but a LIVE one (younger than the window) still refuses.
-		sa_reset_state();
-		$GLOBALS['_admins'] = array( 7 );
-		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'live-fence|' . time();
+	public function test_a_site_claim_is_never_taken_over_by_age_and_is_released_by_deactivating(): void {
+		// Round-7, owner decision: a handler the dashboard timed out on may
+		// still be running, so NO age lets a second install start beside it.
+		// However old the claim is, the connect is refused.
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'dead-fence|' . ( time() - 86400 );
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 409, $res->get_status() );
-		$this->assertStringStartsWith( 'live-fence|', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM ), 'the live claim is untouched' );
+		$this->assertStringStartsWith( 'dead-fence|', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM ), 'no takeover, at any age' );
+		$this->assertFalse( get_option( 'aura_magic_claim_' . $this->magic_id, false ), 'the per-link claim is released' );
+
+		// The operator's release: deactivating the plugin (which no handler
+		// survives) calls the ONE method that deletes the claim.
+		Aura_Worker_Magic_Link::forget_site_claim();
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ) );
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 200, $res->get_status(), 'the connect proceeds once the claim is released' );
+
+		// …and it is wired to activation and deactivation, and to nothing else.
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::forget_site_claim();' ) );
+		$this->assertSame( 0, substr_count( file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker-api.php' ), 'forget_site_claim' ) );
 	}
 
 	public function test_regenerating_the_site_token_revokes_the_managed_password(): void {

@@ -158,7 +158,11 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 for the administrator who created the link and returns it once in the signed callback's
 response, so a magic-link connection can run the builder tools that authenticate with
 WordPress Basic auth. Every connect rotates it; where Application Passwords are
-unavailable the connect stays token-only and names the reason.
+unavailable the connect stays token-only and names the reason. The whole install runs
+under one site-wide connect claim — "Regenerate Token" takes it too — and that claim is
+never taken over by age, because a callback the dashboard timed out on may still be
+running. A claim left behind by a killed request is released by deactivating and
+reactivating the plugin.
 
 ### 2.10.3
 

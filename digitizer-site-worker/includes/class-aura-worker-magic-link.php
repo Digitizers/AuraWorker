@@ -292,11 +292,10 @@ class Aura_Worker_Magic_Link {
 		// application password). Falls back to the first admin if absent.
 		// Verified. From here the whole install — token, binding, key, password
 		// — is one handler's: take the site-wide claim now.
-		// A dead handler's site claim would otherwise refuse every future
-		// connect (round-6): reap one older than the stale window first, then
-		// claim. The reap is a conditional DELETE by the timestamp inside the
-		// value, so a LIVE claim (always younger) is never touched.
-		self::reap_stale_site_claim();
+		// An orphaned claim is NOT taken over by age (round-7): a handler the
+		// dashboard gave up on may still be running, and a takeover would let
+		// this install interleave with it. A stuck claim is released by
+		// deactivating the plugin.
 		$site_fence = self::claim_magic_link( $site_claim_key );
 		if ( '' === $site_fence ) {
 			$release();
@@ -426,16 +425,15 @@ class Aura_Worker_Magic_Link {
 	/** The site-wide connect claim (2.11.0): one install at a time. Under the swept MAGIC_CLAIM prefix. */
 	const SITE_CLAIM = Aura_Worker_Rules::MAGIC_CLAIM . 'site';
 	/**
-	 * How old a site-wide claim must be before a later connect may take it
-	 * over (round-6). The per-link claim deliberately has NO timed takeover —
-	 * a dead handler costs that ONE link. An orphaned site claim costs every
-	 * reconnect the site will ever attempt, and the daily sweep runs from
-	 * rules enforcement, which a disconnected site never reaches. 120 s is far
-	 * past any real handler (the dashboard gives each attempt 15 s and the
-	 * whole connect 40 s; PHP's own max_execution_time is 30-60 s), so a
-	 * takeover cannot land beside a live install.
+	 * The site claim has NO timed takeover (round-7, owner decision). A
+	 * connect handler that a client timeout abandoned is not a handler that
+	 * stopped: PHP keeps running it, and an age-based takeover would let a
+	 * replacement start writing while the original may still resume — exactly
+	 * the credential-splitting race the claim exists to prevent. Recovery of
+	 * an orphaned claim is therefore an explicit operator action: deactivating
+	 * the plugin (which no handler survives) deletes it. See
+	 * aura_worker_deactivate() in digitizer-site-worker.php.
 	 */
-	const SITE_CLAIM_STALE_SECONDS = 120;
 
 	/** The user who owns the CURRENT Aura-minted Application Password — the rotation revokes theirs too, whoever connects next. */
 	const APP_PASSWORD_OWNER_OPTION = 'aura_worker_app_password_user_id';
@@ -510,6 +508,19 @@ class Aura_Worker_Magic_Link {
 	}
 
 	/**
+	 * Delete the site-wide connect claim — the operator's explicit release
+	 * (round-7, owner decision). The claim has no timed takeover, so a handler
+	 * killed mid-connect leaves one that refuses every later connect and no
+	 * clock may clear it. Wired ONLY to the plugin's activation and
+	 * deactivation hooks: no connect handler survives either, so removing the
+	 * claim there cannot admit a second install beside a live one. Never call
+	 * it from a request path.
+	 */
+	public static function forget_site_claim() {
+		delete_option( self::SITE_CLAIM );
+	}
+
+	/**
 	 * Take the site-wide connect claim from OUTSIDE a connect callback
 	 * (round-7): "Regenerate Token" invalidates the same binding a connect
 	 * installs — token, dashboard URL, Application Password — so it must be
@@ -522,7 +533,6 @@ class Aura_Worker_Magic_Link {
 	 * @return string The caller's fence when it holds the claim, else ''.
 	 */
 	public static function claim_site() {
-		self::reap_stale_site_claim();
 		return self::claim_magic_link( self::SITE_CLAIM );
 	}
 
@@ -712,25 +722,6 @@ class Aura_Worker_Magic_Link {
 		wp_cache_delete( $claim_key, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		return $fence;
-	}
-
-	/**
-	 * Delete the site-wide claim if it is older than SITE_CLAIM_STALE_SECONDS
-	 * (round-6) — a handler killed mid-connect (OOM, timeout, fatal) leaves
-	 * one behind, and unlike a per-link orphan it blocks EVERY later connect.
-	 * Conditional on the timestamp inside the value ("<fence>|<unix ts>"), so
-	 * a live claim — always younger than the window — is never removed.
-	 */
-	private static function reap_stale_site_claim() {
-		global $wpdb;
-		$wpdb->query(
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND CAST(SUBSTRING_INDEX(option_value, '|', -1) AS UNSIGNED) < %d",
-				self::SITE_CLAIM,
-				time() - self::SITE_CLAIM_STALE_SECONDS
-			)
-		);
-		wp_cache_delete( self::SITE_CLAIM, 'options' );
 	}
 
 	/**
