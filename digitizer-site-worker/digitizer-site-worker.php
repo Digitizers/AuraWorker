@@ -63,9 +63,16 @@ function aura_worker_activate() {
 	// leave an administrator credential valid indefinitely — the documentation
 	// promises reactivation as the cure, so it has to be one. A site that was
 	// never deactivated by this hook has nothing recorded and this is a no-op.
+	$aura_deferred_password = ( null !== get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null ) );
 	if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: an Aura Application Password left over from a failed deactivation could not be revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+	} elseif ( $aura_deferred_password ) {
+		// A revocation deferred from deactivation lands HERE, so the flag
+		// deactivation could not set belongs here too (round-20) — without it
+		// the settings screen reports an intact connection over a credential
+		// this call has just revoked.
+		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
 	}
 	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
 

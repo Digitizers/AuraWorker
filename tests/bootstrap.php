@@ -1314,8 +1314,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 
 			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
 				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
-				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {
 					// The statement itself failing — NOT "no row matched".
+					// Kept apart from _sa_option_write_fail so a test can refuse
+					// the write while letting the delete land, and vice versa.
 					$this->last_error = 'delete failed';
 					return false;
 				}
@@ -1496,6 +1498,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
+	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
@@ -1995,6 +1998,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
+	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.

@@ -618,6 +618,16 @@ class Aura_Worker_Magic_Link {
 			// A revocation that did not land is NOT reported as a rotation
 			// (round-4): the old credential may still be valid, so nothing new
 			// is minted beside it and the dashboard is told why.
+			//
+			// …and WHICH failure it was is decided by what the site still
+			// records (round-20). The revocation consumes the record before it
+			// deletes the password and puts it back when the delete fails; if
+			// that restoration failed too, a live administrator credential is
+			// left with nothing naming it, and a retry would mint another
+			// beside it. No record ⇒ terminal, exactly as elsewhere.
+			if ( null === self::password_record() ) {
+				return new WP_Error( 'app_password_orphan_untracked', 'A previous Application Password could be neither revoked nor recorded; revoke it by hand in Users → Profile → Application Passwords.' );
+			}
 			return new WP_Error( 'app_password_revoke_failed', 'A previous Aura Application Password could not be revoked; no new one was minted.' );
 		}
 		$user = $user_id > 0 ? get_userdata( $user_id ) : false;

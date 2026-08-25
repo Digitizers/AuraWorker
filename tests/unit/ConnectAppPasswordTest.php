@@ -692,7 +692,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
 		$GLOBALS['_options'][ $claim ] = 'mine|' . time();
 		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+		$GLOBALS['_sa_option_delete_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
 
 		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
 		$this->assertSame( $uuid, $this->uncachedUuid(), 'the record survives a failed delete' );
@@ -731,6 +731,38 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->ml->render_connect_section();
 		$html = (string) ob_get_clean();
 		$this->assertStringNotContainsString( 'aura-connect-btn', $html );
+	}
+
+	public function test_a_previous_password_left_unrevoked_AND_unrecorded_is_terminal(): void {
+		// Round-20: the revocation consumes the record before deleting the
+		// password and restores it when the delete fails. If that restoration
+		// fails too, the old administrator credential is live with nothing
+		// naming it — and a retryable answer would let the next attempt mint
+		// another beside it.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertNotNull( $this->record() );
+		// The delete fails, and so does putting the record back.
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$res  = $this->ml->handle_connect( $this->request() );
+		$data = $res->get_data();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_orphan_untracked', $data['code'] );
+		$this->assertFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'terminal: no retry can mint beside the orphan' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'nothing new was minted' );
+	}
+
+	public function test_activation_completing_a_deferred_revocation_flags_the_reconnect(): void {
+		// Round-20: deactivation that could not revoke keeps the record and sets
+		// no flag; activation retries and, succeeding, must set the flag itself
+		// — otherwise the screen reports an intact connection over a credential
+		// it has just revoked.
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$activate = substr( $main, strpos( $main, 'function aura_worker_activate()' ) );
+		$activate = substr( $activate, 0, strpos( $activate, "\nregister_activation_hook" ) );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false', $activate );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null', $activate, 'the flag is set only when a record was actually there' );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
