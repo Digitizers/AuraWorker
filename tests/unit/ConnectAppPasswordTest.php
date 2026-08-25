@@ -711,6 +711,8 @@ final class ConnectAppPasswordTest extends TestCase {
 		// Deactivation revokes it and says so.
 		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::flag_reconnect_needed();', $main );
+		// What deactivation leaves behind: the record gone, the marker set.
+		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
 		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
 
 		// The settings screen keeps the connect button reachable and explains why.
@@ -800,6 +802,31 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->ml->render_connect_section();
 		$html = (string) ob_get_clean();
 		$this->assertStringContainsString( 'aura-connect-btn', $html );
+	}
+
+	public function test_a_marker_left_behind_beside_a_live_credential_is_stale_and_cleared(): void {
+		// Round-22: the clear is one conditional statement and it can fail. The
+		// connect must NOT be failed over it — the password is already in the
+		// dashboard's hands and a retry would rotate it away — so the screen
+		// decides by the record instead, and drops a marker that contradicts it.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertNotNull( $this->record(), 'a credential is installed' );
+		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
+
+		ob_start();
+		$this->ml->render_connect_section();
+		$html = (string) ob_get_clean();
+		$this->assertStringNotContainsString( 'was revoked when this plugin was deactivated', $html );
+		$this->assertStringNotContainsString( 'aura-connect-btn', $html );
+		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ), 'the stale marker is cleared on sight' );
+
+		// With no record — the state the marker describes — it still speaks up.
+		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
+		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
+		ob_start();
+		$this->ml->render_connect_section();
+		$html = (string) ob_get_clean();
+		$this->assertStringContainsString( 'was revoked when this plugin was deactivated', $html );
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */

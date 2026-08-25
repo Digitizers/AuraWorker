@@ -36,7 +36,18 @@ class Aura_Worker_Magic_Link {
 		echo '<hr>';
 		echo '<h2>' . esc_html__( 'Aura Dashboard Connection', 'digitizer-site-worker' ) . '</h2>';
 
+		// The marker is a HINT; the record is the truth (round-22). A connect
+		// that minted a replacement clears the marker with one conditional
+		// statement, and that statement can fail — leaving the screen begging
+		// for a reconnect the site does not need. Failing the connect over it
+		// would be worse: the credential is already in the dashboard's hands,
+		// and a retry would rotate it away. So a marker standing beside a
+		// usable password record is stale, and is cleared on sight.
 		$reconnect = ( '' !== (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) );
+		if ( $reconnect && null !== self::password_record() ) {
+			delete_option( self::RECONNECT_NEEDED_OPTION );
+			$reconnect = false;
+		}
 		if ( $dashboard_url && $site_token ) {
 			echo '<p style="color:' . ( $reconnect ? '#b26a00' : '#2e7d32' ) . ';">';
 			echo '<span class="dashicons dashicons-' . ( $reconnect ? 'warning' : 'yes-alt' ) . '"></span> ';
