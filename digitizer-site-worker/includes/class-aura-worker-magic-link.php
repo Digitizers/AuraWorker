@@ -601,6 +601,16 @@ class Aura_Worker_Magic_Link {
 	 */
 	const APP_PASSWORD_RECORD_OPTION = 'aura_worker_app_password';
 
+	/**
+	 * How long a mint intent that produced no password is kept before it is
+	 * retired (round-30). Long past any request that could still be inside the
+	 * mint — PHP's max_execution_time is 30-60 s and the dashboard gives the
+	 * whole connect 40 s — so an intent is never removed while the handler that
+	 * wrote it can still create the credential it describes. Retiring one that
+	 * matched nothing destroys no credential, because there is none.
+	 */
+	const MINT_INTENT_STALE_SECONDS = 300;
+
 
 	/**
 	 * Mint the dashboard's Application Password for a user, rotating any
@@ -654,12 +664,13 @@ class Aura_Worker_Magic_Link {
 		// record naming the user and the moment, which reconcile_mint_intent()
 		// above turns back into a real record on the next attempt. An intent
 		// that will not persist means no password is created at all.
-		self::persist_mint_intent( $user_id, $fence );
+		$app_id = wp_generate_uuid4();
+		self::persist_mint_intent( $user_id, $app_id, $fence );
 		$intent = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
-		if ( ! is_array( $intent ) || (int) ( $intent['user_id'] ?? 0 ) !== $user_id || empty( $intent['minting'] ) ) {
+		if ( ! is_array( $intent ) || (int) ( $intent['user_id'] ?? 0 ) !== $user_id || empty( $intent['minting'] ) || (string) ( $intent['app_id'] ?? '' ) !== $app_id ) {
 			return new WP_Error( 'app_password_mint_failed', 'The site could not record that an Application Password was about to be created; none was.' );
 		}
-		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME ) );
+		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME, 'app_id' => $app_id ) );
 		if ( is_wp_error( $created ) ) {
 			// Core refusing to write the password — a failing user-meta write,
 			// a database error — is an OPERATIONAL failure, not one of the
@@ -901,11 +912,13 @@ class Aura_Worker_Magic_Link {
 	 * whatever it created (round-29).
 	 *
 	 * @param int    $user_id The admin the password is being minted for.
+	 * @param string $app_id  The identifier creation will stamp on it — the
+	 *                        EXACT credential this intent is about (round-30).
 	 * @param string $fence   The caller's site-claim fence, when it holds one.
 	 * @return int|false Rows written, as write_option_if_claimed() reports them.
 	 */
-	private static function persist_mint_intent( int $user_id, $fence = '' ) {
-		$record = array( 'user_id' => $user_id, 'minting' => time() );
+	private static function persist_mint_intent( int $user_id, $app_id, $fence = '' ) {
+		$record = array( 'user_id' => $user_id, 'minting' => time(), 'app_id' => (string) $app_id );
 		if ( '' !== (string) $fence ) {
 			return Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
 		}
@@ -934,22 +947,35 @@ class Aura_Worker_Magic_Link {
 			return;
 		}
 		$owner  = (int) ( $rec['user_id'] ?? 0 );
-		$since  = (int) $rec['minting'];
+		$app_id = (string) ( $rec['app_id'] ?? '' );
 		$found  = '';
-		if ( $owner > 0 && class_exists( 'WP_Application_Passwords' ) ) {
+		if ( $owner > 0 && '' !== $app_id && class_exists( 'WP_Application_Passwords' ) ) {
 			foreach ( WP_Application_Passwords::get_user_application_passwords( $owner ) as $item ) {
-				if ( self::APP_PASSWORD_NAME === (string) ( $item['name'] ?? '' ) && (int) ( $item['created'] ?? 0 ) >= $since && ! empty( $item['uuid'] ) ) {
+				// By the app_id creation was told to stamp on it (round-30) —
+				// the EXACT credential this intent is about. Matching on the
+				// name and a timestamp adopted whichever same-named password of
+				// that user came first in the list, so a second one created in
+				// the same second put the rotation onto an unrelated credential
+				// while the real orphan stayed live and untracked.
+				if ( '' !== (string) ( $item['app_id'] ?? '' ) && $app_id === (string) $item['app_id'] && ! empty( $item['uuid'] ) ) {
 					$found = (string) $item['uuid'];
 					break;
 				}
 			}
 		}
-		if ( '' === $found ) {
-			self::forget_password_owner( $fence ); // nothing was created
+		if ( '' !== $found ) {
+			self::persist_password_owner( $owner, $found, $fence, true ); // it exists and nobody received it
 			return;
 		}
-		// It exists and nobody ever received it.
-		self::persist_password_owner( $owner, $found, $fence, true );
+		// Nothing was created under this intent — YET. The handler that wrote it
+		// may still be running (round-30): deleting the intent here and having
+		// that request create its password a moment later would leave a live
+		// administrator credential nothing can find. An intent outlives any real
+		// request before it is retired, and retiring one that matched nothing
+		// destroys no credential, because there is none.
+		if ( (int) $rec['minting'] <= time() - self::MINT_INTENT_STALE_SECONDS ) {
+			self::forget_password_owner( $fence );
+		}
 	}
 
 	/**
@@ -1062,6 +1088,12 @@ class Aura_Worker_Magic_Link {
 			return true;
 		}
 		$rec = self::password_record();
+		if ( null === $rec && is_array( $record ) && ! empty( $record['minting'] ) ) {
+			// A mint intent that reconciliation just found nothing for. It names
+			// no credential, so there is nothing to revoke; the mint about to
+			// run replaces it with its own.
+			return true;
+		}
 		if ( null === $rec ) {
 			// SOMETHING is recorded, but not a record this code can act on
 			// (round-13). It names a password that cannot be deleted, so

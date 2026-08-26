@@ -404,6 +404,11 @@ if ( ! function_exists( 'esc_attr' ) ) {
 		return htmlspecialchars( (string) $text, ENT_QUOTES );
 	}
 }
+if ( ! function_exists( 'wp_generate_uuid4' ) ) {
+	function wp_generate_uuid4(): string {
+		return sprintf( '%08x-%04x-4%03x-%04x-%012x', random_int( 0, 0xffffffff ), random_int( 0, 0xffff ), random_int( 0, 0x0fff ), random_int( 0, 0x3fff ) | 0x8000, random_int( 0, 0xffffffffffff ) );
+	}
+}
 if ( ! function_exists( 'admin_url' ) ) {
 	function admin_url( string $path = '' ): string {
 		return 'https://example.test/wp-admin/' . ltrim( $path, '/' );
@@ -712,7 +717,7 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 			if ( ! empty( $GLOBALS['_sa_steal_site_claim_during_mint'] ) ) {
 				unset( $GLOBALS['_options']['aura_worker_connect_lock'], $GLOBALS['_rows']['aura_worker_connect_lock'] );
 			}
-			$item = array( 'uuid' => 'uuid-' . bin2hex( random_bytes( 4 ) ), 'name' => (string) ( $args['name'] ?? '' ), 'created' => time() );
+			$item = array( 'uuid' => 'uuid-' . bin2hex( random_bytes( 4 ) ), 'app_id' => (string) ( $args['app_id'] ?? '' ), 'name' => (string) ( $args['name'] ?? '' ), 'created' => time() );
 			$GLOBALS['_app_passwords'][ $user_id ][] = $item;
 			return array( 'pw-' . bin2hex( random_bytes( 8 ) ), $item );
 		}

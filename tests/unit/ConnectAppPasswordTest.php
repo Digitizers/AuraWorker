@@ -826,6 +826,49 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'cannot issue the Application Password', $this->renderConnect() );
 	}
 
+	public function test_reconciliation_adopts_the_exact_credential_the_intent_names(): void {
+		// Round-30: matching on the name and a timestamp adopted whichever
+		// same-named password of that user came first in the list, so a second
+		// one created in the same second put the rotation onto an unrelated
+		// credential while the real orphan stayed live and untracked. The intent
+		// carries the app_id creation stamps on the password.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = static function ( $raw ) {
+			return false === strpos( (string) $raw, 'minting' ); // only the intent lands
+		};
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		$this->ml->handle_connect( $this->request() );
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$mine = WP_Application_Passwords::get_user_application_passwords( 7 )[0]['uuid'];
+
+		// The same user creates their own, identically named, right after.
+		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) );
+		$this->assertCount( 2, WP_Application_Passwords::get_user_application_passwords( 7 ) );
+
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$this->ml->handle_connect( $this->request() );
+		$live = array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' );
+		$this->assertNotContains( $mine, $live, "the interrupted mint's own password was revoked" );
+		$this->assertCount( 2, $live, "the stranger's survived, beside the fresh one" );
+	}
+
+	public function test_a_mint_intent_is_not_retired_while_its_handler_could_still_be_running(): void {
+		// Round-30: deleting a young intent and having the request that wrote it
+		// create its password a moment later leaves a live administrator
+		// credential nothing can find.
+		$revoke = static function () {
+			return Aura_Worker_Magic_Link::revoke_managed_password();
+		};
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'abc' ), false );
+		$this->assertTrue( $revoke(), 'an intent names no credential, so nothing is owed' );
+		$this->assertNotNull( $this->record(), 'and it stays: its handler may still be inside the mint' );
+
+		// Older than any real request, and matching no password: retired.
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time() - Aura_Worker_Magic_Link::MINT_INTENT_STALE_SECONDS - 1, 'app_id' => 'abc' ), false );
+		$this->assertTrue( $revoke() );
+		$this->assertNull( $this->record() );
+	}
+
 	/** Render the connect section and return its HTML. */
 	private function renderConnect(): string {
 		ob_start();
