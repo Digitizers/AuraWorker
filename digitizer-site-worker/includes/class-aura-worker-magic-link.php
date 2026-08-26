@@ -1297,8 +1297,13 @@ class Aura_Worker_Magic_Link {
 			}
 			return false; // a genuine delete failure — the credential is still live
 		}
-		// Gone for certain — now the record may go, and only now (round-28).
-		self::forget_password_owner( $fence );
+		// Gone for certain — now the CREDENTIAL's half of the record may go, and
+		// only now (round-28). Pending intents belong to other handlers and stay
+		// (round-36): dropping them with the credential would lose the app_id of
+		// a password one of them may still create.
+		$left    = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		$intents = ( is_array( $left ) && isset( $left['intents'] ) && is_array( $left['intents'] ) ) ? $left['intents'] : array();
+		self::write_password_record( array() === $intents ? array() : array( 'intents' => $intents ), $fence );
 		return true;
 	}
 

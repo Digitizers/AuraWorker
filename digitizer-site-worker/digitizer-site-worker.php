@@ -61,20 +61,30 @@ register_activation_hook( __FILE__, 'aura_worker_activate' );
 function aura_worker_activate_site() {
 	// Store activation timestamp.
 	update_option( 'aura_worker_activated', time() );
-	// Belt and braces for the deactivation release below: a claim that outlived
-	// a crash during deactivation would otherwise still block every connect.
-	Aura_Worker_Magic_Link::forget_site_claim();
+	// The site is SEIZED, not merely unlocked (round-36) — the same fence
+	// deactivation takes, and for the same reason: a callback that claims the
+	// site between an eviction and the revocation below could mint and record a
+	// replacement, which the revocation would then strip of its record while
+	// revoking only the previous UUID. Belt and braces too: a claim that
+	// outlived a crash during deactivation would otherwise block every connect.
+	$aura_fence = Aura_Worker_Magic_Link::seize_site();
 	// Deactivation revokes the Application Password Aura minted, and KEEPS its
-	// owner/uuid whenever the revocation did not land. Reaching activation with
-	// that record still present therefore means exactly one thing: a revocation
-	// that failed. Finish it here (round-11), or a transient failure would
-	// leave an administrator credential valid indefinitely — the documentation
-	// promises reactivation as the cure, so it has to be one. A site that was
-	// never deactivated by this hook has nothing recorded and this is a no-op.
-	if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
+	// record whenever the revocation did not land. Reaching activation with that
+	// record still present therefore means exactly one thing: a revocation that
+	// failed. Finish it here (round-11), or a transient failure would leave an
+	// administrator credential valid indefinitely — the documentation promises
+	// reactivation as the cure, so it has to be one. A site that was never
+	// deactivated by this hook has nothing recorded and this is a no-op.
+	if ( '' === $aura_fence ) {
+		// No fence, no revocation: an unfenced one is the race the fence exists
+		// to prevent. The record survives for the next connect or uninstall.
+		// translators: internal log line, not shown to the user.
+		error_log( 'SiteAgent: a connect held the site while the plugin was activating, so a deferred Aura Application Password revocation was skipped.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+	} elseif ( ! Aura_Worker_Magic_Link::revoke_managed_password( $aura_fence ) ) {
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: an Aura Application Password left over from a failed deactivation could not be revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 	}
+	Aura_Worker_Magic_Link::release_site( $aura_fence );
 	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
 
 	// Generate a unique site token if not exists. Only the SHA-256 hash is

@@ -30,7 +30,10 @@ final class ConnectAppPasswordTest extends TestCase {
 	/** The record, unless it is the "this site cannot have one" statement. */
 	private function password_record_or_null(): ?array {
 		$rec = $this->record();
-		return ( null === $rec || ! empty( $rec['unavailable'] ) ) ? null : $rec;
+		if ( null === $rec || ! empty( $rec['unavailable'] ) || empty( $rec['uuid'] ) ) {
+			return null; // nothing, a token-only statement, or pending intents only
+		}
+		return $rec;
 	}
 
 	private function recordUuid(): string {
@@ -248,9 +251,12 @@ final class ConnectAppPasswordTest extends TestCase {
 		// activation clears it outright, deactivation SEIZES the site (evict,
 		// then claim) so nothing can mint beside its revocation.
 		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
-		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::forget_site_claim();' ) );
-		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::seize_site();' ) );
-		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::release_site( $aura_fence );' ) );
+		// Both lifecycle hooks SEIZE the site and release it (round-36); neither
+		// merely evicts, because an unfenced revocation is the race the fence
+		// exists to prevent.
+		$this->assertSame( 0, substr_count( $main, 'Aura_Worker_Magic_Link::forget_site_claim();' ) );
+		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::seize_site();' ) );
+		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::release_site( $aura_fence );' ) );
 		$this->assertSame( 0, substr_count( file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker-api.php' ), 'forget_site_claim' ) );
 	}
 
@@ -402,7 +408,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		// (round-11): reaching it with a record still present means exactly
 		// that, since a successful revocation clears the record.
 		$activate = substr( $main, strpos( $main, 'function aura_worker_activate_site()' ) );
-		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $activate );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password( $aura_fence )', $activate );
 
 		// A revocation that did not land keeps the owner/uuid, so a
 		// reactivation or the uninstall can finish the job.
@@ -884,13 +890,13 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertNotEmpty( $this->recordUuid() );
 	}
 
-	public function test_uninstall_resolves_a_mint_intent_by_app_id_and_revokes_it(): void {
+	public function test_uninstall_settles_every_pending_mint_by_app_id(): void {
 		// Round-31: after this file runs there is no plugin left to reconcile an
 		// interrupted mint, so uninstall resolves it or the credential outlives
 		// everything that could find it.
 		$created = WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'app_id' => 'the-intent' ) );
 		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) ); // a stranger's
-		update_option( 'aura_worker_app_password', array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'the-intent' ), false );
+		update_option( 'aura_worker_app_password', array( 'intents' => array( 'the-intent' => array( 'user_id' => 7, 'at' => time() ) ) ), false );
 
 		$this->run_uninstall();
 
@@ -1017,6 +1023,28 @@ final class ConnectAppPasswordTest extends TestCase {
 			strpos( $deactivate, 'return;' ),
 			'no fence, no revocation'
 		);
+	}
+
+	public function test_revoking_the_current_password_keeps_other_handlers_intents(): void {
+		// Round-36: a successful revocation deleted the whole option, taking
+		// pending intents with it — and with them the app_id of a password one
+		// of those handlers may still create.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'mine|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		$created = WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) );
+		$rec = array(
+			'user_id' => 7,
+			'uuid'    => $created[1]['uuid'],
+			'intents' => array( 'someone-elses' => array( 'user_id' => 9, 'at' => time() ) ),
+		);
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, $rec, false );
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = serialize( $rec );
+
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'the credential is revoked' );
+		$this->assertSame( array( 'someone-elses' ), array_keys( $this->record()['intents'] ), "…and the other handler's intent survives" );
+		$this->assertNull( $this->password_record_or_null(), 'no credential is described any more' );
 	}
 
 	/** Render the connect section and return its HTML. */

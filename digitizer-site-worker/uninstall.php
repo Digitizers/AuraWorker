@@ -28,18 +28,24 @@ $aura_uninstall_site = static function () {
 	$aura_pw_record  = get_option( 'aura_worker_app_password', null );
 	$aura_pw_owner   = is_array( $aura_pw_record ) ? (int) ( $aura_pw_record['user_id'] ?? 0 ) : 0;
 	$aura_pw_uuid    = is_array( $aura_pw_record ) ? (string) ( $aura_pw_record['uuid'] ?? '' ) : '';
-	$aura_pw_app_id  = is_array( $aura_pw_record ) ? (string) ( $aura_pw_record['app_id'] ?? '' ) : '';
-	// A record with an app_id but no uuid is a MINT INTENT: a connect was
-	// interrupted between creating the password and recording which one it is
-	// (round-31). The plugin's own reconciliation resolves that by app_id — and
-	// after this file runs there is no plugin left to do it, so uninstall
-	// resolves it here, or the credential outlives everything that could find
-	// it. Mirrors Aura_Worker_Magic_Link::reconcile_mint_intent().
-	if ( $aura_pw_owner > 0 && '' === $aura_pw_uuid && '' !== $aura_pw_app_id && class_exists( 'WP_Application_Passwords' ) ) {
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_pw_owner ) as $aura_pw_item ) {
-			if ( '' !== (string) ( $aura_pw_item['app_id'] ?? '' ) && $aura_pw_app_id === (string) $aura_pw_item['app_id'] && ! empty( $aura_pw_item['uuid'] ) ) {
-				$aura_pw_uuid = (string) $aura_pw_item['uuid'];
-				break;
+	// PENDING MINTS (round-36): each entry of $record['intents'] is a connect
+	// that was interrupted between creating an Application Password and
+	// recording which one it is. The plugin's own reconciliation settles those
+	// by app_id — and after this file runs there is no plugin left to do it, so
+	// uninstall settles them here, or the credentials outlive everything that
+	// could find them. Mirrors Aura_Worker_Magic_Link::reconcile_mint_intent().
+	$aura_pw_intents = ( is_array( $aura_pw_record ) && isset( $aura_pw_record['intents'] ) && is_array( $aura_pw_record['intents'] ) ) ? $aura_pw_record['intents'] : array();
+	if ( array() !== $aura_pw_intents && class_exists( 'WP_Application_Passwords' ) ) {
+		foreach ( $aura_pw_intents as $aura_intent_app_id => $aura_intent ) {
+			$aura_intent_owner = (int) ( $aura_intent['user_id'] ?? 0 );
+			if ( $aura_intent_owner <= 0 || '' === (string) $aura_intent_app_id ) {
+				continue;
+			}
+			foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_intent_owner ) as $aura_pw_item ) {
+				if ( '' !== (string) ( $aura_pw_item['app_id'] ?? '' ) && (string) $aura_intent_app_id === (string) $aura_pw_item['app_id'] && ! empty( $aura_pw_item['uuid'] ) ) {
+					WP_Application_Passwords::delete_application_password( $aura_intent_owner, (string) $aura_pw_item['uuid'] );
+					break;
+				}
 			}
 		}
 	}
@@ -49,9 +55,9 @@ $aura_uninstall_site = static function () {
 	// (round-13). Uninstall must not discard it either (round-15): it is the only
 	// thing left pointing at an administrator credential that may still work, so it
 	// stays behind for manual recovery. Nothing recorded at all → nothing to keep.
-	// An intent that resolved to nothing describes no credential, so nothing is
-	// kept for it either.
-	$aura_pw_intent_only = ( ! $aura_pw_tracked && $aura_pw_owner > 0 && '' !== $aura_pw_app_id );
+	// A record that holds only pending intents describes no credential the
+	// uninstall could not reach, so nothing is kept for it either.
+	$aura_pw_intent_only = ( ! $aura_pw_tracked && array() !== $aura_pw_intents );
 	$aura_pw_present     = ( null !== $aura_pw_record && false !== $aura_pw_record && '' !== $aura_pw_record );
 	$aura_pw_gone        = ( ! $aura_pw_present || $aura_pw_intent_only );
 	if ( $aura_pw_tracked && class_exists( 'WP_Application_Passwords' ) ) {
