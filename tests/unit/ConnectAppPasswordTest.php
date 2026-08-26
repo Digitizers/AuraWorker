@@ -27,6 +27,12 @@ final class ConnectAppPasswordTest extends TestCase {
 		return is_array( $rec ) ? $rec : null;
 	}
 
+	/** The record, unless it is the "this site cannot have one" statement. */
+	private function password_record_or_null(): ?array {
+		$rec = $this->record();
+		return ( null === $rec || ! empty( $rec['unavailable'] ) ) ? null : $rec;
+	}
+
 	private function recordUuid(): string {
 		return (string) ( $this->record()['uuid'] ?? '' );
 	}
@@ -181,7 +187,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'connect_user_not_admin', $data['app_password_unavailable'] );
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
-		$this->assertNull( $this->record(), 'no record remains' );
+		$this->assertNull( $this->password_record_or_null(), 'no password is recorded' );
 	}
 
 	public function test_a_revocation_that_did_not_land_is_a_retryable_500_that_keeps_the_transient(): void {
@@ -699,42 +705,6 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'and so does the password' );
 	}
 
-	public function test_deactivation_flags_the_revoked_builder_credential_and_a_connect_clears_it(): void {
-		// Round-19: the token binding survives deactivation, so the settings
-		// screen kept reporting an intact connection while the credential the
-		// builder tools authenticate with was gone — and hid the connect
-		// button, leaving no way to restore it from the site.
-		$this->ml->handle_connect( $this->request() );
-		$this->assertNotNull( $this->record() );
-		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
-
-		// Deactivation revokes it and says so.
-		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
-		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::flag_reconnect_needed();', $main );
-		// What deactivation leaves behind: the record gone, the marker set.
-		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
-		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
-
-		// The settings screen keeps the connect button reachable and explains why.
-		ob_start();
-		$this->ml->render_connect_section();
-		$html = (string) ob_get_clean();
-		$this->assertStringContainsString( 'was revoked when this plugin was deactivated', $html );
-		$this->assertStringContainsString( 'aura-connect-btn', $html, 'the button is reachable again' );
-
-		// A fresh connect mints a replacement and clears the flag.
-		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$data = $this->ml->handle_connect( $this->request() )->get_data();
-		$this->assertSame( 'user7', $data['app_password']['user_login'] );
-		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
-
-		// …and with no flag the screen is the plain connected one, no button.
-		ob_start();
-		$this->ml->render_connect_section();
-		$html = (string) ob_get_clean();
-		$this->assertStringNotContainsString( 'aura-connect-btn', $html );
-	}
-
 	public function test_a_previous_password_left_unrevoked_AND_unrecorded_is_terminal(): void {
 		// Round-20: the revocation consumes the record before deleting the
 		// password and restores it when the delete fails. If that restoration
@@ -755,136 +725,6 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'nothing new was minted' );
 	}
 
-	public function test_activation_completing_a_deferred_revocation_flags_the_reconnect(): void {
-		// Round-20: deactivation that could not revoke keeps the record and sets
-		// no flag; activation retries and, succeeding, must set the flag itself
-		// — otherwise the screen reports an intact connection over a credential
-		// it has just revoked.
-		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
-		$activate = substr( $main, strpos( $main, 'function aura_worker_activate()' ) );
-		$activate = substr( $activate, 0, strpos( $activate, "\nregister_activation_hook" ) );
-		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::flag_reconnect_needed();', $activate );
-		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null', $activate, 'the flag is set only when a record was actually there' );
-	}
-
-	public function test_a_token_only_reconnect_keeps_the_marker(): void {
-		// Round-21: the marker says "no builder credential; connect again to get
-		// one". A connect that completed token-only issued none, so clearing it
-		// there would hide the one local control that can still fix the site.
-		$this->ml->handle_connect( $this->request() );
-		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
-		$GLOBALS['_app_passwords_available'] = false; // token-only completion
-		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$data = $this->ml->handle_connect( $this->request() )->get_data();
-		$this->assertSame( 'app_passwords_unavailable', $data['app_password_unavailable'] );
-		$this->assertSame( '1', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ), 'the marker survives a connect that issued nothing' );
-
-		// …and a connect that DOES issue one clears it.
-		$GLOBALS['_app_passwords_available'] = true;
-		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$data = $this->ml->handle_connect( $this->request() )->get_data();
-		$this->assertSame( 'user7', $data['app_password']['user_login'] );
-		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
-	}
-
-	public function test_a_marker_that_will_not_persist_falls_back_to_showing_the_site_unconnected(): void {
-		// Round-21: the marker is the only thing that keeps the Connect button
-		// reachable once the password record is gone. If it cannot be written,
-		// the dashboard URL goes instead — understating a token binding that
-		// still works, but never hiding the way back.
-		$this->ml->handle_connect( $this->request() );
-		$this->assertNotEmpty( get_option( 'aura_worker_dashboard_url' ) );
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION ] = true;
-		Aura_Worker_Magic_Link::flag_reconnect_needed();
-		$this->assertFalse( get_option( 'aura_worker_dashboard_url', false ) );
-
-		ob_start();
-		$this->ml->render_connect_section();
-		$html = (string) ob_get_clean();
-		$this->assertStringContainsString( 'aura-connect-btn', $html );
-	}
-
-	public function test_a_marker_left_behind_beside_a_live_credential_is_stale_and_cleared(): void {
-		// Round-22: the clear is one conditional statement and it can fail. The
-		// connect must NOT be failed over it — the password is already in the
-		// dashboard's hands and a retry would rotate it away — so the screen
-		// decides by the record instead, and drops a marker that contradicts it.
-		$this->ml->handle_connect( $this->request() );
-		$this->assertNotNull( $this->record(), 'a credential is installed' );
-		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
-
-		ob_start();
-		$this->ml->render_connect_section();
-		$html = (string) ob_get_clean();
-		$this->assertStringNotContainsString( 'was revoked when this plugin was deactivated', $html );
-		$this->assertStringNotContainsString( 'aura-connect-btn', $html );
-		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ), 'the stale marker is cleared on sight' );
-
-		// With no record — the state the marker describes — it still speaks up.
-		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
-		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
-		ob_start();
-		$this->ml->render_connect_section();
-		$html = (string) ob_get_clean();
-		$this->assertStringContainsString( 'was revoked when this plugin was deactivated', $html );
-	}
-
-	public function test_a_record_for_an_undelivered_password_keeps_the_repair_marker(): void {
-		// Round-23: app_password_orphaned leaves a valid record — the rotation
-		// must find that password — but the dashboard never received it. Read
-		// as proof that a connection completed, it cleared the repair marker
-		// and hid the connect button over a site with no working credential.
-		$this->ml->handle_connect( $this->request() );
-		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
-		update_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, 1, false );
-
-		// A connect whose first tracking write and cleanup both fail, but whose
-		// recovery write lands: retryable 500, record kept, nothing delivered.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 2;
-		$GLOBALS['_app_passwords_delete_fail'] = true;
-		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$res = $this->ml->handle_connect( $this->request() );
-		$GLOBALS['_app_passwords_delete_fail'] = false;
-		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'] );
-		$this->assertNotNull( $this->record(), 'the orphan is tracked so it can be revoked' );
-
-		ob_start();
-		$this->ml->render_connect_section();
-		$html = (string) ob_get_clean();
-		$this->assertStringContainsString( 'could not deliver the credential', $html );
-		$this->assertStringContainsString( 'aura-connect-btn', $html, 'the way back stays reachable' );
-		$this->assertSame( '1', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
-
-		// A connect that DOES deliver clears it.
-		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$data = $this->ml->handle_connect( $this->request() )->get_data();
-		$this->assertSame( 'user7', $data['app_password']['user_login'] );
-		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ) );
-	}
-
-	public function test_an_undelivered_record_asks_for_a_reconnect_with_no_marker_at_all(): void {
-		// Round-24: a FIRST connect that ends undelivered wrote the dashboard
-		// URL and token but handed over no credential, and deactivation — the
-		// only thing that sets the marker — never happened. Without the record
-		// speaking for itself the screen reported a completed connection and
-		// hid the button, so a retry that stopped left no local way back.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 2;
-		$GLOBALS['_app_passwords_delete_fail'] = true;
-		$res = $this->ml->handle_connect( $this->request() );
-		$GLOBALS['_app_passwords_delete_fail'] = false;
-		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'] );
-		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::RECONNECT_NEEDED_OPTION, '' ), 'no marker: nothing was deactivated' );
-		$this->assertNotEmpty( get_option( 'aura_worker_dashboard_url' ) );
-
-		ob_start();
-		$this->ml->render_connect_section();
-		$html = (string) ob_get_clean();
-		$this->assertStringContainsString( 'could not deliver the credential', $html );
-		$this->assertStringContainsString( 'aura-connect-btn', $html );
-	}
-
 	public function test_restoring_a_consumed_record_keeps_its_delivery_state(): void {
 		// Round-24: the revocation consumes the record before deleting the
 		// password and restores it when the delete fails. Restored without its
@@ -902,6 +742,60 @@ final class ConnectAppPasswordTest extends TestCase {
 
 		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
 		$this->assertSame( $rec, $this->uncachedRecord(), 'the record comes back exactly as it was' );
+	}
+
+	public function test_the_connect_button_is_always_reachable_and_the_state_is_derived_from_the_record(): void {
+		// Rounds 19-26 each found another path ending without a usable builder
+		// credential, and each time the screen hid the way back. The button is
+		// unconditional now, and the sentence above it is derived from the one
+		// option that records what the site holds — so no path can take the
+		// recovery control away by forgetting to set a flag.
+		$this->ml->handle_connect( $this->request() );
+		$html = $this->renderConnect();
+		$this->assertStringContainsString( 'aura-connect-btn', $html, 'always reachable' );
+		$this->assertStringContainsString( 'Reconnect to Aura', $html );
+		$this->assertStringNotContainsString( 'Connect again to issue', $html, 'a delivered credential says nothing' );
+
+		// Revoked (what deactivation leaves): no record at all.
+		delete_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION );
+		$html = $this->renderConnect();
+		$this->assertStringContainsString( 'no credential for the builder tools', $html );
+		$this->assertStringContainsString( 'aura-connect-btn', $html );
+
+		// Minted but never handed over.
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'uuid' => 'u', 'undelivered' => true ), false );
+		$html = $this->renderConnect();
+		$this->assertStringContainsString( 'could not deliver the credential', $html );
+
+		// A site that cannot have one is healthy token-only, and is not nagged.
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'unavailable' => 'app_passwords_unavailable' ), false );
+		$html = $this->renderConnect();
+		$this->assertStringContainsString( 'cannot issue the Application Password', $html );
+		$this->assertStringNotContainsString( 'Connect again to issue', $html );
+		$this->assertStringContainsString( 'aura-connect-btn', $html );
+	}
+
+	public function test_a_token_only_connect_records_why_and_the_rotation_ignores_it(): void {
+		// Round-26: the reason is RECORDED, not merely reported, so the screen
+		// can tell "this site cannot have one" from "this one is missing".
+		$GLOBALS['_app_passwords_available'] = false;
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'app_passwords_unavailable', $data['app_password_unavailable'] );
+		$this->assertSame( array( 'unavailable' => 'app_passwords_unavailable' ), $this->record() );
+		// It names no password, so nothing revokes by it and nothing refuses a
+		// later mint because of it.
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password() );
+		$GLOBALS['_app_passwords_available'] = true;
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+	}
+
+	/** Render the connect section and return its HTML. */
+	private function renderConnect(): string {
+		ob_start();
+		$this->ml->render_connect_section();
+		return (string) ob_get_clean();
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */

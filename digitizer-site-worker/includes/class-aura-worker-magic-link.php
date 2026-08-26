@@ -36,52 +36,36 @@ class Aura_Worker_Magic_Link {
 		echo '<hr>';
 		echo '<h2>' . esc_html__( 'Aura Dashboard Connection', 'digitizer-site-worker' ) . '</h2>';
 
-		// The marker is a HINT; the record is the truth (round-22). A connect
-		// that minted a replacement clears the marker with one conditional
-		// statement, and that statement can fail — leaving the screen begging
-		// for a reconnect the site does not need. Failing the connect over it
-		// would be worse: the credential is already in the dashboard's hands,
-		// and a retry would rotate it away. So a marker standing beside a
-		// usable password record is stale, and is cleared on sight.
-		$installed = self::password_record();
-		$reconnect = ( '' !== (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) );
-		if ( $reconnect && null !== $installed && empty( $installed['undelivered'] ) ) {
-			delete_option( self::RECONNECT_NEEDED_OPTION );
-			$reconnect = false;
-		}
-		// A record for a password the dashboard never received asks for a
-		// reconnect on its own (round-24), marker or not: a FIRST connect that
-		// ends that way wrote the URL and token but delivered no credential,
-		// and deactivation — which is what sets the marker — never happened.
-		if ( null !== $installed && ! empty( $installed['undelivered'] ) ) {
-			$reconnect = true;
-		}
-		if ( $dashboard_url && $site_token ) {
-			echo '<p style="color:' . ( $reconnect ? '#b26a00' : '#2e7d32' ) . ';">';
-			echo '<span class="dashicons dashicons-' . ( $reconnect ? 'warning' : 'yes-alt' ) . '"></span> ';
+		// Rounds 19-26 each found another path that ends without a usable
+		// builder credential and each time the screen hid the way back. The
+		// paths are not the bug — hiding the button is. It is ALWAYS rendered
+		// now, so no failure anyone finds next can take the recovery control
+		// away, and the state above it is DERIVED from the one thing that
+		// answers the question — what credential the site actually holds —
+		// rather than from a marker some path forgot to set.
+		$state     = self::credential_state();
+		$connected = ( $dashboard_url && $site_token );
+		if ( $connected ) {
+			$healthy = ( 'delivered' === $state || 'unavailable' === $state );
+			echo '<p style="color:' . ( $healthy ? '#2e7d32' : '#b26a00' ) . ';">';
+			echo '<span class="dashicons dashicons-' . ( $healthy ? 'yes-alt' : 'warning' ) . '"></span> ';
 			echo esc_html__( 'Connected to Aura dashboard:', 'digitizer-site-worker' ) . ' ';
 			echo '<strong>' . esc_html( $dashboard_url ) . '</strong>';
 			echo '</p>';
-			if ( ! $reconnect ) {
-				return;
+			if ( 'unavailable' === $state ) {
+				echo '<p>' . esc_html__( 'This site cannot issue the Application Password the builder tools use, so the connection is token-only.', 'digitizer-site-worker' ) . '</p>';
+			} elseif ( 'undelivered' === $state ) {
+				echo '<p>' . esc_html__( 'The last connect could not deliver the credential the builder tools use. Connect again to issue a new one.', 'digitizer-site-worker' ) . '</p>';
+			} elseif ( 'none' === $state ) {
+				echo '<p>' . esc_html__( 'This connection has no credential for the builder tools — it was revoked, or never issued. Connect again to issue one.', 'digitizer-site-worker' ) . '</p>';
 			}
-			// Deactivating the plugin revoked the Application Password the
-			// builder tools authenticate with (round-19). The token binding
-			// above still works, so this is not a disconnection — but the
-			// credential is gone and only a fresh connect can mint another, so
-			// say so and leave the button below reachable.
-			echo '<p>' . esc_html(
-				( null !== $installed && ! empty( $installed['undelivered'] ) )
-					? __( 'The last connect could not deliver the credential the builder tools use. Connect again to issue a new one.', 'digitizer-site-worker' )
-					: __( 'The credential the builder tools use was revoked when this plugin was deactivated. Connect again to issue a new one.', 'digitizer-site-worker' )
-			) . '</p>';
 		}
 
 		$nonce = wp_create_nonce( 'aura_magic_link' );
 		?>
 		<p><?php esc_html_e( 'Connect this site to your Aura dashboard with one click.', 'digitizer-site-worker' ); ?></p>
 		<button type="button" id="aura-connect-btn" class="button button-primary">
-			<?php esc_html_e( 'Connect to Aura', 'digitizer-site-worker' ); ?>
+			<?php echo esc_html( $connected ? __( 'Reconnect to Aura', 'digitizer-site-worker' ) : __( 'Connect to Aura', 'digitizer-site-worker' ) ); ?>
 		</button>
 		<span id="aura-connect-status" style="margin-left:10px;"></span>
 		<script>
@@ -533,16 +517,22 @@ class Aura_Worker_Magic_Link {
 		delete_transient( 'aura_magic_' . $magic_id );
 		if ( is_wp_error( $minted ) ) {
 			$body['app_password_unavailable'] = $minted->get_error_code();
+			// Recorded, not merely reported (round-26): a site that CANNOT issue
+			// an Application Password is healthy token-only, and the settings
+			// screen must say so rather than ask forever for a credential this
+			// site will never have. Written under the claim like every other
+			// install write; the rotation ignores it (password_record() answers
+			// null for it), so nothing is ever revoked by it.
+			Aura_Worker_Rules::write_option_if_claimed(
+				self::APP_PASSWORD_RECORD_OPTION,
+				array( 'unavailable' => $minted->get_error_code() ),
+				$site_claim_key,
+				$site_fence,
+				'no'
+			);
 		} else {
 			// The uuid is the site's own bookkeeping — never part of the response.
 			$body['app_password'] = array( 'user_login' => $minted['user_login'], 'password' => $minted['password'] );
-			// Only a connect that actually issued a credential clears the
-			// "reconnect to restore the builder credential" marker (round-21).
-			// A token-only completion leaves the site exactly as the marker
-			// describes it, and clearing it there would hide the one local
-			// control that can still fix it. Under the claim, like every other
-			// install write.
-			Aura_Worker_Rules::delete_option_if_claimed( self::RECONNECT_NEEDED_OPTION, $site_claim_key, $site_fence );
 		}
 		// Released only NOW (round-3): the site-wide claim exists to make token
 		// and password one handler's; released before the mint, a paused
@@ -611,14 +601,6 @@ class Aura_Worker_Magic_Link {
 	 */
 	const APP_PASSWORD_RECORD_OPTION = 'aura_worker_app_password';
 
-	/**
-	 * Set when deactivation revoked the Application Password (round-19). The
-	 * site token binding survives deactivation — Aura still reaches the site
-	 * with it — but the credential the builder tools authenticate with does
-	 * not, and the settings screen would otherwise report an intact connection
-	 * and offer no way to restore it. Cleared by the next successful connect.
-	 */
-	const RECONNECT_NEEDED_OPTION = 'aura_worker_reconnect_needed';
 
 	/**
 	 * Mint the dashboard's Application Password for a user, rotating any
@@ -769,29 +751,6 @@ class Aura_Worker_Magic_Link {
 	}
 
 	/**
-	 * Record that the Application Password was revoked and a fresh connect is
-	 * needed to issue another — and VERIFY the record landed (round-21).
-	 *
-	 * The marker is the only thing that tells the settings screen to explain
-	 * itself and to keep the Connect button reachable; the password record it
-	 * replaces has already been deleted by then. A write refused by a filter or
-	 * a transient database error would leave the screen reporting a healthy
-	 * connection over a credential that is gone, with no local way back. So
-	 * when the marker will not persist, the dashboard URL goes instead: the
-	 * screen then shows the site as unconnected — understating a token binding
-	 * that still works, but never hiding the way back.
-	 *
-	 * Called from the plugin's activation and deactivation hooks only.
-	 */
-	public static function flag_reconnect_needed() {
-		update_option( self::RECONNECT_NEEDED_OPTION, 1, false );
-		wp_cache_delete( self::RECONNECT_NEEDED_OPTION, 'options' );
-		if ( '' === (string) get_option( self::RECONNECT_NEEDED_OPTION, '' ) ) {
-			delete_option( 'aura_worker_dashboard_url' );
-		}
-	}
-
-	/**
 	 * Delete the site-wide connect claim — the operator's explicit release
 	 * (round-7, owner decision). The claim has no timed takeover, so a handler
 	 * killed mid-connect leaves one that refuses every later connect and no
@@ -847,7 +806,34 @@ class Aura_Worker_Magic_Link {
 		if ( null === $stored || false === $stored || '' === $stored ) {
 			return false; // nothing recorded
 		}
+		if ( is_array( $stored ) && ! empty( $stored['unavailable'] ) ) {
+			return false; // a token-only site, not an orphan
+		}
 		return null === self::password_record();
+	}
+
+	/**
+	 * What credential the site holds for the dashboard's builder tools — the
+	 * one question the settings screen has to answer, read from the one option
+	 * that records it (round-26).
+	 *
+	 * 'delivered'   a password exists and the connect that minted it returned it
+	 * 'undelivered' a password exists but no connect ever handed it over
+	 * 'unavailable' this site cannot issue one; the connection is token-only
+	 * 'none'        nothing recorded — revoked, or never issued
+	 *
+	 * @return string
+	 */
+	private static function credential_state(): string {
+		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		if ( is_array( $rec ) && ! empty( $rec['unavailable'] ) ) {
+			return 'unavailable';
+		}
+		$usable = self::password_record();
+		if ( null === $usable ) {
+			return 'none';
+		}
+		return empty( $usable['undelivered'] ) ? 'delivered' : 'undelivered';
 	}
 
 	/**
@@ -860,6 +846,9 @@ class Aura_Worker_Magic_Link {
 		$rec     = $rec_raw;
 		if ( ! is_array( $rec ) ) {
 			return null;
+		}
+		if ( ! empty( $rec['unavailable'] ) ) {
+			return null; // a statement about the SITE, not a password to revoke
 		}
 		$user_id = (int) ( $rec['user_id'] ?? 0 );
 		$uuid    = (string) ( $rec['uuid'] ?? '' );
@@ -967,6 +956,11 @@ class Aura_Worker_Magic_Link {
 		$record = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
 		if ( null === $record || false === $record || '' === $record ) {
 			return true; // nothing recorded — first mint, or already cleared
+		}
+		if ( is_array( $record ) && ! empty( $record['unavailable'] ) ) {
+			// A statement that this site cannot have one. Nothing to revoke, and
+			// the next connect overwrites it.
+			return true;
 		}
 		$rec = self::password_record();
 		if ( null === $rec ) {

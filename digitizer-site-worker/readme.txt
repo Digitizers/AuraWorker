@@ -271,8 +271,9 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   reactivating finishes the job (activation retries a revocation deactivation
   could not land), as does uninstalling. The site token binding survives
   deactivation, so the settings screen keeps showing the dashboard it is
-  connected to — with a note that the builder credential was revoked, and the
-  Connect button reachable again to issue a new one.
+  connected to. The Connect button is always reachable there, and the line above
+  it says what the site actually holds: a working credential, one that was never
+  delivered, none at all, or a site that cannot issue one (token-only).
 
 = 2.10.3 =
 * Fix (security): **"Regenerate Token" revealed a new site token without ever

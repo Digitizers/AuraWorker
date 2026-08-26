@@ -167,7 +167,9 @@ disappears mid-request costs that request its connect rather than letting it ove
 the install that replaced it. A claim left behind by a killed request is released by deactivating and
 reactivating the plugin — which also revokes the Application Password, since
 unregistering the routes would otherwise leave an administrator credential that
-WordPress core and other REST/MCP plugins still accept.
+WordPress core and other REST/MCP plugins still accept. The settings screen's
+Connect button is always reachable, and the line above it is derived from the
+credential the site actually holds, so no failure path can hide the way back.
 
 ### 2.10.3
 

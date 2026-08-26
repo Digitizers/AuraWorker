@@ -63,16 +63,9 @@ function aura_worker_activate() {
 	// leave an administrator credential valid indefinitely — the documentation
 	// promises reactivation as the cure, so it has to be one. A site that was
 	// never deactivated by this hook has nothing recorded and this is a no-op.
-	$aura_deferred_password = ( null !== get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null ) );
 	if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: an Aura Application Password left over from a failed deactivation could not be revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-	} elseif ( $aura_deferred_password ) {
-		// A revocation deferred from deactivation lands HERE, so the flag
-		// deactivation could not set belongs here too (round-20) — without it
-		// the settings screen reports an intact connection over a credential
-		// this call has just revoked.
-		Aura_Worker_Magic_Link::flag_reconnect_needed();
 	}
 	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
 
@@ -109,17 +102,9 @@ function aura_worker_deactivate() {
 	//    because every write the claim protects re-checks that it still holds
 	//    the claim (Aura_Worker_Magic_Link::holds_site_claim()), so a request
 	//    that resumes after the release writes nothing.
-	$aura_had_password = ( null !== get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null ) );
 	if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: the Aura Application Password could not be revoked while deactivating; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-	} elseif ( $aura_had_password ) {
-		// The token binding survives deactivation, so the settings screen would
-		// go on reporting an intact connection while the credential the builder
-		// tools authenticate with is gone, with no way to restore it from here
-		// (round-19). Flag it; the next successful connect clears the flag as
-		// it mints the replacement.
-		Aura_Worker_Magic_Link::flag_reconnect_needed();
 	}
 	Aura_Worker_Magic_Link::forget_site_claim();
 }
