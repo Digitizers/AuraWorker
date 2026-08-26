@@ -205,13 +205,16 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( 7, $this->recordOwner(), 'the owner is still known' );
 	}
 
-	public function test_an_owner_record_that_did_not_persist_revokes_the_new_password_and_returns_none(): void {
+	public function test_a_store_that_will_not_record_the_intent_creates_no_password_at_all(): void {
+		// Round-29: the intent is written and verified BEFORE the password
+		// exists, so an options table that refuses writes can no longer produce
+		// a credential nothing records — it produces no credential.
 		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
-		$data = $this->ml->handle_connect( $this->request() )->get_data();
-		$this->assertTrue( $data['success'] );
-		$this->assertSame( 'app_password_owner_unrecorded', $data['app_password_unavailable'] );
-		$this->assertArrayNotHasKey( 'app_password', $data );
-		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password just created is revoked again' );
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_mint_failed', $res->get_data()['code'] );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'nothing was created' );
+		$this->assertNotEmpty( get_transient( 'aura_magic_' . $this->magic_id ), 'retryable' );
 	}
 
 	public function test_an_unverified_caller_never_contends_for_the_site_claim(): void {
@@ -270,54 +273,6 @@ final class ConnectAppPasswordTest extends TestCase {
 			strpos( $src, 'delete_application_password' ),
 			'revoke first, then forget'
 		);
-	}
-
-	public function test_a_fresh_password_that_can_be_neither_recorded_nor_revoked_is_terminal_not_retryable(): void {
-		// Round-7 P1: with option writes AND the delete failing, the cleanup of
-		// the untracked password does not land. Reporting a token-only success
-		// there would leave a live administrator credential on the site with
-		// nothing recording it.
-		// Round-11 P1: and it must not be RETRIED either — the next attempt
-		// would find nothing recorded, mint again, and every retry would add
-		// another live untracked administrator credential. The magic link is
-		// consumed to stop that.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
-		$GLOBALS['_app_passwords_delete_fail'] = true;
-		$res  = $this->ml->handle_connect( $this->request() );
-		$data = $res->get_data();
-		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_orphan_untracked', $data['code'] );
-		$this->assertArrayNotHasKey( 'success', $data );
-		$this->assertFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'the magic link is consumed: no second mint beside the orphan' );
-		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ), 'the claim is released' );
-		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password really is still live' );
-
-		// A retry of the same link mints nothing at all — it is refused at the
-		// consumed transient, before any credential work.
-		$res = $this->ml->handle_connect( $this->request() );
-		$this->assertSame( 400, $res->get_status() );
-		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'still exactly one orphan' );
-	}
-
-	public function test_a_password_that_could_not_be_revoked_has_its_tracking_recovered(): void {
-		// Same round-7 P1, with the option store refusing only the FIRST write:
-		// the orphan the cleanup could not delete is recorded after all, so the
-		// next connect's rotation can revoke it by uuid.
-		// One refusal is one whole persist: a statement that failed is not
-		// followed by the next.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 1;
-		$GLOBALS['_app_passwords_delete_fail'] = true;
-		$res = $this->ml->handle_connect( $this->request() );
-		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_orphaned', $res->get_data()['code'], 'tracked: the next attempt can revoke it, so this one is retryable' );
-		$live = WP_Application_Passwords::get_user_application_passwords( 7 );
-		$this->assertCount( 1, $live );
-		$this->assertSame( 7, (int) ( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION )['user_id'] ?? 0 ) );
-		$this->assertSame( $live[0]['uuid'], $this->recordUuid(), 'the orphan is tracked' );
-		// …and the rotation can now kill it once the store recovers.
-		$GLOBALS['_app_passwords_delete_fail'] = false;
-		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password() );
-		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
 	}
 
 	public function test_uninstall_keeps_the_tracking_options_when_the_revocation_does_not_land(): void {
@@ -575,11 +530,14 @@ final class ConnectAppPasswordTest extends TestCase {
 	}
 
 	public function test_a_record_does_not_outlive_the_password_it_named(): void {
-		// Round-14: with only the UUID write refused, the cleanup deletes the
-		// password successfully — so the owner option left behind names nothing.
-		// It would refuse every later magic link and make deactivation report a
-		// revocation failure, for a credential that no longer exists.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+		// Round-14: when the final record will not persist but the cleanup DOES
+		// delete the password, nothing about it may survive — a leftover record
+		// would refuse every later magic link and make deactivation report a
+		// revocation failure, for a credential that no longer exists. (The
+		// intent still gets through: round-29 writes it before creating.)
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = static function ( $raw ) {
+			return false === strpos( (string) $raw, 'minting' );
+		};
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertTrue( $data['success'] );
 		$this->assertSame( 'app_password_owner_unrecorded', $data['app_password_unavailable'] );
@@ -588,7 +546,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password(), 'nothing is recorded, so nothing is owed' );
 
 		// The next connect is not refused.
-		unset( $GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] );
+		$GLOBALS['_sa_option_write_fail'] = array();
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
@@ -830,6 +788,42 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'switch_to_blog( (int) $aura_blog_id );', $uninstall );
 		$this->assertStringContainsString( 'restore_current_blog();', $uninstall );
 		$this->assertStringContainsString( 'is_multisite()', $uninstall );
+	}
+
+	public function test_a_password_recorded_only_as_an_intent_is_adopted_by_the_next_attempt(): void {
+		// Round-29: the intent lands, the password is created, and the final
+		// record does not persist. The credential is live and described only as
+		// "a mint was under way for user 7" — which is enough: the next attempt
+		// adopts whatever that mint created and revokes it.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = static function ( $raw ) {
+			return false === strpos( (string) $raw, 'minting' ); // only the intent gets through
+		};
+		$GLOBALS['_app_passwords_delete_fail'] = true; // …and the cleanup cannot undo it
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the orphan is live' );
+		$rec = $this->record();
+		$this->assertSame( 7, (int) $rec['user_id'] );
+		$this->assertNotEmpty( $rec['minting'], 'described as a mint that was under way' );
+
+		// The next attempt, with the store healthy, adopts it and revokes it.
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the orphan died with the rotation' );
+		$this->assertSame( $this->recordUuid(), WP_Application_Passwords::get_user_application_passwords( 7 )[0]['uuid'] );
+	}
+
+	public function test_a_credential_wordpress_no_longer_accepts_is_not_healthy(): void {
+		// Round-29: Application Passwords can be switched off for a user after
+		// the fact — a security plugin's filter, HTTPS lost — and the recorded
+		// UUID goes on existing while every Basic-auth call fails.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertStringNotContainsString( 'cannot issue the Application Password', $this->renderConnect() );
+		$GLOBALS['_app_passwords_available'] = false;
+		$this->assertStringContainsString( 'cannot issue the Application Password', $this->renderConnect() );
 	}
 
 	/** Render the connect section and return its HTML. */

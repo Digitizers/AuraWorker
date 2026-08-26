@@ -648,6 +648,17 @@ class Aura_Worker_Magic_Link {
 		if ( ! wp_is_application_passwords_available_for_user( $user ) ) {
 			return new WP_Error( 'app_passwords_unavailable', 'Application Passwords are unavailable for this user (HTTPS required, or disabled by a filter).' );
 		}
+		// A password that exists but is recorded nowhere cannot be found by
+		// anything afterwards (round-29). So the INTENT is written first, and
+		// verified: a request killed between the two statements below leaves a
+		// record naming the user and the moment, which reconcile_mint_intent()
+		// above turns back into a real record on the next attempt. An intent
+		// that will not persist means no password is created at all.
+		self::persist_mint_intent( $user_id, $fence );
+		$intent = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		if ( ! is_array( $intent ) || (int) ( $intent['user_id'] ?? 0 ) !== $user_id || empty( $intent['minting'] ) ) {
+			return new WP_Error( 'app_password_mint_failed', 'The site could not record that an Application Password was about to be created; none was.' );
+		}
 		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME ) );
 		if ( is_wp_error( $created ) ) {
 			// Core refusing to write the password — a failing user-meta write,
@@ -809,6 +820,9 @@ class Aura_Worker_Magic_Link {
 		if ( is_array( $stored ) && ! empty( $stored['unavailable'] ) ) {
 			return false; // a token-only site, not an orphan
 		}
+		if ( is_array( $stored ) && ! empty( $stored['minting'] ) && (int) ( $stored['user_id'] ?? 0 ) > 0 ) {
+			return false; // a mint intent — reconciled, not refused (round-29)
+		}
 		return null === self::password_record();
 	}
 
@@ -841,6 +855,14 @@ class Aura_Worker_Magic_Link {
 		if ( ! class_exists( 'WP_Application_Passwords' ) || self::managed_password_gone( $usable['user_id'], $usable['uuid'] ) ) {
 			return 'none';
 		}
+		// A password WordPress will no longer accept is not a working
+		// credential (round-29): Application Passwords can be switched off for
+		// a user after the fact — a security plugin's filter, HTTPS lost — and
+		// the recorded UUID goes on existing while every Basic-auth call fails.
+		$owner = function_exists( 'get_userdata' ) ? get_userdata( $usable['user_id'] ) : false;
+		if ( ! $owner || ! function_exists( 'wp_is_application_passwords_available_for_user' ) || ! wp_is_application_passwords_available_for_user( $owner ) ) {
+			return 'unavailable';
+		}
 		return empty( $usable['undelivered'] ) ? 'delivered' : 'undelivered';
 	}
 
@@ -868,6 +890,66 @@ class Aura_Worker_Magic_Link {
 			$rec['undelivered'] = true;
 		}
 		return $rec;
+	}
+
+	/**
+	 * Record that an Application Password is ABOUT to be created for a user.
+	 *
+	 * Written before create_new_application_password() and verified, so the
+	 * window in which a password can exist unrecorded is closed: a request
+	 * killed inside it leaves this intent behind, and the next attempt adopts
+	 * whatever it created (round-29).
+	 *
+	 * @param int    $user_id The admin the password is being minted for.
+	 * @param string $fence   The caller's site-claim fence, when it holds one.
+	 * @return int|false Rows written, as write_option_if_claimed() reports them.
+	 */
+	private static function persist_mint_intent( int $user_id, $fence = '' ) {
+		$record = array( 'user_id' => $user_id, 'minting' => time() );
+		if ( '' !== (string) $fence ) {
+			return Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
+		}
+		update_option( self::APP_PASSWORD_RECORD_OPTION, $record, false );
+		wp_cache_delete( self::APP_PASSWORD_RECORD_OPTION, 'options' );
+		return 1;
+	}
+
+	/**
+	 * Turn a mint intent left by an interrupted attempt back into a real
+	 * record — or clear it when nothing came of it (round-29).
+	 *
+	 * The evidence is narrow on purpose: a password of the intent's OWNER,
+	 * carrying the fixed Aura name, created no earlier than the intent itself.
+	 * Adopted rather than deleted — the ordinary rotation revokes it a moment
+	 * later, and adopting a password that turned out to be someone else's
+	 * (they would have had to create an identically named one for the same
+	 * user inside the same second) costs them a credential they can re-create,
+	 * where deleting by name outright was rejected in round 5 for good reason.
+	 *
+	 * @param string $fence The caller's site-claim fence, when it holds one.
+	 */
+	private static function reconcile_mint_intent( $fence = '' ) {
+		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		if ( ! is_array( $rec ) || empty( $rec['minting'] ) ) {
+			return;
+		}
+		$owner  = (int) ( $rec['user_id'] ?? 0 );
+		$since  = (int) $rec['minting'];
+		$found  = '';
+		if ( $owner > 0 && class_exists( 'WP_Application_Passwords' ) ) {
+			foreach ( WP_Application_Passwords::get_user_application_passwords( $owner ) as $item ) {
+				if ( self::APP_PASSWORD_NAME === (string) ( $item['name'] ?? '' ) && (int) ( $item['created'] ?? 0 ) >= $since && ! empty( $item['uuid'] ) ) {
+					$found = (string) $item['uuid'];
+					break;
+				}
+			}
+		}
+		if ( '' === $found ) {
+			self::forget_password_owner( $fence ); // nothing was created
+			return;
+		}
+		// It exists and nobody ever received it.
+		self::persist_password_owner( $owner, $found, $fence, true );
 	}
 
 	/**
@@ -969,6 +1051,7 @@ class Aura_Worker_Magic_Link {
 	 * @return bool True when nothing dangerous remains.
 	 */
 	public static function revoke_managed_password( $fence = '' ): bool {
+		self::reconcile_mint_intent( $fence );
 		$record = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
 		if ( null === $record || false === $record || '' === $record ) {
 			return true; // nothing recorded — first mint, or already cleared
