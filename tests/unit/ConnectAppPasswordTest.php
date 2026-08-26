@@ -884,6 +884,32 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_worker_app_password', false ) );
 	}
 
+	public function test_a_recovery_that_cannot_be_recorded_stops_the_next_mint(): void {
+		// Round-32: reconciliation can FIND the interrupted mint's password and
+		// still fail to record it. Ignored, the rotation would read the intent
+		// as naming no credential, let the retry overwrite it and mint another —
+		// leaving the first administrator credential live and untracked.
+		$created = WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'app_id' => 'the-intent' ) );
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'the-intent' ), false );
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = serialize( array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'the-intent' ) );
+		// Every write of the record is refused, so the adoption cannot land.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_revoke_failed', $res->get_data()['code'], 'retryable: the intent is still there to reconcile' );
+		$this->assertSame( array( $created[1]['uuid'] ), array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' ), 'no second credential was minted' );
+
+		// With the store healthy the retry adopts it, revokes it, and mints one.
+		$GLOBALS['_sa_option_write_fail'] = array();
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+		$live = array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' );
+		$this->assertNotContains( $created[1]['uuid'], $live );
+		$this->assertSame( array( $this->recordUuid() ), $live );
+	}
+
 	/** Render the connect section and return its HTML. */
 	private function renderConnect(): string {
 		ob_start();

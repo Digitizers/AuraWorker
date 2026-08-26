@@ -634,7 +634,8 @@ class Aura_Worker_Magic_Link {
 			// that restoration failed too, a live administrator credential is
 			// left with nothing naming it, and a retry would mint another
 			// beside it. No record ⇒ terminal, exactly as elsewhere.
-			if ( null === self::password_record() ) {
+			$anything = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+			if ( null === $anything || false === $anything || '' === $anything ) {
 				return new WP_Error( 'app_password_orphan_untracked', 'A previous Application Password could be neither revoked nor recorded; revoke it by hand in Users → Profile → Application Passwords.' );
 			}
 			return new WP_Error( 'app_password_revoke_failed', 'A previous Aura Application Password could not be revoked; no new one was minted.' );
@@ -931,11 +932,15 @@ class Aura_Worker_Magic_Link {
 	 * where deleting by name outright was rejected in round 5 for good reason.
 	 *
 	 * @param string $fence The caller's site-claim fence, when it holds one.
+	 * @return bool False when a credential was found but could not be recorded
+	 *              — the caller must not go on to mint another beside it
+	 *              (round-32). True when there is nothing to reconcile, or the
+	 *              recovery is durably recorded.
 	 */
 	private static function reconcile_mint_intent( $fence = '' ) {
 		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
 		if ( ! is_array( $rec ) || empty( $rec['minting'] ) ) {
-			return;
+			return true;
 		}
 		$owner  = (int) ( $rec['user_id'] ?? 0 );
 		$app_id = (string) ( $rec['app_id'] ?? '' );
@@ -955,8 +960,12 @@ class Aura_Worker_Magic_Link {
 			}
 		}
 		if ( '' !== $found ) {
-			self::persist_password_owner( $owner, $found, $fence, true ); // it exists and nobody received it
-			return;
+			// It exists and nobody received it. The adoption is VERIFIED: read
+			// back as the intent it still is, this would let the caller mint
+			// another beside a live administrator credential (round-32).
+			self::persist_password_owner( $owner, $found, $fence, true );
+			$stored = self::password_record();
+			return ( null !== $stored && $stored['uuid'] === $found && $stored['user_id'] === $owner );
 		}
 		// Nothing was created under this intent — and it is left exactly where
 		// it is (round-31). Any rule for retiring it rests on knowing that the
@@ -968,6 +977,7 @@ class Aura_Worker_Magic_Link {
 		// replaces it with its own. An intent that outlives its usefulness
 		// costs one option row; retiring one early costs a live administrator
 		// credential nothing can find.
+		return true;
 	}
 
 	/**
@@ -1069,7 +1079,9 @@ class Aura_Worker_Magic_Link {
 	 * @return bool True when nothing dangerous remains.
 	 */
 	public static function revoke_managed_password( $fence = '' ): bool {
-		self::reconcile_mint_intent( $fence );
+		if ( ! self::reconcile_mint_intent( $fence ) ) {
+			return false; // a credential was found and could not be recorded
+		}
 		$record = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
 		if ( null === $record || false === $record || '' === $record ) {
 			return true; // nothing recorded — first mint, or already cleared
