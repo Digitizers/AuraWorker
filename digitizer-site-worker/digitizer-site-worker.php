@@ -61,13 +61,10 @@ register_activation_hook( __FILE__, 'aura_worker_activate' );
 function aura_worker_activate_site() {
 	// Store activation timestamp.
 	update_option( 'aura_worker_activated', time() );
-	// The site is SEIZED, not merely unlocked (round-36) — the same fence
-	// deactivation takes, and for the same reason: a callback that claims the
-	// site between an eviction and the revocation below could mint and record a
-	// replacement, which the revocation would then strip of its record while
-	// revoking only the previous UUID. Belt and braces too: a claim that
-	// outlived a crash during deactivation would otherwise block every connect.
-	$aura_fence = Aura_Worker_Magic_Link::seize_site();
+	// Activation is the REPAIR path: it evicts whatever holds the site and takes
+	// it (round-36/38). A claim left by a crashed handler would otherwise block
+	// every future connect, and this is where an operator comes to fix that.
+	$aura_fence = Aura_Worker_Magic_Link::repair_site_claim();
 	// Deactivation revokes the Application Password Aura minted, and KEEPS its
 	// record whenever the revocation did not land. Reaching activation with that
 	// record still present therefore means exactly one thing: a revocation that

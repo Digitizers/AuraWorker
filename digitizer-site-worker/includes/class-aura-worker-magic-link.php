@@ -565,9 +565,17 @@ class Aura_Worker_Magic_Link {
 			// site will never have. Written under the claim like every other
 			// install write; the rotation ignores it (password_record() answers
 			// null for it), so nothing is ever revoked by it.
+			$pending = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+			$carried = array( 'unavailable' => $minted->get_error_code() );
+			if ( is_array( $pending ) && isset( $pending['intents'] ) && is_array( $pending['intents'] ) && array() !== $pending['intents'] ) {
+				// Another handler's pending mint travels with it (round-38):
+				// replacing the whole record would drop the app_id of a password
+				// that handler may still create.
+				$carried['intents'] = $pending['intents'];
+			}
 			Aura_Worker_Rules::write_option_if_claimed(
 				self::APP_PASSWORD_RECORD_OPTION,
-				array( 'unavailable' => $minted->get_error_code() ),
+				$carried,
 				$site_claim_key,
 				$site_fence,
 				'no'
@@ -790,22 +798,36 @@ class Aura_Worker_Magic_Link {
 	}
 
 	/**
-	 * Take the site EXCLUSIVELY for a lifecycle operation (round-34).
+	 * Take the site EXCLUSIVELY for a lifecycle operation (round-34), and only
+	 * if it is FREE (round-38).
 	 *
-	 * Deactivation must both evict a handler that may still resume AND hold the
-	 * site while it revokes: deleting the claim and leaving it open let a signed
-	 * callback in another already-loaded request claim the site immediately and
-	 * mint a replacement, which the revocation running beside it would then
-	 * strip of its record while revoking only the old UUID — the returned
-	 * administrator credential left live and untracked.
-	 *
-	 * Evict, then claim. A second eviction covers the callback that squeezed in
-	 * between; after that the caller proceeds without a fence rather than
-	 * looping, because a deactivation must not hang, and says so in the log.
+	 * Holding the site while revoking is what keeps a callback from minting a
+	 * replacement the revocation would then strip of its record. Taking it away
+	 * from a live handler is a different thing, and a harmful one: evicted
+	 * between its last ownership check and its response, that handler returns
+	 * the plaintext of a password this revocation deletes a moment later. So a
+	 * held site is simply left alone — the caller skips its revocation, and the
+	 * record survives for the next activation, connect or uninstall.
 	 *
 	 * @return string The caller's fence, or '' if the site could not be taken.
 	 */
 	public static function seize_site() {
+		return self::claim_magic_link( self::SITE_CLAIM );
+	}
+
+	/**
+	 * Take the site for the REPAIR path — evicting whatever holds it first.
+	 *
+	 * Activation is where an operator goes when a connect left the site locked,
+	 * so it is the one lifecycle hook that may evict. Deactivation must not
+	 * (round-38): evicting a live handler between its last ownership check and
+	 * its response has it return the plaintext of a password the revocation
+	 * that follows has already deleted, and the dashboard finishes onboarding
+	 * with a credential WordPress no longer has.
+	 *
+	 * @return string The caller's fence, or '' if the site could not be taken.
+	 */
+	public static function repair_site_claim() {
 		for ( $attempt = 0; $attempt < 2; $attempt++ ) {
 			self::forget_site_claim();
 			$fence = self::claim_magic_link( self::SITE_CLAIM );

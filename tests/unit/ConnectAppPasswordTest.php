@@ -255,7 +255,8 @@ final class ConnectAppPasswordTest extends TestCase {
 		// merely evicts, because an unfenced revocation is the race the fence
 		// exists to prevent.
 		$this->assertSame( 0, substr_count( $main, 'Aura_Worker_Magic_Link::forget_site_claim();' ) );
-		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::seize_site();' ) );
+		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::seize_site();' ), 'deactivation takes a free site' );
+		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::repair_site_claim();' ), 'activation repairs' );
 		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::release_site( $aura_fence );' ) );
 		$this->assertSame( 0, substr_count( file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker-api.php' ), 'forget_site_claim' ) );
 	}
@@ -297,7 +298,9 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( $uuid, $this->recordUuid(), 'the uuid is still recorded' );
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
 
-		// …and when the revocation DOES land, the tracking is forgotten.
+		// …and when the revocation DOES land, the tracking is forgotten. (The
+		// connect that created it left its own intent behind, which uninstall
+		// settles in the same pass.)
 		$GLOBALS['_app_passwords_delete_fail'] = false;
 		$this->run_uninstall();
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
@@ -397,7 +400,7 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertLessThan(
 			strpos( $deactivate, 'revoke_managed_password' ),
 			strpos( $deactivate, 'seize_site' ),
-			'seize the site before revoking'
+			'take the site before revoking'
 		);
 		$this->assertLessThan(
 			strpos( $deactivate, 'release_site' ),
@@ -932,15 +935,22 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertSame( array( $this->recordUuid() ), $live );
 	}
 
-	public function test_deactivation_seizes_the_site_so_nothing_mints_beside_its_revocation(): void {
-		// Round-34: evicting the stale handler without taking the site let a
-		// signed callback in another already-loaded request claim it at once and
-		// mint a replacement, which the revocation running beside it would then
-		// strip of its record while revoking only the old UUID.
+	public function test_deactivation_takes_a_free_site_and_leaves_a_held_one_alone(): void {
+		// Round-34: holding the site is what keeps a callback from minting a
+		// replacement the revocation would strip of its record.
+		// Round-38: but taking it AWAY from a live handler is harmful — evicted
+		// between its last ownership check and its response, that handler hands
+		// the dashboard the plaintext of a password revoked a moment later. A
+		// held site is left alone; only the repair path (activation) evicts.
 		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'someone-else|' . time();
 		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
-		$fence = Aura_Worker_Magic_Link::seize_site();
-		$this->assertNotSame( '', $fence, 'the site is taken, not merely unlocked' );
+		$this->assertSame( '', Aura_Worker_Magic_Link::seize_site(), 'a held site is not taken' );
+		$this->assertStringStartsWith( 'someone-else|', (string) sa_read_option_uncached( Aura_Worker_Magic_Link::SITE_CLAIM ) );
+
+		// The repair path DOES evict — that is where an operator goes when a
+		// crashed handler left the site locked.
+		$fence = Aura_Worker_Magic_Link::repair_site_claim();
+		$this->assertNotSame( '', $fence, 'the repair path takes it' );
 		$this->assertStringStartsWith( $fence . '|', (string) sa_read_option_uncached( Aura_Worker_Magic_Link::SITE_CLAIM ) );
 
 		// While it is held, a signed callback cannot install anything.
@@ -1065,6 +1075,41 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->run_uninstall();
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
 		$this->assertFalse( get_option( 'aura_worker_app_password', false ) );
+	}
+
+	public function test_uninstall_keeps_an_intent_whose_password_does_not_exist_yet(): void {
+		// Round-38: absence at scan time settles nothing. The connect that wrote
+		// the intent may be paused before creating its password, and an
+		// already-loaded request resumes perfectly well after the plugin is gone
+		// — at which point the app_id in this record is the only thing that
+		// could ever find the credential.
+		$rec = array( 'intents' => array( 'not-yet' => array( 'user_id' => 7, 'at' => time() ) ) );
+		update_option( 'aura_worker_app_password', $rec, false );
+		$this->run_uninstall();
+		$this->assertSame( $rec, get_option( 'aura_worker_app_password' ) );
+	}
+
+	public function test_a_token_only_completion_carries_pending_intents_forward(): void {
+		// Round-38: replacing the whole record with the token-only statement
+		// dropped another handler's app_id, and with it the only way to find the
+		// password that handler may still create.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'other|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		$persist = new ReflectionMethod( Aura_Worker_Magic_Link::class, 'persist_mint_intent' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$persist->setAccessible( true );
+		}
+		$persist->invoke( null, 9, 'someone-elses', 'other' );
+		delete_option( $claim );
+		unset( $GLOBALS['_rows'][ $claim ] );
+
+		$GLOBALS['_app_passwords_available'] = false; // this connect completes token-only
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'app_passwords_unavailable', $data['app_password_unavailable'] );
+		$rec = $this->record();
+		$this->assertSame( 'app_passwords_unavailable', $rec['unavailable'] );
+		$this->assertSame( array( 'someone-elses' ), array_keys( $rec['intents'] ), "the other handler's intent survives" );
 	}
 
 	/** Render the connect section and return its HTML. */
