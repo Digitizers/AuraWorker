@@ -12,10 +12,111 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 	exit;
 }
 
-// Remove plugin options.
-delete_option( 'aura_worker_activated' );
-delete_option( 'aura_worker_version' );
-delete_option( 'aura_worker_site_token' );
-delete_option( 'aura_worker_allowed_ips' );
-delete_option( 'aura_worker_allowed_domains' );
-delete_option( 'aura_worker_dashboard_url' );
+// A network-activated plugin's uninstall runs ONCE (round-28). Every subsite has
+// its own options table and therefore its own Application Password record, so
+// the cleanup below is run in each site's context — otherwise administrator
+// credentials survive on every site but one, with the plugin gone.
+$aura_uninstall_site = static function () {
+	// Revoke the Application Password Aura minted for the dashboard BEFORE the
+	// record that identifies it is deleted (2.11.0, round-6). It is an
+	// administrator-level credential: removing the plugin must not leave it
+	// authenticating to WordPress — or to any other REST/MCP plugin — with
+	// nothing left on the site that even records its existence. Deleted by the
+	// STORED UUID, never by name (the display name is user-chosen). The option
+	// name mirrors Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION; this file
+	// deliberately loads no plugin code.
+	$aura_pw_record  = get_option( 'aura_worker_app_password', null );
+	$aura_pw_owner   = is_array( $aura_pw_record ) ? (int) ( $aura_pw_record['user_id'] ?? 0 ) : 0;
+	$aura_pw_uuid    = is_array( $aura_pw_record ) ? (string) ( $aura_pw_record['uuid'] ?? '' ) : '';
+	$aura_pw_tracked = ( $aura_pw_owner > 0 && '' !== $aura_pw_uuid );
+	// PENDING MINTS (round-36): each entry of $record['intents'] is a connect
+	// that was interrupted between creating an Application Password and
+	// recording which one it is. The plugin's own reconciliation settles those
+	// by app_id — and after this file runs there is no plugin left to do it, so
+	// uninstall settles them here, or the credentials outlive everything that
+	// could find them. Mirrors Aura_Worker_Magic_Link::reconcile_mint_intent().
+	$aura_pw_intents       = ( is_array( $aura_pw_record ) && isset( $aura_pw_record['intents'] ) && is_array( $aura_pw_record['intents'] ) ) ? $aura_pw_record['intents'] : array();
+	$aura_intents_all_gone = true;
+	foreach ( $aura_pw_intents as $aura_intent_app_id => $aura_intent ) {
+		$aura_intent_owner = (int) ( $aura_intent['user_id'] ?? 0 );
+		if ( $aura_intent_owner <= 0 || '' === (string) $aura_intent_app_id || ! class_exists( 'WP_Application_Passwords' ) ) {
+			$aura_intents_all_gone = false; // nothing here can settle it
+			continue;
+		}
+		$aura_intent_uuid = '';
+		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_intent_owner ) as $aura_pw_item ) {
+			if ( '' !== (string) ( $aura_pw_item['app_id'] ?? '' ) && (string) $aura_intent_app_id === (string) $aura_pw_item['app_id'] && ! empty( $aura_pw_item['uuid'] ) ) {
+				$aura_intent_uuid = (string) $aura_pw_item['uuid'];
+				break;
+			}
+		}
+		if ( '' === $aura_intent_uuid ) {
+			// Nothing was created under this intent YET. Absence at scan time
+			// settles nothing (round-38): its connect may be paused between
+			// recording the intent and creating the password, and a request
+			// already loaded resumes perfectly well after the plugin is gone.
+			// The record is kept — one option row against a credential nothing
+			// could ever find.
+			$aura_intents_all_gone = false;
+			continue;
+		}
+		WP_Application_Passwords::delete_application_password( $aura_intent_owner, $aura_intent_uuid );
+		// PROVEN by the owner's list, exactly as the credential's own revocation
+		// is (round-37): delete_application_password() answers false for a
+		// failed user-meta write too, and an intent discarded over an unproven
+		// delete takes with it the only app_id that identifies a live
+		// administrator credential.
+		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_intent_owner ) as $aura_pw_item ) {
+			if ( $aura_intent_uuid === (string) ( $aura_pw_item['uuid'] ?? '' ) ) {
+				$aura_intents_all_gone = false;
+				break;
+			}
+		}
+	}
+
+	// A record that holds only pending intents describes no credential the
+	// uninstall could not reach, so nothing is kept for it either.
+	$aura_pw_intent_only = ( ! $aura_pw_tracked && array() !== $aura_pw_intents && $aura_intents_all_gone );
+	$aura_pw_present     = ( null !== $aura_pw_record && false !== $aura_pw_record && '' !== $aura_pw_record );
+	$aura_pw_gone        = ( ! $aura_pw_present || $aura_pw_intent_only );
+	if ( $aura_pw_tracked && class_exists( 'WP_Application_Passwords' ) ) {
+		WP_Application_Passwords::delete_application_password( $aura_pw_owner, $aura_pw_uuid );
+		// The revocation is PROVEN by the owner's list, not by the delete's return
+		// value (round-7): it answers false for a failed user-meta write too. The
+		// record is the only trace of which credential this is, so it is discarded
+		// ONLY once the credential is really gone — otherwise a live administrator
+		// password would survive the uninstall with its owner and UUID
+		// irrecoverably forgotten. Left in place, a reinstall can finish the job.
+		// …and only together with every pending mint: the record carries both,
+		// so it goes only when nothing it describes is left.
+		$aura_pw_gone = $aura_intents_all_gone;
+		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_pw_owner ) as $aura_pw_item ) {
+			if ( isset( $aura_pw_item['uuid'] ) && $aura_pw_uuid === (string) $aura_pw_item['uuid'] ) {
+				$aura_pw_gone = false;
+				break;
+			}
+		}
+	}
+	if ( $aura_pw_gone ) {
+		delete_option( 'aura_worker_app_password' );
+	}
+	
+	// Remove plugin options.
+	delete_option( 'aura_worker_activated' );
+	delete_option( 'aura_worker_version' );
+	delete_option( 'aura_worker_site_token' );
+	delete_option( 'aura_worker_allowed_ips' );
+	delete_option( 'aura_worker_allowed_domains' );
+	delete_option( 'aura_worker_dashboard_url' );
+	delete_option( 'aura_worker_connect_lock' ); // the site-wide connect claim (mirrors Aura_Worker_Magic_Link::SITE_CLAIM)
+};
+
+if ( is_multisite() && function_exists( 'get_sites' ) && function_exists( 'switch_to_blog' ) ) {
+	foreach ( get_sites( array( 'fields' => 'ids', 'number' => 0 ) ) as $aura_blog_id ) {
+		switch_to_blog( (int) $aura_blog_id );
+		$aura_uninstall_site();
+		restore_current_blog();
+	}
+} else {
+	$aura_uninstall_site();
+}

@@ -108,6 +108,19 @@ class Aura_Worker {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'digitizer-site-worker' ) ), 403 );
 		}
 
+		// Serialised against a connect callback (round-7): this rotation and a
+		// connect write the same binding — the token, the dashboard URL and the
+		// Application Password minted beside them — and a rotation landing
+		// between a callback's revocation and its mint would revoke nothing and
+		// still report the site disconnected, leaving the callback's fresh
+		// administrator credential live behind a UI that says otherwise. Taken
+		// BEFORE the token swap, so a refused claim costs nothing; released on
+		// every exit below.
+		$site_fence = Aura_Worker_Magic_Link::claim_site();
+		if ( '' === $site_fence ) {
+			wp_send_json_error( array( 'message' => __( 'A connection to Aura is being installed right now, so the token was not changed. Try again in a moment.', 'digitizer-site-worker' ) ), 409 );
+		}
+
 		$previous = $this->stored_token();
 		$raw      = wp_generate_password( 48, false );
 		$hashed   = Aura_Worker_Security::hash_token( $raw );
@@ -124,6 +137,7 @@ class Aura_Worker {
 		// Raw SQL also puts the write out of reach of any option filter, which is
 		// the failure this whole change exists to remove (#67).
 		if ( ! $this->swap_token( $previous, $hashed ) ) {
+			Aura_Worker_Magic_Link::release_site( $site_fence );
 			$current = $this->stored_token();
 			$message = hash_equals( $previous, $current )
 				? __( 'The new site token could not be saved, so the current token is unchanged. Check the database for write errors and try again.', 'digitizer-site-worker' )
@@ -139,9 +153,47 @@ class Aura_Worker {
 		// transient database error, a stale autoloaded copy — and failing here
 		// would revoke the previous token while revealing no replacement, which
 		// is worse than the defect this rotation exists to fix.
-		update_option( 'aura_worker_connect_user_id', get_current_user_id() );
-		delete_option( 'aura_worker_dashboard_url' );
+		// The cleanup that follows is this rotation's half of the same install
+		// the connect callback writes, so it is issued under the same claim and
+		// with the same conditional statements (round-11). A rotation paused
+		// here while an operator released its claim would otherwise delete the
+		// dashboard URL of the connect that replaced it and revoke that
+		// connect's Application Password.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', get_current_user_id(), $claim, $site_fence );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_dashboard_url', $claim, $site_fence );
+		// The dashboard's binding is what this rotation invalidates, and the
+		// Application Password minted beside the old token is part of it
+		// (2.11.0, round-6): left alone it would keep authenticating to
+		// WordPress — and to every other REST/MCP plugin — while the UI says
+		// the site is disconnected. Best-effort: a failure here must not cost
+		// the operator the new token this response is about to reveal, so it
+		// is logged, not fatal.
+		// The revocation is handed this request's fence, and takes the record it
+		// revokes by in one conditional statement before touching the password
+		// (round-17). Asking "do I still hold the claim?" and then revoking
+		// were two steps: a rotation paused between them would revoke the
+		// Application Password of the connect that replaced it — a credential
+		// that connect had already returned to the dashboard. Having lost the
+		// claim, this call now removes nothing and reports nothing owed.
+		if ( ! Aura_Worker_Magic_Link::revoke_managed_password( $site_fence ) ) {
+			// translators: internal log line, not shown to the user.
+			error_log( 'SiteAgent: the Aura Application Password could not be revoked while regenerating the site token; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		}
+		// The reveal is withheld ONLY on proof that this token is no longer the
+		// site's (round-40). #67's rule stands — a read that fails must never
+		// cost the operator a token that was stored, because that revokes the
+		// old one while showing no replacement — so a read error reveals as
+		// before. But a read that SUCCEEDS and disagrees is not ambiguous: a
+		// connect replaced the token while this request was paused, and handing
+		// over the old raw value gives the operator something the site rejects.
+		$current = Aura_Worker_Rules::read_option_uncached( 'aura_worker_site_token' );
+		if ( ! is_wp_error( $current ) && is_string( $current ) && ! hash_equals( $hashed, $current ) ) {
+			Aura_Worker_Magic_Link::release_site( $site_fence );
+			wp_send_json_error( array( 'message' => __( 'Another site token was stored while this request ran, so this one changed nothing. That token is now the current one — regenerate again if you still want a new one.', 'digitizer-site-worker' ) ), 500 );
+		}
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
+		Aura_Worker_Magic_Link::release_site( $site_fence );
 
 		wp_send_json_success( array( 'token' => $raw ) );
 	}

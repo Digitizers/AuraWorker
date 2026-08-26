@@ -369,6 +369,57 @@ if ( ! function_exists( 'get_option' ) ) {
 	}
 }
 
+/**
+ * Does the claim row named $claim exist with a value matching the LIKE pattern
+ * the caller built from its fence? Mirrors MySQL's LIKE for the one shape the
+ * plugin issues: an esc_like()'d prefix followed by '%'.
+ */
+function sa_claim_like_matches( string $claim, string $like ): bool {
+	$held = sa_read_option_uncached( $claim );
+	if ( ! is_string( $held ) ) {
+		return false;
+	}
+	$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), rtrim( $like, '%' ) );
+	return 0 === strpos( $held, $prefix );
+}
+
+// --- Admin-screen escaping/nonce stubs (render_connect_section) -------------
+if ( ! function_exists( 'esc_html' ) ) {
+	function esc_html( $text ): string {
+		return htmlspecialchars( (string) $text, ENT_QUOTES );
+	}
+}
+if ( ! function_exists( 'esc_html_e' ) ) {
+	function esc_html_e( string $text, string $domain = '' ): void {
+		echo esc_html( $text );
+	}
+}
+if ( ! function_exists( 'esc_url' ) ) {
+	function esc_url( $url ): string {
+		return (string) $url;
+	}
+}
+if ( ! function_exists( 'esc_attr' ) ) {
+	function esc_attr( $text ): string {
+		return htmlspecialchars( (string) $text, ENT_QUOTES );
+	}
+}
+if ( ! function_exists( 'wp_generate_uuid4' ) ) {
+	function wp_generate_uuid4(): string {
+		return sprintf( '%08x-%04x-4%03x-%04x-%012x', random_int( 0, 0xffffffff ), random_int( 0, 0xffff ), random_int( 0, 0x0fff ), random_int( 0, 0x3fff ) | 0x8000, random_int( 0, 0xffffffffffff ) );
+	}
+}
+if ( ! function_exists( 'admin_url' ) ) {
+	function admin_url( string $path = '' ): string {
+		return 'https://example.test/wp-admin/' . ltrim( $path, '/' );
+	}
+}
+if ( ! function_exists( 'wp_create_nonce' ) ) {
+	function wp_create_nonce( $action = -1 ): string {
+		return 'nonce-' . md5( (string) $action );
+	}
+}
+
 if ( ! function_exists( 'update_option' ) ) {
 	function update_option( string $option, $value, $autoload = null ): bool {
 		// The database refusing (or a filter short-circuiting) a write:
@@ -376,6 +427,12 @@ if ( ! function_exists( 'update_option' ) ) {
 		// prove a value landed cannot use the return value alone — it reads
 		// the row back.
 		if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $option ] ) ) {
+			// `true` fails every write; a positive INT fails that many writes
+			// and then lets the option through — a transient database refusal,
+			// which is what a recovery path is for.
+			if ( is_int( $GLOBALS['_sa_option_write_fail'][ $option ] ) ) {
+				--$GLOBALS['_sa_option_write_fail'][ $option ];
+			}
 			return false;
 		}
 		// Core sanitises before storing: update_option() calls sanitize_option(),
@@ -624,6 +681,57 @@ if ( ! function_exists( 'user_can' ) ) {
 	function user_can( $user, string $cap, ...$args ): bool {
 		// Administrators in $GLOBALS['_admins'] hold every capability.
 		return in_array( (int) $user, array_map( 'intval', $GLOBALS['_admins'] ), true );
+	}
+}
+
+// --- Application Passwords (2.11.0: the /connect callback mints one) --------
+// $GLOBALS['_app_passwords'][user_id] = list of items { uuid, name, created };
+// $GLOBALS['_app_passwords_available'] gates wp_is_application_passwords_available_for_user().
+$GLOBALS['_app_passwords']           = array();
+$GLOBALS['_app_passwords_available'] = true;
+$GLOBALS['_app_passwords_delete_fail'] = false;
+if ( ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
+	function wp_is_application_passwords_available_for_user( $user ): bool {
+		return (bool) $GLOBALS['_app_passwords_available'];
+	}
+}
+if ( ! function_exists( 'get_userdata' ) ) {
+	function get_userdata( int $user_id ) {
+		if ( $user_id <= 0 ) {
+			return false;
+		}
+		return (object) array( 'ID' => $user_id, 'user_login' => 'user' . $user_id );
+	}
+}
+if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+	class WP_Application_Passwords {
+		public static function create_new_application_password( int $user_id, array $args = array() ) {
+			if ( ! empty( $GLOBALS['_sa_app_password_create_fails'] ) ) {
+				// Core's own failure mode: the user-meta write did not land.
+				return new WP_Error( 'db_error', 'Could not save application password.' );
+			}
+			// Witness for the connect tests: was the site-wide claim still held at mint time?
+			$GLOBALS['_sa_site_claim_during_mint'] = get_option( 'aura_worker_connect_lock', false );
+			// A test can model losing the site to another install while this
+			// mint runs (round-8): the claim vanishes mid-handler.
+			if ( ! empty( $GLOBALS['_sa_steal_site_claim_during_mint'] ) ) {
+				unset( $GLOBALS['_options']['aura_worker_connect_lock'], $GLOBALS['_rows']['aura_worker_connect_lock'] );
+			}
+			$item = array( 'uuid' => 'uuid-' . bin2hex( random_bytes( 4 ) ), 'app_id' => (string) ( $args['app_id'] ?? '' ), 'name' => (string) ( $args['name'] ?? '' ), 'created' => time() );
+			$GLOBALS['_app_passwords'][ $user_id ][] = $item;
+			return array( 'pw-' . bin2hex( random_bytes( 8 ) ), $item );
+		}
+		public static function get_user_application_passwords( int $user_id ): array {
+			return $GLOBALS['_app_passwords'][ $user_id ] ?? array();
+		}
+		public static function delete_application_password( int $user_id, string $uuid ) {
+			if ( ! empty( $GLOBALS['_app_passwords_delete_fail'] ) ) {
+				return new WP_Error( 'db_update_error', 'user meta write failed' );
+			}
+			$before = count( $GLOBALS['_app_passwords'][ $user_id ] ?? array() );
+			$GLOBALS['_app_passwords'][ $user_id ] = array_values( array_filter( $GLOBALS['_app_passwords'][ $user_id ] ?? array(), static fn( $i ) => $i['uuid'] !== $uuid ) );
+			return count( $GLOBALS['_app_passwords'][ $user_id ] ) < $before ? true : new WP_Error( 'application_password_not_found', 'not found' );
+		}
 	}
 }
 
@@ -1209,6 +1317,77 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
+			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
+				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {
+					// The statement itself failing — NOT "no row matched".
+					// Kept apart from _sa_option_write_fail so a test can refuse
+					// the write while letting the delete land, and vice versa.
+					$this->last_error = 'delete failed';
+					return false;
+				}
+				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ] );
+				$GLOBALS['_option_writes'][] = array( 'delete', $name );
+				return 1;
+			}
+			// The site token written CONDITIONALLY on the site claim (2.11.0,
+			// round-9): one UPDATE joined to the claim row, and its INSERT
+			// counterpart for a site whose token row does not exist yet. A
+			// caller that no longer owns the claim matches no row.
+			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
+				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					// `true` fails every write; a positive INT fails that many
+					// and then lets it through, as update_option() does; a
+					// CALLABLE decides per value, which is how a test refuses
+					// one write of a sequence and allows another.
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( $value ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						return false; // the database refusing the statement outright
+					}
+				}
+				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM \S+ c WHERE c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' AND NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
+				list( , $name, $value, , $claim, $like ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					// `true` fails every write; a positive INT fails that many
+					// and then lets it through, as update_option() does; a
+					// CALLABLE decides per value, which is how a test refuses
+					// one write of a sequence and allows another.
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( $value ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						return false; // the database refusing the statement outright
+					}
+				}
+				if ( ! sa_claim_like_matches( $claim, $like ) || null !== sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
+
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
 				if ( true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
@@ -1268,6 +1447,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				$GLOBALS['_rows'][ $name ]    = $new;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				// The mirror of sa_before_swap(): a second request landing right
+				// AFTER this caller's write, which is the window a confirming
+				// read is about.
+				if ( isset( $GLOBALS['_sa_after_swap'] ) && is_callable( $GLOBALS['_sa_after_swap'] ) ) {
+					$after                    = $GLOBALS['_sa_after_swap'];
+					$GLOBALS['_sa_after_swap'] = null;
+					$after( $name );
+				}
 				return 1;
 			}
 
@@ -1338,8 +1525,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
+	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
 }
@@ -1803,6 +1992,11 @@ if ( ! function_exists( 'sa_register_ability' ) ) {
 }
 
 function sa_reset_state(): void {
+	$GLOBALS['_app_passwords']           = array();
+	$GLOBALS['_app_passwords_available'] = true;
+	$GLOBALS['_app_passwords_delete_fail'] = false;
+	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
+	$GLOBALS['_sa_app_password_create_fails']    = false;
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_transients']   = array();
@@ -1832,8 +2026,10 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
+	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_posts']        = array();
 	$GLOBALS['_post_meta']    = array();

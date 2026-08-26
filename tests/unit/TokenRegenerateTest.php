@@ -240,26 +240,39 @@ final class TokenRegenerateTest extends TestCase {
 	 * with. So assert the shape directly — nothing reads the token row after the
 	 * write.
 	 */
-	public function test_no_read_of_the_token_row_follows_a_successful_swap(): void {
+	public function test_a_read_that_fails_never_costs_the_operator_their_token(): void {
+		// #67's rule, refined in round-40. A confirming read cannot prove THIS
+		// request stored the token — a read answers what the row holds, never
+		// who wrote it — so a read that FAILS must not withhold the reveal:
+		// that revokes the previous token while showing no replacement, and the
+		// administrator is locked out with nothing to reconnect with.
 		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( 'the-previous-token' ) );
+		$GLOBALS['_sa_wpdb_error'] = 'the database is having a moment';
+		$res = $this->regenerate();
+		$GLOBALS['_sa_wpdb_error'] = '';
+		$this->assertTrue( $res->success, 'the token is revealed even though nothing could be read back' );
+		$this->assertNotSame( '', (string) ( $res->data['token'] ?? '' ) );
+	}
 
-		$this->assertTrue( $this->regenerate()->success );
-
-		$write = null;
-		foreach ( $GLOBALS['_db_queries'] as $i => $query ) {
-			if ( 0 === strpos( $query, 'UPDATE' ) && false !== strpos( $query, 'aura_worker_site_token' ) ) {
-				$write = $i;
+	public function test_a_token_another_request_replaced_is_not_revealed(): void {
+		// Round-40: a read that SUCCEEDS and disagrees is not ambiguous — a
+		// connect stored its own token while this request was paused, and
+		// handing over this raw value gives the operator something the site
+		// rejects.
+		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( 'the-previous-token' ) );
+		$stolen = Aura_Worker_Security::hash_token( 'someone-elses-token' );
+		$GLOBALS['_sa_after_swap'] = static function ( $name ) use ( $stolen ) {
+			if ( 'aura_worker_site_token' === $name ) {
+				$GLOBALS['_rows'][ $name ]    = $stolen;
+				$GLOBALS['_options'][ $name ] = $stolen;
 			}
-		}
-		$this->assertNotNull( $write, 'the rotation must have issued its compare-and-swap' );
+		};
 
-		$after = array_slice( $GLOBALS['_db_queries'], $write + 1 );
-		foreach ( $after as $query ) {
-			$this->assertFalse(
-				0 === strpos( $query, 'SELECT' ) && false !== strpos( $query, 'aura_worker_site_token' ),
-				'the token row must not be read back after the swap: a read that fails would revoke the old token without revealing the new one'
-			);
-		}
+		$res = $this->regenerate();
+		$this->assertFalse( $res->success, 'a superseded token is not revealed' );
+		$this->assertSame( 500, $res->status );
+		$this->assertStringContainsString( 'Another site token was stored', (string) ( $res->data['message'] ?? '' ) );
+		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ), 'and nothing is left to reveal it later' );
 	}
 
 	/**

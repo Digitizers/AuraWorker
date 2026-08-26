@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.10.3-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.11.0-green" alt="Stable" />
 </p>
 
 ---
@@ -151,6 +151,25 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.11.0
+
+**Feature:** the magic-link connect mints an Application Password ("Aura SiteAgent")
+for the administrator who created the link and returns it once in the signed callback's
+response, so a magic-link connection can run the builder tools that authenticate with
+WordPress Basic auth. Every connect rotates it; where Application Passwords are
+unavailable the connect stays token-only and names the reason. The whole install runs
+under one site-wide connect claim — "Regenerate Token" takes it too — and that claim is
+never taken over by age, because a callback the dashboard timed out on may still be
+running. Every write the install makes — site token, client binding, dashboard URL,
+gateway key — is issued by a statement conditional on holding the claim, so a claim that
+disappears mid-request costs that request its connect rather than letting it overwrite
+the install that replaced it. A claim left behind by a killed request is released by deactivating and
+reactivating the plugin — which also revokes the Application Password, since
+unregistering the routes would otherwise leave an administrator credential that
+WordPress core and other REST/MCP plugins still accept. The settings screen's
+Connect button is always reachable, and the line above it is derived from the
+credential the site actually holds, so no failure path can hide the way back.
 
 ### 2.10.3
 

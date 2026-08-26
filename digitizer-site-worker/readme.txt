@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.10.3
+Stable tag: 2.11.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -232,6 +232,48 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
 
 == Changelog ==
+
+= 2.11.0 =
+* Feature: **the magic-link connect now mints an Application Password for
+  the dashboard.** A magic-link connection could run SiteAgent's own tools
+  but not the builder tools (Elementor MCP and friends) that authenticate
+  with WordPress Basic auth — only a manual connect, which never provisions
+  the gateway key, could. The signed /connect callback now also mints an
+  Application Password named "Aura SiteAgent" for the administrator who
+  created the link and returns it once, in the callback's response, so the
+  dashboard stores it encrypted beside the site token. Every connect rotates
+  it (earlier ones under that name are deleted first). Where Application
+  Passwords are unavailable (no HTTPS, disabled by a filter, no admin user)
+  the connect succeeds token-only as before and names the reason.
+* The whole install — token, client binding, gateway key, Application
+  Password — runs under one site-wide connect claim, so two callbacks for the
+  same site cannot split the credentials the dashboard ends up holding.
+  "Regenerate Token" takes the same claim (it is refused while a connect is
+  installing). The claim is never taken over by age: a callback the dashboard
+  timed out on may still be running. Every write the install makes — the site
+  token, the client binding, the dashboard URL, the gateway key — is issued by
+  a statement conditional on holding the claim, so a claim that goes away
+  mid-request costs that request its connect (retryable) rather than letting it
+  overwrite the install that replaced it. If a
+  killed request ever leaves a claim behind, every later connect is refused
+  until an administrator deactivates and reactivates the plugin, which
+  releases it.
+  "Regenerate Token" issues its cleanup the same way, and skips revoking the
+  Application Password when it no longer owns the claim — the password on the
+  site then belongs to whichever connect replaced it. It still reveals the
+  token it stored: refusing to would revoke the old token while showing no
+  replacement.
+* Deactivating the plugin now also revokes the Application Password Aura
+  minted. Unregistering SiteAgent's routes does not stop an
+  administrator-level credential from authenticating to WordPress core and to
+  other REST/MCP plugins, so "deactivated" would not have meant
+  "disconnected". If the revocation fails the owner and UUID are kept, and
+  reactivating finishes the job (activation retries a revocation deactivation
+  could not land), as does uninstalling. The site token binding survives
+  deactivation, so the settings screen keeps showing the dashboard it is
+  connected to. The Connect button is always reachable there, and the line above
+  it says what the site actually holds: a working credential, one that was never
+  delivered, none at all, or a site that cannot issue one (token-only).
 
 = 2.10.3 =
 * Fix (security): **"Regenerate Token" revealed a new site token without ever

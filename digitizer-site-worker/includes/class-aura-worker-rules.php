@@ -723,7 +723,131 @@ class Aura_Worker_Rules {
 	 * @param string $token_hash Hash of the site token just installed.
 	 * @return true|WP_Error
 	 */
-	public static function bind( $client, $token_hash ) {
+	/**
+	 * Write an option ONLY while the caller still holds a named claim, in one
+	 * statement (2.11.0, round-10). A check followed by a write is two
+	 * statements, and a request paused between them — deactivation does not
+	 * terminate a running PHP request — resumes and writes anyway, over an
+	 * install that has already answered 200. Joining the claim row into the
+	 * write makes ownership part of its own predicate.
+	 *
+	 * Two statements are issued because MySQL has no conditional upsert that
+	 * can carry this predicate: an UPDATE for a row that exists, an
+	 * INSERT … SELECT for one that does not. Both match nothing for a caller
+	 * whose fence is no longer in the claim.
+	 *
+	 * @param string $option   Option name.
+	 * @param mixed  $value    Value (serialised as the options table stores it).
+	 * @param string $claim    The claim option's name.
+	 * @param string $fence    The caller's fence.
+	 * @param string $autoload 'yes' or 'no' for a row this call creates.
+	 * @return int|false Rows written: 1 when this caller changed or created the
+	 *                   row, 0 when it did not own the claim (or the value was
+	 *                   already exactly this), FALSE when a statement failed.
+	 *                   A caller that needs the write as an ownership proof
+	 *                   reads it (round-28).
+	 */
+	public static function write_option_if_claimed( $option, $value, $claim, $fence, $autoload = 'yes' ) {
+		global $wpdb;
+		if ( '' === (string) $fence || '' === (string) $claim ) {
+			return 0;
+		}
+		$like = $wpdb->esc_like( $fence . '|' ) . '%';
+		$raw  = maybe_serialize( $value );
+		$wpdb->last_error = '';
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s",
+				$claim,
+				$like,
+				$raw,
+				$option
+			)
+		);
+		if ( false === $updated || '' !== (string) $wpdb->last_error ) {
+			self::forget_option_cache( $option );
+			return false;
+		}
+		$inserted = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+				$option,
+				$raw,
+				$autoload,
+				$claim,
+				$like,
+				$option
+			)
+		);
+		self::forget_option_cache( $option );
+		if ( false === $inserted || '' !== (string) $wpdb->last_error ) {
+			return false;
+		}
+		return (int) $updated + (int) $inserted;
+	}
+
+	/**
+	 * Delete an option ONLY while the caller still holds a named claim — the
+	 * same reasoning as write_option_if_claimed(), for the install steps that
+	 * remove a value rather than set one.
+	 *
+	 * @param string $option Option name.
+	 * @param string $claim  The claim option's name.
+	 * @param string $fence  The caller's fence.
+	 * @return int|false Rows removed: 1 when this caller took the row, 0 when
+	 *                   it did not own the claim (or the row was already gone),
+	 *                   and FALSE when the statement itself failed. A database
+	 *                   error read as "0 rows" would be read as "not mine" and
+	 *                   let the caller carry on as though nothing were owed
+	 *                   (round-18), so the two are kept apart.
+	 */
+	public static function delete_option_if_claimed( $option, $claim, $fence ) {
+		global $wpdb;
+		if ( '' === (string) $fence || '' === (string) $claim ) {
+			return 0;
+		}
+		$wpdb->last_error = '';
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name = %s",
+				$claim,
+				$wpdb->esc_like( $fence . '|' ) . '%',
+				$option
+			)
+		);
+		self::forget_option_cache( $option );
+		if ( false === $rows || '' !== (string) $wpdb->last_error ) {
+			return false;
+		}
+		return (int) $rows;
+	}
+
+	/**
+	 * One raw options-table read for callers outside this class — the row, not
+	 * the option cache. Used to VERIFY a claim-conditional write landed
+	 * (round-18): those statements go round the cache, and a write that failed
+	 * is indistinguishable from one that changed nothing without reading back.
+	 *
+	 * @param string $name Option name.
+	 * @return string|null|WP_Error Raw value, null when absent, WP_Error on a database error.
+	 */
+	public static function read_option_uncached( $name ) {
+		return self::option_raw( $name );
+	}
+
+	/**
+	 * Evict what update_option()/delete_option() would have maintained for a
+	 * row written behind the option cache's back.
+	 *
+	 * @param string $option Option name.
+	 */
+	private static function forget_option_cache( $option ) {
+		wp_cache_delete( $option, 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+	}
+
+	public static function bind( $client, $token_hash, $claim = '', $fence = '' ) {
 		$record = array(
 			'envelope'    => '',
 			'client'      => (string) $client,
@@ -738,7 +862,14 @@ class Aura_Worker_Rules {
 		// failed", so the return value alone proves nothing; what proves the
 		// binding is the ROW. Read it back from the database (never this
 		// request's cache) and compare the fields that matter.
-		update_option( self::OPTION, $record, false );
+		// Under a connect's site claim the binding is written conditionally on
+		// it (round-10): a handler that lost the claim must not overwrite the
+		// winner's binding with one naming its own, now-superseded token.
+		if ( '' !== (string) $claim && '' !== (string) $fence ) {
+			self::write_option_if_claimed( self::OPTION, $record, $claim, $fence, 'no' );
+		} else {
+			update_option( self::OPTION, $record, false );
+		}
 		$stored = self::stored_uncached();
 		if ( is_wp_error( $stored ) ) {
 			return $stored;
@@ -862,8 +993,14 @@ class Aura_Worker_Rules {
 	/**
 	 * Forget the ruleset (disconnect, tests).
 	 */
-	public static function clear() {
-		delete_option( self::OPTION );
+	public static function clear( $claim = '', $fence = '' ) {
+		// Under a connect's site claim this is one of the install's writes, so
+		// it is conditional on the claim like the rest (round-10).
+		if ( '' !== (string) $claim && '' !== (string) $fence ) {
+			self::delete_option_if_claimed( self::OPTION, $claim, $fence );
+		} else {
+			delete_option( self::OPTION );
+		}
 		// The claims are deliberately NOT swept here. They are statements
 		// about a DAY, and the time-based sweep in note_expired() drops every
 		// claim older than today whatever the ruleset now holds — so a claim
