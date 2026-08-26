@@ -381,6 +381,14 @@ final class ConnectAppPasswordTest extends TestCase {
 		$deactivate = substr( $main, strpos( $main, 'function aura_worker_deactivate_site()' ) );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $deactivate );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::forget_site_claim();', $deactivate );
+		// The claim goes FIRST (round-33): a connect paused between its mint and
+		// its ownership check would otherwise still pass that check and hand out
+		// the plaintext of a password this hook had already revoked.
+		$this->assertLessThan(
+			strpos( $deactivate, 'revoke_managed_password' ),
+			strpos( $deactivate, 'forget_site_claim' ),
+			'release the claim before revoking'
+		);
 		// …and activation finishes a revocation deactivation could not land
 		// (round-11): reaching it with a record still present means exactly
 		// that, since a successful revocation clears the record.

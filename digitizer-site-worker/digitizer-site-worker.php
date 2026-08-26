@@ -126,26 +126,23 @@ register_deactivation_hook( __FILE__, 'aura_worker_deactivate' );
  * Deactivation cleanup for ONE site.
  */
 function aura_worker_deactivate_site() {
-	// Options are removed on uninstall, not here — with two exceptions, both
-	// about what "disconnected" has to mean.
-	//
-	// 1. The Application Password minted for the dashboard (2.11.0) is an
-	//    administrator-level WordPress credential. Unregistering SiteAgent's
-	//    routes does not touch it: core's REST API and every other REST/MCP
-	//    plugin keep accepting it, so a deactivated plugin would still leave
-	//    Aura able to act on the site (round-8). Best-effort — deactivation
-	//    must not fail — and revoke_managed_password() keeps its owner/uuid
-	//    record whenever the revocation did not land, so a reactivation or the
-	//    uninstall can finish the job.
-	// 2. The site-wide connect claim, which has no timed takeover: a claim a
-	//    killed handler left behind refuses every later connect, and this is
-	//    the operator's release for it. Clearing it is safe on its own terms
-	//    because every write the claim protects re-checks that it still holds
-	//    the claim (Aura_Worker_Magic_Link::holds_site_claim()), so a request
-	//    that resumes after the release writes nothing.
+	// The claim goes FIRST (round-33). A connect paused between its mint and
+	// the check that it still owns the site would otherwise pass that check —
+	// its fence still in the row — and hand the dashboard the plaintext of a
+	// password this hook had already revoked. Released first, the same check
+	// fails, and that handler revokes what it created and answers 409 instead.
+	Aura_Worker_Magic_Link::forget_site_claim();
+	// Options are removed on uninstall, not here — with one exception. The
+	// Application Password minted for the dashboard (2.11.0) is an
+	// administrator-level WordPress credential. Unregistering SiteAgent's
+	// routes does not touch it: core's REST API and every other REST/MCP
+	// plugin keep accepting it, so a deactivated plugin would still leave Aura
+	// able to act on the site (round-8). Best-effort — deactivation must not
+	// fail — and revoke_managed_password() keeps its record whenever the
+	// revocation did not land, so a reactivation or the uninstall can finish
+	// the job.
 	if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: the Aura Application Password could not be revoked while deactivating; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 	}
-	Aura_Worker_Magic_Link::forget_site_claim();
 }
