@@ -50,7 +50,15 @@ add_action( 'plugins_loaded', 'aura_worker_init' );
 /**
  * Activation hook.
  */
-function aura_worker_activate() {
+function aura_worker_activate( $network_wide = false ) {
+	aura_worker_for_each_site( 'aura_worker_activate_site', (bool) $network_wide );
+}
+register_activation_hook( __FILE__, 'aura_worker_activate' );
+
+/**
+ * Activation setup for ONE site.
+ */
+function aura_worker_activate_site() {
 	// Store activation timestamp.
 	update_option( 'aura_worker_activated', time() );
 	// Belt and braces for the deactivation release below: a claim that outlived
@@ -79,12 +87,45 @@ function aura_worker_activate() {
 		set_transient( 'aura_worker_token_reveal', $raw, 30 * MINUTE_IN_SECONDS );
 	}
 }
-register_activation_hook( __FILE__, 'aura_worker_activate' );
+
+/**
+ * Run a per-site cleanup on every site of the network, or on this one alone.
+ *
+ * A network-activated plugin's activation and deactivation hooks fire ONCE, in
+ * whichever blog context the request happens to be in (round-28). Every subsite
+ * has its own options table and therefore its own Application Password record,
+ * so without this the credentials of every OTHER subsite survive — administrator
+ * credentials, on sites whose plugin is gone.
+ *
+ * @param callable $per_site           What to do in one blog's context.
+ * @param bool     $network_wide Whether this is a network-wide operation.
+ */
+function aura_worker_for_each_site( callable $per_site, $network_wide = false ) {
+	if ( $network_wide && is_multisite() && function_exists( 'get_sites' ) && function_exists( 'switch_to_blog' ) ) {
+		foreach ( get_sites( array( 'fields' => 'ids', 'number' => 0 ) ) as $aura_blog_id ) {
+			switch_to_blog( (int) $aura_blog_id );
+			$per_site();
+			restore_current_blog();
+		}
+		return;
+	}
+	$per_site();
+}
 
 /**
  * Deactivation hook.
+ *
+ * @param bool $network_deactivating Whether the plugin is being deactivated network-wide.
  */
-function aura_worker_deactivate() {
+function aura_worker_deactivate( $network_deactivating = false ) {
+	aura_worker_for_each_site( 'aura_worker_deactivate_site', (bool) $network_deactivating );
+}
+register_deactivation_hook( __FILE__, 'aura_worker_deactivate' );
+
+/**
+ * Deactivation cleanup for ONE site.
+ */
+function aura_worker_deactivate_site() {
 	// Options are removed on uninstall, not here — with two exceptions, both
 	// about what "disconnected" has to mean.
 	//
@@ -108,4 +149,3 @@ function aura_worker_deactivate() {
 	}
 	Aura_Worker_Magic_Link::forget_site_claim();
 }
-register_deactivation_hook( __FILE__, 'aura_worker_deactivate' );

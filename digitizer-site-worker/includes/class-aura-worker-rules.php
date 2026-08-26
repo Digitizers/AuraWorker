@@ -741,15 +741,21 @@ class Aura_Worker_Rules {
 	 * @param string $claim    The claim option's name.
 	 * @param string $fence    The caller's fence.
 	 * @param string $autoload 'yes' or 'no' for a row this call creates.
+	 * @return int|false Rows written: 1 when this caller changed or created the
+	 *                   row, 0 when it did not own the claim (or the value was
+	 *                   already exactly this), FALSE when a statement failed.
+	 *                   A caller that needs the write as an ownership proof
+	 *                   reads it (round-28).
 	 */
 	public static function write_option_if_claimed( $option, $value, $claim, $fence, $autoload = 'yes' ) {
 		global $wpdb;
 		if ( '' === (string) $fence || '' === (string) $claim ) {
-			return;
+			return 0;
 		}
 		$like = $wpdb->esc_like( $fence . '|' ) . '%';
 		$raw  = maybe_serialize( $value );
-		$wpdb->query(
+		$wpdb->last_error = '';
+		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s",
 				$claim,
@@ -758,7 +764,11 @@ class Aura_Worker_Rules {
 				$option
 			)
 		);
-		$wpdb->query(
+		if ( false === $updated || '' !== (string) $wpdb->last_error ) {
+			self::forget_option_cache( $option );
+			return false;
+		}
+		$inserted = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
 				$option,
@@ -770,6 +780,10 @@ class Aura_Worker_Rules {
 			)
 		);
 		self::forget_option_cache( $option );
+		if ( false === $inserted || '' !== (string) $wpdb->last_error ) {
+			return false;
+		}
+		return (int) $updated + (int) $inserted;
 	}
 
 	/**

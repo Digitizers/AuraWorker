@@ -903,8 +903,16 @@ class Aura_Worker_Magic_Link {
 	 * @param string $uuid    Its UUID.
 	 * @param string $fence   The caller's site-claim fence, when it holds one.
 	 */
-	private static function persist_password_owner( int $user_id, string $uuid, $fence = '', $undelivered = false ) {
+	private static function persist_password_owner( int $user_id, string $uuid, $fence = '', $undelivered = false, $revoking = '' ) {
 		$record = array( 'user_id' => $user_id, 'uuid' => $uuid );
+		if ( '' !== (string) $revoking ) {
+			// A revocation of THIS record is under way, by the holder of this
+			// fence. The value differs from every other writer's, so the UPDATE
+			// that sets it changes exactly one row for the claim holder and none
+			// for anyone else — the ownership proof, without destroying the
+			// record while the password it names is still live.
+			$record['revoking'] = (string) $revoking;
+		}
 		if ( $undelivered ) {
 			// The password this record names was minted but never returned to
 			// the dashboard (round-23). It exists, so the rotation must find
@@ -914,11 +922,11 @@ class Aura_Worker_Magic_Link {
 			$record['undelivered'] = true;
 		}
 		if ( '' !== (string) $fence ) {
-			Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
-			return;
+			return Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
 		}
 		update_option( self::APP_PASSWORD_RECORD_OPTION, $record, false );
 		wp_cache_delete( self::APP_PASSWORD_RECORD_OPTION, 'options' );
+		return 1;
 	}
 
 	/**
@@ -988,15 +996,24 @@ class Aura_Worker_Magic_Link {
 		// dashboard. Removing the row is the ownership test that cannot be
 		// raced, because the row is the record.
 		if ( '' !== (string) $fence ) {
-			$taken = self::forget_password_owner( $fence );
-			if ( false === $taken ) {
+			// MARKED, not consumed (round-28). Consuming the record first made
+			// ownership provable but left a window in which a request killed
+			// between the two statements destroyed the only description of a
+			// credential that is still live — nothing afterwards could find it.
+			// The mark is a single claim-conditional UPDATE, so it proves
+			// ownership exactly as the delete did (one row changed, and only for
+			// the claim holder, the fence inside the value making the write
+			// distinct from anyone else's), while the record stays durable until
+			// the password is provably gone.
+			$marked = self::persist_password_owner( $rec['user_id'], $rec['uuid'], $fence, ! empty( $rec['undelivered'] ), $fence );
+			if ( false === $marked ) {
 				// The statement itself failed. Read as "0 rows — not mine" this
 				// would report nothing owed, and the mint would then create a
 				// replacement over a record whose password is still live and
 				// about to become untracked (round-18). A failure is a failure.
 				return false;
 			}
-			if ( 1 !== (int) $taken ) {
+			if ( 1 !== (int) $marked ) {
 				return true; // the record is not this caller's to act on
 			}
 		}
@@ -1011,14 +1028,14 @@ class Aura_Worker_Magic_Link {
 			if ( '' !== (string) $fence ) {
 				// …with its delivery state intact (round-24): rewriting an
 				// undelivered record as delivered would tell the settings screen
-				// a credential reached the dashboard when none did.
+				// a credential reached the dashboard when none did. The
+				// pending-revocation mark comes off with it.
 				self::persist_password_owner( $rec['user_id'], $rec['uuid'], $fence, ! empty( $rec['undelivered'] ) );
 			}
 			return false; // a genuine delete failure — the credential is still live
 		}
-		if ( '' === (string) $fence ) {
-			self::forget_password_owner();
-		}
+		// Gone for certain — now the record may go, and only now (round-28).
+		self::forget_password_owner( $fence );
 		return true;
 	}
 

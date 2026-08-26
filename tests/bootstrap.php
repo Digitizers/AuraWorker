@@ -1336,11 +1336,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', $m );
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
 					// `true` fails every write; a positive INT fails that many
-					// and then lets it through, as update_option() does.
-					if ( is_int( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
-						--$GLOBALS['_sa_option_write_fail'][ $name ];
+					// and then lets it through, as update_option() does; a
+					// CALLABLE decides per value, which is how a test refuses
+					// one write of a sequence and allows another.
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( $value ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						return false; // the database refusing the statement outright
 					}
-					return false; // the database refusing the statement outright
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
@@ -1354,11 +1361,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				list( , $name, $value, , $claim, $like ) = array_map( 'stripslashes', $m );
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
 					// `true` fails every write; a positive INT fails that many
-					// and then lets it through, as update_option() does.
-					if ( is_int( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
-						--$GLOBALS['_sa_option_write_fail'][ $name ];
+					// and then lets it through, as update_option() does; a
+					// CALLABLE decides per value, which is how a test refuses
+					// one write of a sequence and allows another.
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( $value ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						return false; // the database refusing the statement outright
 					}
-					return false; // the database refusing the statement outright
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null !== sa_read_option_uncached( $name ) ) {
 					return 0;

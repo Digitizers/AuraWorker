@@ -303,9 +303,9 @@ final class ConnectAppPasswordTest extends TestCase {
 		// Same round-7 P1, with the option store refusing only the FIRST write:
 		// the orphan the cleanup could not delete is recorded after all, so the
 		// next connect's rotation can revoke it by uuid.
-		// The claim-conditional write is two statements (UPDATE, then INSERT for
-		// an absent row), so refusing two refuses the FIRST persist entirely.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 2;
+		// One refusal is one whole persist: a statement that failed is not
+		// followed by the next.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = 1;
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 500, $res->get_status() );
@@ -423,15 +423,13 @@ final class ConnectAppPasswordTest extends TestCase {
 		// unregistering the routes leaves an administrator credential that core
 		// and every other REST/MCP plugin still accept.
 		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
-		$deactivate = substr( $main, strpos( $main, 'function aura_worker_deactivate()' ) );
-		$deactivate = substr( $deactivate, 0, strpos( $deactivate, "\nregister_deactivation_hook" ) );
+		$deactivate = substr( $main, strpos( $main, 'function aura_worker_deactivate_site()' ) );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $deactivate );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::forget_site_claim();', $deactivate );
 		// …and activation finishes a revocation deactivation could not land
 		// (round-11): reaching it with a record still present means exactly
 		// that, since a successful revocation clears the record.
-		$activate = substr( $main, strpos( $main, 'function aura_worker_activate()' ) );
-		$activate = substr( $activate, 0, strpos( $activate, "\nregister_activation_hook" ) );
+		$activate = substr( $main, strpos( $main, 'function aura_worker_activate_site()' ) );
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $activate );
 
 		// A revocation that did not land keeps the owner/uuid, so a
@@ -698,31 +696,39 @@ final class ConnectAppPasswordTest extends TestCase {
 		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
 		$GLOBALS['_options'][ $claim ] = 'mine|' . time();
 		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
-		$GLOBALS['_sa_option_delete_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
 
 		$this->assertFalse( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
-		$this->assertSame( $uuid, $this->uncachedUuid(), 'the record survives a failed delete' );
+		$this->assertSame( $uuid, $this->uncachedUuid(), 'the record survives a statement that failed' );
 		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'and so does the password' );
 	}
 
-	public function test_a_previous_password_left_unrevoked_AND_unrecorded_is_terminal(): void {
-		// Round-20: the revocation consumes the record before deleting the
-		// password and restores it when the delete fails. If that restoration
-		// fails too, the old administrator credential is live with nothing
-		// naming it — and a retryable answer would let the next attempt mint
-		// another beside it.
+	public function test_a_previous_password_that_will_not_die_stays_findable_for_the_next_attempt(): void {
+		// Round-28: the revocation MARKS the record instead of consuming it, so
+		// a failure anywhere after that — including a restore that will not
+		// land — still leaves the credential described. The connect is
+		// retryable rather than terminal, because the next attempt can find the
+		// password and revoke it.
 		$this->ml->handle_connect( $this->request() );
-		$this->assertNotNull( $this->record() );
-		// The delete fails, and so does putting the record back.
+		$uuid = $this->recordUuid();
 		$GLOBALS['_app_passwords_delete_fail'] = true;
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+		// The pending-revocation mark lands; putting the record BACK does not.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = static function ( $raw ) {
+			return false === strpos( (string) $raw, 'revoking' );
+		};
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$res  = $this->ml->handle_connect( $this->request() );
-		$data = $res->get_data();
+		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_orphan_untracked', $data['code'] );
-		$this->assertFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'terminal: no retry can mint beside the orphan' );
-		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'nothing new was minted' );
+		$this->assertSame( 'app_password_revoke_failed', $res->get_data()['code'] );
+		$this->assertNotEmpty( get_transient( 'aura_magic_' . $this->magic_id ), 'retryable' );
+		$this->assertSame( $uuid, $this->recordUuid(), 'the credential is still described' );
+
+		// And the retry, with the store working, does revoke it.
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the old one died, the new one lives' );
 	}
 
 	public function test_restoring_a_consumed_record_keeps_its_delivery_state(): void {
@@ -805,6 +811,25 @@ final class ConnectAppPasswordTest extends TestCase {
 		$html = $this->renderConnect();
 		$this->assertStringContainsString( 'no credential for the builder tools', $html );
 		$this->assertStringContainsString( 'aura-connect-btn', $html );
+	}
+
+	public function test_the_lifecycle_hooks_reach_every_site_of_a_network(): void {
+		// Round-28: a network-activated plugin's activation, deactivation and
+		// uninstall each run ONCE, in whichever blog context the request is in.
+		// Every subsite keeps its own options table, so without switching blogs
+		// the Application Passwords of every OTHER subsite outlive the plugin —
+		// administrator credentials, on sites that no longer run it.
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$this->assertStringContainsString( 'function aura_worker_deactivate( $network_deactivating = false )', $main );
+		$this->assertStringContainsString( "aura_worker_for_each_site( 'aura_worker_deactivate_site', (bool) \$network_deactivating )", $main );
+		$this->assertStringContainsString( "aura_worker_for_each_site( 'aura_worker_activate_site', (bool) \$network_wide )", $main );
+		$this->assertStringContainsString( 'switch_to_blog( (int) $aura_blog_id );', $main );
+		$this->assertStringContainsString( 'restore_current_blog();', $main );
+
+		$uninstall = file_get_contents( __DIR__ . '/../../digitizer-site-worker/uninstall.php' );
+		$this->assertStringContainsString( 'switch_to_blog( (int) $aura_blog_id );', $uninstall );
+		$this->assertStringContainsString( 'restore_current_blog();', $uninstall );
+		$this->assertStringContainsString( 'is_multisite()', $uninstall );
 	}
 
 	/** Render the connect section and return its HTML. */
