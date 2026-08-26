@@ -134,8 +134,15 @@ function aura_worker_deactivate_site() {
 	// without claiming did the first and invited the second.
 	$aura_fence = Aura_Worker_Magic_Link::seize_site();
 	if ( '' === $aura_fence ) {
+		// Without the fence the revocation is exactly the race it exists to
+		// prevent (round-35): it could read the old record, let the callback
+		// that won the site mint and record a replacement, and then delete the
+		// replacement's record while revoking only the old UUID. So it does not
+		// run. The record survives, and the next activation, connect or
+		// uninstall finishes what this one could not.
 		// translators: internal log line, not shown to the user.
-		error_log( 'SiteAgent: a connect held the site while the plugin was deactivating; the Application Password revocation ran without holding it.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( 'SiteAgent: a connect held the site while the plugin was deactivating, so the Aura Application Password was not revoked; reactivating or uninstalling will revoke it.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		return;
 	}
 	// Options are removed on uninstall, not here — with one exception. The
 	// Application Password minted for the dashboard (2.11.0) is an

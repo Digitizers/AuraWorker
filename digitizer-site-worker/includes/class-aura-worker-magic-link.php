@@ -414,8 +414,13 @@ class Aura_Worker_Magic_Link {
 		} else {
 			// An older dashboard names no client: clear, exactly as before. The
 			// old client's rules are not this site's to keep, and the new
-			// client's seq starts wherever it starts.
-			Aura_Worker_Rules::clear( $site_claim_key, $site_fence );
+			// client's seq starts wherever it starts. Verified like every other
+			// install write (round-35) — a clear that did not land leaves the
+			// old client's policy governing the new dashboard behind a 200.
+			if ( ! self::clear_ruleset_verified( $site_claim_key, $site_fence ) ) {
+				$release();
+				return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous ruleset could not be cleared; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
+			}
 		}
 		// Every remaining install write is conditional on the claim too
 		// (round-10). A handler that lost it would otherwise leave the winner's
@@ -452,7 +457,15 @@ class Aura_Worker_Magic_Link {
 				return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous approval-grant key could not be cleared; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
 			}
 			if ( '' === $client ) {
-				Aura_Worker_Rules::clear( $site_claim_key, $site_fence ); // keyless AND clientless: an older dashboard — clear as before
+				// Keyless AND clientless: an older dashboard — clear as before,
+				// and VERIFY it (round-35). A conditional delete that failed
+				// leaves the previous ruleset visible through current(), so the
+				// old client's block and warn policy would go on governing the
+				// newly connected dashboard behind a 200.
+				if ( ! self::clear_ruleset_verified( $site_claim_key, $site_fence ) ) {
+					$release();
+					return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous ruleset could not be cleared; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
+				}
 			}
 		}
 		// 2.11.0: the callback also mints an Application Password for the admin
@@ -670,7 +683,8 @@ class Aura_Worker_Magic_Link {
 		$app_id = wp_generate_uuid4();
 		self::persist_mint_intent( $user_id, $app_id, $fence );
 		$intent = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
-		if ( ! is_array( $intent ) || (int) ( $intent['user_id'] ?? 0 ) !== $user_id || empty( $intent['minting'] ) || (string) ( $intent['app_id'] ?? '' ) !== $app_id ) {
+		$listed = ( is_array( $intent ) && isset( $intent['intents'][ $app_id ]['user_id'] ) ) ? (int) $intent['intents'][ $app_id ]['user_id'] : 0;
+		if ( $listed !== $user_id ) {
 			return new WP_Error( 'app_password_mint_failed', 'The site could not record that an Application Password was about to be created; none was.' );
 		}
 		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME, 'app_id' => $app_id ) );
@@ -691,7 +705,7 @@ class Aura_Worker_Magic_Link {
 		// fresh read, not update_option()'s return (false also means
 		// "unchanged"); if it did not persist, the password just created is
 		// revoked again and the connect stays token-only.
-		self::persist_password_owner( $user_id, $uuid, $fence );
+		self::persist_password_owner( $user_id, $uuid, $fence, false, '', $app_id );
 		$recorded = self::password_record();
 		if ( null === $recorded || $recorded['user_id'] !== $user_id || $recorded['uuid'] !== $uuid ) {
 			// The cleanup is VERIFIED, never assumed (round-7): with option and
@@ -707,7 +721,7 @@ class Aura_Worker_Magic_Link {
 				// later rotation chase a password that no longer exists, and
 				// deactivation report a revocation failure. Logged if even the
 				// delete will not land, so the operator can find the option.
-				self::forget_password_owner( $fence );
+				self::settle_intent( $app_id, $fence );
 				if ( self::tracking_is_incomplete() ) {
 					// translators: internal log line, not shown to the user.
 					error_log( 'SiteAgent: the Aura Application Password tracking options could not be cleared after the password was revoked; delete aura_worker_app_password by hand.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
@@ -718,7 +732,7 @@ class Aura_Worker_Magic_Link {
 			// what a later rotation revokes by, so recovering it is worth more
 			// than the failed delete — and fail RETRYABLY either way, so the
 			// connect is not reported as completed beside an orphan credential.
-			self::persist_password_owner( $user_id, $uuid, $fence, true );
+			self::persist_password_owner( $user_id, $uuid, $fence, true, '', $app_id );
 			// …and the recovery is verified too (round-11). If the pair still
 			// did not persist, the NEXT attempt's rotation would find nothing
 			// recorded, mint again, and every retry would add another live
@@ -858,11 +872,11 @@ class Aura_Worker_Magic_Link {
 		if ( null === $stored || false === $stored || '' === $stored ) {
 			return false; // nothing recorded
 		}
+		if ( is_array( $stored ) && ! isset( $stored['uuid'] ) && isset( $stored['intents'] ) ) {
+			return false; // pending intents only — reconciled, not refused
+		}
 		if ( is_array( $stored ) && ! empty( $stored['unavailable'] ) ) {
 			return false; // a token-only site, not an orphan
-		}
-		if ( is_array( $stored ) && ! empty( $stored['minting'] ) && (int) ( $stored['user_id'] ?? 0 ) > 0 ) {
-			return false; // a mint intent — reconciled, not refused (round-29)
 		}
 		return null === self::password_record();
 	}
@@ -948,7 +962,17 @@ class Aura_Worker_Magic_Link {
 	 * @return int|false Rows written, as write_option_if_claimed() reports them.
 	 */
 	private static function persist_mint_intent( int $user_id, $app_id, $fence = '' ) {
-		$record = array( 'user_id' => $user_id, 'minting' => time(), 'app_id' => (string) $app_id );
+		// APPENDED, never overwriting (round-35). Two handlers can be inside a
+		// mint at once — one paused with its claim released, another holding the
+		// site — and a record that holds only the latest intent forgets the
+		// app_id of the password the first may still create, leaving it live and
+		// unfindable. The record therefore carries a SET of pending intents
+		// beside whatever credential it describes.
+		$rec     = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		$record  = is_array( $rec ) ? $rec : array();
+		$intents = isset( $record['intents'] ) && is_array( $record['intents'] ) ? $record['intents'] : array();
+		$intents[ (string) $app_id ] = array( 'user_id' => $user_id, 'at' => time() );
+		$record['intents'] = $intents;
 		if ( '' !== (string) $fence ) {
 			return Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
 		}
@@ -977,45 +1001,117 @@ class Aura_Worker_Magic_Link {
 	 */
 	private static function reconcile_mint_intent( $fence = '' ) {
 		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
-		if ( ! is_array( $rec ) || empty( $rec['minting'] ) ) {
+		if ( ! is_array( $rec ) || empty( $rec['intents'] ) || ! is_array( $rec['intents'] ) ) {
 			return true;
 		}
-		$owner  = (int) ( $rec['user_id'] ?? 0 );
-		$app_id = (string) ( $rec['app_id'] ?? '' );
-		$found  = '';
-		if ( $owner > 0 && '' !== $app_id && class_exists( 'WP_Application_Passwords' ) ) {
-			foreach ( WP_Application_Passwords::get_user_application_passwords( $owner ) as $item ) {
-				// By the app_id creation was told to stamp on it (round-30) —
-				// the EXACT credential this intent is about. Matching on the
-				// name and a timestamp adopted whichever same-named password of
-				// that user came first in the list, so a second one created in
-				// the same second put the rotation onto an unrelated credential
-				// while the real orphan stayed live and untracked.
-				if ( '' !== (string) ( $item['app_id'] ?? '' ) && $app_id === (string) $item['app_id'] && ! empty( $item['uuid'] ) ) {
-					$found = (string) $item['uuid'];
-					break;
+		if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+			return true;
+		}
+		$settled = array();
+		foreach ( $rec['intents'] as $app_id => $intent ) {
+			$owner = (int) ( $intent['user_id'] ?? 0 );
+			$found = '';
+			if ( $owner > 0 && '' !== (string) $app_id ) {
+				foreach ( WP_Application_Passwords::get_user_application_passwords( $owner ) as $item ) {
+					// By the app_id creation was told to stamp on it (round-30)
+					// — the EXACT credential this intent is about. Matching on
+					// the name and a timestamp adopted whichever same-named
+					// password of that user came first, so a second one created
+					// in the same second put the rotation onto an unrelated
+					// credential while the real orphan stayed live.
+					if ( '' !== (string) ( $item['app_id'] ?? '' ) && (string) $app_id === (string) $item['app_id'] && ! empty( $item['uuid'] ) ) {
+						$found = (string) $item['uuid'];
+						break;
+					}
 				}
 			}
+			if ( '' === $found ) {
+				// Nothing was created under this intent — YET. It stays: any
+				// rule for retiring it rests on knowing the request that wrote
+				// it can no longer resume, and PHP offers no such proof
+				// (round-31). It names no credential, so nothing depends on its
+				// absence.
+				continue;
+			}
+			// A password nobody ever received. It is revoked here rather than
+			// adopted: the caller is about to mint a fresh one, and an
+			// undelivered credential is worth nothing to anybody.
+			WP_Application_Passwords::delete_application_password( $owner, $found );
+			if ( ! self::managed_password_gone( $owner, $found ) ) {
+				return false; // still live — the caller must not mint beside it
+			}
+			$settled[] = (string) $app_id;
 		}
-		if ( '' !== $found ) {
-			// It exists and nobody received it. The adoption is VERIFIED: read
-			// back as the intent it still is, this would let the caller mint
-			// another beside a live administrator credential (round-32).
-			self::persist_password_owner( $owner, $found, $fence, true );
-			$stored = self::password_record();
-			return ( null !== $stored && $stored['uuid'] === $found && $stored['user_id'] === $owner );
+		if ( empty( $settled ) ) {
+			return true;
 		}
-		// Nothing was created under this intent — and it is left exactly where
-		// it is (round-31). Any rule for retiring it rests on knowing that the
-		// request which wrote it can no longer resume, and PHP offers no such
-		// proof: max_execution_time can be 0, or generous, or spent inside a
-		// database call that does not count against it. Nothing depends on the
-		// intent's absence — it names no credential, so the revocation reports
-		// nothing owed, the screen reads it as no credential, and the next mint
-		// replaces it with its own. An intent that outlives its usefulness
-		// costs one option row; retiring one early costs a live administrator
-		// credential nothing can find.
+		// Drop only what was settled, and VERIFY: read back with an intent still
+		// listed, this would let the caller mint beside a credential whose
+		// description it had just failed to update (round-32).
+		foreach ( $settled as $app_id ) {
+			unset( $rec['intents'][ $app_id ] );
+		}
+		self::write_password_record( $rec, $fence );
+		$after = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		$left  = ( is_array( $after ) && isset( $after['intents'] ) && is_array( $after['intents'] ) ) ? $after['intents'] : array();
+		foreach ( $settled as $app_id ) {
+			if ( isset( $left[ $app_id ] ) ) {
+				return false;
+			}
+		}
 		return true;
+	}
+
+	/**
+	 * Clear the ruleset store under the claim and prove the row is gone.
+	 * ONE implementation for both compatibility paths that clear it (round-35):
+	 * a conditional delete that failed leaves the previous client's block and
+	 * warn policy governing the newly connected dashboard behind a 200.
+	 *
+	 * @param string $claim The claim option's name.
+	 * @param string $fence This handler's fence.
+	 * @return bool True when the store is empty.
+	 */
+	private static function clear_ruleset_verified( $claim, $fence ): bool {
+		Aura_Worker_Rules::clear( $claim, $fence );
+		$left = Aura_Worker_Rules::read_option_uncached( Aura_Worker_Rules::OPTION );
+		return ! is_wp_error( $left ) && ( null === $left || '' === (string) $left );
+	}
+
+	/**
+	 * Drop ONE pending intent, leaving every other handler's alone (round-35)
+	 * and clearing the credential fields with it. Used where a mint's own
+	 * password has been revoked again: nothing of that attempt should remain,
+	 * and nothing of anyone else's should go with it.
+	 *
+	 * @param string $app_id The intent this attempt owns.
+	 * @param string $fence  The caller's site-claim fence, when it holds one.
+	 */
+	private static function settle_intent( $app_id, $fence = '' ) {
+		$prev    = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		$intents = ( is_array( $prev ) && isset( $prev['intents'] ) && is_array( $prev['intents'] ) ) ? $prev['intents'] : array();
+		unset( $intents[ (string) $app_id ] );
+		self::write_password_record( array() === $intents ? array() : array( 'intents' => $intents ), $fence );
+	}
+
+	/**
+	 * Write the whole record — ONE implementation for the paths that carry
+	 * pending intents alongside the credential.
+	 *
+	 * @param array  $record The record to store.
+	 * @param string $fence  The caller's site-claim fence, when it holds one.
+	 * @return int|false Rows written, as write_option_if_claimed() reports them.
+	 */
+	private static function write_password_record( array $record, $fence = '' ) {
+		if ( array() === $record || ( 1 === count( $record ) && isset( $record['intents'] ) && array() === $record['intents'] ) ) {
+			return self::forget_password_owner( $fence );
+		}
+		if ( '' !== (string) $fence ) {
+			return Aura_Worker_Rules::write_option_if_claimed( self::APP_PASSWORD_RECORD_OPTION, $record, self::SITE_CLAIM, $fence, 'no' );
+		}
+		update_option( self::APP_PASSWORD_RECORD_OPTION, $record, false );
+		wp_cache_delete( self::APP_PASSWORD_RECORD_OPTION, 'options' );
+		return 1;
 	}
 
 	/**
@@ -1051,8 +1147,18 @@ class Aura_Worker_Magic_Link {
 	 * @param string $uuid    Its UUID.
 	 * @param string $fence   The caller's site-claim fence, when it holds one.
 	 */
-	private static function persist_password_owner( int $user_id, string $uuid, $fence = '', $undelivered = false, $revoking = '' ) {
+	private static function persist_password_owner( int $user_id, string $uuid, $fence = '', $undelivered = false, $revoking = '', $fulfilled = '' ) {
 		$record = array( 'user_id' => $user_id, 'uuid' => $uuid );
+		// Whatever else is still pending travels with it (round-35), minus the
+		// intent this write fulfils.
+		$prev = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+		if ( is_array( $prev ) && isset( $prev['intents'] ) && is_array( $prev['intents'] ) ) {
+			$intents = $prev['intents'];
+			unset( $intents[ (string) $fulfilled ] );
+			if ( array() !== $intents ) {
+				$record['intents'] = $intents;
+			}
+		}
 		if ( '' !== (string) $revoking ) {
 			// A revocation of THIS record is under way, by the holder of this
 			// fence. The value differs from every other writer's, so the UPDATE
@@ -1130,10 +1236,10 @@ class Aura_Worker_Magic_Link {
 			return true;
 		}
 		$rec = self::password_record();
-		if ( null === $rec && is_array( $record ) && ! empty( $record['minting'] ) ) {
-			// A mint intent that reconciliation just found nothing for. It names
-			// no credential, so there is nothing to revoke; the mint about to
-			// run replaces it with its own.
+		if ( null === $rec && is_array( $record ) && isset( $record['intents'] ) ) {
+			// Pending intents that reconciliation found nothing for. They name no
+			// credential, so there is nothing to revoke; they travel on beside
+			// whatever the mint about to run records.
 			return true;
 		}
 		if ( null === $rec ) {

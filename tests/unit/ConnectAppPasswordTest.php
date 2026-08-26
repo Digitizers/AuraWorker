@@ -553,13 +553,13 @@ final class ConnectAppPasswordTest extends TestCase {
 		// revocation failure, for a credential that no longer exists. (The
 		// intent still gets through: round-29 writes it before creating.)
 		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = static function ( $raw ) {
-			return false === strpos( (string) $raw, 'minting' );
+			return false !== strpos( (string) $raw, 'uuid' ); // the final record only
 		};
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertTrue( $data['success'] );
 		$this->assertSame( 'app_password_owner_unrecorded', $data['app_password_unavailable'] );
 		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'the password was revoked' );
-		$this->assertNull( $this->record(), '…and its record with it' );
+		$this->assertNull( $this->password_record_or_null(), '…and its record with it' );
 		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password(), 'nothing is recorded, so nothing is owed' );
 
 		// The next connect is not refused.
@@ -807,30 +807,29 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'is_multisite()', $uninstall );
 	}
 
-	public function test_a_password_recorded_only_as_an_intent_is_adopted_by_the_next_attempt(): void {
-		// Round-29: the intent lands, the password is created, and the final
-		// record does not persist. The credential is live and described only as
-		// "a mint was under way for user 7" — which is enough: the next attempt
-		// adopts whatever that mint created and revokes it.
+	public function test_a_password_left_by_an_interrupted_mint_is_revoked_by_the_next_attempt(): void {
+		// Round-29/35: the intent lands, the password is created, the final
+		// record does not. The credential is live and described only as "a mint
+		// was under way" — enough for the next attempt to find it by app_id and
+		// revoke it. Nobody ever received it, so it is revoked rather than kept.
 		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = static function ( $raw ) {
-			return false === strpos( (string) $raw, 'minting' ); // only the intent gets through
+			return false !== strpos( (string) $raw, 'uuid' ); // the intent lands, the final record does not
 		};
 		$GLOBALS['_app_passwords_delete_fail'] = true; // …and the cleanup cannot undo it
 		$res = $this->ml->handle_connect( $this->request() );
-		$this->assertSame( 500, $res->get_status() );
-		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the orphan is live' );
-		$rec = $this->record();
-		$this->assertSame( 7, (int) $rec['user_id'] );
-		$this->assertNotEmpty( $rec['minting'], 'described as a mint that was under way' );
-
-		// The next attempt, with the store healthy, adopts it and revokes it.
 		$GLOBALS['_sa_option_write_fail'] = array();
 		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$this->assertSame( 500, $res->get_status() );
+		$live = WP_Application_Passwords::get_user_application_passwords( 7 );
+		$this->assertCount( 1, $live, 'the orphan is live' );
+		$this->assertNotEmpty( $this->record()['intents'] ?? array(), 'and described as a pending mint' );
+
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
-		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ), 'the orphan died with the rotation' );
-		$this->assertSame( $this->recordUuid(), WP_Application_Passwords::get_user_application_passwords( 7 )[0]['uuid'] );
+		$after = array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' );
+		$this->assertNotContains( $live[0]['uuid'], $after, 'the orphan was revoked' );
+		$this->assertSame( array( $this->recordUuid() ), $after );
 	}
 
 	public function test_a_credential_wordpress_no_longer_accepts_is_not_healthy(): void {
@@ -843,14 +842,14 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'cannot issue the Application Password', $this->renderConnect() );
 	}
 
-	public function test_reconciliation_adopts_the_exact_credential_the_intent_names(): void {
+	public function test_reconciliation_settles_the_exact_credential_the_intent_names(): void {
 		// Round-30: matching on the name and a timestamp adopted whichever
 		// same-named password of that user came first in the list, so a second
 		// one created in the same second put the rotation onto an unrelated
 		// credential while the real orphan stayed live and untracked. The intent
 		// carries the app_id creation stamps on the password.
 		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = static function ( $raw ) {
-			return false === strpos( (string) $raw, 'minting' ); // only the intent lands
+			return false !== strpos( (string) $raw, 'uuid' ); // the intent lands, the final record does not
 		};
 		$GLOBALS['_app_passwords_delete_fail'] = true;
 		$this->ml->handle_connect( $this->request() );
@@ -875,9 +874,9 @@ final class ConnectAppPasswordTest extends TestCase {
 		// max_execution_time can be 0, or generous, or spent inside a call that
 		// does not count against it. Nothing depends on the intent's absence, so
 		// it is simply left alone.
-		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time() - 365 * DAY_IN_SECONDS, 'app_id' => 'abc' ), false );
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'intents' => array( 'abc' => array( 'user_id' => 7, 'at' => time() - 365 * DAY_IN_SECONDS ) ) ), false );
 		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password(), 'an intent names no credential, so nothing is owed' );
-		$this->assertNotNull( $this->record(), 'and it is not deleted, however old' );
+		$this->assertNotEmpty( $this->record()['intents'] ?? array(), 'and it is not deleted, however old' );
 
 		// The next mint replaces it with its own, which is what retires it.
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
@@ -901,24 +900,24 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_worker_app_password', false ) );
 	}
 
-	public function test_a_recovery_that_cannot_be_recorded_stops_the_next_mint(): void {
-		// Round-32: reconciliation can FIND the interrupted mint's password and
-		// still fail to record it. Ignored, the rotation would read the intent
-		// as naming no credential, let the retry overwrite it and mint another —
-		// leaving the first administrator credential live and untracked.
+	public function test_a_settlement_that_cannot_be_recorded_stops_the_next_mint(): void {
+		// Round-32/35: reconciliation can revoke the interrupted mint's password
+		// and still fail to drop its intent from the record. Ignored, the next
+		// attempt would mint while the site still describes a pending mint it
+		// has already settled — and, in the failure that matters, while a
+		// credential it could NOT revoke is still live.
 		$created = WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'app_id' => 'the-intent' ) );
-		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'the-intent' ), false );
-		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = serialize( array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'the-intent' ) );
-		// Every write of the record is refused, so the adoption cannot land.
-		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = true;
+		$rec = array( 'intents' => array( 'the-intent' => array( 'user_id' => 7, 'at' => time() ) ) );
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, $rec, false );
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = serialize( $rec );
+		$GLOBALS['_app_passwords_delete_fail'] = true; // the orphan will not die
 
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 500, $res->get_status() );
-		$this->assertSame( 'app_password_revoke_failed', $res->get_data()['code'], 'retryable: the intent is still there to reconcile' );
+		$this->assertSame( 'app_password_revoke_failed', $res->get_data()['code'], 'retryable: the intent is still there to settle' );
 		$this->assertSame( array( $created[1]['uuid'] ), array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' ), 'no second credential was minted' );
 
-		// With the store healthy the retry adopts it, revokes it, and mints one.
-		$GLOBALS['_sa_option_write_fail'] = array();
+		$GLOBALS['_app_passwords_delete_fail'] = false;
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
@@ -979,6 +978,45 @@ final class ConnectAppPasswordTest extends TestCase {
 		$req->set_param( 'client', $client );
 		$req->set_param( 'signature', Aura_Worker_Magic_Link::sign_connect_payload( $this->secret, $this->magic_id, $token, $dash, $ts, '', $client ) );
 		return $req;
+	}
+
+	public function test_two_pending_mints_are_both_remembered(): void {
+		// Round-35: the record held ONE intent, so a second mint overwrote the
+		// first — and the password the first handler may still create became
+		// unfindable. Intents are a set now.
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+		$GLOBALS['_options'][ $claim ] = 'mine|' . time();
+		$GLOBALS['_rows'][ $claim ]    = $GLOBALS['_options'][ $claim ];
+		$persist = new ReflectionMethod( Aura_Worker_Magic_Link::class, 'persist_mint_intent' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$persist->setAccessible( true );
+		}
+		$persist->invoke( null, 7, 'intent-a', 'mine' );
+		$persist->invoke( null, 9, 'intent-b', 'mine' );
+		$rec = $this->record();
+		$this->assertSame( array( 'intent-a', 'intent-b' ), array_keys( $rec['intents'] ) );
+		$this->assertSame( 7, $rec['intents']['intent-a']['user_id'] );
+		$this->assertSame( 9, $rec['intents']['intent-b']['user_id'] );
+
+		// Reconciliation settles only what it can find, and leaves the rest.
+		$created = WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'app_id' => 'intent-a' ) );
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password( 'mine' ) );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), "the first handler's orphan is revoked" );
+		$this->assertSame( array( 'intent-b' ), array_keys( $this->record()['intents'] ), "the second handler's intent survives" );
+	}
+
+	public function test_deactivation_that_cannot_seize_the_site_revokes_nothing(): void {
+		// Round-35: an unfenced revocation is exactly the race the fence exists
+		// to prevent — it could strip the record of a replacement another
+		// callback had just minted and returned. So it does not run at all; the
+		// record survives for the next activation, connect or uninstall.
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$deactivate = substr( $main, strpos( $main, 'function aura_worker_deactivate_site()' ) );
+		$this->assertLessThan(
+			strpos( $deactivate, 'revoke_managed_password' ),
+			strpos( $deactivate, 'return;' ),
+			'no fence, no revocation'
+		);
 	}
 
 	/** Render the connect section and return its HTML. */
