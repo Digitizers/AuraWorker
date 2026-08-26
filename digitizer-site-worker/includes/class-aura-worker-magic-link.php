@@ -428,6 +428,15 @@ class Aura_Worker_Magic_Link {
 		// grants signed for the winner's key would then fail closed, behind a
 		// 200 the winner already returned.
 		Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_dashboard_url', $dashboard_url, $site_claim_key, $site_fence );
+		// Verified like the token and the gateway key (round-39): the settings
+		// screen reads this row to know the site is connected at all, so a write
+		// that did not land leaves the dashboard believing onboarding finished
+		// over a site that reports itself disconnected.
+		$stored_url = Aura_Worker_Rules::read_option_uncached( 'aura_worker_dashboard_url' );
+		if ( is_wp_error( $stored_url ) || (string) $stored_url !== (string) $dashboard_url ) {
+			$release();
+			return new WP_REST_Response( array( 'error' => 'Connect not completed: the dashboard URL could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
+		}
 		if ( '' !== $grant_pubkey ) {
 			// Provision the gateway key → turns on approval-grant enforcement
 			// (Aura_Worker_Grant::is_enforced()).
@@ -697,6 +706,12 @@ class Aura_Worker_Magic_Link {
 		}
 		$created = WP_Application_Passwords::create_new_application_password( $user_id, array( 'name' => self::APP_PASSWORD_NAME, 'app_id' => $app_id ) );
 		if ( is_wp_error( $created ) ) {
+			// Nothing was created and this request cannot create anything now,
+			// so its intent is settled before the error goes back (round-39).
+			// Left behind, every retry would append another app_id that no
+			// password will ever match, and uninstall deliberately keeps each
+			// one — an option that grows and never shrinks.
+			self::settle_intent( $app_id, $fence );
 			// Core refusing to write the password — a failing user-meta write,
 			// a database error — is an OPERATIONAL failure, not one of the
 			// token-only cases (round-12). Given its own code so the caller

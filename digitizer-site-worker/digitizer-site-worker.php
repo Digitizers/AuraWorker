@@ -61,10 +61,19 @@ register_activation_hook( __FILE__, 'aura_worker_activate' );
 function aura_worker_activate_site() {
 	// Store activation timestamp.
 	update_option( 'aura_worker_activated', time() );
-	// Activation is the REPAIR path: it evicts whatever holds the site and takes
-	// it (round-36/38). A claim left by a crashed handler would otherwise block
-	// every future connect, and this is where an operator comes to fix that.
-	$aura_fence = Aura_Worker_Magic_Link::repair_site_claim();
+	// Two different jobs, and only one of them may evict (round-39).
+	//
+	// The revocation runs only on a site taken cleanly — exactly as deactivation
+	// does — because revoking beneath a live handler has it return the plaintext
+	// of a password already deleted. The stuck-claim repair, which is why an
+	// operator reactivates at all, does evict; it just does not revoke anything,
+	// and an evicted handler's own writes are all conditional on the claim it no
+	// longer holds, so it revokes what it created and answers 409.
+	$aura_fence = Aura_Worker_Magic_Link::seize_site();
+	$aura_free  = ( '' !== $aura_fence );
+	if ( ! $aura_free ) {
+		$aura_fence = Aura_Worker_Magic_Link::repair_site_claim();
+	}
 	// Deactivation revokes the Application Password Aura minted, and KEEPS its
 	// record whenever the revocation did not land. Reaching activation with that
 	// record still present therefore means exactly one thing: a revocation that
@@ -72,9 +81,9 @@ function aura_worker_activate_site() {
 	// administrator credential valid indefinitely — the documentation promises
 	// reactivation as the cure, so it has to be one. A site that was never
 	// deactivated by this hook has nothing recorded and this is a no-op.
-	if ( '' === $aura_fence ) {
-		// No fence, no revocation: an unfenced one is the race the fence exists
-		// to prevent. The record survives for the next connect or uninstall.
+	if ( ! $aura_free ) {
+		// The site was held: the claim has been repaired, but nothing is revoked
+		// here. The record survives for the next connect or uninstall.
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: a connect held the site while the plugin was activating, so a deferred Aura Application Password revocation was skipped.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 	} elseif ( ! Aura_Worker_Magic_Link::revoke_managed_password( $aura_fence ) ) {

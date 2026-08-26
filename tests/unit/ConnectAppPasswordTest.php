@@ -255,7 +255,9 @@ final class ConnectAppPasswordTest extends TestCase {
 		// merely evicts, because an unfenced revocation is the race the fence
 		// exists to prevent.
 		$this->assertSame( 0, substr_count( $main, 'Aura_Worker_Magic_Link::forget_site_claim();' ) );
-		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::seize_site();' ), 'deactivation takes a free site' );
+		// Both hooks take a FREE site to revoke on; only activation goes on to
+		// evict, and then only to repair the claim, never to revoke (round-39).
+		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::seize_site();' ) );
 		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::repair_site_claim();' ), 'activation repairs' );
 		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::release_site( $aura_fence );' ) );
 		$this->assertSame( 0, substr_count( file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker-api.php' ), 'forget_site_claim' ) );
@@ -1110,6 +1112,58 @@ final class ConnectAppPasswordTest extends TestCase {
 		$rec = $this->record();
 		$this->assertSame( 'app_passwords_unavailable', $rec['unavailable'] );
 		$this->assertSame( array( 'someone-elses' ), array_keys( $rec['intents'] ), "the other handler's intent survives" );
+	}
+
+	public function test_activation_repairs_a_held_claim_without_revoking_under_it(): void {
+		// Round-39: activation evicted first and then revoked, so a callback
+		// paused after its post-mint check lost its password and still returned
+		// 200 with its plaintext. Eviction repairs the claim; the revocation
+		// runs only on a site that was FREE.
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$activate = substr( $main, strpos( $main, 'function aura_worker_activate_site()' ) );
+		$this->assertLessThan(
+			strpos( $activate, 'repair_site_claim' ),
+			strpos( $activate, 'seize_site' ),
+			'try a clean take first'
+		);
+		$this->assertStringContainsString( 'if ( ! $aura_free ) {', $activate );
+		$this->assertLessThan(
+			strpos( $activate, 'revoke_managed_password' ),
+			strpos( $activate, 'if ( ! $aura_free ) {' ),
+			'a repaired (evicted) site revokes nothing'
+		);
+	}
+
+	public function test_a_creation_that_failed_settles_its_own_intent(): void {
+		// Round-39: the request created nothing and cannot create anything now,
+		// so leaving its intent behind would have every retry append another
+		// app_id no password will ever match — and uninstall deliberately keeps
+		// each one.
+		$GLOBALS['_sa_app_password_create_fails'] = true;
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'app_password_mint_failed', $res->get_data()['code'] );
+		$this->assertNull( $this->record(), 'no intent is left behind' );
+
+		// Three more failures leave nothing accumulating either.
+		for ( $i = 0; $i < 3; $i++ ) {
+			set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+			$this->ml->handle_connect( $this->request() );
+		}
+		$this->assertNull( $this->record() );
+	}
+
+	public function test_a_dashboard_url_that_does_not_land_fails_the_connect(): void {
+		// Round-39: the settings screen reads this row to know the site is
+		// connected at all, so a write that did not land left the dashboard
+		// believing onboarding finished over a site reporting itself
+		// disconnected.
+		$GLOBALS['_sa_option_write_fail']['aura_worker_dashboard_url'] = true;
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
+		$this->assertNotEmpty( get_transient( 'aura_magic_' . $this->magic_id ), 'retryable' );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ), 'nothing was minted' );
 	}
 
 	/** Render the connect section and return its HTML. */
