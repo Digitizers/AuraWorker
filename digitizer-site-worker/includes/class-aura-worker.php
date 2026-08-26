@@ -180,12 +180,18 @@ class Aura_Worker {
 			// translators: internal log line, not shown to the user.
 			error_log( 'SiteAgent: the Aura Application Password could not be revoked while regenerating the site token; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 		}
-		// The RESPONSE is deliberately not conditioned on the claim as well. The
-		// swap matched a row, so the token it revealed was the site's when this
-		// request wrote it; refusing to reveal it afterwards — because the row
-		// has since moved on — would revoke the old token while showing no
-		// replacement, which is the #67 defect this handler exists to remove.
-		// Losing the claim costs this rotation its cleanup, never its token.
+		// The reveal is withheld ONLY on proof that this token is no longer the
+		// site's (round-40). #67's rule stands — a read that fails must never
+		// cost the operator a token that was stored, because that revokes the
+		// old one while showing no replacement — so a read error reveals as
+		// before. But a read that SUCCEEDS and disagrees is not ambiguous: a
+		// connect replaced the token while this request was paused, and handing
+		// over the old raw value gives the operator something the site rejects.
+		$current = Aura_Worker_Rules::read_option_uncached( 'aura_worker_site_token' );
+		if ( ! is_wp_error( $current ) && is_string( $current ) && ! hash_equals( $hashed, $current ) ) {
+			Aura_Worker_Magic_Link::release_site( $site_fence );
+			wp_send_json_error( array( 'message' => __( 'Another site token was stored while this request ran, so this one changed nothing. That token is now the current one — regenerate again if you still want a new one.', 'digitizer-site-worker' ) ), 500 );
+		}
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
 		Aura_Worker_Magic_Link::release_site( $site_fence );
 

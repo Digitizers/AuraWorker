@@ -1447,6 +1447,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				$GLOBALS['_rows'][ $name ]    = $new;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				// The mirror of sa_before_swap(): a second request landing right
+				// AFTER this caller's write, which is the window a confirming
+				// read is about.
+				if ( isset( $GLOBALS['_sa_after_swap'] ) && is_callable( $GLOBALS['_sa_after_swap'] ) ) {
+					$after                    = $GLOBALS['_sa_after_swap'];
+					$GLOBALS['_sa_after_swap'] = null;
+					$after( $name );
+				}
 				return 1;
 			}
 
@@ -1520,6 +1528,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
 }
@@ -2020,6 +2029,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_posts']        = array();
 	$GLOBALS['_post_meta']    = array();
