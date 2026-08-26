@@ -833,6 +833,14 @@ class Aura_Worker_Magic_Link {
 		if ( null === $usable ) {
 			return 'none';
 		}
+		// The record is bookkeeping; WordPress holds the credential. An
+		// administrator revoking it under Users → Profile, or the owning user
+		// being deleted, changes nothing here — so the list is consulted before
+		// this screen calls the connection healthy (round-27). One read, on an
+		// admin page render.
+		if ( ! class_exists( 'WP_Application_Passwords' ) || self::managed_password_gone( $usable['user_id'], $usable['uuid'] ) ) {
+			return 'none';
+		}
 		return empty( $usable['undelivered'] ) ? 'delivered' : 'undelivered';
 	}
 

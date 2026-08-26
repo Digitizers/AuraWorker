@@ -762,8 +762,9 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'no credential for the builder tools', $html );
 		$this->assertStringContainsString( 'aura-connect-btn', $html );
 
-		// Minted but never handed over.
-		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'uuid' => 'u', 'undelivered' => true ), false );
+		// Minted but never handed over — the password really exists.
+		$created = WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) );
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'uuid' => $created[1]['uuid'], 'undelivered' => true ), false );
 		$html = $this->renderConnect();
 		$this->assertStringContainsString( 'could not deliver the credential', $html );
 
@@ -789,6 +790,21 @@ final class ConnectAppPasswordTest extends TestCase {
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
 		$data = $this->ml->handle_connect( $this->request() )->get_data();
 		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+	}
+
+	public function test_a_password_revoked_outside_aura_is_not_reported_as_delivered(): void {
+		// Round-27: the record is bookkeeping; WordPress holds the credential.
+		// An administrator revoking it under Users → Profile leaves the record
+		// untouched, and the screen would go on calling the connection healthy
+		// while the dashboard's Basic auth no longer works.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertStringNotContainsString( 'Connect again to issue', $this->renderConnect() );
+
+		$uuid = $this->recordUuid();
+		WP_Application_Passwords::delete_application_password( 7, $uuid ); // the operator, by hand
+		$html = $this->renderConnect();
+		$this->assertStringContainsString( 'no credential for the builder tools', $html );
+		$this->assertStringContainsString( 'aura-connect-btn', $html );
 	}
 
 	/** Render the connect section and return its HTML. */
