@@ -34,7 +34,8 @@ $aura_uninstall_site = static function () {
 	// by app_id — and after this file runs there is no plugin left to do it, so
 	// uninstall settles them here, or the credentials outlive everything that
 	// could find them. Mirrors Aura_Worker_Magic_Link::reconcile_mint_intent().
-	$aura_pw_intents = ( is_array( $aura_pw_record ) && isset( $aura_pw_record['intents'] ) && is_array( $aura_pw_record['intents'] ) ) ? $aura_pw_record['intents'] : array();
+	$aura_pw_intents  = ( is_array( $aura_pw_record ) && isset( $aura_pw_record['intents'] ) && is_array( $aura_pw_record['intents'] ) ) ? $aura_pw_record['intents'] : array();
+	$aura_intents_all_gone = true;
 	if ( array() !== $aura_pw_intents && class_exists( 'WP_Application_Passwords' ) ) {
 		foreach ( $aura_pw_intents as $aura_intent_app_id => $aura_intent ) {
 			$aura_intent_owner = (int) ( $aura_intent['user_id'] ?? 0 );
@@ -47,7 +48,20 @@ $aura_uninstall_site = static function () {
 					break;
 				}
 			}
+			// PROVEN by the owner's list, exactly as the credential's own
+			// revocation is (round-37): delete_application_password() answers
+			// false for a failed user-meta write too, and an intent discarded
+			// over an unproven delete takes with it the only app_id that
+			// identifies a live administrator credential.
+			foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_intent_owner ) as $aura_pw_item ) {
+				if ( '' !== (string) ( $aura_pw_item['app_id'] ?? '' ) && (string) $aura_intent_app_id === (string) $aura_pw_item['app_id'] ) {
+					$aura_intents_all_gone = false;
+					break;
+				}
+			}
 		}
+	} elseif ( array() !== $aura_pw_intents ) {
+		$aura_intents_all_gone = false; // no Application Passwords API here to prove anything
 	}
 	$aura_pw_tracked = ( $aura_pw_owner > 0 && '' !== $aura_pw_uuid );
 	// A record that is NOT usable — present but malformed — names a password this
@@ -57,7 +71,7 @@ $aura_uninstall_site = static function () {
 	// stays behind for manual recovery. Nothing recorded at all → nothing to keep.
 	// A record that holds only pending intents describes no credential the
 	// uninstall could not reach, so nothing is kept for it either.
-	$aura_pw_intent_only = ( ! $aura_pw_tracked && array() !== $aura_pw_intents );
+	$aura_pw_intent_only = ( ! $aura_pw_tracked && array() !== $aura_pw_intents && $aura_intents_all_gone );
 	$aura_pw_present     = ( null !== $aura_pw_record && false !== $aura_pw_record && '' !== $aura_pw_record );
 	$aura_pw_gone        = ( ! $aura_pw_present || $aura_pw_intent_only );
 	if ( $aura_pw_tracked && class_exists( 'WP_Application_Passwords' ) ) {

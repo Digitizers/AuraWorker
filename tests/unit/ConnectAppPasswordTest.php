@@ -1047,6 +1047,26 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertNull( $this->password_record_or_null(), 'no credential is described any more' );
 	}
 
+	public function test_uninstall_keeps_a_pending_mint_whose_revocation_it_cannot_prove(): void {
+		// Round-37: an intent discarded over an unproven delete takes with it the
+		// only app_id identifying a live administrator credential — and after
+		// uninstall nothing is left to look for it.
+		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'app_id' => 'the-intent' ) );
+		$rec = array( 'intents' => array( 'the-intent' => array( 'user_id' => 7, 'at' => time() ) ) );
+		update_option( 'aura_worker_app_password', $rec, false );
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+
+		$this->run_uninstall();
+		$this->assertSame( $rec, get_option( 'aura_worker_app_password' ), 'the intent survives an unproven revocation' );
+		$this->assertCount( 1, WP_Application_Passwords::get_user_application_passwords( 7 ) );
+
+		// With the delete working, the same uninstall settles and forgets it.
+		$GLOBALS['_app_passwords_delete_fail'] = false;
+		$this->run_uninstall();
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+		$this->assertFalse( get_option( 'aura_worker_app_password', false ) );
+	}
+
 	/** Render the connect section and return its HTML. */
 	private function renderConnect(): string {
 		ob_start();
