@@ -852,21 +852,36 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertCount( 2, $live, "the stranger's survived, beside the fresh one" );
 	}
 
-	public function test_a_mint_intent_is_not_retired_while_its_handler_could_still_be_running(): void {
-		// Round-30: deleting a young intent and having the request that wrote it
-		// create its password a moment later leaves a live administrator
-		// credential nothing can find.
-		$revoke = static function () {
-			return Aura_Worker_Magic_Link::revoke_managed_password();
-		};
-		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'abc' ), false );
-		$this->assertTrue( $revoke(), 'an intent names no credential, so nothing is owed' );
-		$this->assertNotNull( $this->record(), 'and it stays: its handler may still be inside the mint' );
+	public function test_a_mint_intent_is_never_retired_on_a_clock(): void {
+		// Round-31: any rule for retiring an intent rests on knowing the request
+		// that wrote it can no longer resume, and PHP offers no such proof —
+		// max_execution_time can be 0, or generous, or spent inside a call that
+		// does not count against it. Nothing depends on the intent's absence, so
+		// it is simply left alone.
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time() - 365 * DAY_IN_SECONDS, 'app_id' => 'abc' ), false );
+		$this->assertTrue( Aura_Worker_Magic_Link::revoke_managed_password(), 'an intent names no credential, so nothing is owed' );
+		$this->assertNotNull( $this->record(), 'and it is not deleted, however old' );
 
-		// Older than any real request, and matching no password: retired.
-		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'minting' => time() - Aura_Worker_Magic_Link::MINT_INTENT_STALE_SECONDS - 1, 'app_id' => 'abc' ), false );
-		$this->assertTrue( $revoke() );
-		$this->assertNull( $this->record() );
+		// The next mint replaces it with its own, which is what retires it.
+		$data = $this->ml->handle_connect( $this->request() )->get_data();
+		$this->assertSame( 'user7', $data['app_password']['user_login'] );
+		$this->assertNotEmpty( $this->recordUuid() );
+	}
+
+	public function test_uninstall_resolves_a_mint_intent_by_app_id_and_revokes_it(): void {
+		// Round-31: after this file runs there is no plugin left to reconcile an
+		// interrupted mint, so uninstall resolves it or the credential outlives
+		// everything that could find it.
+		$created = WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'app_id' => 'the-intent' ) );
+		WP_Application_Passwords::create_new_application_password( 7, array( 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME ) ); // a stranger's
+		update_option( 'aura_worker_app_password', array( 'user_id' => 7, 'minting' => time(), 'app_id' => 'the-intent' ), false );
+
+		$this->run_uninstall();
+
+		$live = array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' );
+		$this->assertNotContains( $created[1]['uuid'], $live, 'the interrupted mint is revoked' );
+		$this->assertCount( 1, $live, "the stranger's is untouched" );
+		$this->assertFalse( get_option( 'aura_worker_app_password', false ) );
 	}
 
 	/** Render the connect section and return its HTML. */

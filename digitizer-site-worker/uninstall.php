@@ -28,14 +28,32 @@ $aura_uninstall_site = static function () {
 	$aura_pw_record  = get_option( 'aura_worker_app_password', null );
 	$aura_pw_owner   = is_array( $aura_pw_record ) ? (int) ( $aura_pw_record['user_id'] ?? 0 ) : 0;
 	$aura_pw_uuid    = is_array( $aura_pw_record ) ? (string) ( $aura_pw_record['uuid'] ?? '' ) : '';
+	$aura_pw_app_id  = is_array( $aura_pw_record ) ? (string) ( $aura_pw_record['app_id'] ?? '' ) : '';
+	// A record with an app_id but no uuid is a MINT INTENT: a connect was
+	// interrupted between creating the password and recording which one it is
+	// (round-31). The plugin's own reconciliation resolves that by app_id — and
+	// after this file runs there is no plugin left to do it, so uninstall
+	// resolves it here, or the credential outlives everything that could find
+	// it. Mirrors Aura_Worker_Magic_Link::reconcile_mint_intent().
+	if ( $aura_pw_owner > 0 && '' === $aura_pw_uuid && '' !== $aura_pw_app_id && class_exists( 'WP_Application_Passwords' ) ) {
+		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_pw_owner ) as $aura_pw_item ) {
+			if ( '' !== (string) ( $aura_pw_item['app_id'] ?? '' ) && $aura_pw_app_id === (string) $aura_pw_item['app_id'] && ! empty( $aura_pw_item['uuid'] ) ) {
+				$aura_pw_uuid = (string) $aura_pw_item['uuid'];
+				break;
+			}
+		}
+	}
 	$aura_pw_tracked = ( $aura_pw_owner > 0 && '' !== $aura_pw_uuid );
 	// A record that is NOT usable — present but malformed — names a password this
 	// code cannot delete, and the connect path treats it as a possibly live orphan
 	// (round-13). Uninstall must not discard it either (round-15): it is the only
 	// thing left pointing at an administrator credential that may still work, so it
 	// stays behind for manual recovery. Nothing recorded at all → nothing to keep.
-	$aura_pw_present = ( null !== $aura_pw_record && false !== $aura_pw_record && '' !== $aura_pw_record );
-	$aura_pw_gone    = ! $aura_pw_present;
+	// An intent that resolved to nothing describes no credential, so nothing is
+	// kept for it either.
+	$aura_pw_intent_only = ( ! $aura_pw_tracked && $aura_pw_owner > 0 && '' !== $aura_pw_app_id );
+	$aura_pw_present     = ( null !== $aura_pw_record && false !== $aura_pw_record && '' !== $aura_pw_record );
+	$aura_pw_gone        = ( ! $aura_pw_present || $aura_pw_intent_only );
 	if ( $aura_pw_tracked && class_exists( 'WP_Application_Passwords' ) ) {
 		WP_Application_Passwords::delete_application_password( $aura_pw_owner, $aura_pw_uuid );
 		// The revocation is PROVEN by the owner's list, not by the delete's return

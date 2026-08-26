@@ -601,15 +601,6 @@ class Aura_Worker_Magic_Link {
 	 */
 	const APP_PASSWORD_RECORD_OPTION = 'aura_worker_app_password';
 
-	/**
-	 * How long a mint intent that produced no password is kept before it is
-	 * retired (round-30). Long past any request that could still be inside the
-	 * mint — PHP's max_execution_time is 30-60 s and the dashboard gives the
-	 * whole connect 40 s — so an intent is never removed while the handler that
-	 * wrote it can still create the credential it describes. Retiring one that
-	 * matched nothing destroys no credential, because there is none.
-	 */
-	const MINT_INTENT_STALE_SECONDS = 300;
 
 
 	/**
@@ -967,15 +958,16 @@ class Aura_Worker_Magic_Link {
 			self::persist_password_owner( $owner, $found, $fence, true ); // it exists and nobody received it
 			return;
 		}
-		// Nothing was created under this intent — YET. The handler that wrote it
-		// may still be running (round-30): deleting the intent here and having
-		// that request create its password a moment later would leave a live
-		// administrator credential nothing can find. An intent outlives any real
-		// request before it is retired, and retiring one that matched nothing
-		// destroys no credential, because there is none.
-		if ( (int) $rec['minting'] <= time() - self::MINT_INTENT_STALE_SECONDS ) {
-			self::forget_password_owner( $fence );
-		}
+		// Nothing was created under this intent — and it is left exactly where
+		// it is (round-31). Any rule for retiring it rests on knowing that the
+		// request which wrote it can no longer resume, and PHP offers no such
+		// proof: max_execution_time can be 0, or generous, or spent inside a
+		// database call that does not count against it. Nothing depends on the
+		// intent's absence — it names no credential, so the revocation reports
+		// nothing owed, the screen reads it as no credential, and the next mint
+		// replaces it with its own. An intent that outlives its usefulness
+		// costs one option row; retiring one early costs a live administrator
+		// credential nothing can find.
 	}
 
 	/**
