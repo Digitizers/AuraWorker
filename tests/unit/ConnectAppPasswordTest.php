@@ -244,9 +244,13 @@ final class ConnectAppPasswordTest extends TestCase {
 		$res = $this->ml->handle_connect( $this->request() );
 		$this->assertSame( 200, $res->get_status(), 'the connect proceeds once the claim is released' );
 
-		// …and it is wired to activation and deactivation, and to nothing else.
+		// …and the release is wired to the lifecycle hooks and to nothing else:
+		// activation clears it outright, deactivation SEIZES the site (evict,
+		// then claim) so nothing can mint beside its revocation.
 		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
-		$this->assertSame( 2, substr_count( $main, 'Aura_Worker_Magic_Link::forget_site_claim();' ) );
+		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::forget_site_claim();' ) );
+		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::seize_site();' ) );
+		$this->assertSame( 1, substr_count( $main, 'Aura_Worker_Magic_Link::release_site( $aura_fence );' ) );
 		$this->assertSame( 0, substr_count( file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker-api.php' ), 'forget_site_claim' ) );
 	}
 
@@ -379,15 +383,20 @@ final class ConnectAppPasswordTest extends TestCase {
 		// and every other REST/MCP plugin still accept.
 		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
 		$deactivate = substr( $main, strpos( $main, 'function aura_worker_deactivate_site()' ) );
-		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password()', $deactivate );
-		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::forget_site_claim();', $deactivate );
-		// The claim goes FIRST (round-33): a connect paused between its mint and
-		// its ownership check would otherwise still pass that check and hand out
-		// the plaintext of a password this hook had already revoked.
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password( $aura_fence )', $deactivate );
+		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::seize_site();', $deactivate );
+		// The site is taken FIRST (rounds 33-34): a connect paused between its
+		// mint and its ownership check must fail that check, and no new callback
+		// may mint a replacement beside this revocation.
 		$this->assertLessThan(
 			strpos( $deactivate, 'revoke_managed_password' ),
-			strpos( $deactivate, 'forget_site_claim' ),
-			'release the claim before revoking'
+			strpos( $deactivate, 'seize_site' ),
+			'seize the site before revoking'
+		);
+		$this->assertLessThan(
+			strpos( $deactivate, 'release_site' ),
+			strpos( $deactivate, 'revoke_managed_password' ),
+			'…and release it after'
 		);
 		// …and activation finishes a revocation deactivation could not land
 		// (round-11): reaching it with a record still present means exactly
@@ -916,6 +925,60 @@ final class ConnectAppPasswordTest extends TestCase {
 		$live = array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' );
 		$this->assertNotContains( $created[1]['uuid'], $live );
 		$this->assertSame( array( $this->recordUuid() ), $live );
+	}
+
+	public function test_deactivation_seizes_the_site_so_nothing_mints_beside_its_revocation(): void {
+		// Round-34: evicting the stale handler without taking the site let a
+		// signed callback in another already-loaded request claim it at once and
+		// mint a replacement, which the revocation running beside it would then
+		// strip of its record while revoking only the old UUID.
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'someone-else|' . time();
+		$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ];
+		$fence = Aura_Worker_Magic_Link::seize_site();
+		$this->assertNotSame( '', $fence, 'the site is taken, not merely unlocked' );
+		$this->assertStringStartsWith( $fence . '|', (string) sa_read_option_uncached( Aura_Worker_Magic_Link::SITE_CLAIM ) );
+
+		// While it is held, a signed callback cannot install anything.
+		$res = $this->ml->handle_connect( $this->request() );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( array(), WP_Application_Passwords::get_user_application_passwords( 7 ) );
+
+		// Released, the next connect proceeds.
+		Aura_Worker_Magic_Link::release_site( $fence );
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM, false ) );
+		$this->assertSame( 200, $this->ml->handle_connect( $this->request() )->get_status() );
+	}
+
+	public function test_the_previous_password_dies_with_the_token_even_when_the_binding_fails(): void {
+		// Round-34: the rotation used to run inside the mint, after the binding
+		// and the gateway key. A binding failure then returned 500 with the old
+		// administrator credential still valid — and if no retry completed
+		// before the magic link expired, valid indefinitely.
+		$this->ml->handle_connect( $this->request( ) );
+		$old = $this->recordUuid();
+		$this->assertNotEmpty( $old );
+
+		$GLOBALS['_sa_option_write_fail']['aura_worker_ruleset'] = true;
+		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
+		$res = $this->ml->handle_connect( $this->requestWithClient( 'client-new' ) );
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 500, $res->get_status(), 'the binding failure still fails the connect' );
+		$this->assertNotContains( $old, array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' ), 'the old credential died with its token' );
+	}
+
+	/** A signed request that also names a client. */
+	private function requestWithClient( string $client ): WP_REST_Request {
+		$token = 'raw-token';
+		$dash  = 'https://dash.example';
+		$ts    = time();
+		$req   = new WP_REST_Request();
+		$req->set_param( 'magic_id', $this->magic_id );
+		$req->set_param( 'token', $token );
+		$req->set_param( 'dashboard_url', $dash );
+		$req->set_param( 'timestamp', $ts );
+		$req->set_param( 'client', $client );
+		$req->set_param( 'signature', Aura_Worker_Magic_Link::sign_connect_payload( $this->secret, $this->magic_id, $token, $dash, $ts, '', $client ) );
+		return $req;
 	}
 
 	/** Render the connect section and return its HTML. */

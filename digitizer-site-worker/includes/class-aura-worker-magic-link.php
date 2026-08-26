@@ -358,6 +358,35 @@ class Aura_Worker_Magic_Link {
 			}
 			return new WP_REST_Response( array( 'error' => 'Connect not completed: the site token could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
 		}
+		// The token is stored, so the credential minted beside the PREVIOUS one
+		// is now a credential without a token — revoke it here, before anything
+		// else can fail (round-34). Left until the mint, a binding or gateway-key
+		// failure returned 500 with the old administrator password still valid,
+		// and if no retry completed before the magic link expired it stayed
+		// valid indefinitely. Rotation is a promise about the OLD credential,
+		// kept at the moment the token it belonged to is replaced.
+		if ( self::tracking_is_incomplete() ) {
+			// Something is recorded that names a password nothing here can
+			// delete. Minting beside it would add a second live administrator
+			// credential, so the link is consumed and the operator is told.
+			delete_transient( 'aura_magic_' . $magic_id );
+			$release();
+			return new WP_REST_Response( array( 'error' => 'This site records half an Aura Application Password, so another cannot be minted beside it; revoke it by hand in Users → Profile → Application Passwords and delete the aura_worker_app_password option.', 'code' => 'app_password_tracking_incomplete' ), 500 );
+		}
+		if ( ! self::revoke_managed_password( $site_fence ) ) {
+			$release();
+			// WHICH failure it was is decided by what the site still records
+			// (round-20/32): nothing recorded at all means a live credential
+			// nothing can find, which no retry may mint beside.
+			$anything = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
+			if ( null === $anything || false === $anything || '' === $anything ) {
+				delete_transient( 'aura_magic_' . $magic_id );
+				// translators: internal log line, not shown to the user.
+				error_log( 'SiteAgent: a previous Aura Application Password could be neither revoked nor recorded; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				return new WP_REST_Response( array( 'error' => 'A previous Application Password could be neither revoked nor recorded; revoke it by hand in Users → Profile → Application Passwords.', 'code' => 'app_password_orphan_untracked' ), 500 );
+			}
+			return new WP_REST_Response( array( 'error' => 'A previous Application Password could not be revoked; retry.', 'code' => 'app_password_revoke_failed' ), 500 );
+		}
 		if ( '' !== $client ) {
 			// A (re)connect binds this site to a client. The binding is written
 			// INTO the ruleset store, as a seq-0 sentinel record that names the
@@ -615,30 +644,12 @@ class Aura_Worker_Magic_Link {
 		if ( ! class_exists( 'WP_Application_Passwords' ) || ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 			return new WP_Error( 'app_passwords_unsupported', 'This WordPress does not support Application Passwords.' );
 		}
-		// REVOKE FIRST, whatever happens next (round-3): the token was just
-		// replaced, so the previous owner's Aura password must die with it even
-		// when no replacement can be minted for this creator (not an admin,
-		// Application Passwords unavailable for them). Rotation is a promise
-		// about the OLD credential, not a side effect of minting a new one.
+		// The rotation itself has already run, at the moment the token was
+		// replaced (round-34). What remains here is the check that nothing
+		// unusable is recorded — a mint beside an orphan is the one thing this
+		// must never do.
 		if ( self::tracking_is_incomplete() ) {
 			return new WP_Error( 'app_password_tracking_incomplete', 'This site records half an Aura Application Password, so another cannot be minted beside it; revoke it by hand in Users → Profile → Application Passwords and delete the aura_worker_app_password option.' );
-		}
-		if ( ! self::revoke_managed_password( $fence ) ) {
-			// A revocation that did not land is NOT reported as a rotation
-			// (round-4): the old credential may still be valid, so nothing new
-			// is minted beside it and the dashboard is told why.
-			//
-			// …and WHICH failure it was is decided by what the site still
-			// records (round-20). The revocation consumes the record before it
-			// deletes the password and puts it back when the delete fails; if
-			// that restoration failed too, a live administrator credential is
-			// left with nothing naming it, and a retry would mint another
-			// beside it. No record ⇒ terminal, exactly as elsewhere.
-			$anything = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
-			if ( null === $anything || false === $anything || '' === $anything ) {
-				return new WP_Error( 'app_password_orphan_untracked', 'A previous Application Password could be neither revoked nor recorded; revoke it by hand in Users → Profile → Application Passwords.' );
-			}
-			return new WP_Error( 'app_password_revoke_failed', 'A previous Aura Application Password could not be revoked; no new one was minted.' );
 		}
 		$user = $user_id > 0 ? get_userdata( $user_id ) : false;
 		if ( ! $user || empty( $user->user_login ) ) {
@@ -762,6 +773,33 @@ class Aura_Worker_Magic_Link {
 		}
 		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::SITE_CLAIM ) );
 		return is_string( $held ) && 0 === strpos( $held, $fence . '|' );
+	}
+
+	/**
+	 * Take the site EXCLUSIVELY for a lifecycle operation (round-34).
+	 *
+	 * Deactivation must both evict a handler that may still resume AND hold the
+	 * site while it revokes: deleting the claim and leaving it open let a signed
+	 * callback in another already-loaded request claim the site immediately and
+	 * mint a replacement, which the revocation running beside it would then
+	 * strip of its record while revoking only the old UUID — the returned
+	 * administrator credential left live and untracked.
+	 *
+	 * Evict, then claim. A second eviction covers the callback that squeezed in
+	 * between; after that the caller proceeds without a fence rather than
+	 * looping, because a deactivation must not hang, and says so in the log.
+	 *
+	 * @return string The caller's fence, or '' if the site could not be taken.
+	 */
+	public static function seize_site() {
+		for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+			self::forget_site_claim();
+			$fence = self::claim_magic_link( self::SITE_CLAIM );
+			if ( '' !== $fence ) {
+				return $fence;
+			}
+		}
+		return '';
 	}
 
 	/**

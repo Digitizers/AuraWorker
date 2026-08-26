@@ -126,12 +126,17 @@ register_deactivation_hook( __FILE__, 'aura_worker_deactivate' );
  * Deactivation cleanup for ONE site.
  */
 function aura_worker_deactivate_site() {
-	// The claim goes FIRST (round-33). A connect paused between its mint and
-	// the check that it still owns the site would otherwise pass that check —
-	// its fence still in the row — and hand the dashboard the plaintext of a
-	// password this hook had already revoked. Released first, the same check
-	// fails, and that handler revokes what it created and answers 409 instead.
-	Aura_Worker_Magic_Link::forget_site_claim();
+	// The site is SEIZED first (round-34), not merely unlocked. Two things have
+	// to be true while this hook revokes: a connect paused between its mint and
+	// its ownership check must fail that check — it would otherwise hand the
+	// dashboard the plaintext of a password just revoked — and no NEW callback
+	// may take the site and mint a replacement beside the revocation. Evicting
+	// without claiming did the first and invited the second.
+	$aura_fence = Aura_Worker_Magic_Link::seize_site();
+	if ( '' === $aura_fence ) {
+		// translators: internal log line, not shown to the user.
+		error_log( 'SiteAgent: a connect held the site while the plugin was deactivating; the Application Password revocation ran without holding it.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+	}
 	// Options are removed on uninstall, not here — with one exception. The
 	// Application Password minted for the dashboard (2.11.0) is an
 	// administrator-level WordPress credential. Unregistering SiteAgent's
@@ -141,8 +146,10 @@ function aura_worker_deactivate_site() {
 	// fail — and revoke_managed_password() keeps its record whenever the
 	// revocation did not land, so a reactivation or the uninstall can finish
 	// the job.
-	if ( ! Aura_Worker_Magic_Link::revoke_managed_password() ) {
+	if ( ! Aura_Worker_Magic_Link::revoke_managed_password( $aura_fence ) ) {
 		// translators: internal log line, not shown to the user.
 		error_log( 'SiteAgent: the Aura Application Password could not be revoked while deactivating; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 	}
+	// Released, so the site is not left locked against every future connect.
+	Aura_Worker_Magic_Link::release_site( $aura_fence );
 }
