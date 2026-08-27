@@ -249,7 +249,12 @@ class Aura_Worker_Tools {
 		// A plain read touches nothing a rule governs, so it declares nothing.
 		$annotations = $tool->get_annotations();
 		$touches     = Aura_Worker_Call_Context::tool_needs_grant( $annotations ) ? $tool->touches( $params ) : array();
-		$rule        = empty( $touches ) ? null : Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules() );
+		// In THIS site's identity (2.12.0): the preview is what the gateway
+		// shows before approval, so it must name the rule enforcement would
+		// actually apply. Without the identity every scoped rule reads as
+		// applying here, and a preview would warn about a block that execution
+		// then skips — the two disagreeing about the same call.
+		$rule        = empty( $touches ) ? null : Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules(), null, Aura_Worker_Rules::site_ref() );
 		$rule_match  = null === $rule ? null : array(
 			'key'    => isset( $rule['key'] ) ? (string) $rule['key'] : 'rule/?',
 			'effect' => (string) $rule['effect'],

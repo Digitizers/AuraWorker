@@ -150,4 +150,153 @@ final class RulesMatchTest extends TestCase {
 			)
 		);
 	}
+	// -----------------------------------------------------------------------
+	// 2.12.0 — a rule may name the sites it applies to (Aura spec §4). The
+	// predicate is normative and fail-closed: a site that cannot prove its own
+	// identity enforces EVERY scoped rule, exactly as an unreadable `touches`
+	// declaration matches every rule rather than none.
+	// -----------------------------------------------------------------------
+
+	/** A rule scoped to the given site ids. */
+	private function scoped( string $key, string $effect, array $sites ): array {
+		$rule          = $this->rule( $key, $effect, 'site' );
+		$rule['sites'] = $sites;
+		return $rule;
+	}
+
+	public function test_a_scoped_rule_skips_a_foreign_site_and_hits_its_own(): void {
+		$rule  = $this->scoped( 'rule/checkout', 'block', array( 'res_A' ) );
+		$touch = array( array( 'type' => 'post', 'id' => '7' ) );
+		$this->assertNull( Aura_Worker_Rules::match( $touch, array( $rule ), 1000, 'res_B' ) );
+		$this->assertSame( 'rule/checkout', Aura_Worker_Rules::match( $touch, array( $rule ), 1000, 'res_A' )['key'] );
+	}
+
+	public function test_an_unknown_identity_enforces_everything(): void {
+		// The site does not know who it is: a pre-2.12 record, a document that
+		// carried no site_ref, a repair that has not run. Over-block.
+		$rule  = $this->scoped( 'rule/checkout', 'block', array( 'res_A' ) );
+		$touch = array( array( 'type' => 'post', 'id' => '7' ) );
+		$this->assertSame( 'rule/checkout', Aura_Worker_Rules::match( $touch, array( $rule ), 1000, '' )['key'] );
+		// …and the default argument is that same unknown, so any caller that
+		// has not been taught to pass an identity keeps enforcing everything.
+		$this->assertSame( 'rule/checkout', Aura_Worker_Rules::match( $touch, array( $rule ), 1000 )['key'] );
+	}
+
+	public function test_a_rule_without_sites_is_client_wide_regardless(): void {
+		$rule = $this->rule( 'rule/freeze', 'warn', 'site' );
+		$this->assertSame(
+			'rule/freeze',
+			Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1000, 'res_B' )['key']
+		);
+	}
+
+	public function test_a_malformed_sites_value_is_treated_as_client_wide(): void {
+		// Aura's validator refuses these at write time. If one arrives anyway,
+		// the site does not guess at a NARROWING it cannot read.
+		foreach ( array( 'res_A', 42, new stdClass(), array() ) as $junk ) {
+			$rule          = $this->rule( 'rule/checkout', 'block', 'site' );
+			$rule['sites'] = $junk;
+			$this->assertSame(
+				'rule/checkout',
+				Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1000, 'res_B' )['key'],
+				'an unreadable sites value narrowed a rule away'
+			);
+		}
+	}
+
+	public function test_scoping_is_by_exact_id_never_a_loose_comparison(): void {
+		// in_array with strict comparison: a differently-cased or padded id is
+		// a different id, and a prefix is not a match.
+		$rule  = $this->scoped( 'rule/checkout', 'block', array( 'res_A' ) );
+		$touch = array( array( 'type' => 'post', 'id' => '7' ) );
+		foreach ( array( 'res_AB', 'RES_A', ' res_A', 'res' ) as $other ) {
+			$this->assertNull( Aura_Worker_Rules::match( $touch, array( $rule ), 1000, $other ), "{$other} matched res_A" );
+		}
+		$numeric = $this->scoped( 'rule/num', 'block', array( '0' ) );
+		$this->assertNull( Aura_Worker_Rules::match( $touch, array( $numeric ), 1000, 'res_A' ), 'a non-numeric id matched "0"' );
+	}
+
+	public function test_a_foreign_scoped_block_does_not_shadow_a_local_warn(): void {
+		// The block wins outright when it applies. When it is scoped elsewhere
+		// it must be skipped entirely — not merely demoted — or the warn that
+		// follows it would be lost with it.
+		$foreign = $this->scoped( 'rule/elsewhere', 'block', array( 'res_A' ) );
+		$local   = $this->rule( 'rule/local', 'warn', 'site' );
+		$hit     = Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $foreign, $local ), 1000, 'res_B' );
+		$this->assertSame( 'rule/local', $hit['key'] );
+	}
+
+	public function test_an_expired_scoped_rule_stays_expired(): void {
+		$rule          = $this->rule( 'rule/checkout', 'block', 'site', null, '2020-01-01T00:00:00Z' );
+		$rule['sites'] = array( 'res_A' );
+		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1800000000, 'res_A' ) );
+	}
+	// -----------------------------------------------------------------------
+	// Codex round 1 — three ways the scoping could betray its own promise.
+	// -----------------------------------------------------------------------
+
+	public function test_a_malformed_sites_list_never_narrows(): void {
+		// `accept()` does not validate individual rules: a rule is enforced
+		// from whatever was signed. A non-empty list that is not a list of
+		// non-empty strings is therefore possible, and treating it as a
+		// narrowing would fail OPEN — the strict comparison could never match,
+		// so the rule would be skipped on EVERY site.
+		$touch = array( array( 'type' => 'post', 'id' => '7' ) );
+		$cases = array(
+			'ints'            => array( 42 ),
+			'mixed'           => array( 'res_A', 42 ),
+			'nested'          => array( array( 'res_A' ) ),
+			'object-shaped'   => array( 'a' => 'res_A' ),
+			'empty string id' => array( '' ),
+			// A stored identity is trimmed at accept() and matched strictly, so
+			// a padded or blank entry can never equal any site's id: reading it
+			// as a narrowing would skip the rule on EVERY site (round-3 P2).
+			'blank id'        => array( ' ' ),
+			'tab id'          => array( "\t" ),
+			'padded id'       => array( ' res_A ' ),
+			'trailing space'  => array( 'res_A ' ),
+			'padded beside a good one' => array( 'res_A', ' res_B' ),
+			'null id'         => array( null ),
+			'bool id'         => array( true ),
+		);
+		foreach ( $cases as $label => $sites ) {
+			$rule          = $this->rule( 'rule/checkout', 'block', 'site' );
+			$rule['sites'] = $sites;
+			$this->assertSame(
+				'rule/checkout',
+				Aura_Worker_Rules::match( $touch, array( $rule ), 1000, 'res_B' )['key'],
+				"an unreadable sites value ({$label}) narrowed a rule away"
+			);
+		}
+	}
+
+	public function test_a_padded_id_can_never_match_so_it_is_not_a_narrowing(): void {
+		// The specific danger: `accept()` trims the identity it stores, so
+		// there is no site whose id is `" res_A "`. Treating that as scoping
+		// would retire the rule everywhere, silently.
+		$rule          = $this->rule( 'rule/checkout', 'block', 'site' );
+		$rule['sites'] = array( ' res_A ' );
+		foreach ( array( 'res_A', ' res_A ', 'res_B' ) as $ref ) {
+			$this->assertSame(
+				'rule/checkout',
+				Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1000, $ref )['key'],
+				"a padded entry narrowed the rule away for identity '{$ref}'"
+			);
+		}
+	}
+
+	public function test_one_junk_entry_does_not_disarm_the_whole_rule(): void {
+		// The dangerous half of the case above: `['res_A', 42]` on res_A. If
+		// the junk made this "a narrowing", res_A would still be matched — but
+		// on res_B the rule would vanish. Client-wide is the only reading that
+		// cannot lose an enforcement.
+		$rule          = $this->rule( 'rule/checkout', 'block', 'site' );
+		$rule['sites'] = array( 'res_A', 42 );
+		foreach ( array( 'res_A', 'res_B', '' ) as $ref ) {
+			$this->assertSame(
+				'rule/checkout',
+				Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1000, $ref )['key']
+			);
+		}
+	}
 }

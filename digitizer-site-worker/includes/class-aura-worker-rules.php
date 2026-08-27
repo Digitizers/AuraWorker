@@ -228,10 +228,98 @@ class Aura_Worker_Rules {
 	 * @param int|null $now     Unix time; defaults to now. Injected for tests.
 	 * @return array|null
 	 */
-	public static function match( array $touches, array $rules, $now = null ) {
-		$now     = null === $now ? time() : (int) $now;
-		$winner  = null;
-		$touched = self::normalize_touches( $touches );
+	/**
+	 * This site's own id in the rules' vocabulary, or '' when it is unknown.
+	 *
+	 * ONE accessor, so every surface that judges a rule — the enforcement
+	 * path and the preview the gateway shows before approval — asks the same
+	 * question of the same record. A second spelling is how a preview comes to
+	 * report a block that execution would skip (round-1 P2).
+	 *
+	 * Read defensively: '' both when the document carried no identity and when
+	 * the record predates 2.12.0 and no repair has run yet. The matcher turns
+	 * '' into "enforce everything".
+	 *
+	 * @since 2.12.0
+	 *
+	 * @return string
+	 */
+	public static function site_ref() {
+		$rec = self::stored();
+		return ( is_array( $rec ) && isset( $rec['site_ref'] ) && is_string( $rec['site_ref'] ) ) ? $rec['site_ref'] : '';
+	}
+
+	/**
+	 * Is this rule's `sites` a NARROWING this site can act on?
+	 *
+	 * Only a non-empty list of non-empty strings is. Aura's validator refuses
+	 * anything else at write time, so an accepted document should never carry
+	 * one — but `accept()` does not validate individual rules, and a rule is
+	 * enforced from whatever was signed. A malformed value (`sites: [42]`, a
+	 * decoded object, a list with one junk entry) must therefore read as NO
+	 * narrowing at all: the rule stays client-wide and over-blocks. Treating it
+	 * as a narrowing would fail OPEN — the strict comparison could never match,
+	 * so the rule would be skipped everywhere (round-1 P2).
+	 *
+	 * @since 2.12.0
+	 *
+	 * @param mixed $sites The rule's `sites` value.
+	 * @return bool
+	 */
+	private static function is_site_narrowing( $sites ) {
+		if ( ! is_array( $sites ) || empty( $sites ) ) {
+			return false;
+		}
+		// A decoded JSON object arrives as an associative array; its KEYS are
+		// not ids, so it is not a list of them.
+		if ( array_keys( $sites ) !== range( 0, count( $sites ) - 1 ) ) {
+			return false;
+		}
+		foreach ( $sites as $id ) {
+			// A stored identity is TRIMMED at accept() time, and the match is
+			// strict — so `" res_A "` or `" "` can never equal any site's id,
+			// and reading them as a narrowing would skip the rule EVERYWHERE
+			// (round-3 P2). Nor are they trimmed here: Aura's ids carry no
+			// padding, so trimming would invent an id the document did not
+			// name. An entry that is not already normalised means the list is
+			// not one this site can read — client-wide, over-block.
+			if ( ! is_string( $id ) || '' === trim( $id ) || trim( $id ) !== $id ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Does this rule reach THIS site?
+	 *
+	 * The one predicate for it (round-2 P2). Both the matcher and the expiry
+	 * report ask it, so a rule scoped to a sibling can never be skipped for
+	 * enforcement while still being announced as this site's expired rule —
+	 * two statements about one rule, from one test.
+	 *
+	 * Normative, and fail-closed in both directions that matter: an unknown
+	 * identity reaches EVERY rule, and a `sites` this site cannot read is no
+	 * narrowing at all.
+	 *
+	 * @since 2.12.0
+	 *
+	 * @param array  $rule     The rule.
+	 * @param string $site_ref This site's id, or '' when unknown.
+	 * @return bool
+	 */
+	private static function rule_reaches_here( array $rule, $site_ref ) {
+		if ( ! isset( $rule['sites'] ) || ! self::is_site_narrowing( $rule['sites'] ) ) {
+			return true; // client-wide
+		}
+		return ( '' === $site_ref ) || in_array( $site_ref, $rule['sites'], true );
+	}
+
+	public static function match( array $touches, array $rules, $now = null, $site_ref = '' ) {
+		$now      = null === $now ? time() : (int) $now;
+		$winner   = null;
+		$touched  = self::normalize_touches( $touches );
+		$site_ref = is_string( $site_ref ) ? $site_ref : '';
 
 		foreach ( $rules as $rule ) {
 			if ( ! is_array( $rule ) || self::is_expired( $rule, $now ) ) {
@@ -240,6 +328,12 @@ class Aura_Worker_Rules {
 			$effect = isset( $rule['effect'] ) ? (string) $rule['effect'] : '';
 			if ( 'block' !== $effect && 'warn' !== $effect ) {
 				continue;
+			}
+			// Site scoping (Aura spec §4, 2.12.0), through the shared predicate
+			// so the expiry report cannot disagree with enforcement about the
+			// very same rule.
+			if ( ! self::rule_reaches_here( $rule, $site_ref ) ) {
+				continue; // scoped to other sites: not this one's rule
 			}
 			if ( ! self::rule_touches( $rule, $touched ) ) {
 				continue;
@@ -402,6 +496,14 @@ class Aura_Worker_Rules {
 		// holds for the very first document, before anything is stored.
 		$site = isset( $doc['site'] ) && is_string( $doc['site'] ) ? $doc['site'] : '';
 
+		// WHO this site is, in Aura's own names (spec §4, 2.12.0). `site`
+		// proves the document was issued FOR us; `site_ref` is the id a rule's
+		// `sites` list names. Absent — an older Aura, or a document signed
+		// before that field existed — stores as '' and the matcher then
+		// enforces every scoped rule: an identity we do not know can only be
+		// answered by over-blocking.
+		$site_ref = isset( $doc['site_ref'] ) && is_string( $doc['site_ref'] ) ? trim( $doc['site_ref'] ) : '';
+
 		// AUTHORITATIVE reads, in the connect's write order reversed: the store
 		// first, then the token — both from the database, never from this
 		// request's option cache (a request paused after authenticating with
@@ -431,6 +533,24 @@ class Aura_Worker_Rules {
 		if ( null !== $current && isset( $current['envelope'] ) && '' !== (string) $current['envelope'] && hash_equals( (string) $current['envelope'], (string) $envelope ) ) {
 			// The very document we already hold — a retry after a lost 200.
 			// Delivered is delivered; saying 409 would record it as failed forever.
+			//
+			// It is also the ONLY moment a ≤2.11 record can learn its own
+			// `site_ref` from the wire (2.12.0): Aura does not re-push a
+			// document it has already confirmed, so a site upgraded between
+			// two pushes would otherwise hold rules it cannot scope. Heal the
+			// record here — the same verified bytes, one field added — and
+			// answer the retry as before.
+			if ( '' !== $site_ref && ( ! isset( $current['site_ref'] ) || $current['site_ref'] !== $site_ref ) ) {
+				$healed             = $current;
+				$healed['site_ref'] = $site_ref;
+				// A lost swap (or a database refusal) is NOT a failure of this
+				// request: the racer's record was written by an accept() of a
+				// newer document, which stores `site_ref` itself. Re-deciding
+				// here would be worse than doing nothing — the retry would meet
+				// the newer seq and answer 409 for a document Aura has already
+				// delivered, turning an idempotent 200 into a recorded conflict.
+				self::swap( $current, $healed );
+			}
 			return true;
 		}
 		$stale = null !== $current && self::is_stale( $current, $ours );
@@ -472,6 +592,12 @@ class Aura_Worker_Rules {
 			// carries the binding forward, so the next old-client document meets
 			// the same refusal and the stale check keeps working.
 			'token_hash'  => $ours,
+			// This site's own id in the rules' vocabulary (2.12.0). Stored
+			// RAW, exactly as the document carried it — '' when it carried
+			// none. Never synthesised on read: `stored()` is the value the
+			// compare-and-swap names, and a record that gains a field on the
+			// way out could never be matched by the CAS that must heal it.
+			'site_ref'    => $site_ref,
 			'seq'         => (int) $doc['seq'],
 			'issued_at'   => isset( $doc['issued_at'] ) ? (string) $doc['issued_at'] : '',
 			'received_at' => time(),
@@ -991,6 +1117,61 @@ class Aura_Worker_Rules {
 	}
 
 	/**
+	 * Rebuild the stored record from its OWN verified envelope — offline.
+	 *
+	 * The upgrade window this exists for: a record written by <= 2.11 kept the
+	 * rules but not `site_ref`, and Aura does not push again for a document it
+	 * has already confirmed. Without a repair such a site would enforce every
+	 * scoped rule (fail-closed, so safe) until its client's next release — which
+	 * may be never.
+	 *
+	 * The record stores the accepted envelope VERBATIM, so the repair needs no
+	 * network: re-verify those bytes with the site's own stored public key and
+	 * read the identity out of the document that was already accepted. Bytes
+	 * that no longer verify — a tampered row, a rotated key — are never a source
+	 * of truth, and the record is left exactly as it is.
+	 *
+	 * The write goes through the same compare-and-swap as `accept()`, and LOSING
+	 * it is success: whatever won is a newer record, written by an `accept()`
+	 * that stores `site_ref` itself. Idempotent — a complete record answers true
+	 * without writing.
+	 *
+	 * @since 2.12.0
+	 *
+	 * @return bool The record now carries the identity this version knows how to use.
+	 */
+	public static function backfill_from_stored_envelope() {
+		$current = self::stored();
+		if ( null === $current || ! isset( $current['envelope'] ) || '' === (string) $current['envelope'] ) {
+			// No record, or the connect's sentinel, which carries no envelope
+			// and no rules: nothing to repair, and nothing broken.
+			return true;
+		}
+		$doc = Aura_Worker_Grant::verify_signed_document( (string) $current['envelope'] );
+		if ( ! is_array( $doc ) ) {
+			// Never rebuild from unverified bytes. Answering false keeps the
+			// version marker behind so a later request — after a key is
+			// re-provisioned, say — tries again.
+			return false;
+		}
+		$site_ref = isset( $doc['site_ref'] ) && is_string( $doc['site_ref'] ) ? trim( $doc['site_ref'] ) : '';
+		if ( isset( $current['site_ref'] ) && $current['site_ref'] === $site_ref ) {
+			return true; // already complete
+		}
+		$record             = $current;
+		$record['site_ref'] = $site_ref;
+		$swapped            = self::swap( $current, $record );
+		if ( true === $swapped ) {
+			return true;
+		}
+		// A lost swap or a refused write: decide on the RECORD, not on the
+		// return value. A racer's newer record already carries the field, and
+		// that is the outcome this function is asked about.
+		$after = self::stored();
+		return is_array( $after ) && isset( $after['site_ref'] );
+	}
+
+	/**
 	 * Forget the ruleset (disconnect, tests).
 	 */
 	public static function clear( $claim = '', $fence = '' ) {
@@ -1215,12 +1396,24 @@ class Aura_Worker_Rules {
 	 * @return string[]
 	 */
 	public static function expired_keys( $now = null ) {
-		$now = null === $now ? time() : (int) $now;
-		$out = array();
+		$now      = null === $now ? time() : (int) $now;
+		$site_ref = self::site_ref();
+		$out      = array();
 		foreach ( self::rules() as $rule ) {
-			if ( is_array( $rule ) && self::is_expired( $rule, $now ) && isset( $rule['key'] ) ) {
-				$out[] = (string) $rule['key'];
+			if ( ! is_array( $rule ) || ! self::is_expired( $rule, $now ) || ! isset( $rule['key'] ) ) {
+				continue;
 			}
+			// A rule scoped to OTHER sites is not this site's protection, so
+			// its expiry is not this site's news (round-2 P2). Announcing it
+			// here — and reporting it in `audit_rules` as this site's
+			// `expired_active` — raises a fleet alert about a rule that never
+			// applied here, and the operator is sent to repair the wrong site.
+			// The same predicate enforcement uses: an unknown identity still
+			// reports everything, exactly as it still enforces everything.
+			if ( ! self::rule_reaches_here( $rule, $site_ref ) ) {
+				continue;
+			}
+			$out[] = (string) $rule['key'];
 		}
 		return $out;
 	}
@@ -1310,7 +1503,11 @@ class Aura_Worker_Rules {
 	 */
 	public static function enforce( array $touches, $tool_name, $now = null ) {
 		self::note_expired( $now );
-		$rule = self::match( $touches, self::rules(), $now );
+		// Judged in THIS site's identity (self::site_ref(), the one accessor —
+		// the preview path asks the same question of the same record, so the
+		// two can never disagree). The fork inherits this through enforce(),
+		// so its governance wrapper needs no change of its own.
+		$rule = self::match( $touches, self::rules(), $now, self::site_ref() );
 		if ( null === $rule ) {
 			return array( 'effect' => null );
 		}

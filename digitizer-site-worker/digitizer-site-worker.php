@@ -3,7 +3,7 @@
  * Plugin Name:       SiteAgent for Aura
  * Plugin URI:        https://my-aura.app/siteagent
  * Description:       Remote site management agent for Aura dashboard. Enables secure updates, health monitoring, and maintenance operations via REST API.
- * Version:           2.11.0
+ * Version:           2.12.0
  * Requires at least: 6.2
  * Requires PHP:      7.4
  * Author:            Digitizer
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'AURA_WORKER_VERSION', '2.11.0' );
+define( 'AURA_WORKER_VERSION', '2.12.0' );
 define( 'AURA_WORKER_FILE', __FILE__ );
 define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -41,8 +41,34 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';
  * Initialize the plugin.
  */
 function aura_worker_init() {
+	aura_worker_maybe_upgrade();
 	$plugin = new Aura_Worker();
 	$plugin->init();
+}
+
+/**
+ * Run the one-time repairs a version change needs, then record the version.
+ *
+ * 2.12.0: a record written by an earlier version carries no `site_ref`, so the
+ * matcher cannot tell a rule scoped to a sibling site from one scoped to this
+ * one and enforces both. Aura will not re-push a document it has already
+ * confirmed, so the repair has to happen here, offline, from the envelope the
+ * record already stores.
+ *
+ * The marker advances ONLY when the repair is complete (or there was nothing
+ * to repair). A transient verification or write failure on the first
+ * post-upgrade request would otherwise stamp the version done, the repair
+ * would never run again, and — Aura never resending a confirmed envelope —
+ * every scoped rule would stay client-wide on this site indefinitely.
+ */
+function aura_worker_maybe_upgrade() {
+	if ( get_option( 'aura_worker_version' ) === AURA_WORKER_VERSION ) {
+		return;
+	}
+	if ( class_exists( 'Aura_Worker_Rules' ) && ! Aura_Worker_Rules::backfill_from_stored_envelope() ) {
+		return; // the NEXT request retries; the marker stays behind on purpose
+	}
+	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
 }
 add_action( 'plugins_loaded', 'aura_worker_init' );
 
@@ -91,7 +117,14 @@ function aura_worker_activate_site() {
 		error_log( 'SiteAgent: an Aura Application Password left over from a failed deactivation could not be revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 	}
 	Aura_Worker_Magic_Link::release_site( $aura_fence );
-	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
+	// Through the SAME decision as a request-time upgrade (round-1 P2). A site
+	// updated while the plugin was inactive reaches this hook with the marker
+	// still behind and `plugins_loaded` already past: stamping the version
+	// here unconditionally — as this line used to — would retire the repair
+	// before it ever ran, and every later request would return early from
+	// aura_worker_maybe_upgrade() with the record still missing its identity.
+	// One function writes the marker, and only behind a completed repair.
+	aura_worker_maybe_upgrade();
 
 	// Generate a unique site token if not exists. Only the SHA-256 hash is
 	// stored; the raw value is revealed once via a transient on the settings

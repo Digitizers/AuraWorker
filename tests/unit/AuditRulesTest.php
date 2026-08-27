@@ -358,4 +358,203 @@ final class AuditRulesTest extends TestCase {
 		$r = $this->run_tool();
 		$this->assertSame( array( 'total_seen' => 0, 'returned' => 0, 'truncated' => false, 'cap' => '' ), $r['coverage'] );
 	}
+	// -----------------------------------------------------------------------
+	// 2.12.0 — enforce() is the bridge the elementor-mcp fork calls, so the
+	// scoping has to arrive THERE, from the stored record, with no change on
+	// the fork's side. These tests drive the whole path: a stored record, a
+	// scoped rule, and the verdict the wrapper acts on.
+	// -----------------------------------------------------------------------
+
+	/** Store a record directly — the shape accept() writes. */
+	private function store_record( array $rules, $site_ref = null ): void {
+		$rec = array(
+			'envelope'    => 'x.y',
+			'client'      => 'c1',
+			'seq'         => 1,
+			'issued_at'   => '',
+			'received_at' => 1800000000,
+			'rules'       => $rules,
+		);
+		if ( null !== $site_ref ) {
+			$rec['site_ref'] = $site_ref;
+		}
+		// update_option, not a raw assignment: core answers "absent" for a name
+		// listed in `notoptions`, which any earlier read of an empty store put
+		// it there — the row and the cache must agree the way a real site's do.
+		update_option( Aura_Worker_Rules::OPTION, $rec );
+	}
+
+	public function test_enforce_skips_a_rule_scoped_to_another_site(): void {
+		$this->store_record(
+			array( array( 'key' => 'rule/elsewhere', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) ),
+			'res_B'
+		);
+		$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+		$this->assertNull( $out['effect'] );
+	}
+
+	public function test_enforce_applies_a_rule_scoped_to_this_site(): void {
+		$this->store_record(
+			array( array( 'key' => 'rule/mine', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) ),
+			'res_A'
+		);
+		$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+		$this->assertSame( 'block', $out['effect'] );
+		$this->assertSame( 'rule/mine', $out['rule']['key'] );
+	}
+
+	public function test_enforce_on_a_record_written_before_2_12_enforces_everything(): void {
+		// No site_ref key at all — the shape 2.11 wrote, before any repair.
+		// The site cannot prove it is NOT the named one, so it obeys.
+		$this->store_record(
+			array( array( 'key' => 'rule/elsewhere', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) )
+		);
+		$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+		$this->assertSame( 'block', $out['effect'], 'an unknown identity must over-block, never under-block' );
+	}
+
+	public function test_enforce_still_applies_client_wide_rules_unchanged(): void {
+		// The regression that matters most: every rule without `sites` must
+		// decide exactly as it did in 2.11, whatever the identity is.
+		foreach ( array( 'res_A', '' ) as $ref ) {
+			$this->store_record(
+				array( array( 'key' => 'rule/freeze', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r' ) ),
+				$ref
+			);
+			$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+			$this->assertSame( 'block', $out['effect'] );
+		}
+	}
+	// -----------------------------------------------------------------------
+	// Codex round 1 P2: the preview the gateway shows before approval must
+	// name the rule enforcement would actually apply. Two views of one call,
+	// so they ask ONE accessor for the identity.
+	// -----------------------------------------------------------------------
+
+	public function test_the_identity_accessor_reads_the_record_defensively(): void {
+		$this->assertSame( '', Aura_Worker_Rules::site_ref(), 'no record at all is an unknown identity' );
+
+		$this->store_record( array(), 'res_A' );
+		$this->assertSame( 'res_A', Aura_Worker_Rules::site_ref() );
+
+		// A record from before 2.12.0: the key is simply absent.
+		$this->store_record( array() );
+		$this->assertSame( '', Aura_Worker_Rules::site_ref() );
+
+		// A record whose field is junk is not an identity either.
+		$rec = $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ];
+		$rec['site_ref'] = array( 'res_A' );
+		update_option( Aura_Worker_Rules::OPTION, $rec );
+		$this->assertSame( '', Aura_Worker_Rules::site_ref() );
+	}
+
+	public function test_the_preview_and_enforcement_agree_about_a_foreign_scoped_rule(): void {
+		// The preview path is `Aura_Worker_Tools::preview_tool()`, which calls
+		// `match()` directly. Asserted at the seam it shares with enforce():
+		// the same rules, the same identity, the same verdict.
+		$rules = array( array( 'key' => 'rule/elsewhere', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) );
+		$this->store_record( $rules, 'res_B' );
+		$touches = array( array( 'type' => 'post', 'id' => '7' ) );
+
+		$previewed = Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules(), null, Aura_Worker_Rules::site_ref() );
+		$enforced  = Aura_Worker_Rules::enforce( $touches, 'x', 1800000000 );
+
+		$this->assertNull( $previewed, 'the preview reported a rule enforcement skips' );
+		$this->assertNull( $enforced['effect'] );
+	}
+
+	public function test_the_preview_path_passes_the_identity_through(): void {
+		// The call site itself — a preview that dropped the argument would
+		// silently fall back to the unknown identity and warn about blocks
+		// that never fire.
+		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker-tools.php' );
+		$this->assertStringContainsString(
+			'Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules(), null, Aura_Worker_Rules::site_ref() )',
+			$src
+		);
+	}
+
+	public function test_activation_repairs_before_it_records_the_version(): void {
+		// A site updated while the plugin was inactive reaches activation with
+		// the marker behind and plugins_loaded already past. Stamping the
+		// version there retires the repair before it ever runs.
+		$main     = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$activate = substr( $main, strpos( $main, 'function aura_worker_activate_site()' ) );
+		$activate = substr( $activate, 0, strpos( $activate, "\n}\n" ) );
+
+		$this->assertStringContainsString( 'aura_worker_maybe_upgrade();', $activate );
+		$this->assertStringNotContainsString(
+			"update_option( 'aura_worker_version', AURA_WORKER_VERSION )",
+			$activate,
+			'activation writes the version marker directly, bypassing the repair'
+		);
+	}
+	// -----------------------------------------------------------------------
+	// Codex round 2 P2: an expired rule scoped to a SIBLING site is not this
+	// site's expired rule. Announcing it — and reporting it in audit_rules as
+	// this site's `expired_active` — raises a fleet alert about protection
+	// that never applied here.
+	// -----------------------------------------------------------------------
+
+	private function expired_rule( string $key, array $sites = null ): array {
+		$rule = array(
+			'key'    => $key,
+			'effect' => 'block',
+			'target' => array( 'type' => 'site' ),
+			'reason' => 'r',
+			'until'  => '2020-01-01T00:00:00Z',
+		);
+		if ( null !== $sites ) {
+			$rule['sites'] = $sites;
+		}
+		return $rule;
+	}
+
+	public function test_expired_keys_skips_a_rule_scoped_to_another_site(): void {
+		$this->store_record(
+			array( $this->expired_rule( 'rule/elsewhere', array( 'res_A' ) ), $this->expired_rule( 'rule/mine' ) ),
+			'res_B'
+		);
+		$this->assertSame( array( 'rule/mine' ), Aura_Worker_Rules::expired_keys( 1800000000 ) );
+	}
+
+	public function test_expired_keys_reports_a_rule_scoped_to_this_site(): void {
+		$this->store_record( array( $this->expired_rule( 'rule/mine', array( 'res_A' ) ) ), 'res_A' );
+		$this->assertSame( array( 'rule/mine' ), Aura_Worker_Rules::expired_keys( 1800000000 ) );
+	}
+
+	public function test_an_unknown_identity_reports_every_expired_rule(): void {
+		// Same direction as enforcement: what it enforces, it reports.
+		$this->store_record( array( $this->expired_rule( 'rule/elsewhere', array( 'res_A' ) ) ) );
+		$this->assertSame( array( 'rule/elsewhere' ), Aura_Worker_Rules::expired_keys( 1800000000 ) );
+	}
+
+	public function test_the_expiry_hook_stays_silent_about_another_site_s_rule(): void {
+		$this->store_record( array( $this->expired_rule( 'rule/elsewhere', array( 'res_A' ) ) ), 'res_B' );
+		$GLOBALS['_did_actions'] = array();
+
+		Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+
+		$fired = array_values( array_filter( $GLOBALS['_did_actions'], static function ( $a ) {
+			return 'aura_worker_rule_expired' === $a['tag'];
+		} ) );
+		$this->assertSame( array(), $fired, 'this site announced a sibling site\'s expired rule' );
+	}
+
+	public function test_enforcement_and_the_expiry_report_never_disagree(): void {
+		// The invariant behind the shared predicate: a rule this site does not
+		// enforce is a rule this site does not report, and the other way round.
+		foreach ( array( 'res_A', 'res_B', '' ) as $ref ) {
+			$this->store_record( array( $this->expired_rule( 'rule/scoped', array( 'res_A' ) ) ), $ref );
+			$reported = in_array( 'rule/scoped', Aura_Worker_Rules::expired_keys( 1800000000 ), true );
+
+			// Would it be enforced if it had not expired? Same rule, no `until`.
+			$live = $this->expired_rule( 'rule/scoped', array( 'res_A' ) );
+			unset( $live['until'] );
+			$this->store_record( array( $live ), $ref );
+			$enforced = 'block' === Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 )['effect'];
+
+			$this->assertSame( $enforced, $reported, "the two views disagreed for identity '{$ref}'" );
+		}
+	}
 }

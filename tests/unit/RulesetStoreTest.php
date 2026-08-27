@@ -84,18 +84,21 @@ final class RulesetStoreTest extends TestCase {
 		return (string) $GLOBALS['_options']['aura_worker_site_token'];
 	}
 
-	private function ruleset( int $seq, array $rules = array(), ?string $secret = null, ?string $client = null, ?string $site = null ): string {
-		return $this->sign(
-			array(
-				'v'         => 1,
-				'client'    => $client ?? 'client-1',
-				'site'      => $site ?? $this->site(),
-				'seq'       => $seq,
-				'issued_at' => gmdate( 'c', 1_800_000_000 + $seq ),
-				'rules'     => $rules,
-			),
-			$secret
+	private function ruleset( int $seq, array $rules = array(), ?string $secret = null, ?string $client = null, ?string $site = null, ?string $site_ref = null ): string {
+		$doc = array(
+			'v'         => 1,
+			'client'    => $client ?? 'client-1',
+			'site'      => $site ?? $this->site(),
+			'seq'       => $seq,
+			'issued_at' => gmdate( 'c', 1_800_000_000 + $seq ),
+			'rules'     => $rules,
 		);
+		// Omitted, not empty, when the caller wants a pre-2.12 document: the
+		// two are different bytes and the site must handle both.
+		if ( null !== $site_ref ) {
+			$doc['site_ref'] = $site_ref;
+		}
+		return $this->sign( $doc, $secret );
 	}
 
 	private function freeze(): array {
@@ -638,6 +641,164 @@ final class RulesetStoreTest extends TestCase {
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 5, array() ) ); // same seq, different rules
 		$this->assertInstanceOf( WP_Error::class, $res );
 		$this->assertCount( 1, Aura_Worker_Rules::rules() );
+	}
+
+	// -----------------------------------------------------------------------
+	// 2.12.0 — the record carries this site's own id (spec §4). Without it the
+	// matcher cannot tell a rule scoped to a sibling from one scoped to us,
+	// and the fail-closed direction (enforce everything) is the only safe
+	// answer. So the id must arrive, be stored raw, and be healed onto records
+	// written by a version that did not know about it.
+	// -----------------------------------------------------------------------
+
+	public function test_site_ref_is_stored_with_the_record(): void {
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, null, null, 'res_abc' ) ) );
+		$this->assertSame( 'res_abc', Aura_Worker_Rules::stored()['site_ref'] );
+	}
+
+	public function test_a_document_without_site_ref_stores_the_empty_identity(): void {
+		// An older Aura, or a document signed before the field existed. The
+		// record says "unknown", never guesses, and the matcher over-blocks.
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 1 ) ) );
+		$this->assertSame( '', Aura_Worker_Rules::stored()['site_ref'] ?? '' );
+	}
+
+	public function test_site_ref_is_stored_trimmed(): void {
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 1, array(), null, null, null, "  res_abc\n" ) ) );
+		$this->assertSame( 'res_abc', Aura_Worker_Rules::stored()['site_ref'] );
+	}
+
+	public function test_the_identical_envelope_heals_a_record_written_before_2_12(): void {
+		// The upgrade window Aura cannot fix by pushing: it does not re-send a
+		// document it has already confirmed. A retry of the SAME envelope is
+		// the one wire event left, so it must both answer 200 and heal.
+		$env = $this->ruleset( 2, array( $this->freeze() ), null, null, null, 'res_abc' );
+		$this->assertTrue( Aura_Worker_Rules::accept( $env ) );
+		$rec = $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ];
+		unset( $rec['site_ref'] ); // exactly the shape 2.11 wrote
+		// Through update_option, so the ROW and the cache agree: the CAS
+		// compares raw bytes, and a doctored cache over a 2.12 row would make
+		// the heal miss for a reason no real site can have.
+		update_option( Aura_Worker_Rules::OPTION, $rec );
+
+		$this->assertTrue( Aura_Worker_Rules::accept( $env ) );
+		$this->assertSame( 'res_abc', Aura_Worker_Rules::stored()['site_ref'] );
+		// …and nothing else about the held document moved.
+		$this->assertSame( 2, Aura_Worker_Rules::current()['seq'] );
+		$this->assertCount( 1, Aura_Worker_Rules::rules() );
+	}
+
+	public function test_an_identical_envelope_that_carries_no_site_ref_heals_nothing(): void {
+		// A pre-2.12 document retried against a pre-2.12 record: there is no
+		// identity on the wire to learn, and inventing '' would claim the
+		// record is complete when it is only unknown.
+		$env = $this->ruleset( 2, array( $this->freeze() ) );
+		$this->assertTrue( Aura_Worker_Rules::accept( $env ) );
+		$rec = $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ];
+		unset( $rec['site_ref'] );
+		update_option( Aura_Worker_Rules::OPTION, $rec );
+
+		$this->assertTrue( Aura_Worker_Rules::accept( $env ) );
+		$this->assertArrayNotHasKey( 'site_ref', Aura_Worker_Rules::stored() );
+	}
+
+	// -----------------------------------------------------------------------
+	// 2.12.0 — the upgrade repairs itself offline. The record keeps the
+	// accepted envelope verbatim, so the identity can be recovered from bytes
+	// this site can re-verify on its own, without Aura sending anything.
+	// -----------------------------------------------------------------------
+
+	/** Store a record in the shape 2.11 wrote: everything but `site_ref`. */
+	private function downgrade_record_to_2_11(): void {
+		$rec = $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ];
+		unset( $rec['site_ref'] );
+		update_option( Aura_Worker_Rules::OPTION, $rec );
+	}
+
+	public function test_the_backfill_rebuilds_site_ref_from_the_stored_envelope(): void {
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 3, array( $this->freeze() ) ) ) );
+		$this->downgrade_record_to_2_11();
+		$this->assertArrayNotHasKey( 'site_ref', Aura_Worker_Rules::stored(), 'precondition' );
+
+		$this->assertTrue( Aura_Worker_Rules::backfill_from_stored_envelope() );
+		$this->assertSame( '', Aura_Worker_Rules::stored()['site_ref'], 'a pre-2.12 document carries no identity, and the repair records that as unknown' );
+	}
+
+	public function test_the_backfill_recovers_a_real_identity(): void {
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 3, array( $this->freeze() ), null, null, null, 'res_abc' ) ) );
+		$this->downgrade_record_to_2_11();
+
+		$this->assertTrue( Aura_Worker_Rules::backfill_from_stored_envelope() );
+		$this->assertSame( 'res_abc', Aura_Worker_Rules::stored()['site_ref'] );
+		// The repair rebuilds ONE field. The document it describes is untouched.
+		$this->assertSame( 3, Aura_Worker_Rules::current()['seq'] );
+		$this->assertCount( 1, Aura_Worker_Rules::rules() );
+	}
+
+	public function test_the_backfill_leaves_a_tampered_envelope_alone(): void {
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 3, array(), null, null, null, 'res_abc' ) ) );
+		$rec = $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ];
+		unset( $rec['site_ref'] );
+		$rec['envelope'] = substr( (string) $rec['envelope'], 0, -4 ) . 'AAAA'; // signature no longer verifies
+		update_option( Aura_Worker_Rules::OPTION, $rec );
+
+		$this->assertFalse( Aura_Worker_Rules::backfill_from_stored_envelope() );
+		$this->assertArrayNotHasKey( 'site_ref', Aura_Worker_Rules::stored(), 'unverified bytes are never a source of truth' );
+	}
+
+	public function test_the_backfill_is_idempotent_and_writes_nothing_when_complete(): void {
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 3, array(), null, null, null, 'res_abc' ) ) );
+		$GLOBALS['_option_writes'] = array();
+
+		$this->assertTrue( Aura_Worker_Rules::backfill_from_stored_envelope() );
+		$this->assertSame( array(), $GLOBALS['_option_writes'], 'a complete record is not rewritten' );
+	}
+
+	public function test_the_backfill_has_nothing_to_do_without_a_record(): void {
+		// A site that has never been pushed to — and the connect's sentinel,
+		// which is a binding and carries no envelope. Neither is broken, so
+		// neither may hold the version marker back.
+		$this->assertTrue( Aura_Worker_Rules::backfill_from_stored_envelope() );
+	}
+
+	public function test_a_lost_swap_still_counts_as_repaired(): void {
+		// A concurrent accept() wrote a newer record while the repair was in
+		// flight. That record was written by a version that stores site_ref,
+		// so the question the repair answers — "does the record carry it?" —
+		// is already true, and reporting failure would hold the marker back
+		// forever on a busy site.
+		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 3, array(), null, null, null, 'res_abc' ) ) );
+		$this->downgrade_record_to_2_11();
+		$GLOBALS['_cas_racer'] = $this->ruleset( 4, array(), null, null, null, 'res_abc' );
+
+		$this->assertTrue( Aura_Worker_Rules::backfill_from_stored_envelope() );
+		$this->assertSame( 'res_abc', Aura_Worker_Rules::stored()['site_ref'] );
+		$this->assertSame( 4, Aura_Worker_Rules::current()['seq'], 'the racer won, and its record is the complete one' );
+	}
+
+	// The upgrade hook itself lives in the main plugin file, which the harness
+	// deliberately does not load (it defines the plugin's constants). Its
+	// BEHAVIOUR is `backfill_from_stored_envelope()`, unit-tested above; what
+	// is asserted here is the thing source can prove and the unit tests
+	// cannot: that the version marker is written only behind the repair.
+	public function test_the_version_marker_advances_only_when_the_repair_succeeded(): void {
+		$main = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$fn   = substr( $main, strpos( $main, 'function aura_worker_maybe_upgrade()' ) );
+		$fn   = substr( $fn, 0, strpos( $fn, "\n}\n" ) );
+
+		// It runs on every request until the marker matches…
+		$this->assertStringContainsString( "get_option( 'aura_worker_version' ) === AURA_WORKER_VERSION", $fn );
+		// …and a failed repair RETURNS instead of stamping the version.
+		$this->assertStringContainsString( '! Aura_Worker_Rules::backfill_from_stored_envelope()', $fn );
+		$this->assertStringContainsString( 'return; // the NEXT request retries', $fn );
+		// The marker write is the LAST statement, after that guard — never before.
+		$this->assertGreaterThan(
+			strpos( $fn, 'backfill_from_stored_envelope' ),
+			strpos( $fn, "update_option( 'aura_worker_version'" ),
+			'the version is recorded before the repair is known to have worked'
+		);
+		// And the hook is actually wired into the request, not merely defined.
+		$this->assertStringContainsString( 'aura_worker_maybe_upgrade();', $main );
 	}
 
 	public function test_clear_forgets_everything(): void {
