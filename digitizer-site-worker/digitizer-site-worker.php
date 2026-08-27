@@ -41,8 +41,34 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';
  * Initialize the plugin.
  */
 function aura_worker_init() {
+	aura_worker_maybe_upgrade();
 	$plugin = new Aura_Worker();
 	$plugin->init();
+}
+
+/**
+ * Run the one-time repairs a version change needs, then record the version.
+ *
+ * 2.12.0: a record written by an earlier version carries no `site_ref`, so the
+ * matcher cannot tell a rule scoped to a sibling site from one scoped to this
+ * one and enforces both. Aura will not re-push a document it has already
+ * confirmed, so the repair has to happen here, offline, from the envelope the
+ * record already stores.
+ *
+ * The marker advances ONLY when the repair is complete (or there was nothing
+ * to repair). A transient verification or write failure on the first
+ * post-upgrade request would otherwise stamp the version done, the repair
+ * would never run again, and — Aura never resending a confirmed envelope —
+ * every scoped rule would stay client-wide on this site indefinitely.
+ */
+function aura_worker_maybe_upgrade() {
+	if ( get_option( 'aura_worker_version' ) === AURA_WORKER_VERSION ) {
+		return;
+	}
+	if ( class_exists( 'Aura_Worker_Rules' ) && ! Aura_Worker_Rules::backfill_from_stored_envelope() ) {
+		return; // the NEXT request retries; the marker stays behind on purpose
+	}
+	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
 }
 add_action( 'plugins_loaded', 'aura_worker_init' );
 

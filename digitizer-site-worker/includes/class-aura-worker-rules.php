@@ -1023,6 +1023,61 @@ class Aura_Worker_Rules {
 	}
 
 	/**
+	 * Rebuild the stored record from its OWN verified envelope — offline.
+	 *
+	 * The upgrade window this exists for: a record written by <= 2.11 kept the
+	 * rules but not `site_ref`, and Aura does not push again for a document it
+	 * has already confirmed. Without a repair such a site would enforce every
+	 * scoped rule (fail-closed, so safe) until its client's next release — which
+	 * may be never.
+	 *
+	 * The record stores the accepted envelope VERBATIM, so the repair needs no
+	 * network: re-verify those bytes with the site's own stored public key and
+	 * read the identity out of the document that was already accepted. Bytes
+	 * that no longer verify — a tampered row, a rotated key — are never a source
+	 * of truth, and the record is left exactly as it is.
+	 *
+	 * The write goes through the same compare-and-swap as `accept()`, and LOSING
+	 * it is success: whatever won is a newer record, written by an `accept()`
+	 * that stores `site_ref` itself. Idempotent — a complete record answers true
+	 * without writing.
+	 *
+	 * @since 2.12.0
+	 *
+	 * @return bool The record now carries the identity this version knows how to use.
+	 */
+	public static function backfill_from_stored_envelope() {
+		$current = self::stored();
+		if ( null === $current || ! isset( $current['envelope'] ) || '' === (string) $current['envelope'] ) {
+			// No record, or the connect's sentinel, which carries no envelope
+			// and no rules: nothing to repair, and nothing broken.
+			return true;
+		}
+		$doc = Aura_Worker_Grant::verify_signed_document( (string) $current['envelope'] );
+		if ( ! is_array( $doc ) ) {
+			// Never rebuild from unverified bytes. Answering false keeps the
+			// version marker behind so a later request — after a key is
+			// re-provisioned, say — tries again.
+			return false;
+		}
+		$site_ref = isset( $doc['site_ref'] ) && is_string( $doc['site_ref'] ) ? trim( $doc['site_ref'] ) : '';
+		if ( isset( $current['site_ref'] ) && $current['site_ref'] === $site_ref ) {
+			return true; // already complete
+		}
+		$record             = $current;
+		$record['site_ref'] = $site_ref;
+		$swapped            = self::swap( $current, $record );
+		if ( true === $swapped ) {
+			return true;
+		}
+		// A lost swap or a refused write: decide on the RECORD, not on the
+		// return value. A racer's newer record already carries the field, and
+		// that is the outcome this function is asked about.
+		$after = self::stored();
+		return is_array( $after ) && isset( $after['site_ref'] );
+	}
+
+	/**
 	 * Forget the ruleset (disconnect, tests).
 	 */
 	public static function clear( $claim = '', $fence = '' ) {
