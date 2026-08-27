@@ -358,4 +358,69 @@ final class AuditRulesTest extends TestCase {
 		$r = $this->run_tool();
 		$this->assertSame( array( 'total_seen' => 0, 'returned' => 0, 'truncated' => false, 'cap' => '' ), $r['coverage'] );
 	}
+	// -----------------------------------------------------------------------
+	// 2.12.0 — enforce() is the bridge the elementor-mcp fork calls, so the
+	// scoping has to arrive THERE, from the stored record, with no change on
+	// the fork's side. These tests drive the whole path: a stored record, a
+	// scoped rule, and the verdict the wrapper acts on.
+	// -----------------------------------------------------------------------
+
+	/** Store a record directly — the shape accept() writes. */
+	private function store_record( array $rules, $site_ref = null ): void {
+		$rec = array(
+			'envelope'    => 'x.y',
+			'client'      => 'c1',
+			'seq'         => 1,
+			'issued_at'   => '',
+			'received_at' => 1800000000,
+			'rules'       => $rules,
+		);
+		if ( null !== $site_ref ) {
+			$rec['site_ref'] = $site_ref;
+		}
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ]    = maybe_serialize( $rec );
+	}
+
+	public function test_enforce_skips_a_rule_scoped_to_another_site(): void {
+		$this->store_record(
+			array( array( 'key' => 'rule/elsewhere', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) ),
+			'res_B'
+		);
+		$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+		$this->assertNull( $out['effect'] );
+	}
+
+	public function test_enforce_applies_a_rule_scoped_to_this_site(): void {
+		$this->store_record(
+			array( array( 'key' => 'rule/mine', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) ),
+			'res_A'
+		);
+		$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+		$this->assertSame( 'block', $out['effect'] );
+		$this->assertSame( 'rule/mine', $out['rule']['key'] );
+	}
+
+	public function test_enforce_on_a_record_written_before_2_12_enforces_everything(): void {
+		// No site_ref key at all — the shape 2.11 wrote, before any repair.
+		// The site cannot prove it is NOT the named one, so it obeys.
+		$this->store_record(
+			array( array( 'key' => 'rule/elsewhere', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) )
+		);
+		$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+		$this->assertSame( 'block', $out['effect'], 'an unknown identity must over-block, never under-block' );
+	}
+
+	public function test_enforce_still_applies_client_wide_rules_unchanged(): void {
+		// The regression that matters most: every rule without `sites` must
+		// decide exactly as it did in 2.11, whatever the identity is.
+		foreach ( array( 'res_A', '' ) as $ref ) {
+			$this->store_record(
+				array( array( 'key' => 'rule/freeze', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r' ) ),
+				$ref
+			);
+			$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+			$this->assertSame( 'block', $out['effect'] );
+		}
+	}
 }

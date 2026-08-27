@@ -228,10 +228,11 @@ class Aura_Worker_Rules {
 	 * @param int|null $now     Unix time; defaults to now. Injected for tests.
 	 * @return array|null
 	 */
-	public static function match( array $touches, array $rules, $now = null ) {
-		$now     = null === $now ? time() : (int) $now;
-		$winner  = null;
-		$touched = self::normalize_touches( $touches );
+	public static function match( array $touches, array $rules, $now = null, $site_ref = '' ) {
+		$now      = null === $now ? time() : (int) $now;
+		$winner   = null;
+		$touched  = self::normalize_touches( $touches );
+		$site_ref = is_string( $site_ref ) ? $site_ref : '';
 
 		foreach ( $rules as $rule ) {
 			if ( ! is_array( $rule ) || self::is_expired( $rule, $now ) ) {
@@ -240,6 +241,19 @@ class Aura_Worker_Rules {
 			$effect = isset( $rule['effect'] ) ? (string) $rule['effect'] : '';
 			if ( 'block' !== $effect && 'warn' !== $effect ) {
 				continue;
+			}
+			// Site scoping (Aura spec §4, 2.12.0). The predicate is normative:
+			// a site that does not know its own id enforces EVERYTHING — the
+			// same fail-closed direction as the `unknown:*` touches sentinel,
+			// and the reason the identity is stored rather than guessed. A
+			// `sites` that is not a non-empty list is not a narrowing this
+			// site can read (Aura's validator refuses those at write time), so
+			// it is treated as client-wide: over-block, never under.
+			if ( isset( $rule['sites'] ) && is_array( $rule['sites'] ) && ! empty( $rule['sites'] ) ) {
+				$applies = ( '' === $site_ref ) || in_array( $site_ref, $rule['sites'], true );
+				if ( ! $applies ) {
+					continue; // scoped to other sites: not this one's rule
+				}
 			}
 			if ( ! self::rule_touches( $rule, $touched ) ) {
 				continue;
@@ -1397,7 +1411,15 @@ class Aura_Worker_Rules {
 	 */
 	public static function enforce( array $touches, $tool_name, $now = null ) {
 		self::note_expired( $now );
-		$rule = self::match( $touches, self::rules(), $now );
+		// This site's own id, read DEFENSIVELY from the raw record: '' both
+		// when the document carried none and when the record predates 2.12.0
+		// and no repair has run yet. The matcher's predicate turns that into
+		// "enforce everything", which is the only safe reading of an identity
+		// we cannot prove. The fork inherits this through enforce(), so its
+		// governance wrapper needs no change of its own.
+		$rec      = self::stored();
+		$site_ref = ( is_array( $rec ) && isset( $rec['site_ref'] ) && is_string( $rec['site_ref'] ) ) ? $rec['site_ref'] : '';
+		$rule     = self::match( $touches, self::rules(), $now, $site_ref );
 		if ( null === $rule ) {
 			return array( 'effect' => null );
 		}
