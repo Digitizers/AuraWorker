@@ -248,6 +248,14 @@ final class RulesMatchTest extends TestCase {
 			'nested'          => array( array( 'res_A' ) ),
 			'object-shaped'   => array( 'a' => 'res_A' ),
 			'empty string id' => array( '' ),
+			// A stored identity is trimmed at accept() and matched strictly, so
+			// a padded or blank entry can never equal any site's id: reading it
+			// as a narrowing would skip the rule on EVERY site (round-3 P2).
+			'blank id'        => array( ' ' ),
+			'tab id'          => array( "\t" ),
+			'padded id'       => array( ' res_A ' ),
+			'trailing space'  => array( 'res_A ' ),
+			'padded beside a good one' => array( 'res_A', ' res_B' ),
 			'null id'         => array( null ),
 			'bool id'         => array( true ),
 		);
@@ -258,6 +266,21 @@ final class RulesMatchTest extends TestCase {
 				'rule/checkout',
 				Aura_Worker_Rules::match( $touch, array( $rule ), 1000, 'res_B' )['key'],
 				"an unreadable sites value ({$label}) narrowed a rule away"
+			);
+		}
+	}
+
+	public function test_a_padded_id_can_never_match_so_it_is_not_a_narrowing(): void {
+		// The specific danger: `accept()` trims the identity it stores, so
+		// there is no site whose id is `" res_A "`. Treating that as scoping
+		// would retire the rule everywhere, silently.
+		$rule          = $this->rule( 'rule/checkout', 'block', 'site' );
+		$rule['sites'] = array( ' res_A ' );
+		foreach ( array( 'res_A', ' res_A ', 'res_B' ) as $ref ) {
+			$this->assertSame(
+				'rule/checkout',
+				Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1000, $ref )['key'],
+				"a padded entry narrowed the rule away for identity '{$ref}'"
 			);
 		}
 	}

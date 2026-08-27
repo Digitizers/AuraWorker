@@ -276,7 +276,14 @@ class Aura_Worker_Rules {
 			return false;
 		}
 		foreach ( $sites as $id ) {
-			if ( ! is_string( $id ) || '' === $id ) {
+			// A stored identity is TRIMMED at accept() time, and the match is
+			// strict — so `" res_A "` or `" "` can never equal any site's id,
+			// and reading them as a narrowing would skip the rule EVERYWHERE
+			// (round-3 P2). Nor are they trimmed here: Aura's ids carry no
+			// padding, so trimming would invent an id the document did not
+			// name. An entry that is not already normalised means the list is
+			// not one this site can read — client-wide, over-block.
+			if ( ! is_string( $id ) || '' === trim( $id ) || trim( $id ) !== $id ) {
 				return false;
 			}
 		}
