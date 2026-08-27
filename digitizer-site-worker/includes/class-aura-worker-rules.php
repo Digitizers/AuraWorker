@@ -402,6 +402,14 @@ class Aura_Worker_Rules {
 		// holds for the very first document, before anything is stored.
 		$site = isset( $doc['site'] ) && is_string( $doc['site'] ) ? $doc['site'] : '';
 
+		// WHO this site is, in Aura's own names (spec §4, 2.12.0). `site`
+		// proves the document was issued FOR us; `site_ref` is the id a rule's
+		// `sites` list names. Absent — an older Aura, or a document signed
+		// before that field existed — stores as '' and the matcher then
+		// enforces every scoped rule: an identity we do not know can only be
+		// answered by over-blocking.
+		$site_ref = isset( $doc['site_ref'] ) && is_string( $doc['site_ref'] ) ? trim( $doc['site_ref'] ) : '';
+
 		// AUTHORITATIVE reads, in the connect's write order reversed: the store
 		// first, then the token — both from the database, never from this
 		// request's option cache (a request paused after authenticating with
@@ -431,6 +439,24 @@ class Aura_Worker_Rules {
 		if ( null !== $current && isset( $current['envelope'] ) && '' !== (string) $current['envelope'] && hash_equals( (string) $current['envelope'], (string) $envelope ) ) {
 			// The very document we already hold — a retry after a lost 200.
 			// Delivered is delivered; saying 409 would record it as failed forever.
+			//
+			// It is also the ONLY moment a ≤2.11 record can learn its own
+			// `site_ref` from the wire (2.12.0): Aura does not re-push a
+			// document it has already confirmed, so a site upgraded between
+			// two pushes would otherwise hold rules it cannot scope. Heal the
+			// record here — the same verified bytes, one field added — and
+			// answer the retry as before.
+			if ( '' !== $site_ref && ( ! isset( $current['site_ref'] ) || $current['site_ref'] !== $site_ref ) ) {
+				$healed             = $current;
+				$healed['site_ref'] = $site_ref;
+				// A lost swap (or a database refusal) is NOT a failure of this
+				// request: the racer's record was written by an accept() of a
+				// newer document, which stores `site_ref` itself. Re-deciding
+				// here would be worse than doing nothing — the retry would meet
+				// the newer seq and answer 409 for a document Aura has already
+				// delivered, turning an idempotent 200 into a recorded conflict.
+				self::swap( $current, $healed );
+			}
 			return true;
 		}
 		$stale = null !== $current && self::is_stale( $current, $ours );
@@ -472,6 +498,12 @@ class Aura_Worker_Rules {
 			// carries the binding forward, so the next old-client document meets
 			// the same refusal and the stale check keeps working.
 			'token_hash'  => $ours,
+			// This site's own id in the rules' vocabulary (2.12.0). Stored
+			// RAW, exactly as the document carried it — '' when it carried
+			// none. Never synthesised on read: `stored()` is the value the
+			// compare-and-swap names, and a record that gains a field on the
+			// way out could never be matched by the CAS that must heal it.
+			'site_ref'    => $site_ref,
 			'seq'         => (int) $doc['seq'],
 			'issued_at'   => isset( $doc['issued_at'] ) ? (string) $doc['issued_at'] : '',
 			'received_at' => time(),
