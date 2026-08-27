@@ -283,6 +283,31 @@ class Aura_Worker_Rules {
 		return true;
 	}
 
+	/**
+	 * Does this rule reach THIS site?
+	 *
+	 * The one predicate for it (round-2 P2). Both the matcher and the expiry
+	 * report ask it, so a rule scoped to a sibling can never be skipped for
+	 * enforcement while still being announced as this site's expired rule —
+	 * two statements about one rule, from one test.
+	 *
+	 * Normative, and fail-closed in both directions that matter: an unknown
+	 * identity reaches EVERY rule, and a `sites` this site cannot read is no
+	 * narrowing at all.
+	 *
+	 * @since 2.12.0
+	 *
+	 * @param array  $rule     The rule.
+	 * @param string $site_ref This site's id, or '' when unknown.
+	 * @return bool
+	 */
+	private static function rule_reaches_here( array $rule, $site_ref ) {
+		if ( ! isset( $rule['sites'] ) || ! self::is_site_narrowing( $rule['sites'] ) ) {
+			return true; // client-wide
+		}
+		return ( '' === $site_ref ) || in_array( $site_ref, $rule['sites'], true );
+	}
+
 	public static function match( array $touches, array $rules, $now = null, $site_ref = '' ) {
 		$now      = null === $now ? time() : (int) $now;
 		$winner   = null;
@@ -297,18 +322,11 @@ class Aura_Worker_Rules {
 			if ( 'block' !== $effect && 'warn' !== $effect ) {
 				continue;
 			}
-			// Site scoping (Aura spec §4, 2.12.0). The predicate is normative:
-			// a site that does not know its own id enforces EVERYTHING — the
-			// same fail-closed direction as the `unknown:*` touches sentinel,
-			// and the reason the identity is stored rather than guessed. A
-			// `sites` that is not a non-empty list is not a narrowing this
-			// site can read (Aura's validator refuses those at write time), so
-			// it is treated as client-wide: over-block, never under.
-			if ( isset( $rule['sites'] ) && self::is_site_narrowing( $rule['sites'] ) ) {
-				$applies = ( '' === $site_ref ) || in_array( $site_ref, $rule['sites'], true );
-				if ( ! $applies ) {
-					continue; // scoped to other sites: not this one's rule
-				}
+			// Site scoping (Aura spec §4, 2.12.0), through the shared predicate
+			// so the expiry report cannot disagree with enforcement about the
+			// very same rule.
+			if ( ! self::rule_reaches_here( $rule, $site_ref ) ) {
+				continue; // scoped to other sites: not this one's rule
 			}
 			if ( ! self::rule_touches( $rule, $touched ) ) {
 				continue;
@@ -1371,12 +1389,24 @@ class Aura_Worker_Rules {
 	 * @return string[]
 	 */
 	public static function expired_keys( $now = null ) {
-		$now = null === $now ? time() : (int) $now;
-		$out = array();
+		$now      = null === $now ? time() : (int) $now;
+		$site_ref = self::site_ref();
+		$out      = array();
 		foreach ( self::rules() as $rule ) {
-			if ( is_array( $rule ) && self::is_expired( $rule, $now ) && isset( $rule['key'] ) ) {
-				$out[] = (string) $rule['key'];
+			if ( ! is_array( $rule ) || ! self::is_expired( $rule, $now ) || ! isset( $rule['key'] ) ) {
+				continue;
 			}
+			// A rule scoped to OTHER sites is not this site's protection, so
+			// its expiry is not this site's news (round-2 P2). Announcing it
+			// here — and reporting it in `audit_rules` as this site's
+			// `expired_active` — raises a fleet alert about a rule that never
+			// applied here, and the operator is sent to repair the wrong site.
+			// The same predicate enforcement uses: an unknown identity still
+			// reports everything, exactly as it still enforces everything.
+			if ( ! self::rule_reaches_here( $rule, $site_ref ) ) {
+				continue;
+			}
+			$out[] = (string) $rule['key'];
 		}
 		return $out;
 	}

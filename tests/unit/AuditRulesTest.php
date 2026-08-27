@@ -489,4 +489,72 @@ final class AuditRulesTest extends TestCase {
 			'activation writes the version marker directly, bypassing the repair'
 		);
 	}
+	// -----------------------------------------------------------------------
+	// Codex round 2 P2: an expired rule scoped to a SIBLING site is not this
+	// site's expired rule. Announcing it — and reporting it in audit_rules as
+	// this site's `expired_active` — raises a fleet alert about protection
+	// that never applied here.
+	// -----------------------------------------------------------------------
+
+	private function expired_rule( string $key, array $sites = null ): array {
+		$rule = array(
+			'key'    => $key,
+			'effect' => 'block',
+			'target' => array( 'type' => 'site' ),
+			'reason' => 'r',
+			'until'  => '2020-01-01T00:00:00Z',
+		);
+		if ( null !== $sites ) {
+			$rule['sites'] = $sites;
+		}
+		return $rule;
+	}
+
+	public function test_expired_keys_skips_a_rule_scoped_to_another_site(): void {
+		$this->store_record(
+			array( $this->expired_rule( 'rule/elsewhere', array( 'res_A' ) ), $this->expired_rule( 'rule/mine' ) ),
+			'res_B'
+		);
+		$this->assertSame( array( 'rule/mine' ), Aura_Worker_Rules::expired_keys( 1800000000 ) );
+	}
+
+	public function test_expired_keys_reports_a_rule_scoped_to_this_site(): void {
+		$this->store_record( array( $this->expired_rule( 'rule/mine', array( 'res_A' ) ) ), 'res_A' );
+		$this->assertSame( array( 'rule/mine' ), Aura_Worker_Rules::expired_keys( 1800000000 ) );
+	}
+
+	public function test_an_unknown_identity_reports_every_expired_rule(): void {
+		// Same direction as enforcement: what it enforces, it reports.
+		$this->store_record( array( $this->expired_rule( 'rule/elsewhere', array( 'res_A' ) ) ) );
+		$this->assertSame( array( 'rule/elsewhere' ), Aura_Worker_Rules::expired_keys( 1800000000 ) );
+	}
+
+	public function test_the_expiry_hook_stays_silent_about_another_site_s_rule(): void {
+		$this->store_record( array( $this->expired_rule( 'rule/elsewhere', array( 'res_A' ) ) ), 'res_B' );
+		$GLOBALS['_did_actions'] = array();
+
+		Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
+
+		$fired = array_values( array_filter( $GLOBALS['_did_actions'], static function ( $a ) {
+			return 'aura_worker_rule_expired' === $a['tag'];
+		} ) );
+		$this->assertSame( array(), $fired, 'this site announced a sibling site\'s expired rule' );
+	}
+
+	public function test_enforcement_and_the_expiry_report_never_disagree(): void {
+		// The invariant behind the shared predicate: a rule this site does not
+		// enforce is a rule this site does not report, and the other way round.
+		foreach ( array( 'res_A', 'res_B', '' ) as $ref ) {
+			$this->store_record( array( $this->expired_rule( 'rule/scoped', array( 'res_A' ) ) ), $ref );
+			$reported = in_array( 'rule/scoped', Aura_Worker_Rules::expired_keys( 1800000000 ), true );
+
+			// Would it be enforced if it had not expired? Same rule, no `until`.
+			$live = $this->expired_rule( 'rule/scoped', array( 'res_A' ) );
+			unset( $live['until'] );
+			$this->store_record( array( $live ), $ref );
+			$enforced = 'block' === Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 )['effect'];
+
+			$this->assertSame( $enforced, $reported, "the two views disagreed for identity '{$ref}'" );
+		}
+	}
 }
