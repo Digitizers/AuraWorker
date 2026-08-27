@@ -231,4 +231,49 @@ final class RulesMatchTest extends TestCase {
 		$rule['sites'] = array( 'res_A' );
 		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1800000000, 'res_A' ) );
 	}
+	// -----------------------------------------------------------------------
+	// Codex round 1 — three ways the scoping could betray its own promise.
+	// -----------------------------------------------------------------------
+
+	public function test_a_malformed_sites_list_never_narrows(): void {
+		// `accept()` does not validate individual rules: a rule is enforced
+		// from whatever was signed. A non-empty list that is not a list of
+		// non-empty strings is therefore possible, and treating it as a
+		// narrowing would fail OPEN — the strict comparison could never match,
+		// so the rule would be skipped on EVERY site.
+		$touch = array( array( 'type' => 'post', 'id' => '7' ) );
+		$cases = array(
+			'ints'            => array( 42 ),
+			'mixed'           => array( 'res_A', 42 ),
+			'nested'          => array( array( 'res_A' ) ),
+			'object-shaped'   => array( 'a' => 'res_A' ),
+			'empty string id' => array( '' ),
+			'null id'         => array( null ),
+			'bool id'         => array( true ),
+		);
+		foreach ( $cases as $label => $sites ) {
+			$rule          = $this->rule( 'rule/checkout', 'block', 'site' );
+			$rule['sites'] = $sites;
+			$this->assertSame(
+				'rule/checkout',
+				Aura_Worker_Rules::match( $touch, array( $rule ), 1000, 'res_B' )['key'],
+				"an unreadable sites value ({$label}) narrowed a rule away"
+			);
+		}
+	}
+
+	public function test_one_junk_entry_does_not_disarm_the_whole_rule(): void {
+		// The dangerous half of the case above: `['res_A', 42]` on res_A. If
+		// the junk made this "a narrowing", res_A would still be matched — but
+		// on res_B the rule would vanish. Client-wide is the only reading that
+		// cannot lose an enforcement.
+		$rule          = $this->rule( 'rule/checkout', 'block', 'site' );
+		$rule['sites'] = array( 'res_A', 42 );
+		foreach ( array( 'res_A', 'res_B', '' ) as $ref ) {
+			$this->assertSame(
+				'rule/checkout',
+				Aura_Worker_Rules::match( array( array( 'type' => 'post', 'id' => '7' ) ), array( $rule ), 1000, $ref )['key']
+			);
+		}
+	}
 }

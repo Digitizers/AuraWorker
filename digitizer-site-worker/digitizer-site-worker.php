@@ -117,7 +117,14 @@ function aura_worker_activate_site() {
 		error_log( 'SiteAgent: an Aura Application Password left over from a failed deactivation could not be revoked; revoke it by hand in Users → Profile → Application Passwords.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 	}
 	Aura_Worker_Magic_Link::release_site( $aura_fence );
-	update_option( 'aura_worker_version', AURA_WORKER_VERSION );
+	// Through the SAME decision as a request-time upgrade (round-1 P2). A site
+	// updated while the plugin was inactive reaches this hook with the marker
+	// still behind and `plugins_loaded` already past: stamping the version
+	// here unconditionally — as this line used to — would retire the repair
+	// before it ever ran, and every later request would return early from
+	// aura_worker_maybe_upgrade() with the record still missing its identity.
+	// One function writes the marker, and only behind a completed repair.
+	aura_worker_maybe_upgrade();
 
 	// Generate a unique site token if not exists. Only the SHA-256 hash is
 	// stored; the raw value is revealed once via a transient on the settings

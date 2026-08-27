@@ -228,6 +228,61 @@ class Aura_Worker_Rules {
 	 * @param int|null $now     Unix time; defaults to now. Injected for tests.
 	 * @return array|null
 	 */
+	/**
+	 * This site's own id in the rules' vocabulary, or '' when it is unknown.
+	 *
+	 * ONE accessor, so every surface that judges a rule — the enforcement
+	 * path and the preview the gateway shows before approval — asks the same
+	 * question of the same record. A second spelling is how a preview comes to
+	 * report a block that execution would skip (round-1 P2).
+	 *
+	 * Read defensively: '' both when the document carried no identity and when
+	 * the record predates 2.12.0 and no repair has run yet. The matcher turns
+	 * '' into "enforce everything".
+	 *
+	 * @since 2.12.0
+	 *
+	 * @return string
+	 */
+	public static function site_ref() {
+		$rec = self::stored();
+		return ( is_array( $rec ) && isset( $rec['site_ref'] ) && is_string( $rec['site_ref'] ) ) ? $rec['site_ref'] : '';
+	}
+
+	/**
+	 * Is this rule's `sites` a NARROWING this site can act on?
+	 *
+	 * Only a non-empty list of non-empty strings is. Aura's validator refuses
+	 * anything else at write time, so an accepted document should never carry
+	 * one — but `accept()` does not validate individual rules, and a rule is
+	 * enforced from whatever was signed. A malformed value (`sites: [42]`, a
+	 * decoded object, a list with one junk entry) must therefore read as NO
+	 * narrowing at all: the rule stays client-wide and over-blocks. Treating it
+	 * as a narrowing would fail OPEN — the strict comparison could never match,
+	 * so the rule would be skipped everywhere (round-1 P2).
+	 *
+	 * @since 2.12.0
+	 *
+	 * @param mixed $sites The rule's `sites` value.
+	 * @return bool
+	 */
+	private static function is_site_narrowing( $sites ) {
+		if ( ! is_array( $sites ) || empty( $sites ) ) {
+			return false;
+		}
+		// A decoded JSON object arrives as an associative array; its KEYS are
+		// not ids, so it is not a list of them.
+		if ( array_keys( $sites ) !== range( 0, count( $sites ) - 1 ) ) {
+			return false;
+		}
+		foreach ( $sites as $id ) {
+			if ( ! is_string( $id ) || '' === $id ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	public static function match( array $touches, array $rules, $now = null, $site_ref = '' ) {
 		$now      = null === $now ? time() : (int) $now;
 		$winner   = null;
@@ -249,7 +304,7 @@ class Aura_Worker_Rules {
 			// `sites` that is not a non-empty list is not a narrowing this
 			// site can read (Aura's validator refuses those at write time), so
 			// it is treated as client-wide: over-block, never under.
-			if ( isset( $rule['sites'] ) && is_array( $rule['sites'] ) && ! empty( $rule['sites'] ) ) {
+			if ( isset( $rule['sites'] ) && self::is_site_narrowing( $rule['sites'] ) ) {
 				$applies = ( '' === $site_ref ) || in_array( $site_ref, $rule['sites'], true );
 				if ( ! $applies ) {
 					continue; // scoped to other sites: not this one's rule
@@ -1411,15 +1466,11 @@ class Aura_Worker_Rules {
 	 */
 	public static function enforce( array $touches, $tool_name, $now = null ) {
 		self::note_expired( $now );
-		// This site's own id, read DEFENSIVELY from the raw record: '' both
-		// when the document carried none and when the record predates 2.12.0
-		// and no repair has run yet. The matcher's predicate turns that into
-		// "enforce everything", which is the only safe reading of an identity
-		// we cannot prove. The fork inherits this through enforce(), so its
-		// governance wrapper needs no change of its own.
-		$rec      = self::stored();
-		$site_ref = ( is_array( $rec ) && isset( $rec['site_ref'] ) && is_string( $rec['site_ref'] ) ) ? $rec['site_ref'] : '';
-		$rule     = self::match( $touches, self::rules(), $now, $site_ref );
+		// Judged in THIS site's identity (self::site_ref(), the one accessor —
+		// the preview path asks the same question of the same record, so the
+		// two can never disagree). The fork inherits this through enforce(),
+		// so its governance wrapper needs no change of its own.
+		$rule = self::match( $touches, self::rules(), $now, self::site_ref() );
 		if ( null === $rule ) {
 			return array( 'effect' => null );
 		}

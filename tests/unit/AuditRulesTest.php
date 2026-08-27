@@ -378,8 +378,10 @@ final class AuditRulesTest extends TestCase {
 		if ( null !== $site_ref ) {
 			$rec['site_ref'] = $site_ref;
 		}
-		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = $rec;
-		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ]    = maybe_serialize( $rec );
+		// update_option, not a raw assignment: core answers "absent" for a name
+		// listed in `notoptions`, which any earlier read of an empty store put
+		// it there — the row and the cache must agree the way a real site's do.
+		update_option( Aura_Worker_Rules::OPTION, $rec );
 	}
 
 	public function test_enforce_skips_a_rule_scoped_to_another_site(): void {
@@ -422,5 +424,69 @@ final class AuditRulesTest extends TestCase {
 			$out = Aura_Worker_Rules::enforce( array( array( 'type' => 'post', 'id' => '7' ) ), 'x', 1800000000 );
 			$this->assertSame( 'block', $out['effect'] );
 		}
+	}
+	// -----------------------------------------------------------------------
+	// Codex round 1 P2: the preview the gateway shows before approval must
+	// name the rule enforcement would actually apply. Two views of one call,
+	// so they ask ONE accessor for the identity.
+	// -----------------------------------------------------------------------
+
+	public function test_the_identity_accessor_reads_the_record_defensively(): void {
+		$this->assertSame( '', Aura_Worker_Rules::site_ref(), 'no record at all is an unknown identity' );
+
+		$this->store_record( array(), 'res_A' );
+		$this->assertSame( 'res_A', Aura_Worker_Rules::site_ref() );
+
+		// A record from before 2.12.0: the key is simply absent.
+		$this->store_record( array() );
+		$this->assertSame( '', Aura_Worker_Rules::site_ref() );
+
+		// A record whose field is junk is not an identity either.
+		$rec = $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ];
+		$rec['site_ref'] = array( 'res_A' );
+		update_option( Aura_Worker_Rules::OPTION, $rec );
+		$this->assertSame( '', Aura_Worker_Rules::site_ref() );
+	}
+
+	public function test_the_preview_and_enforcement_agree_about_a_foreign_scoped_rule(): void {
+		// The preview path is `Aura_Worker_Tools::preview_tool()`, which calls
+		// `match()` directly. Asserted at the seam it shares with enforce():
+		// the same rules, the same identity, the same verdict.
+		$rules = array( array( 'key' => 'rule/elsewhere', 'effect' => 'block', 'target' => array( 'type' => 'site' ), 'reason' => 'r', 'sites' => array( 'res_A' ) ) );
+		$this->store_record( $rules, 'res_B' );
+		$touches = array( array( 'type' => 'post', 'id' => '7' ) );
+
+		$previewed = Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules(), null, Aura_Worker_Rules::site_ref() );
+		$enforced  = Aura_Worker_Rules::enforce( $touches, 'x', 1800000000 );
+
+		$this->assertNull( $previewed, 'the preview reported a rule enforcement skips' );
+		$this->assertNull( $enforced['effect'] );
+	}
+
+	public function test_the_preview_path_passes_the_identity_through(): void {
+		// The call site itself — a preview that dropped the argument would
+		// silently fall back to the unknown identity and warn about blocks
+		// that never fire.
+		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/includes/class-aura-worker-tools.php' );
+		$this->assertStringContainsString(
+			'Aura_Worker_Rules::match( $touches, Aura_Worker_Rules::rules(), null, Aura_Worker_Rules::site_ref() )',
+			$src
+		);
+	}
+
+	public function test_activation_repairs_before_it_records_the_version(): void {
+		// A site updated while the plugin was inactive reaches activation with
+		// the marker behind and plugins_loaded already past. Stamping the
+		// version there retires the repair before it ever runs.
+		$main     = file_get_contents( __DIR__ . '/../../digitizer-site-worker/digitizer-site-worker.php' );
+		$activate = substr( $main, strpos( $main, 'function aura_worker_activate_site()' ) );
+		$activate = substr( $activate, 0, strpos( $activate, "\n}\n" ) );
+
+		$this->assertStringContainsString( 'aura_worker_maybe_upgrade();', $activate );
+		$this->assertStringNotContainsString(
+			"update_option( 'aura_worker_version', AURA_WORKER_VERSION )",
+			$activate,
+			'activation writes the version marker directly, bypassing the repair'
+		);
 	}
 }
