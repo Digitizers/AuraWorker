@@ -230,6 +230,7 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 1. The SiteAgent settings page in WordPress admin (under the Settings menu) showing the Site Token and connection status.
 2. The Aura dashboard showing connected WordPress sites with health status, WordPress version, PHP version, and available updates.
 3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
+4. The Updates tab for a connected site in Aura — pending plugin updates with one-click Update / Update All, plus database optimization.
 
 == Changelog ==
 
