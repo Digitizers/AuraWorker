@@ -227,10 +227,13 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 
 == Screenshots ==
 
-1. The SiteAgent settings page in WordPress admin (under the Settings menu) showing the Site Token and connection status.
-2. The Aura dashboard showing connected WordPress sites with health status, WordPress version, PHP version, and available updates.
-3. Remote plugin update in progress from the Aura dashboard — select a plugin and update it with a single click.
-4. The Updates tab for a connected site in Aura — SiteAgent rollout control (release channel, auto-update toggle, policy and risk state), the site’s update status, and database migration status per plugin.
+1. Settings → SiteAgent in wp-admin: site token status, optional IP / domain allowlists, one-click Connect to Aura, and a live connection test.
+2. Aura → Apps → Connection tab: connection status, plugin version, release channels (stable / beta), re-test, disconnect, and credential rotation.
+3. Health tab: WordPress / PHP / MySQL versions, server info, settings, active theme, and the full plugin inventory with status.
+4. Updates tab: SiteAgent rollout control (release channel, auto-update, policy and risk state), update status, and per-plugin database migration status.
+5. Fleet AI: the catalog of agent tools every connected site exposes — each tagged Read or Power — runnable across the whole fleet from one control plane.
+6. SiteAgent Power Pack: the companion plugin's write and code tools, each off until armed in wp-config.php and approval-gated through Aura.
+7. Connections: provider connections (Cloudways, Cloudflare, Bunny, Hostinger, Vultr, xCloud) with resource counts, status, and credential-rotation reminders.
 
 == Changelog ==
 
