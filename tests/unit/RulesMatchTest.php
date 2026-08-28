@@ -103,6 +103,18 @@ final class RulesMatchTest extends TestCase {
 		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'site', 'id' => '*' ) ), array( $rule ) ) );
 	}
 
+	public function test_an_unknown_target_type_is_inert_even_against_the_undeclared_sentinel(): void {
+		// Aura #431: an `infra` rule (a target type this plugin does not know)
+		// is inert even when the caller declared nothing — the type check
+		// precedes the undeclared-touches sentinel. A refactor that swaps the
+		// two would make the power pack's `unknown:*` declaration match an
+		// infra freeze.
+		$infra = $this->rule( 'rule/freeze', 'block', 'infra', null );
+		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'unknown', 'id' => '*' ) ), array( $infra ) ) );
+		$this->assertNull( Aura_Worker_Rules::match( array(), array( $infra ) ) );
+		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'plugin', 'id' => 'woo' ) ), array( $infra ) ) );
+	}
+
 	public function test_malformed_touches_entries_do_not_buy_an_exemption(): void {
 		// Garbage in a declaration is not a narrow declaration. Every entry
 		// here is unusable, so the call has told us nothing — and "nothing"
