@@ -36,6 +36,7 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-call-context.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-rules.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-abilities.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-unbind.php';
 
 /**
  * Initialize the plugin.

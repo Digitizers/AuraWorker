@@ -888,7 +888,7 @@ if ( ! function_exists( 'get_plugins' ) ) {
 	function get_plugins() {
 		return isset( $GLOBALS['_installed_plugins'] )
 			? $GLOBALS['_installed_plugins']
-			: array( 'akismet/akismet.php' => array( 'Name' => 'Akismet' ) );
+			: array( 'akismet/akismet.php' => array( 'Name' => 'Akismet', 'Version' => '1.0' ) );
 	}
 }
 
@@ -911,11 +911,25 @@ if ( ! class_exists( 'SA_Test_Theme' ) ) {
 		private string $slug;
 
 		public function __construct( $slug = '' ) {
-			$this->slug = (string) $slug;
+			$this->slug = '' !== (string) $slug ? (string) $slug : 'sa-test-theme';
 		}
 
 		public function exists(): bool {
 			return '' !== $this->slug && ! isset( $GLOBALS['_missing_themes'][ $this->slug ] );
+		}
+
+		/** get_status()'s health report reads Name/Version headers off the theme. */
+		public function get( string $header ) {
+			return $GLOBALS['_theme_headers'][ $this->slug ][ $header ] ?? $header;
+		}
+
+		public function get_stylesheet(): string {
+			return $this->slug;
+		}
+
+		/** No parent theme modelled — get_status() treats this as "not a child theme". */
+		public function parent() {
+			return false;
 		}
 	}
 }
@@ -1174,6 +1188,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public string $options    = 'wp_options';
 		public string $last_error = '';
 		public string $last_query = '';
+
+		/** Used only by get_status()'s health report — a fixed stand-in, not modelled state. */
+		public function db_version(): string {
+			return '8.0.30';
+		}
 
 		/**
 		 * get_results returns the next queued result-set (for tools that run
@@ -1839,6 +1858,7 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-magic-link.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-call-context.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-abilities.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-unbind.php';
 // The plugin's admin/settings class: registers settings and owns the token
 // regeneration handler (#67).
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker.php';
@@ -1904,6 +1924,30 @@ if ( ! function_exists( 'wp_get_upload_dir' ) ) {
 if ( ! function_exists( 'get_locale' ) ) {
 	function get_locale(): string {
 		return 'en_US';
+	}
+}
+
+if ( ! function_exists( 'wp_timezone_string' ) ) {
+	function wp_timezone_string(): string {
+		return $GLOBALS['_timezone_string'] ?? 'UTC';
+	}
+}
+
+if ( ! function_exists( 'wp_max_upload_size' ) ) {
+	function wp_max_upload_size(): int {
+		return $GLOBALS['_max_upload_size'] ?? 2097152;
+	}
+}
+
+if ( ! function_exists( 'get_site_url' ) ) {
+	function get_site_url(): string {
+		return $GLOBALS['_home_url'] ?? 'https://example.com';
+	}
+}
+
+if ( ! function_exists( 'get_home_url' ) ) {
+	function get_home_url(): string {
+		return $GLOBALS['_home_url'] ?? 'https://example.com';
 	}
 }
 

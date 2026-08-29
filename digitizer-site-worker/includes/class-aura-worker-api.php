@@ -388,6 +388,11 @@ class Aura_Worker_API {
 			'timestamp'           => gmdate( 'c' ),
 		);
 
+		$unbound = Aura_Worker_Unbind::status_fragment();
+		if ( null !== $unbound ) {
+			$status['unbound'] = $unbound;
+		}
+
 		return rest_ensure_response( $status );
 	}
 

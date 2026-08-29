@@ -71,6 +71,10 @@ class Aura_Worker {
 		// app-password agent and a second MCP server actually write through.
 		Aura_Worker_Rules::init();
 
+		// The unbind marker's Phase B sweep (#434) — the body is filled in
+		// once Phase A/B exist; this only registers the init hook.
+		Aura_Worker_Unbind::init();
+
 		// Standards-alignment: also expose tools via the WordPress Abilities API
 		// (when present) so the official MCP adapter can discover them. Additive —
 		// the aura/mcp namespace above is unaffected. The category must register
