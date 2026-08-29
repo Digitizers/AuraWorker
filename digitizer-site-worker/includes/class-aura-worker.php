@@ -71,6 +71,13 @@ class Aura_Worker {
 		// app-password agent and a second MCP server actually write through.
 		Aura_Worker_Rules::init();
 
+		// Which Application Password authenticated this request (#434). Copied
+		// into the unbind marker by Phase A, before Phase B revokes it, so the
+		// core-REST seam can still recognise the departed binding. Registered
+		// here because WordPress fires the hook during REST authentication —
+		// earlier than any route callback, later than plugins_loaded.
+		Aura_Worker_Security::init();
+
 		// The unbind marker's Phase B sweep (#434) — the body is filled in
 		// once Phase A/B exist; this only registers the init hook.
 		Aura_Worker_Unbind::init();

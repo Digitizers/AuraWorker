@@ -915,7 +915,14 @@ class Aura_Worker_API {
 	 * @return WP_REST_Response
 	 */
 	public function receive_rules( $request ) {
-		if ( ! Aura_Worker_Grant::has_usable_key() ) {
+		// The 412 below must NOT pre-empt the unbind marker's fast path (#434,
+		// spec §2.3): Phase B deletes the gateway key BEFORE the site token, so
+		// a tombstone retried after a partial cleanup would otherwise be
+		// stranded on "reconnect the site" forever — for a site Aura has
+		// already disconnected. is_set() is the loose probe on purpose: it says
+		// only "let accept() decide", and accept()'s step 0 does the strict,
+		// fail-closed read (is_set_strict()) that actually rules.
+		if ( ! Aura_Worker_Unbind::is_set() && ! Aura_Worker_Grant::has_usable_key() ) {
 			// No USABLE gateway key on this site: nothing can be verified.
 			// Deliberately not is_enforced(), which means only "the option is
 			// non-empty" — a truncated or corrupt key would then answer 400 on
@@ -932,6 +939,22 @@ class Aura_Worker_API {
 			);
 		}
 		$res = Aura_Worker_Rules::accept( (string) $request->get_param( 'ruleset' ) );
+		if ( is_array( $res ) && ! empty( $res['unbound'] ) ) {
+			// The unbind answer (#434). `seq` is the one THIS request carried,
+			// so Aura can retire the tombstone it actually sent;
+			// `cleanup_complete` says whether Phase B finished — false leaves
+			// the tombstone pending and the site finishes the job itself.
+			// Authenticated by the token before Phase B deleted it.
+			return new WP_REST_Response(
+				array(
+					'success'          => true,
+					'seq'              => (int) $res['seq'],
+					'unbound'          => true,
+					'cleanup_complete' => (bool) $res['cleanup_complete'],
+				),
+				200
+			);
+		}
 		if ( is_wp_error( $res ) ) {
 			$data = $res->get_error_data();
 			return new WP_REST_Response(

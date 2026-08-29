@@ -347,6 +347,33 @@ class Aura_Worker_Grant {
 	 * @param string $s
 	 * @return string|false
 	 */
+	/**
+	 * The payload of a signed envelope WITHOUT verifying it.
+	 *
+	 * For the one caller that has no key to verify with: the unbind marker's
+	 * fast path (#434, spec §2.3 step 0). There, the token that already
+	 * authenticated the request is the authority and the gateway public key
+	 * may have been deleted by an earlier Phase B — so the document is read
+	 * only to learn which `seq` the retry is echoing and whether it says
+	 * `final`. NEVER use this to make a trust decision; verify_signed_document()
+	 * is the only function that answers that question.
+	 *
+	 * @param string $envelope Signed document — or anything at all.
+	 * @return array Decoded payload, or an empty array for anything that is not one.
+	 */
+	public static function peek_payload( $envelope ) {
+		$parts = explode( '.', (string) $envelope );
+		if ( '' === $parts[0] ) {
+			return array();
+		}
+		$json = self::b64url_decode( $parts[0] );
+		if ( ! is_string( $json ) || '' === $json ) {
+			return array();
+		}
+		$doc = json_decode( $json, true );
+		return is_array( $doc ) ? $doc : array();
+	}
+
 	private static function b64url_decode( $s ) {
 		$s   = strtr( (string) $s, '-_', '+/' );
 		$pad = strlen( $s ) % 4;

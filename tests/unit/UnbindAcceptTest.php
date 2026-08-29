@@ -92,4 +92,206 @@ final class UnbindAcceptTest extends TestCase {
 		}
 		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM, '' ), 'the finally block must still release the claim' );
 	}
+
+	// -----------------------------------------------------------------------
+	// Task 3 — Phase A: the unbind document, the marker fast path, the write.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * A clear tombstone's envelope, `unbind: true` after `rules` (spec §2.1).
+	 *
+	 * @param array $over Fields to override.
+	 * @return string
+	 */
+	private function unbind_env( array $over = array() ): string {
+		return sa_sign_ruleset( array_merge( array( 'v' => 1, 'client' => 'c1', 'site' => sa_token_hash(), 'site_ref' => 'r1', 'seq' => 9, 'issued_at' => '2026-08-29T10:00:00Z', 'rules' => array(), 'unbind' => true, 'final' => true ), $over ) );
+	}
+
+	public function test_unbind_writes_the_marker_with_the_binding_identity(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );               // seq-0 sentinel, as a connect leaves it
+		update_option( 'aura_worker_connect_user_id', 3 );
+		sa_set_managed_app_password( 3, 'uuid-managed' );
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-manual' ); // the password that authenticated THIS request
+		$GLOBALS['_current_user_id'] = 3;                                         // the user that password belongs to
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+
+		$this->assertSame( true, $res['unbound'] );
+		$this->assertSame( 9, $res['seq'] );
+		$this->assertFalse( $res['cleanup_complete'], 'Phase B is a Task 4 stub — the response must say so honestly' );
+		$m = Aura_Worker_Unbind::read();
+		$this->assertSame( sa_token_hash(), $m['site'] );
+		$this->assertSame( 'r1', $m['site_ref'] );
+		$this->assertSame( 'c1', $m['client'] );
+		$this->assertSame( 9, $m['seq'] );
+		$this->assertSame( 3, $m['connect_user_id'] );
+		$this->assertEqualsCanonicalizing( array( 'uuid-managed', 'uuid-manual' ), $m['app_password_uuids'] );
+		$this->assertSame( 3, $m['app_password_users']['uuid-managed'] );
+		$this->assertSame( 3, $m['app_password_users']['uuid-manual'] );
+		$this->assertMatchesRegularExpression( '/^\d{4}-\d{2}-\d{2}T/', $m['at'] );
+		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM, '' ), 'claim released' );
+	}
+
+	public function test_wrong_site_writes_nothing(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		$res = Aura_Worker_Rules::accept( $this->unbind_env( array( 'site' => str_repeat( 'b', 64 ) ) ) );
+		$this->assertSame( 'aura_ruleset_wrong_site', $res->get_error_code() );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	public function test_client_mismatch_writes_nothing(): void {
+		Aura_Worker_Rules::bind( 'c-other', sa_token_hash() );
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+		$this->assertSame( 'aura_ruleset_client_mismatch', $res->get_error_code() );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	public function test_stale_seq_writes_no_marker(): void {
+		Aura_Worker_Rules::accept( sa_sign_ruleset( array( 'v' => 1, 'client' => 'c1', 'site' => sa_token_hash(), 'site_ref' => 'r1', 'seq' => 9, 'issued_at' => 'x', 'rules' => array() ) ) );
+		$res = Aura_Worker_Rules::accept( $this->unbind_env( array( 'seq' => 9 ) ) );
+		$this->assertSame( 'aura_ruleset_stale', $res->get_error_code() );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * DEVIATION from the brief's `test_marker_set_ordinary_document_is_refused_
+	 * store_untouched`, which asserted `aura_site_unbound` here. Spec §2.3 step
+	 * 0 is explicit: the fast path answers on the TOKEN alone, before any
+	 * decoding — and the brief's own
+	 * test_marker_set_token_matches_fast_path_answers_unbound_without_verifying
+	 * feeds it literal garbage and demands `unbound`. No ordering satisfies
+	 * both, so the token match wins and an ordinary push arriving at an
+	 * unbound site learns `unbound: true`. The half of that test that is not
+	 * in conflict — the ruleset store is never touched — is what is pinned.
+	 */
+	public function test_marker_set_ordinary_document_answers_unbound_store_untouched(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9 ) );
+		$before = get_option( Aura_Worker_Rules::OPTION );
+		$res    = Aura_Worker_Rules::accept( sa_sign_ruleset( array( 'v' => 1, 'client' => 'c1', 'site' => sa_token_hash(), 'site_ref' => 'r1', 'seq' => 10, 'issued_at' => 'x', 'rules' => array() ) ) );
+		$this->assertSame( true, $res['unbound'] );
+		$this->assertSame( 10, $res['seq'] );
+		$this->assertSame( $before, get_option( Aura_Worker_Rules::OPTION ) );
+	}
+
+	public function test_marker_set_token_matches_fast_path_answers_unbound_without_verifying(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9 ) );
+		delete_option( 'aura_worker_grant_pubkey' );                       // key already gone: no envelope can verify
+		$res = Aura_Worker_Rules::accept( 'garbage-not-an-envelope' );
+		$this->assertSame( true, $res['unbound'] );
+		$this->assertSame( 9, $res['seq'] );
+	}
+
+	public function test_fast_path_echoes_the_retrys_own_seq(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9 ) );
+		$res = Aura_Worker_Rules::accept( $this->unbind_env( array( 'seq' => 12, 'final' => false ) ) ); // a sibling tombstone's clearSeq
+		$this->assertSame( 12, $res['seq'] );
+	}
+
+	public function test_fast_path_aborts_when_the_uuid_append_fails(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9, 'app_password_uuids' => array( 'uuid-managed' ) ) );
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-second' );
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Unbind::OPTION ] = true;   // the claimed marker rewrite fails
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env( array( 'final' => true ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_unbind_store_failed', $res->get_error_code() );
+		$this->assertSame( 500, $res->get_error_data()['status'] );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'no cleanup ran' );
+		$this->assertSame( array( 'uuid-managed' ), Aura_Worker_Unbind::read()['app_password_uuids'] );
+	}
+
+	public function test_fast_path_appends_the_authenticating_uuid_on_every_visit(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9, 'app_password_uuids' => array( 'uuid-managed' ), 'app_password_users' => array( 'uuid-managed' => 3 ) ) );
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-second' );
+		$GLOBALS['_current_user_id'] = 7;
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env( array( 'seq' => 12 ) ) );
+
+		$this->assertSame( true, $res['unbound'] );
+		$m = Aura_Worker_Unbind::read();
+		$this->assertSame( array( 'uuid-managed', 'uuid-second' ), $m['app_password_uuids'] );
+		$this->assertSame( 7, $m['app_password_users']['uuid-second'] );
+		$this->assertSame( 9, $m['seq'], 'the append must not move the marker seq' );
+	}
+
+	public function test_marker_set_token_differs_is_403_nothing_touched(): void {
+		sa_set_marker( array( 'site' => str_repeat( 'c', 64 ), 'seq' => 9 ) );
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+		$this->assertSame( 'aura_site_unbound', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+		$this->assertSame( str_repeat( 'c', 64 ), Aura_Worker_Unbind::read()['site'] );
+	}
+
+	/**
+	 * Controller ruling 1: an UNREADABLE marker is never "the site is bound".
+	 * Task 1 made read() tri-state exactly so this boundary can fail CLOSED —
+	 * a database blip at step 0 answers the retryable store failure and writes
+	 * nothing, rather than proceeding as though no unbind had ever happened.
+	 */
+	public function test_unreadable_marker_fails_closed_and_writes_nothing(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		$before = get_option( Aura_Worker_Rules::OPTION );
+		// Scoped to the MARKER's own row: a request-wide $wpdb failure would
+		// break the ruleset store's read too and the assertion below would pass
+		// for the wrong reason.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
+		$this->assertSame( 500, $res->get_error_data()['status'] );
+		$this->assertSame( $before, get_option( Aura_Worker_Rules::OPTION ) );
+		$this->assertNull( Aura_Worker_Unbind::read(), 'nothing marked on an unreadable marker' );
+	}
+
+	/**
+	 * DEVIATION from the brief, which asserted `$res['seq']`: accept() answers
+	 * plain `true` for an ordinary document and has since 2.10 — the array
+	 * shape is the unbind answer only. What the brief meant is pinned instead:
+	 * the ruleset lands, and no marker is written.
+	 */
+	public function test_envelope_without_unbind_stores_rules_exactly_as_before(): void {
+		$env = sa_sign_ruleset( array( 'v' => 1, 'client' => 'c1', 'site' => sa_token_hash(), 'site_ref' => 'r1', 'seq' => 1, 'issued_at' => 'x', 'rules' => array( array( 'key' => 'rule/x', 'effect' => 'block', 'target' => 'site:*' ) ) ) );
+		$res = Aura_Worker_Rules::accept( $env );
+		$this->assertTrue( $res );
+		$this->assertSame( 1, Aura_Worker_Rules::current()['seq'] );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	public function test_receive_rules_answers_the_contract_body(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
+		$req->set_param( 'ruleset', $this->unbind_env() );
+		$resp = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req );
+		$this->assertSame( 200, $resp->get_status() );
+		$this->assertSame( array( 'success' => true, 'seq' => 9, 'unbound' => true, 'cleanup_complete' => false ), $resp->get_data() ); // false until Task 4
+	}
+
+	/**
+	 * The 412 `no_gateway_key` branch must not pre-empt the fast path: Phase B
+	 * deletes the gateway key BEFORE the token, so a tombstone retried after a
+	 * partial cleanup would otherwise be stranded on a 412 forever.
+	 */
+	public function test_receive_rules_lets_the_fast_path_run_with_no_gateway_key(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9 ) );
+		delete_option( 'aura_worker_grant_pubkey' );
+		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
+		$req->set_param( 'ruleset', $this->unbind_env( array( 'seq' => 11 ) ) );
+		$resp = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req );
+		$this->assertSame( 200, $resp->get_status() );
+		$this->assertSame( array( 'success' => true, 'seq' => 11, 'unbound' => true, 'cleanup_complete' => false ), $resp->get_data() );
+	}
+
+	public function test_receive_rules_still_412s_a_marker_less_unkeyed_site(): void {
+		delete_option( 'aura_worker_grant_pubkey' );
+		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
+		$req->set_param( 'ruleset', 'anything' );
+		$resp = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req );
+		$this->assertSame( 412, $resp->get_status() );
+		$this->assertSame( 'no_gateway_key', $resp->get_data()['code'] );
+	}
 }

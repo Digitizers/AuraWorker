@@ -467,7 +467,10 @@ class Aura_Worker_Rules {
 	 * @param string $envelope Signed document from the gateway.
 	 * @param int    $attempt  Internal: how many times this call has re-decided
 	 *                         after losing the compare-and-swap.
-	 * @return true|WP_Error
+	 * @return true|array|WP_Error True for an ordinary ruleset; the unbind
+	 *                             answer `{ unbound, seq, cleanup_complete }`
+	 *                             for an unbind document or a fast-path retry
+	 *                             (#434); WP_Error otherwise.
 	 */
 	public static function accept( $envelope, $attempt = 0 ) {
 		$fence = Aura_Worker_Magic_Link::claim_site();
@@ -486,19 +489,55 @@ class Aura_Worker_Rules {
 	}
 
 	/**
-	 * The former accept() body, verbatim, run under a site claim the caller
-	 * already holds. $fence is unused here today; Task 3's unbind check reads
-	 * it. Never call this without first taking the claim — the CAS retry
-	 * branch below recurses HERE, not into accept(), so the claim is taken
-	 * exactly once per request and never re-entered.
+	 * The former accept() body, run under a site claim the caller already
+	 * holds; $fence fences the unbind marker's writes (#434). Never call this
+	 * without first taking the claim — the CAS retry branch below recurses
+	 * HERE, not into accept(), so the claim is taken exactly once per request
+	 * and never re-entered.
+	 *
+	 * Verification order (spec §2.3, Phase A):
+	 *   0. the unbind MARKER — before any signature work at all;
+	 *   1. signature, then `v` / `seq` / `rules` / `client` shape;
+	 *   2. (nothing: step 0 already handled a marker that is set);
+	 *   3. `site` against the authoritative uncached token, `client` against
+	 *      the stored record, then the stale-seq comparison;
+	 *   4. an `unbind` document writes the marker under the claim — before
+	 *      which nothing about this request has written anything.
 	 *
 	 * @param string $envelope Signed document from the gateway.
 	 * @param int    $attempt  How many times this call has re-decided after
 	 *                         losing the compare-and-swap.
 	 * @param string $fence    This request's site-claim fence.
-	 * @return true|WP_Error
+	 * @return true|array|WP_Error
 	 */
 	private static function accept_under_claim( $envelope, $attempt, $fence ) {
+		// STEP 0 — the marker fast path, BEFORE any signature work (spec §2.3).
+		// An unbound site may already have had its gateway key deleted by a
+		// previous Phase B, so nothing here may depend on verifying anything:
+		// the token that authenticated this request is the whole authority.
+		//
+		// is_set_strict(), never is_set(): an UNREADABLE marker is not "the
+		// site is bound". A database blip answers the retryable store failure
+		// and writes nothing, rather than letting an ordinary push install
+		// rules on a site Aura has already disconnected. This is exactly why
+		// Aura_Worker_Unbind::read() is tri-state.
+		$marked = Aura_Worker_Unbind::is_set_strict();
+		if ( is_wp_error( $marked ) ) {
+			return $marked;
+		}
+		if ( $marked ) {
+			// The document is read LENIENTLY here — peek_payload(), no
+			// verification — only to learn which seq this retry echoes and
+			// whether it says `final`. fast_path_or_refusal() re-reads the
+			// marker itself and is the authority; a marker that vanished
+			// between the probe and it answers null and we carry on as an
+			// ordinary push.
+			$fast = self::fast_path_or_refusal( $fence, self::final_flag_of( $envelope ), self::seq_of( $envelope, null ) );
+			if ( null !== $fast ) {
+				return $fast;
+			}
+		}
+
 		$doc = Aura_Worker_Grant::verify_signed_document( (string) $envelope );
 		if ( ! is_array( $doc ) ) {
 			return new WP_Error( 'aura_ruleset_rejected', 'Ruleset refused: ' . $doc, array( 'status' => 400 ) );
@@ -615,6 +654,58 @@ class Aura_Worker_Rules {
 		// wrong_site check above proved is for the site's CURRENT token,
 		// replaces it with no seq comparison. The swap still names it.
 
+		// STEP 4 — an unbind document (spec §2.3). Everything above ran first
+		// and unchanged: an unbind is refused for the same reasons, with the
+		// same codes, as any other document. Only now — with the signature
+		// verified, the token proven ours and the seq proven newer — does the
+		// marker get written, and the ruleset store is left exactly as it was
+		// (Phase B clears it, under the same claim).
+		if ( isset( $doc['unbind'] ) && true === $doc['unbind'] ) {
+			$marker = array(
+				'at'                 => gmdate( 'c' ),
+				// The token hash the document was bound to — the AUTHORITATIVE
+				// one read above and proved equal to the document's own `site`,
+				// never a fresh read. A retry is matched against this after the
+				// stored record is gone.
+				'site'               => $ours,
+				'site_ref'           => $site_ref,
+				'client'             => $client,
+				'seq'                => (int) $doc['seq'],
+				'connect_user_id'    => (int) get_option( 'aura_worker_connect_user_id', 0 ),
+				'app_password_uuids' => array(),
+				'app_password_users' => array(),
+			);
+			// Every credential that can authenticate as this binding, copied in
+			// BEFORE Phase B deletes the options that name them: the managed
+			// Application Password SiteAgent minted, and the one that
+			// authenticated THIS request (a manually connected site's, or one
+			// Aura's PATCH installed, was never minted here). The core-REST
+			// seam matches on the marker's identity, never on the live options.
+			$managed = get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null );
+			if ( is_array( $managed ) && ! empty( $managed['uuid'] ) ) {
+				$uuid                                  = (string) $managed['uuid'];
+				$marker['app_password_uuids'][]        = $uuid;
+				$marker['app_password_users'][ $uuid ] = (int) ( $managed['user_id'] ?? 0 );
+			}
+			$auth = Aura_Worker_Security::authenticating_app_password_uuid();
+			if ( is_string( $auth ) && '' !== $auth && ! in_array( $auth, $marker['app_password_uuids'], true ) ) {
+				$marker['app_password_uuids'][]        = $auth;
+				$marker['app_password_users'][ $auth ] = (int) get_current_user_id();
+			}
+			// Claim-fenced and verified by read-back; a failed write is a
+			// retryable 500 with nothing else touched — never a silent unbind
+			// that no boundary can see.
+			if ( ! Aura_Worker_Unbind::write_under_claim( $marker, $fence ) ) {
+				return self::unbind_store_failed();
+			}
+			$done = Aura_Worker_Unbind::cleanup( isset( $doc['final'] ) && true === $doc['final'], $fence );
+			return array(
+				'unbound'          => true,
+				'seq'              => (int) $doc['seq'],
+				'cleanup_complete' => (bool) $done,
+			);
+		}
+
 		// Compare-and-swap. The seq check above read $current; between that read
 		// and this write another request can install a newer ruleset — a retry
 		// of seq 6 racing a fresh seq 7 would otherwise land last and roll policy
@@ -695,6 +786,159 @@ class Aura_Worker_Rules {
 		// is also what makes this safe under overlapping pushes — there is no
 		// keep-set to go stale between deciding and deleting.
 		return true;
+	}
+
+	/**
+	 * STEP 0 of Phase A (spec §2.3), extracted so the unkeyed bare-body form
+	 * (Task 8) answers a retry exactly as the enveloped form does.
+	 *
+	 * Reads the marker uncached and decides on the TOKEN alone — no signature,
+	 * no decoding, because an unbound site's gateway key may already be gone:
+	 *  - marker set and the site's stored token hashes to the marker's `site`:
+	 *    this request IS the departed binding, so it is a retry of the unbind.
+	 *    Append the authenticating Application Password's UUID, re-run Phase B,
+	 *    and answer 200 `unbound`.
+	 *  - marker set and the token differs: some other binding is talking to an
+	 *    unbound site. 403 `aura_site_unbound`, nothing touched.
+	 *  - marker absent: null, and the caller carries on with its ordinary path.
+	 *
+	 * @internal Consumed by accept_under_claim() and by Task 8's bare body.
+	 *
+	 * @param string   $fence This request's site-claim fence.
+	 * @param bool     $final Whether the request says `final: true` — only then
+	 *                        may Phase B delete the site token.
+	 * @param int|null $seq   The seq the REQUEST carries, echoed back verbatim;
+	 *                        null to answer the marker's own seq. Aura requires
+	 *                        the echoed seq to match the one it pushed, and a
+	 *                        second legacy tombstone sharing this token carries
+	 *                        a different clearSeq from the one that marked it.
+	 * @return array|WP_Error|null The unbind answer, a refusal/failure, or null
+	 *                             when there is no marker.
+	 */
+	public static function fast_path_or_refusal( $fence, $final, $seq ) {
+		$marker = Aura_Worker_Unbind::read();
+		if ( is_wp_error( $marker ) ) {
+			return $marker; // aura_ruleset_store_failed, 500 — retryable, fails CLOSED
+		}
+		if ( null === $marker ) {
+			return null;
+		}
+		$ours = self::site_token_uncached();
+		if ( is_wp_error( $ours ) ) {
+			return $ours;
+		}
+		$ours = (string) $ours;
+		if ( '' === $ours || ! hash_equals( (string) $marker['site'], $ours ) ) {
+			return Aura_Worker_Unbind::refusal();
+		}
+		// The marker must carry every credential that authenticated an unbind
+		// BEFORE Phase B may delete the token: a failed — therefore unverified
+		// — append means a password the core-REST seam would not recognise, so
+		// nothing may proceed to cleanup. Retryable, nothing else touched.
+		if ( ! self::append_authenticating_uuid( $marker, $fence ) ) {
+			return self::unbind_store_failed();
+		}
+		$done = Aura_Worker_Unbind::cleanup( (bool) $final, $fence );
+		return array(
+			'unbound'          => true,
+			'seq'              => null === $seq ? (int) $marker['seq'] : (int) $seq,
+			'cleanup_complete' => (bool) $done,
+		);
+	}
+
+	/**
+	 * Add the Application Password that authenticated THIS request to the
+	 * marker, if it is not already there. The fast path calls this on every
+	 * visit (spec §2.3): two legacy rows sharing one token leave two
+	 * tombstones, each authenticating with its own password, and the token
+	 * outlives both unbinds precisely so the second can be recorded here.
+	 *
+	 * Verified by an uncached re-read of the marker rather than by
+	 * write_under_claim()'s own read-back: that read-back proves "the row names
+	 * my site at my seq", which an append does not change — so it would pass
+	 * whether or not the UUID landed.
+	 *
+	 * @param array  $marker The marker, replaced in place by the stored copy on
+	 *                       a successful append.
+	 * @param string $fence  This request's site-claim fence.
+	 * @return bool False only when an append was needed and did not verify.
+	 */
+	private static function append_authenticating_uuid( array &$marker, $fence ) {
+		$auth = Aura_Worker_Security::authenticating_app_password_uuid();
+		if ( ! is_string( $auth ) || '' === $auth ) {
+			return true; // a token-only request carries no password to record
+		}
+		$uuids = isset( $marker['app_password_uuids'] ) && is_array( $marker['app_password_uuids'] )
+			? array_values( array_map( 'strval', $marker['app_password_uuids'] ) )
+			: array();
+		if ( in_array( $auth, $uuids, true ) ) {
+			return true;
+		}
+		$uuids[] = $auth;
+		$users   = isset( $marker['app_password_users'] ) && is_array( $marker['app_password_users'] )
+			? $marker['app_password_users']
+			: array();
+		$users[ $auth ] = (int) get_current_user_id();
+
+		$updated                       = $marker;
+		$updated['app_password_uuids'] = $uuids;
+		$updated['app_password_users'] = $users;
+		if ( ! Aura_Worker_Unbind::write_under_claim( $updated, (string) $fence ) ) {
+			return false;
+		}
+		$back = Aura_Worker_Unbind::read();
+		if ( ! is_array( $back ) || ! in_array( $auth, $back['app_password_uuids'], true ) ) {
+			return false;
+		}
+		$marker = $back;
+		return true;
+	}
+
+	/**
+	 * The one refusal Phase A answers when the marker could not be recorded.
+	 * Retryable: Aura's tombstone stays pending and the site is untouched.
+	 *
+	 * @return WP_Error
+	 */
+	private static function unbind_store_failed() {
+		return new WP_Error(
+			'aura_unbind_store_failed',
+			__( 'Could not record the disconnect; retry.', 'digitizer-site-worker' ),
+			array( 'status' => 500 )
+		);
+	}
+
+	/**
+	 * Does this document say `final: true`? Read LENIENTLY — the fast path has
+	 * no key to verify with, and the token is the authority there. Anything
+	 * that is not exactly `true` is false, garbage included: `final` only ever
+	 * widens Phase B (it permits deleting the token), so the safe reading of an
+	 * unreadable document is "not final".
+	 *
+	 * @param string $envelope Signed document, or anything at all.
+	 * @return bool
+	 */
+	private static function final_flag_of( $envelope ) {
+		$doc = Aura_Worker_Grant::peek_payload( $envelope );
+		return isset( $doc['final'] ) && true === $doc['final'];
+	}
+
+	/**
+	 * The seq this document carries, read leniently, or $fallback when it
+	 * carries no usable one. Same lenient reading as final_flag_of(): the fast
+	 * path echoes the seq back so Aura can match it to the push it sent, and a
+	 * document it cannot read has no seq to echo.
+	 *
+	 * @param string   $envelope Signed document, or anything at all.
+	 * @param int|null $fallback What to answer when there is no valid seq.
+	 * @return int|null
+	 */
+	private static function seq_of( $envelope, $fallback ) {
+		$doc = Aura_Worker_Grant::peek_payload( $envelope );
+		if ( isset( $doc['seq'] ) && is_int( $doc['seq'] ) && $doc['seq'] >= 0 ) {
+			return $doc['seq'];
+		}
+		return $fallback;
 	}
 
 	/**

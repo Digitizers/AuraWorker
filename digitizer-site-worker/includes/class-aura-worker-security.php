@@ -27,6 +27,70 @@ class Aura_Worker_Security {
 	const TOKEN_FAILURE_WINDOW = 900; // 15 minutes.
 
 	/**
+	 * The UUID of the Application Password that authenticated THIS request, or
+	 * null when the request carried no Application Password (a token-only call,
+	 * or a cookie-authenticated one). Static, because WordPress hands it over
+	 * once, on a hook, long before any handler runs.
+	 *
+	 * Load-bearing for the unbind (#434, spec §2.3): the marker must carry
+	 * every credential that authenticated an unbind BEFORE Phase B revokes
+	 * them, or the core-REST seam would stop recognising a request made with a
+	 * password it never recorded — a manually connected site, or one whose
+	 * password Aura replaced through its PATCH, was never minted by SiteAgent
+	 * and so is not in the plugin's own bookkeeping option.
+	 *
+	 * @var string|null
+	 */
+	private static $authenticating_uuid = null;
+
+	/**
+	 * Register the hook that captures the authenticating Application Password.
+	 * Called from Aura_Worker::init(); WordPress fires the hook during REST
+	 * authentication, which is earlier than any route callback.
+	 *
+	 * @return void
+	 */
+	public static function init() {
+		add_action( 'application_password_did_authenticate', array( __CLASS__, 'capture_app_password' ), 10, 2 );
+	}
+
+	/**
+	 * Record the authenticating password's UUID. Only the UUID — never the
+	 * password, never the hash: the UUID is an opaque identifier WordPress
+	 * already stores in user meta, and it is all the marker needs to recognise
+	 * the credential again.
+	 *
+	 * @param WP_User|mixed $user The authenticated user (unused; WordPress passes it).
+	 * @param array|mixed   $item The application password item, with its uuid.
+	 * @return void
+	 */
+	public static function capture_app_password( $user, $item ) {
+		unset( $user );
+		self::$authenticating_uuid = is_array( $item ) && ! empty( $item['uuid'] ) ? (string) $item['uuid'] : null;
+	}
+
+	/**
+	 * The UUID of the Application Password that authenticated this request.
+	 *
+	 * @return string|null
+	 */
+	public static function authenticating_app_password_uuid() {
+		return self::$authenticating_uuid;
+	}
+
+	/**
+	 * Set the captured UUID directly.
+	 *
+	 * @internal Tests only — production sets this from the WordPress hook above.
+	 *
+	 * @param string|null $uuid The uuid, or null for a token-only request.
+	 * @return void
+	 */
+	public static function _set_authenticating_uuid_for_tests( $uuid ) {
+		self::$authenticating_uuid = null === $uuid ? null : (string) $uuid;
+	}
+
+	/**
 	 * Hash a raw site token for storage / comparison.
 	 *
 	 * Tokens are stored as a SHA-256 hash so a database leak does not expose a

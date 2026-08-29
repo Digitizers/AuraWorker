@@ -690,6 +690,60 @@ function sa_token_hash(): string {
 }
 
 /**
+ * Seed the unbind marker (#434) straight into the "database", the way a
+ * completed Phase A leaves it — so a test can start from an already-unbound
+ * site without driving accept() there first. Only the fields a test cares
+ * about need naming; the rest take the shape Phase A writes.
+ *
+ * Written to $GLOBALS['_options'], which sa_read_option_uncached() serves as
+ * the raw row: Aura_Worker_Unbind::read() goes round the option cache, so a
+ * marker seeded anywhere else would read as absent.
+ *
+ * @param array $over Fields to override.
+ * @return array The seeded marker.
+ */
+function sa_set_marker( array $over = array() ): array {
+	$marker = array_merge(
+		array(
+			'at'                 => '2026-08-29T10:00:00Z',
+			'site'               => sa_token_hash(),
+			'site_ref'           => 'r1',
+			'client'             => 'c1',
+			'seq'                => 9,
+			'connect_user_id'    => 3,
+			'app_password_uuids' => array(),
+			'app_password_users' => array(),
+		),
+		$over
+	);
+	$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = $marker;
+	unset( $GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ], $GLOBALS['_notoptions'][ Aura_Worker_Unbind::OPTION ] );
+	return $marker;
+}
+
+/**
+ * Seed the Application Password a connect would have minted: the plugin's own
+ * bookkeeping row (aura_worker_app_password = { user_id, uuid }) AND the
+ * WP_Application_Passwords stub entry, so both the marker copy (Phase A) and
+ * the revoke (Phase B) see the same password.
+ *
+ * @param int    $user_id Owning administrator.
+ * @param string $uuid    The password's uuid.
+ * @return void
+ */
+function sa_set_managed_app_password( int $user_id, string $uuid ): void {
+	$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array(
+		'user_id' => $user_id,
+		'uuid'    => $uuid,
+	);
+	$GLOBALS['_app_passwords'][ $user_id ][] = array(
+		'uuid'    => $uuid,
+		'name'    => Aura_Worker_Magic_Link::APP_PASSWORD_NAME,
+		'created' => time(),
+	);
+}
+
+/**
  * The seam that runs between a caller's read and its compare-and-swap — the
  * window in which a concurrent connect writes its binding. A test sets
  * $GLOBALS['_sa_before_swap'] to a callable (which clears itself, so it fires
@@ -1313,8 +1367,19 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				$name = stripslashes( $m[1] );
+				// A read failure scoped to ONE option, unlike _sa_wpdb_error
+				// which breaks every read of the request. A test that must
+				// prove a specific boundary fails closed needs the boundary's
+				// own read to fail while the rest of the request still works —
+				// otherwise a later shared failure would satisfy the assertion
+				// just as well and the test would prove nothing.
+				if ( ! empty( $GLOBALS['_sa_option_read_fail'][ $name ] ) ) {
+					$this->last_error = 'read failed';
+					return null;
+				}
 				// The row, not the cache (see sa_read_option_uncached()).
-				return sa_read_option_uncached( stripslashes( $m[1] ) );
+				return sa_read_option_uncached( $name );
 			}
 			if ( ! empty( $GLOBALS['_db_var_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_var_queue'] );
@@ -1627,6 +1692,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
+	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
@@ -2123,6 +2189,13 @@ if ( ! function_exists( 'sa_register_ability' ) ) {
 }
 
 function sa_reset_state(): void {
+	// Static request state on the security layer: the UUID of the Application
+	// Password that authenticated THIS request (#434 Phase A copies it into
+	// the marker). A static survives the test that set it, so it is cleared
+	// here like every $GLOBALS store below.
+	if ( class_exists( 'Aura_Worker_Security' ) ) {
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( null );
+	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
@@ -2135,6 +2208,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_logged_in']    = false;
 	$GLOBALS['_admins']       = array();
 	$GLOBALS['_current_user'] = 0;
+	$GLOBALS['_current_user_id'] = 0; // get_current_user_id()'s store — see the stub above.
 	$GLOBALS['_did_actions']  = array();
 	$GLOBALS['_filters']      = array();
 	$GLOBALS['_registered_settings'] = array();
@@ -2158,6 +2232,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
+	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.

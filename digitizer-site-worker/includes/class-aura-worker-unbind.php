@@ -184,6 +184,25 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
+	 * Phase B cleanup — revoke the marker's Application Passwords, delete the
+	 * dashboard url and connect user, clear the ruleset store, delete the
+	 * gateway key, and (only when $final and every earlier step verified)
+	 * delete the site token.
+	 *
+	 * STUB. Task 4 implements it; it returns false here so Phase A's response
+	 * reports `cleanup_complete: false` honestly rather than claiming work
+	 * that has not happened.
+	 *
+	 * @param bool   $final Whether this request may delete the site token.
+	 * @param string $fence The caller's site-claim fence.
+	 * @return bool True once every step is verified complete.
+	 */
+	public static function cleanup( bool $final, string $fence ): bool {
+		unset( $final, $fence );
+		return false; // Task 4
+	}
+
+	/**
 	 * Phase B cleanup (Task 4). Empty for now — init() only registers the hook
 	 * this task; nothing runs from it yet.
 	 */
