@@ -539,6 +539,23 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/**
+	 * The confirming read needs a database handle to make its confirmation
+	 * with. Without one it has proved nothing — which is 'unknown', not
+	 * 'gone'. (A cheap guard, but it is the branch that runs on the platforms
+	 * this code has least visibility into.)
+	 */
+	public function test_a_missing_database_handle_is_never_proof_of_absence(): void {
+		$real            = $GLOBALS['wpdb'];
+		$GLOBALS['wpdb'] = new stdClass(); // no usermeta table, no get_var
+		try {
+			$state = Aura_Worker_Magic_Link::password_state( 3, 'uuid-never-existed' );
+		} finally {
+			$GLOBALS['wpdb'] = $real;
+		}
+		$this->assertSame( 'unknown', $state );
+	}
+
+	/**
 	 * password_gone() answers PROVEN gone and nothing else: the boolean form
 	 * every fail-closed caller in the plugin reads.
 	 */

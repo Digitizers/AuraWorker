@@ -581,6 +581,33 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
 	}
 
+	/**
+	 * The same, through the FAST path — the retry of a tombstone whose marker
+	 * is already on the site. It is the path an interrupted unbind actually
+	 * comes back on, so it must carry the same answer: what is owed, by name.
+	 */
+	public function test_the_fast_path_reports_the_leftovers_too(): void {
+		sa_set_marker(
+			array(
+				'site'               => sa_token_hash(),
+				'seq'                => 9,
+				'connect_user_id'    => 0,
+				'app_password_uuids' => array( 'uuid-managed' ),
+				'app_password_users' => array(),   // an owner this site cannot name
+			)
+		);
+		sa_add_app_password( 7, 'uuid-managed' );
+		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
+		$req->set_param( 'ruleset', $this->unbind_env( array( 'seq' => 12 ) ) ); // final: true
+
+		$body = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req )->get_data();
+
+		$this->assertSame( 12, $body['seq'], 'the retry\'s own seq' );
+		$this->assertFalse( $body['cleanup_complete'] );
+		$this->assertSame( array( 'app_passwords' ), $body['leftovers'] );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
 	public function test_receive_rules_still_412s_a_marker_less_unkeyed_site(): void {
 		delete_option( 'aura_worker_grant_pubkey' );
 		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
