@@ -385,9 +385,12 @@ final class Aura_Worker_Unbind {
 			$owner = self::password_owner( $m, $uuid );
 			// Owed when the owner is unknown — no proof is attempted, and an
 			// unknown is never reported clean (rounds 1-3) — and owed when the
-			// recorded owner still holds it. Only "the owner this site
-			// recorded no longer has it" is evidence of absence.
-			if ( null === $owner || ! Aura_Worker_Magic_Link::password_gone( $owner, $uuid ) ) {
+			// recorded owner still holds it, AND owed when that owner's list
+			// could not be read at all (round 4, I5). Only STATE_GONE, "the
+			// owner this site recorded was asked and no longer has it", is
+			// evidence of absence — the same rule option_absent() applies to a
+			// row, applied to a credential.
+			if ( null === $owner || Aura_Worker_Magic_Link::STATE_GONE !== Aura_Worker_Magic_Link::password_state( $owner, $uuid ) ) {
 				$left[] = 'app_passwords';
 				break;
 			}
@@ -481,9 +484,13 @@ final class Aura_Worker_Unbind {
 					continue;
 				}
 				if ( ! Aura_Worker_Magic_Link::password_gone( $owner, $uuid ) ) {
-					// The return value is not the proof (it is false for a
-					// failed user-meta write as well as for "not there"), so
-					// leftovers() looks again below.
+					// Includes "the list could not be read" (I5): attempting a
+					// delete that may be unnecessary costs one write and is
+					// idempotent, whereas SKIPPING one that was necessary
+					// leaves the credential live. The return value is not the
+					// proof either way (it is false for a failed user-meta
+					// write as well as for "not there"), so leftovers() looks
+					// again below.
 					WP_Application_Passwords::delete_application_password( $owner, $uuid );
 				}
 			}

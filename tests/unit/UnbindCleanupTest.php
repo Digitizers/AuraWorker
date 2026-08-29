@@ -478,6 +478,79 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( array(), $GLOBALS['_unbind_trace'] );
 	}
 
+	// -----------------------------------------------------------------------
+	// Round 4, I5 — "gone" may never be answered from a read that failed.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * The last negative proof in Phase B. Core implements
+	 * WP_Application_Passwords::get_user_application_passwords() as a
+	 * get_user_meta() followed by `if ( ! is_array( $passwords ) ) return
+	 * array();`, so a meta read that could not be completed is
+	 * INDISTINGUISHABLE there from "this user holds none" — and round 3 made
+	 * that the SOLE evidence gating step (5). With the owner's list
+	 * unreadable, `leftovers()` must name the credential rather than report a
+	 * clean site: this is `option_absent()`'s discipline, applied to a
+	 * credential instead of a row.
+	 */
+	public function test_an_owners_unreadable_password_list_is_never_proof_of_absence(): void {
+		$GLOBALS['_sa_app_password_read_fail'][3] = true; // that user's meta row will not read
+
+		$left = Aura_Worker_Unbind::leftovers();
+
+		$GLOBALS['_sa_app_password_read_fail'] = array();
+		$this->assertContains( 'app_passwords', $left, 'a read that failed is not evidence the credential is gone' );
+	}
+
+	/**
+	 * And the whole irreversible step turns on it: `final: true`, everything
+	 * else removable, the recorded owner known — and the one thing that cannot
+	 * be READ is the credential itself. The token must survive.
+	 */
+	public function test_an_unreadable_password_list_stops_the_teardown_short_of_the_token(): void {
+		$fence                                    = Aura_Worker_Magic_Link::claim_site();
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;
+
+		$done = Aura_Worker_Unbind::cleanup( true, $fence );
+
+		$GLOBALS['_sa_app_password_read_fail'] = array();
+		Aura_Worker_Magic_Link::release_site( $fence );
+		$this->assertFalse( $done );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'the token outlives a proof that could not be made' );
+		$this->assertNotContains( 'token', $GLOBALS['_unbind_trace'] );
+	}
+
+	/**
+	 * The tri-state itself, at the one implementation every caller shares.
+	 * A boolean cannot carry three answers, and each of this function's
+	 * callers decides which way it leans for itself.
+	 */
+	public function test_password_state_tells_present_gone_and_unreadable_apart(): void {
+		$this->assertSame( 'present', Aura_Worker_Magic_Link::password_state( 3, 'uuid-manual' ) );
+		$this->assertSame( 'gone', Aura_Worker_Magic_Link::password_state( 3, 'uuid-never-existed' ) );
+		$this->assertSame( 'gone', Aura_Worker_Magic_Link::password_state( 4, 'uuid-manual' ), 'a user with no row at all holds nothing' );
+
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;
+		$state                                    = Aura_Worker_Magic_Link::password_state( 3, 'uuid-manual' );
+		$GLOBALS['_sa_app_password_read_fail']    = array();
+
+		$this->assertSame( 'unknown', $state );
+		$this->assertTrue( Aura_Worker_Magic_Link::password_gone( 3, 'uuid-never-existed' ), 'a genuine absence still reads as gone' );
+	}
+
+	/**
+	 * password_gone() answers PROVEN gone and nothing else: the boolean form
+	 * every fail-closed caller in the plugin reads.
+	 */
+	public function test_password_gone_is_false_for_a_list_that_could_not_be_read(): void {
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;
+
+		$gone = Aura_Worker_Magic_Link::password_gone( 3, 'uuid-manual' );
+
+		$GLOBALS['_sa_app_password_read_fail'] = array();
+		$this->assertFalse( $gone );
+	}
+
 	/**
 	 * The sweep only runs because something hooks it. Deleting the
 	 * registration, renaming the hook, or dropping it to a priority that never

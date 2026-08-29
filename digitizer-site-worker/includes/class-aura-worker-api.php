@@ -390,7 +390,14 @@ class Aura_Worker_API {
 
 		$unbound = Aura_Worker_Unbind::status_fragment();
 		if ( null !== $unbound ) {
-			$status['unbound'] = $unbound;
+			// An OBJECT on the wire, always (#434 Task 4, M10). PHP's empty
+			// array serialises as JSON `[]`, so the "no field was readable"
+			// answer would reach Aura as an array where every other answer is
+			// an object — and a strict parse of `unbound` as {at, site_ref}
+			// would reject it and read the site as bound again. The key's
+			// PRESENCE is the signal; its shape must not change with its
+			// contents.
+			$status['unbound'] = (object) $unbound;
 		}
 
 		return rest_ensure_response( $status );
@@ -945,12 +952,22 @@ class Aura_Worker_API {
 			// `cleanup_complete` says whether Phase B finished — false leaves
 			// the tombstone pending and the site finishes the job itself.
 			// Authenticated by the token before Phase B deleted it.
+			//
+			// `leftovers` names what is still owed (#434 Task 4, M9). A false
+			// `cleanup_complete` has two opposite causes — something could not
+			// be proven removed, or the token was deliberately kept because
+			// the document was not `final` — and Aura cannot separate them
+			// from the bool alone. Empty exactly when nothing is owed; a
+			// non-empty list means a credential or a store this site still
+			// holds, and the tombstone must stay.
+			$leftovers = ( isset( $res['leftovers'] ) && is_array( $res['leftovers'] ) ) ? $res['leftovers'] : array();
 			return new WP_REST_Response(
 				array(
 					'success'          => true,
 					'seq'              => (int) $res['seq'],
 					'unbound'          => true,
 					'cleanup_complete' => (bool) $res['cleanup_complete'],
+					'leftovers'        => array_values( array_map( 'strval', $leftovers ) ),
 				),
 				200
 			);

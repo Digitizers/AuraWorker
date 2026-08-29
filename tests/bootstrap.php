@@ -858,6 +858,21 @@ if ( ! function_exists( 'user_can' ) ) {
 	}
 }
 
+// --- WP_User ----------------------------------------------------------------
+// Minimal stand-in for core's user object. It exists so the
+// `application_password_did_authenticate` hook can be fired with the SHAPE
+// WordPress fires it with: the capture only accepts a WP_User with a positive
+// ID as an identity (#434 Task 4, C4), and a stdClass must NOT satisfy it.
+if ( ! class_exists( 'WP_User' ) ) {
+	class WP_User {
+		public $ID = 0;
+
+		public function __construct( $id = 0 ) {
+			$this->ID = (int) $id;
+		}
+	}
+}
+
 // --- Application Passwords (2.11.0: the /connect callback mints one) --------
 // $GLOBALS['_app_passwords'][user_id] = list of items { uuid, name, created };
 // $GLOBALS['_app_passwords_available'] gates wp_is_application_passwords_available_for_user().
@@ -865,6 +880,7 @@ $GLOBALS['_app_passwords']           = array();
 $GLOBALS['_app_passwords_available'] = true;
 $GLOBALS['_app_passwords_delete_fail'] = false;
 $GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails (#434 Task 4).
+$GLOBALS['_sa_app_password_read_fail'] = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
 $GLOBALS['_unbind_trace']              = array(); // Phase B's step trace; sa_reset_state() re-arms the recorder.
 if ( ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 	function wp_is_application_passwords_available_for_user( $user ): bool {
@@ -898,6 +914,14 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 			return array( 'pw-' . bin2hex( random_bytes( 8 ) ), $item );
 		}
 		public static function get_user_application_passwords( int $user_id ): array {
+			// Core maps a user-meta read it could not complete to array(),
+			// indistinguishable from "this user has none" — the whole of #434
+			// Task 4's I5. The seam models THAT, not a magic error return:
+			// with the row unreadable this answers empty, exactly as core
+			// would, and only the confirming raw read can tell the difference.
+			if ( ! empty( $GLOBALS['_sa_app_password_read_fail'][ $user_id ] ) ) {
+				return array();
+			}
 			return $GLOBALS['_app_passwords'][ $user_id ] ?? array();
 		}
 		public static function delete_application_password( int $user_id, string $uuid ) {
@@ -1396,6 +1420,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	class SA_Test_Wpdb {
 		public string $prefix     = 'wp_';
 		public string $options    = 'wp_options';
+		public string $usermeta   = 'wp_usermeta';
 		public string $last_error = '';
 		public string $last_query = '';
 
@@ -1466,6 +1491,27 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				// The row, not the cache (see sa_read_option_uncached()).
 				return sa_read_option_uncached( $name );
+			}
+			// The one shape managed_password_state()'s confirming read issues
+			// (#434 Task 4, I5): a user's Application Passwords meta row, read
+			// straight from the "database" ($GLOBALS['_app_passwords'], which
+			// is what the WP_Application_Passwords stub above is backed by).
+			// Serialised, as core stores it.
+			if ( preg_match( "/^SELECT meta_value FROM \S+ WHERE user_id = (\d+) AND meta_key = '_application_passwords' LIMIT 1$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$user = (int) $m[1];
+				// A read failure scoped to ONE user's row, not the whole
+				// request: a test proving THIS boundary fails closed needs the
+				// rest of the request to keep working, or a later shared
+				// failure would satisfy the assertion just as well.
+				if ( ! empty( $GLOBALS['_sa_app_password_read_fail'][ $user ] ) ) {
+					$this->last_error = 'read failed';
+					return null;
+				}
+				if ( ! isset( $GLOBALS['_app_passwords'][ $user ] ) ) {
+					return null; // no row at all
+				}
+				return serialize( $GLOBALS['_app_passwords'][ $user ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
 			}
 			if ( ! empty( $GLOBALS['_db_var_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_var_queue'] );
@@ -2306,12 +2352,13 @@ function sa_reset_state(): void {
 	// the marker). A static survives the test that set it, so it is cleared
 	// here like every $GLOBALS store below.
 	if ( class_exists( 'Aura_Worker_Security' ) ) {
-		Aura_Worker_Security::_set_authenticating_uuid_for_tests( null );
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( null ); // clears the captured user too
 	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails; see the stub above.
+	$GLOBALS['_sa_app_password_read_fail']  = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
 	$GLOBALS['_sa_app_password_create_fails']    = false;
 	$GLOBALS['_abilities']    = array();

@@ -112,7 +112,12 @@ final class UnbindMarkerTest extends TestCase {
 		Aura_Worker_Magic_Link::release_site( $fence );
 		$api  = new Aura_Worker_API( new Aura_Worker_Security() );
 		$body = $api->get_status( new WP_REST_Request( 'GET', '/aura/v1/status' ) )->get_data();
-		$this->assertSame( array( 'at' => '2026-08-29T10:00:00Z', 'site_ref' => 'res1' ), $body['unbound'] );
+		// An OBJECT, and its JSON is an object too (round-4 M10): Aura parses
+		// `unbound` as {at, site_ref}, and a PHP array would reach it as `[]`
+		// the moment no field was readable.
+		$this->assertIsObject( $body['unbound'] );
+		$this->assertSame( array( 'at' => '2026-08-29T10:00:00Z', 'site_ref' => 'res1' ), (array) $body['unbound'] );
+		$this->assertSame( '{"at":"2026-08-29T10:00:00Z","site_ref":"res1"}', wp_json_encode( $body['unbound'] ) );
 	}
 
 	public function test_status_omits_unbound_when_no_marker(): void {
@@ -245,7 +250,11 @@ final class UnbindMarkerTest extends TestCase {
 		$body = $api->get_status( new WP_REST_Request( 'GET', '/aura/v1/status' ) )->get_data();
 
 		$this->assertArrayHasKey( 'unbound', $body );
-		$this->assertSame( array(), $body['unbound'] );
+		$this->assertSame( array(), (array) $body['unbound'] );
+		// M10: `{}`, never `[]`. A strict Aura-side parse of `unbound` as an
+		// object rejects a JSON array, and the site would read as bound again
+		// — the exact failure the malformed-marker branch exists to prevent.
+		$this->assertSame( '{}', wp_json_encode( $body['unbound'] ) );
 	}
 
 	/**

@@ -44,6 +44,29 @@ class Aura_Worker_Security {
 	private static $authenticating_uuid = null;
 
 	/**
+	 * The user WordPress said that Application Password authenticated as —
+	 * captured from the SAME hook call that named the uuid, never re-derived
+	 * later from `get_current_user_id()`.
+	 *
+	 * The two are not the same fact (#434 Task 4, C4). `get_current_user_id()`
+	 * is whatever the request's current user is by the time a route callback
+	 * runs, and anything on `determine_current_user` after priority 20, or any
+	 * `wp_set_current_user()` on `init` / `rest_api_init` /
+	 * `rest_authentication_errors` — user-switching, SSO, membership "view as"
+	 * and impersonation plugins all do this routinely — moves it. The unbind
+	 * marker records this owner as KNOWLEDGE, and Phase B does exactly one
+	 * lookup against it: a wrong owner answering "not there" is how the site
+	 * token gets deleted beside a live administrator credential. So the
+	 * identity is taken from the writer that has it, and never re-derived.
+	 *
+	 * Null whenever the hook did not fire, or fired with something that is not
+	 * a WP_User with a positive ID: an explicit unknown, never 0.
+	 *
+	 * @var int|null
+	 */
+	private static $authenticating_user = null;
+
+	/**
 	 * Register the hook that captures the authenticating Application Password.
 	 * Called from Aura_Worker::init(); WordPress fires the hook during REST
 	 * authentication, which is earlier than any route callback.
@@ -60,13 +83,27 @@ class Aura_Worker_Security {
 	 * already stores in user meta, and it is all the marker needs to recognise
 	 * the credential again.
 	 *
-	 * @param WP_User|mixed $user The authenticated user (unused; WordPress passes it).
+	 * The USER travels with it (#434 Task 4, C4). WordPress hands this hook the
+	 * authoritative pairing — this password, that user — and it is the only
+	 * place the pairing exists as a statement rather than as a guess about the
+	 * request. It is recorded here and used verbatim; nothing downstream may
+	 * re-derive it from `get_current_user_id()`.
+	 *
+	 * Only a WP_User with a positive ID is an identity. Anything else — a
+	 * bare int, a stdClass, false, a WP_Error — is an explicit unknown; a cast
+	 * would turn a shape this code does not understand into a user id, which
+	 * is exactly the class of mistake rounds 1-4 of #434 are about.
+	 *
+	 * @param WP_User|mixed $user The authenticated user (WordPress passes it).
 	 * @param array|mixed   $item The application password item, with its uuid.
 	 * @return void
 	 */
 	public static function capture_app_password( $user, $item ) {
-		unset( $user );
-		self::$authenticating_uuid = is_array( $item ) && ! empty( $item['uuid'] ) ? (string) $item['uuid'] : null;
+		$uuid                        = is_array( $item ) && ! empty( $item['uuid'] ) ? (string) $item['uuid'] : null;
+		self::$authenticating_uuid   = $uuid;
+		// Paired: an item with no readable uuid names no password, so the user
+		// beside it identifies nothing either.
+		self::$authenticating_user   = ( null !== $uuid && $user instanceof WP_User && (int) $user->ID > 0 ) ? (int) $user->ID : null;
 	}
 
 	/**
@@ -79,15 +116,34 @@ class Aura_Worker_Security {
 	}
 
 	/**
+	 * The user WordPress named beside that Application Password, or null when
+	 * no hook fired (or it named nothing usable). Never 0 — an owner that
+	 * names nobody must not be written where a user id is read (#434 C1-C4).
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return int|null
+	 */
+	public static function authenticating_app_password_user() {
+		return self::$authenticating_user;
+	}
+
+	/**
 	 * Set the captured UUID directly.
 	 *
 	 * @internal Tests only — production sets this from the WordPress hook above.
 	 *
 	 * @param string|null $uuid The uuid, or null for a token-only request.
+	 * @param int|null    $user The user WordPress named beside it, as the real
+	 *                          hook does. Omitted (or <= 0) models a uuid that
+	 *                          reached the request with no identity attached —
+	 *                          an explicit unknown, exactly as production
+	 *                          records when the hook did not fire.
 	 * @return void
 	 */
-	public static function _set_authenticating_uuid_for_tests( $uuid ) {
+	public static function _set_authenticating_uuid_for_tests( $uuid, $user = null ) {
 		self::$authenticating_uuid = null === $uuid ? null : (string) $uuid;
+		self::$authenticating_user = ( null === $uuid || null === $user || (int) $user <= 0 ) ? null : (int) $user;
 	}
 
 	/**

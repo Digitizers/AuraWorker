@@ -690,7 +690,10 @@ class Aura_Worker_Rules {
 			$auth = Aura_Worker_Security::authenticating_app_password_uuid();
 			if ( is_string( $auth ) && '' !== $auth && ! in_array( $auth, $marker['app_password_uuids'], true ) ) {
 				$marker['app_password_uuids'][]        = $auth;
-				$marker['app_password_users'][ $auth ] = self::marker_password_owner( $auth, (int) get_current_user_id(), (int) $marker['connect_user_id'] );
+				// The user the SAME hook named beside this uuid — never
+				// get_current_user_id(), which is a fact about the request and
+				// not about the password (#434 Task 4, C4).
+				$marker['app_password_users'][ $auth ] = self::marker_password_owner( $auth, (int) Aura_Worker_Security::authenticating_app_password_user(), (int) $marker['connect_user_id'] );
 			}
 			// Claim-fenced and verified by read-back; a failed write is a
 			// retryable 500 with nothing else touched — never a silent unbind
@@ -717,6 +720,14 @@ class Aura_Worker_Rules {
 				'unbound'          => true,
 				'seq'              => (int) $doc['seq'],
 				'cleanup_complete' => (bool) $done,
+				// What is still OWED, by name (#434 Task 4, M9). Without it
+				// `cleanup_complete: false` has two opposite meanings — a
+				// credential that could not be proven revoked, or the
+				// deliberate `! final` token retention — and Aura cannot tell
+				// them apart from a bool, so it would retire the very
+				// tombstone that names a live credential. Empty exactly when
+				// nothing is owed.
+				'leftovers'        => Aura_Worker_Unbind::leftovers(),
 			);
 		}
 
@@ -857,6 +868,9 @@ class Aura_Worker_Rules {
 			'unbound'          => true,
 			'seq'              => null === $seq ? (int) $marker['seq'] : (int) $seq,
 			'cleanup_complete' => (bool) $done,
+			// See the build path above: the names of what is still owed, so a
+			// false `cleanup_complete` can be told from a `! final` one (M9).
+			'leftovers'        => Aura_Worker_Unbind::leftovers(),
 		);
 	}
 
@@ -872,10 +886,15 @@ class Aura_Worker_Rules {
 	 * Resolution therefore belongs at WRITE time, where the request has the
 	 * facts:
 	 *
-	 *   - `$claimed` — the user WordPress says the password authenticated as
-	 *     (`get_current_user_id()` beside the captured uuid), or the `user_id`
-	 *     the managed record wrote beside its own uuid. Either is a statement
-	 *     by the writer about that exact password: authoritative.
+	 *   - `$claimed` — the user WordPress named beside the captured uuid on
+	 *     `application_password_did_authenticate`
+	 *     (`Aura_Worker_Security::authenticating_app_password_user()`), or the
+	 *     `user_id` the managed record wrote beside its own uuid. Either is a
+	 *     statement by the writer about that exact password: authoritative.
+	 *     `get_current_user_id()` is NOT one of them — it is a fact about the
+	 *     request, and a `determine_current_user` filter or any
+	 *     `wp_set_current_user()` desynchronises the two (#434 Task 4, C4).
+	 *     Never re-derive what you were told.
 	 *   - the connecting user — a CANDIDATE, not a statement. Recorded only
 	 *     once this request has CONFIRMED the password really is in that user's
 	 *     list; an unconfirmed guess would be read as authoritative later, and
@@ -895,7 +914,12 @@ class Aura_Worker_Rules {
 		if ( $claimed > 0 ) {
 			return (int) $claimed;
 		}
-		if ( $connect_user_id > 0 && ! Aura_Worker_Magic_Link::password_gone( $connect_user_id, (string) $uuid ) ) {
+		// PROVEN present, never merely "not proven gone" (#434 Task 4, I5):
+		// password_state() answers 'unknown' for a user-meta read it could not
+		// complete, and an unreadable list is not a confirmation. Recording a
+		// candidate on a failed read would write a guess where Phase B reads
+		// knowledge.
+		if ( $connect_user_id > 0 && Aura_Worker_Magic_Link::STATE_PRESENT === Aura_Worker_Magic_Link::password_state( $connect_user_id, (string) $uuid ) ) {
 			return (int) $connect_user_id;
 		}
 		return null;
@@ -933,7 +957,8 @@ class Aura_Worker_Rules {
 		$users   = isset( $marker['app_password_users'] ) && is_array( $marker['app_password_users'] )
 			? $marker['app_password_users']
 			: array();
-		$users[ $auth ] = self::marker_password_owner( $auth, (int) get_current_user_id(), (int) ( $marker['connect_user_id'] ?? 0 ) );
+		// The hook's own pairing, not the request's current user (#434 C4).
+		$users[ $auth ] = self::marker_password_owner( $auth, (int) Aura_Worker_Security::authenticating_app_password_user(), (int) ( $marker['connect_user_id'] ?? 0 ) );
 
 		$updated                       = $marker;
 		$updated['app_password_uuids'] = $uuids;

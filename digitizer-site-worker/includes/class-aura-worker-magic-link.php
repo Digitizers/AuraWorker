@@ -540,6 +540,10 @@ class Aura_Worker_Magic_Link {
 				// so retries cannot mint more beside it, and the operator is
 				// told what to revoke.
 				WP_Application_Passwords::delete_application_password( $creator, $minted['uuid'] );
+				// "Could not read the list" is not a revocation (#434 I5):
+				// managed_password_gone() is now PROVEN gone, so an unreadable
+				// list takes this branch and the operator is told what to
+				// revoke by hand rather than being told nothing.
 				if ( ! self::managed_password_gone( $creator, $minted['uuid'] ) ) {
 					delete_transient( 'aura_magic_' . $magic_id );
 					$release();
@@ -685,6 +689,23 @@ class Aura_Worker_Magic_Link {
 	 */
 	const APP_PASSWORD_RECORD_OPTION = 'aura_worker_app_password';
 
+	/**
+	 * Core's user-meta key for a user's Application Passwords
+	 * (`WP_Application_Passwords::USERMETA_KEY_APPLICATION_PASSWORDS`), named
+	 * here so the confirming raw read does not depend on the class being
+	 * loaded. #434 Task 4, I5.
+	 */
+	const APP_PASSWORD_USERMETA_KEY = '_application_passwords';
+
+	/** password_state(): the password is in that user's list. */
+	const STATE_PRESENT = 'present';
+
+	/** password_state(): that user's list was read and does not carry it. */
+	const STATE_GONE = 'gone';
+
+	/** password_state(): the list could not be read — never evidence of absence. */
+	const STATE_UNKNOWN = 'unknown';
+
 
 
 	/**
@@ -763,6 +784,10 @@ class Aura_Worker_Magic_Link {
 			// it. Same proof the rotation uses — the password is gone only when
 			// it is absent from the owner's list.
 			WP_Application_Passwords::delete_application_password( $user_id, $uuid );
+			// PROVEN gone (#434 I5). A list that could not be read falls to the
+			// "still live and untracked" recovery below, which fails retryably
+			// — the safe direction: the alternative reports a connect finished
+			// beside a credential nothing recorded.
 			if ( self::managed_password_gone( $user_id, $uuid ) ) {
 				// The record must not outlive the password it named (round-14):
 				// the credential is gone, so a surviving record would make every
@@ -974,7 +999,13 @@ class Aura_Worker_Magic_Link {
 		// being deleted, changes nothing here — so the list is consulted before
 		// this screen calls the connection healthy (round-27). One read, on an
 		// admin page render.
-		if ( ! class_exists( 'WP_Application_Passwords' ) || self::managed_password_gone( $usable['user_id'], $usable['uuid'] ) ) {
+		// DELIBERATELY the only caller that does not fail closed on 'unknown'
+		// (#434 I5). This is a screen render, not a gate: an unreadable list is
+		// reported exactly as it was before the tri-state existed — 'none',
+		// whose advice ("connect again to issue one") is harmless and
+		// self-correcting on the next page load. Reporting it as healthy
+		// instead would be the worse lie. Nothing irreversible reads this.
+		if ( ! class_exists( 'WP_Application_Passwords' ) || self::STATE_PRESENT !== self::managed_password_state( $usable['user_id'], $usable['uuid'] ) ) {
 			return 'none';
 		}
 		// A password WordPress will no longer accept is not a working
@@ -1105,7 +1136,10 @@ class Aura_Worker_Magic_Link {
 			// undelivered credential is worth nothing to anybody.
 			WP_Application_Passwords::delete_application_password( $owner, $found );
 			if ( ! self::managed_password_gone( $owner, $found ) ) {
-				return false; // still live — the caller must not mint beside it
+				// Includes "the list could not be read" (#434 I5): the caller
+				// must not mint a second administrator credential beside one
+				// this request could not prove is gone.
+				return false; // still live, or not provably gone
 			}
 			$settled[] = (string) $app_id;
 		}
@@ -1268,21 +1302,44 @@ class Aura_Worker_Magic_Link {
 	 * made into, evidence that nobody else holds the password — three review
 	 * rounds of #434 Task 4 turned on exactly that mistake.
 	 *
-	 * A WordPress with no Application Passwords class holds no such password
-	 * and can authenticate nobody with one, so there is nothing left to
-	 * revoke: "gone", exactly as usable_password() already treats it.
+	 * PROVEN gone, and only that (#434 Task 4, I5): a list that could not be
+	 * read answers FALSE here, not true. See password_state() for the third
+	 * answer and for why it exists.
 	 *
 	 * @since 2.13.0
 	 *
 	 * @param int    $user Owner user ID.
 	 * @param string $uuid Password UUID.
-	 * @return bool True when nothing with that UUID remains.
+	 * @return bool True only when that user's list was read and does not carry it.
 	 */
 	public static function password_gone( int $user, string $uuid ): bool {
+		return self::STATE_GONE === self::password_state( $user, $uuid );
+	}
+
+	/**
+	 * The tri-state behind password_gone(): 'present', 'gone' or 'unknown'.
+	 *
+	 * "Could not determine" is a THIRD answer, not a quiet 'gone' (#434 Task 4,
+	 * I5). Callers that must fail closed read `STATE_GONE !==`; the one caller
+	 * that must fail closed the OTHER way — Phase A confirming a candidate
+	 * owner — reads `STATE_PRESENT ===`. Nobody has to remember which way a
+	 * boolean leans.
+	 *
+	 * A WordPress with no Application Passwords class holds no such password
+	 * and can authenticate nobody with one, so there is nothing left to
+	 * revoke: 'gone', exactly as usable_password() already treats it.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int    $user Owner user ID.
+	 * @param string $uuid Password UUID.
+	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
+	 */
+	public static function password_state( int $user, string $uuid ): string {
 		if ( ! class_exists( 'WP_Application_Passwords' ) ) {
-			return true;
+			return self::STATE_GONE;
 		}
-		return self::managed_password_gone( $user, $uuid );
+		return self::managed_password_state( $user, $uuid );
 	}
 
 	/**
@@ -1292,17 +1349,94 @@ class Aura_Worker_Magic_Link {
 	 * proves a revocation landed — the owner's list does. ONE implementation,
 	 * used by the rotation and by the mint's cleanup.
 	 *
+	 * PROVEN gone: an unreadable list is 'unknown', which is not true here
+	 * (#434 Task 4, I5). Every caller of this form fails closed on that.
+	 *
 	 * @param int    $owner Owner user ID.
 	 * @param string $uuid  Password UUID.
-	 * @return bool True when nothing with that UUID remains.
+	 * @return bool True only when the list was read and does not carry it.
 	 */
 	private static function managed_password_gone( int $owner, string $uuid ): bool {
+		return self::STATE_GONE === self::managed_password_state( $owner, $uuid );
+	}
+
+	/**
+	 * Is that password present in that user's list, absent from it, or is the
+	 * list not readable at all?
+	 *
+	 * The third answer is the point (#434 Task 4, I5). Core implements
+	 * `WP_Application_Passwords::get_user_application_passwords()` as a
+	 * `get_user_meta( …, true )` followed by `if ( ! is_array( $passwords ) )
+	 * return array();` — so a meta read that could not be completed (a failed
+	 * `update_meta_cache()` query caches an empty array and `get_metadata()`
+	 * then answers `''`) is INDISTINGUISHABLE at that layer from "this user
+	 * holds no Application Passwords". Every caller here was reading that as
+	 * proven absence, and in Phase B of the unbind it was the sole evidence
+	 * gating an irreversible step: the site token deleted beside a live
+	 * `manage_options` credential.
+	 *
+	 * So absence is confirmed the way `Aura_Worker_Unbind::option_absent()`
+	 * confirms an option's: with an error-surfacing raw read (the pattern
+	 * `Aura_Worker_Rules::read_option_uncached()` follows — `$wpdb->last_error`
+	 * is the one thing that tells "no such row" from "the database is
+	 * broken"). Core's own list still answers PRESENT, so any filter or
+	 * alternative meta store keeps its say over the positive; the raw probe
+	 * runs only on the path about to conclude absence, and can only turn that
+	 * conclusion into 'present' or 'unknown' — never the other way.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int    $owner Owner user ID.
+	 * @param string $uuid  Password UUID.
+	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
+	 */
+	private static function managed_password_state( int $owner, string $uuid ): string {
 		foreach ( WP_Application_Passwords::get_user_application_passwords( $owner ) as $item ) {
-			if ( isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
-				return false;
+			if ( is_array( $item ) && isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
+				return self::STATE_PRESENT;
 			}
 		}
-		return true;
+		return self::app_password_row_state( $owner, $uuid );
+	}
+
+	/**
+	 * The confirming raw read: does that user's Application Passwords meta row
+	 * really not carry that uuid, or could the row not be read?
+	 *
+	 * Uncached and error-surfacing, deliberately: the value core just consulted
+	 * may itself be a cached empty array left behind by a failed query, so a
+	 * second trip through the meta cache would repeat the same wrong answer.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int    $owner Owner user ID.
+	 * @param string $uuid  Password UUID.
+	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
+	 */
+	private static function app_password_row_state( int $owner, string $uuid ): string {
+		global $wpdb;
+		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
+			return self::STATE_UNKNOWN; // no way to confirm: never a proof of absence
+		}
+		$wpdb->last_error = '';
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1", $owner, self::APP_PASSWORD_USERMETA_KEY ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return self::STATE_UNKNOWN;
+		}
+		if ( null === $raw ) {
+			return self::STATE_GONE; // no row at all: that user holds no Application Passwords
+		}
+		$list = maybe_unserialize( $raw );
+		if ( ! is_array( $list ) ) {
+			return self::STATE_GONE; // core reads a non-array the same way: no passwords
+		}
+		foreach ( $list as $item ) {
+			if ( is_array( $item ) && isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
+				return self::STATE_PRESENT;
+			}
+		}
+		return self::STATE_GONE;
 	}
 
 	/**
@@ -1386,6 +1520,10 @@ class Aura_Worker_Magic_Link {
 		// user-chosen, so a stranger's "Aura SiteAgent" must not be nuked, and
 		// a renamed Aura password must still be found.
 		$deleted = WP_Application_Passwords::delete_application_password( $rec['user_id'], $rec['uuid'] );
+		// Not provably gone — a genuine "still there", or a list that could not
+		// be read at all (#434 I5). Either way the record must survive for the
+		// next attempt; forgetting it would leave an administrator credential
+		// with nothing tracking it.
 		if ( true !== $deleted && ! self::managed_password_gone( $rec['user_id'], $rec['uuid'] ) ) {
 			// The credential is still live, so its record must exist for the
 			// next attempt to find. Under a claim it was consumed above — put

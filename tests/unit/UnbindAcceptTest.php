@@ -116,8 +116,13 @@ final class UnbindAcceptTest extends TestCase {
 		Aura_Worker_Rules::bind( 'c1', $token_hash );                   // seq-0 sentinel, as a connect leaves it
 		update_option( 'aura_worker_connect_user_id', 3 );
 		sa_set_managed_app_password( 3, 'uuid-managed' );
-		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-manual' ); // the password that authenticated THIS request
-		$GLOBALS['_current_user_id'] = 3;                                         // the user that password belongs to
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-manual', 3 ); // the password that authenticated THIS request, and the user WordPress named beside it
+		sa_add_app_password( 3, 'uuid-manual' );                                      // …who really holds it
+		// DIFFERENT from the hook's user on purpose (round-4 C4): a
+		// determine_current_user filter, or any wp_set_current_user() before
+		// the route, moves the global. The marker must record what the hook
+		// said, not what the request currently is.
+		$GLOBALS['_current_user_id'] = 9;
 
 		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
 
@@ -142,7 +147,8 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertSame( 3, $m['connect_user_id'] );
 		$this->assertEqualsCanonicalizing( array( 'uuid-managed', 'uuid-manual' ), $m['app_password_uuids'] );
 		$this->assertSame( 3, $m['app_password_users']['uuid-managed'] );
-		$this->assertSame( 3, $m['app_password_users']['uuid-manual'] );
+		$this->assertSame( 3, $m['app_password_users']['uuid-manual'], 'the hook\'s user, not get_current_user_id()' );
+		$this->assertFalse( sa_app_password_exists( 3, 'uuid-manual' ), 'and that is who it is revoked from' );
 		$this->assertMatchesRegularExpression( '/^\d{4}-\d{2}-\d{2}T/', $m['at'] );
 		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM, '' ), 'claim released' );
 	}
@@ -222,15 +228,17 @@ final class UnbindAcceptTest extends TestCase {
 
 	public function test_fast_path_appends_the_authenticating_uuid_on_every_visit(): void {
 		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9, 'app_password_uuids' => array( 'uuid-managed' ), 'app_password_users' => array( 'uuid-managed' => 3 ) ) );
-		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-second' );
-		$GLOBALS['_current_user_id'] = 7;
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-second', 7 );
+		$GLOBALS['_current_user_id'] = 9; // desynchronised on purpose (round-4 C4)
 
 		$res = Aura_Worker_Rules::accept( $this->unbind_env( array( 'seq' => 12 ) ) );
 
 		$this->assertSame( true, $res['unbound'] );
 		$m = Aura_Worker_Unbind::read();
 		$this->assertSame( array( 'uuid-managed', 'uuid-second' ), $m['app_password_uuids'] );
-		$this->assertSame( 7, $m['app_password_users']['uuid-second'] );
+		$this->assertSame( 7, $m['app_password_users']['uuid-second'], 'the hook\'s user, not the request\'s current one' );
+		$stored = maybe_unserialize( sa_read_option_uncached( Aura_Worker_Unbind::OPTION ) );
+		$this->assertSame( 7, $stored['app_password_users']['uuid-second'], 'and that is what the RAW row holds' );
 		$this->assertSame( 9, $m['seq'], 'the append must not move the marker seq' );
 	}
 
@@ -291,7 +299,9 @@ final class UnbindAcceptTest extends TestCase {
 		// `final: true`, so the transported body reports a COMPLETED Phase B —
 		// and the token it deleted is gone, which is what makes the flag mean
 		// anything.
-		$this->assertSame( array( 'success' => true, 'seq' => 9, 'unbound' => true, 'cleanup_complete' => true ), $resp->get_data() );
+		// `leftovers` travels too (round-4 M9): empty here because nothing is
+		// owed, which is the only reading of `cleanup_complete: true`.
+		$this->assertSame( array( 'success' => true, 'seq' => 9, 'unbound' => true, 'cleanup_complete' => true, 'leftovers' => array() ), $resp->get_data() );
 		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
 	}
 
@@ -307,7 +317,7 @@ final class UnbindAcceptTest extends TestCase {
 		$req->set_param( 'ruleset', $this->unbind_env( array( 'seq' => 11 ) ) );
 		$resp = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req );
 		$this->assertSame( 200, $resp->get_status() );
-		$this->assertSame( array( 'success' => true, 'seq' => 11, 'unbound' => true, 'cleanup_complete' => true ), $resp->get_data() );
+		$this->assertSame( array( 'success' => true, 'seq' => 11, 'unbound' => true, 'cleanup_complete' => true, 'leftovers' => array() ), $resp->get_data() );
 		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'the retry finished the teardown the first attempt started' );
 	}
 
@@ -436,6 +446,141 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
 	}
 
+	// -----------------------------------------------------------------------
+	// Round 4, C4 — Phase A records the user WordPress named beside the uuid,
+	// never the user the request happens to be running as.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * The reviewer's end-to-end probe. WordPress authenticates the request
+	 * with user 5's Application Password and says so on the hook; something
+	 * that runs afterwards — a `determine_current_user` filter, a
+	 * user-switching / SSO / "view as" plugin calling `wp_set_current_user()`
+	 * on init — leaves the global at 9.
+	 *
+	 * Recording 9 was `cleanup_complete: true` with the token deleted and user
+	 * 5's `manage_options` credential still live: rounds 1-3's outcome through
+	 * a fourth door. The marker must name 5, Phase B's single lookup must find
+	 * the password there, and only then may the token go.
+	 */
+	public function test_the_owner_is_the_hooks_user_even_when_the_request_moved_on(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		update_option( 'aura_worker_connect_user_id', 3 );
+		sa_add_app_password( 5, 'uuid-manual' );                                   // user 5 really holds it
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-manual', 5 ); // …and WordPress said so
+		$GLOBALS['_current_user_id'] = 9;                                          // …while the request now runs as 9
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );                   // final: true
+
+		$stored = maybe_unserialize( sa_read_option_uncached( Aura_Worker_Unbind::OPTION ) );
+		$this->assertSame( 5, $stored['app_password_users']['uuid-manual'], 'the RAW row names the hook\'s user' );
+		$this->assertFalse( sa_app_password_exists( 5, 'uuid-manual' ), 'and the credential is actually revoked' );
+		$this->assertTrue( $res['cleanup_complete'] );
+		$this->assertSame( array(), $res['leftovers'] );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	/**
+	 * The other half, and the one that makes the mutation visible: user 9 —
+	 * the request's current user — really does hold a password with this uuid,
+	 * and the hook named nobody (it never fired; the uuid reached this request
+	 * some other way). Re-deriving the owner from the global would find it,
+	 * record 9 as knowledge and finish the teardown. What the site actually
+	 * KNOWS is nothing, so it records the explicit unknown and stops.
+	 */
+	public function test_the_current_user_is_never_borrowed_when_the_hook_named_nobody(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		update_option( 'aura_worker_connect_user_id', 0 );
+		sa_add_app_password( 9, 'uuid-manual' );
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-manual' ); // no identity beside it
+		$GLOBALS['_current_user_id'] = 9;
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );                   // final: true
+
+		$stored = maybe_unserialize( sa_read_option_uncached( Aura_Worker_Unbind::OPTION ) );
+		$this->assertArrayHasKey( 'uuid-manual', $stored['app_password_users'] );
+		$this->assertNull( $stored['app_password_users']['uuid-manual'], 'an explicit unknown, never the request\'s current user' );
+		$this->assertFalse( $res['cleanup_complete'] );
+		$this->assertSame( array( 'app_passwords' ), $res['leftovers'] );
+		$this->assertTrue( sa_app_password_exists( 9, 'uuid-manual' ), 'nothing was deleted from a user the site cannot name' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	// -----------------------------------------------------------------------
+	// Round 4, I5 — Phase A confirms a candidate owner on evidence, and a
+	// read that failed is not evidence.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * The connecting user is a CANDIDATE. Confirming it means finding the
+	 * password in that user's list — and a list that could not be read is not
+	 * a finding. Recorded as the explicit unknown instead, so Phase B's one
+	 * lookup is never run against a guess.
+	 */
+	public function test_a_candidate_owner_is_not_confirmed_by_a_read_that_failed(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		update_option( 'aura_worker_connect_user_id', 3 );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
+		sa_add_app_password( 3, 'uuid-managed' );                                  // the connector does hold it…
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;                          // …but this request cannot read that
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+
+		$GLOBALS['_sa_app_password_read_fail'] = array();
+		$stored = maybe_unserialize( sa_read_option_uncached( Aura_Worker_Unbind::OPTION ) );
+		$this->assertNull( $stored['app_password_users']['uuid-managed'], 'unconfirmed is unknown, never recorded as knowledge' );
+		$this->assertFalse( $res['cleanup_complete'] );
+		$this->assertSame( array( 'app_passwords' ), $res['leftovers'] );
+		$this->assertTrue( sa_app_password_exists( 3, 'uuid-managed' ), 'the credential is still live' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	// -----------------------------------------------------------------------
+	// Round 4, M9 — what is owed travels on the wire, by name.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * `cleanup_complete: false` has two opposite causes, and Aura cannot tell
+	 * them apart from a bool: something could not be proven removed, or the
+	 * token was deliberately kept because the document was not `final`. Here
+	 * it is the second — nothing is owed, so `leftovers` is EMPTY and Aura may
+	 * retire the tombstone when its siblings are done.
+	 */
+	public function test_a_non_final_unbind_reports_no_leftovers(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		update_option( 'aura_worker_connect_user_id', 3 );
+		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
+		$req->set_param( 'ruleset', $this->unbind_env( array( 'final' => false ) ) );
+
+		$body = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req )->get_data();
+
+		$this->assertFalse( $body['cleanup_complete'], 'the token was kept, deliberately' );
+		$this->assertSame( array(), $body['leftovers'], 'and nothing is owed' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	/**
+	 * And the case that must never look like the one above: an owner the site
+	 * cannot name, so a `manage_options` credential is still live. `leftovers`
+	 * names it, which is what stops Aura retiring the very tombstone that is
+	 * the site's only remaining way to be told about the remainder.
+	 */
+	public function test_an_unknown_owner_names_app_passwords_on_the_wire(): void {
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		update_option( 'aura_worker_connect_user_id', 0 );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
+		sa_add_app_password( 7, 'uuid-managed' );
+		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
+		$req->set_param( 'ruleset', $this->unbind_env() ); // final: true
+
+		$body = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req )->get_data();
+
+		$this->assertFalse( $body['cleanup_complete'] );
+		$this->assertSame( array( 'app_passwords' ), $body['leftovers'] );
+		$this->assertTrue( sa_app_password_exists( 7, 'uuid-managed' ) );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
 	public function test_receive_rules_still_412s_a_marker_less_unkeyed_site(): void {
 		delete_option( 'aura_worker_grant_pubkey' );
 		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
@@ -473,18 +618,41 @@ final class UnbindAcceptTest extends TestCase {
 	public function test_a_fired_application_password_hook_records_the_uuid(): void {
 		( new Aura_Worker() )->init();
 
-		do_action( 'application_password_did_authenticate', (object) array( 'ID' => 3 ), array( 'uuid' => 'uuid-from-wp', 'name' => 'Aura SiteAgent' ) );
+		do_action( 'application_password_did_authenticate', new WP_User( 3 ), array( 'uuid' => 'uuid-from-wp', 'name' => 'Aura SiteAgent' ) );
 
 		$this->assertSame( 'uuid-from-wp', Aura_Worker_Security::authenticating_app_password_uuid() );
+		$this->assertSame( 3, Aura_Worker_Security::authenticating_app_password_user(), 'the pairing, not just the uuid (round-4 C4)' );
 	}
 
 	public function test_a_password_item_with_no_uuid_records_nothing(): void {
 		( new Aura_Worker() )->init();
 		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'stale' );
 
-		do_action( 'application_password_did_authenticate', (object) array( 'ID' => 3 ), 'not an item at all' );
+		do_action( 'application_password_did_authenticate', new WP_User( 3 ), 'not an item at all' );
 
 		$this->assertNull( Aura_Worker_Security::authenticating_app_password_uuid(), 'an unreadable item must clear, never keep, a stale uuid' );
+		$this->assertNull( Aura_Worker_Security::authenticating_app_password_user(), 'and the user beside it, which names nothing without a uuid' );
+	}
+
+	/**
+	 * Round-4 C4, the input side of the same rule. WordPress's own signature
+	 * for this hook is `WP_User|mixed`, and only a WP_User with a positive ID
+	 * is an identity. A stdClass that happens to carry an `ID`, a bare int, or
+	 * a user object for the anonymous user names nobody — and a cast would
+	 * turn each of them into a user id that Phase B then treats as knowledge.
+	 */
+	public function test_only_a_wp_user_with_a_real_id_is_an_identity(): void {
+		( new Aura_Worker() )->init();
+
+		do_action( 'application_password_did_authenticate', (object) array( 'ID' => 5 ), array( 'uuid' => 'uuid-manual' ) );
+		$this->assertSame( 'uuid-manual', Aura_Worker_Security::authenticating_app_password_uuid(), 'the uuid is still captured' );
+		$this->assertNull( Aura_Worker_Security::authenticating_app_password_user(), 'but a stdClass with an ID is not a WP_User' );
+
+		do_action( 'application_password_did_authenticate', 5, array( 'uuid' => 'uuid-manual' ) );
+		$this->assertNull( Aura_Worker_Security::authenticating_app_password_user(), 'nor is a bare int' );
+
+		do_action( 'application_password_did_authenticate', new WP_User( 0 ), array( 'uuid' => 'uuid-manual' ) );
+		$this->assertNull( Aura_Worker_Security::authenticating_app_password_user(), 'nor is user 0, which is nobody' );
 	}
 
 	/**
@@ -495,9 +663,11 @@ final class UnbindAcceptTest extends TestCase {
 	public function test_a_uuid_captured_from_the_real_hook_reaches_the_marker(): void {
 		( new Aura_Worker() )->init();
 		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
-		$GLOBALS['_current_user_id'] = 5;
+		// The global is NOT the hook's user (round-4 C4). It used to be set to
+		// match, which is exactly why the divergence was invisible.
+		$GLOBALS['_current_user_id'] = 9;
 
-		do_action( 'application_password_did_authenticate', (object) array( 'ID' => 5 ), array( 'uuid' => 'uuid-manual' ) );
+		do_action( 'application_password_did_authenticate', new WP_User( 5 ), array( 'uuid' => 'uuid-manual' ) );
 		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
 
 		$this->assertSame( true, $res['unbound'] );
