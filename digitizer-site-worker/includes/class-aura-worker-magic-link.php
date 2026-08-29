@@ -308,11 +308,18 @@ class Aura_Worker_Magic_Link {
 		// application password). Falls back to the first admin if absent.
 		// Verified. From here the whole install — token, binding, key, password
 		// — is one handler's: take the site-wide claim now.
-		// An orphaned claim is NOT taken over by age (round-7): a handler the
-		// dashboard gave up on may still be running, and a takeover would let
-		// this install interleave with it. A stuck claim is released by
-		// deactivating the plugin.
-		$site_fence = self::claim_magic_link( $site_claim_key );
+		// An orphaned claim was originally NOT taken over by age at all
+		// (round-7): a handler the dashboard gave up on may still be running,
+		// and a takeover would let this install interleave with it. #434
+		// review round 1 (I2) bounds that instead of ruling it out entirely —
+		// SITE_CLAIM_TAKEOVER_AFTER seconds, well past any real request —
+		// because every write below is already claim-conditional
+		// (write_option_if_claimed()/bind()'s $claim,$fence/
+		// delete_option_if_claimed(), all the way through the mint at the
+		// end): a resumed original that lost the claim to a seize has every
+		// one of its own writes refused, not racing the replacement. Recovery
+		// of a genuinely stuck claim is no longer solely an operator action.
+		$site_fence = self::claim_magic_link( $site_claim_key, self::SITE_CLAIM_TAKEOVER_AFTER );
 		if ( '' === $site_fence ) {
 			$release();
 			return new WP_REST_Response( array( 'error' => 'A connect for this site is already in progress; retry.', 'code' => 'aura_connect_in_progress' ), 409 );
@@ -636,15 +643,33 @@ class Aura_Worker_Magic_Link {
 	 */
 	const SITE_CLAIM = 'aura_worker_connect_lock';
 	/**
-	 * The site claim has NO timed takeover (round-7, owner decision). A
-	 * connect handler that a client timeout abandoned is not a handler that
-	 * stopped: PHP keeps running it, and an age-based takeover would let a
-	 * replacement start writing while the original may still resume — exactly
-	 * the credential-splitting race the claim exists to prevent. Recovery of
-	 * an orphaned claim is therefore an explicit operator action: deactivating
-	 * the plugin (which no handler survives) deletes it. See
-	 * aura_worker_deactivate() in digitizer-site-worker.php.
+	 * The site claim originally had NO timed takeover at all (round-7, owner
+	 * decision): a connect handler that a client timeout abandoned is not a
+	 * handler that stopped, and an age-based takeover would let a replacement
+	 * start writing while the original may still resume. That reasoning
+	 * assumed only rare, operator-initiated lifecycle operations held this
+	 * claim, with recovery as an explicit operator action (deactivate/
+	 * reactivate — aura_worker_deactivate() in digitizer-site-worker.php).
+	 *
+	 * #434 (review round 1, I2) puts a routine, gateway-driven path —
+	 * Aura_Worker_Rules::accept(), arbitrarily frequent — behind the same
+	 * lock. `finally` cannot catch an OOM kill or a max_execution_time fatal,
+	 * so without SOME recovery a single crashed push would strand the site:
+	 * every later push, and every connect, 503s until a human deactivates the
+	 * plugin. SITE_CLAIM_TAKEOVER_AFTER bounds that: claim_site() may now
+	 * seize a claim recorded stale enough, via the SAME conditional
+	 * compare-and-swap the ruleset store uses (never a blind overwrite) — see
+	 * claim_magic_link()'s $takeover_after parameter. The round-7 hazard this
+	 * guards against — a paused original resuming and writing over its
+	 * replacement — is closed by Aura_Worker_Rules::accept_under_claim()'s own
+	 * fence re-check immediately before every write (I1): a seized original's
+	 * next write meets a fence that is no longer its own and is refused, not
+	 * raced. Per-magic-link claims keep the original no-timed-takeover
+	 * behaviour unchanged — they still assume nothing about the frequency or
+	 * duration of the operation they guard, and nothing in this task changes
+	 * that reasoning for them.
 	 */
+	const SITE_CLAIM_TAKEOVER_AFTER = 120; // seconds; well above any push.
 
 	/**
 	 * The CURRENT Aura-minted Application Password's record: the user who owns
@@ -876,10 +901,15 @@ class Aura_Worker_Magic_Link {
 	 * disconnected, while the callback goes on to hand out a fresh
 	 * administrator credential the UI no longer admits exists.
 	 *
+	 * Also Aura_Worker_Rules::accept()'s entry point since #434: a routine,
+	 * gateway-driven ruleset push takes this same claim for its whole
+	 * decision, so it may seize a stale one too (SITE_CLAIM_TAKEOVER_AFTER,
+	 * review round 1, I2) — see that constant's docblock.
+	 *
 	 * @return string The caller's fence when it holds the claim, else ''.
 	 */
 	public static function claim_site() {
-		return self::claim_magic_link( self::SITE_CLAIM );
+		return self::claim_magic_link( self::SITE_CLAIM, self::SITE_CLAIM_TAKEOVER_AFTER );
 	}
 
 	/**
@@ -1425,30 +1455,97 @@ class Aura_Worker_Magic_Link {
 	 *
 	 * @since 2.10.2
 	 *
-	 * @param string $claim_key Option name.
+	 * @param string $claim_key      Option name.
+	 * @param int    $takeover_after Seconds; 0 (the default, and every
+	 *                                per-magic-link caller) means no timed
+	 *                                takeover at all, exactly as before. > 0
+	 *                                (the site claim's callers, #434 review
+	 *                                round 1, I2) additionally attempts
+	 *                                seize_stale_claim() when the row is
+	 *                                already held.
 	 * @return string This handler's fence when it holds the claim, else ''.
 	 */
-	private static function claim_magic_link( $claim_key ) {
+	private static function claim_magic_link( $claim_key, $takeover_after = 0 ) {
 		global $wpdb;
 		$fence = bin2hex( random_bytes( 16 ) );
+		$value = $fence . '|' . time();
 		$rows  = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
 				$claim_key,
-				$fence . '|' . time(),
+				$value,
 				'no',
 				$claim_key
 			)
 		);
-		if ( 1 !== (int) $rows || '' !== (string) $wpdb->last_error ) {
-			return ''; // 0: a row is there. false/last_error: nothing was claimed.
+		if ( 1 === (int) $rows && '' === (string) $wpdb->last_error ) {
+			// The row was created behind the option cache's back, so evict what
+			// add_option() would have maintained: this name, and the `notoptions`
+			// entry any earlier miss on it left (see insert_if_absent()).
+			wp_cache_delete( $claim_key, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			return $fence;
 		}
-		// The row was created behind the option cache's back, so evict what
-		// add_option() would have maintained: this name, and the `notoptions`
-		// entry any earlier miss on it left (see insert_if_absent()).
+		// 0: a row is there. false/last_error: nothing was claimed (and a
+		// takeover attempt below could not tell those apart either — a
+		// database refusing this INSERT would just as likely refuse the
+		// takeover's UPDATE, which fails closed to '' on its own).
+		if ( $takeover_after > 0 && self::seize_stale_claim( $claim_key, $fence, $value, $takeover_after ) ) {
+			return $fence;
+		}
+		return '';
+	}
+
+	/**
+	 * Seize a claim recorded stale enough — #434 review round 1 (I2). A
+	 * claim row a fatal (OOM, max_execution_time — nothing `finally` can
+	 * catch) stranded would otherwise 503 every later request against this
+	 * claim forever; this bounds that to SITE_CLAIM_TAKEOVER_AFTER seconds,
+	 * via the SAME conditional compare-and-swap the ruleset store uses —
+	 * never a blind overwrite, so a claim that is genuinely still held (a
+	 * live request refreshing it, or simply not yet stale) cannot be seized
+	 * out from under it: the UPDATE names the exact bytes just read, and a
+	 * change since then — a release, a refresh, another seize — loses it.
+	 *
+	 * A row with no `|<ts>` suffix (written before this backward-compatible
+	 * format existed, or never at all) is treated as fresh and is never
+	 * seized — there is nothing to measure an age against, and reporting one
+	 * from nowhere would be worse than declining to seize.
+	 *
+	 * @param string $claim_key      Option name.
+	 * @param string $fence          This handler's fence — $new_value's prefix.
+	 * @param string $new_value      This handler's "<fence>|<ts>" to install.
+	 * @param int    $takeover_after Seconds the existing claim's age must
+	 *                                EXCEED (not merely reach) to be seizable.
+	 * @return bool True when this handler seized the claim.
+	 */
+	private static function seize_stale_claim( $claim_key, $fence, $new_value, $takeover_after ) {
+		global $wpdb;
+		$existing = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $claim_key ) );
+		if ( ! is_string( $existing ) || '' === $existing ) {
+			return false; // Gone already, or unreadable — a plain retry is the safe next step, not a seize.
+		}
+		$pipe = strrpos( $existing, '|' );
+		if ( false === $pipe ) {
+			return false; // No timestamp on record: never seizable.
+		}
+		$age = time() - (int) substr( $existing, $pipe + 1 );
+		if ( $age <= $takeover_after ) {
+			return false;
+		}
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				$new_value,
+				$claim_key,
+				$existing
+			)
+		);
+		if ( 1 !== (int) $rows ) {
+			return false; // Someone else released, refreshed, or seized it first.
+		}
 		wp_cache_delete( $claim_key, 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
-		return $fence;
+		return true;
 	}
 
 	/**

@@ -570,7 +570,14 @@ class Aura_Worker_Rules {
 			// two pushes would otherwise hold rules it cannot scope. Heal the
 			// record here — the same verified bytes, one field added — and
 			// answer the retry as before.
-			if ( '' !== $site_ref && ( ! isset( $current['site_ref'] ) || $current['site_ref'] !== $site_ref ) ) {
+			if ( '' !== $site_ref && ( ! isset( $current['site_ref'] ) || $current['site_ref'] !== $site_ref )
+				// Same claim re-check as the primary write below (I1): this
+				// heal is a write too, and best-effort already — silently
+				// skipping it when the claim is gone is consistent with the
+				// "re-deciding here would be worse than doing nothing" note
+				// just below, not a new failure mode.
+				&& Aura_Worker_Magic_Link::holds_site_claim( $fence )
+			) {
 				$healed             = $current;
 				$healed['site_ref'] = $site_ref;
 				// A lost swap (or a database refusal) is NOT a failure of this
@@ -633,6 +640,30 @@ class Aura_Worker_Rules {
 			'received_at' => time(),
 			'rules'       => array_values( array_filter( $doc['rules'], 'is_array' ) ),
 		);
+		// Re-verify the claim immediately before writing (review round 1,
+		// I1): swap()/insert_if_absent() are plain CAS statements with no
+		// claim predicate, so without this an evicted handler — the activation
+		// repair path (magic-link.php:845) evicts a live claim on purpose —
+		// would still install its ruleset. That splits exactly what the
+		// site-wide claim exists to keep together: Task 3's unbind marker
+		// write IS claim-fenced, so an evicted handler would write the
+		// ruleset and be refused the marker, leaving the site's enforced
+		// state and Aura's record of it disagreeing (the docblock above).
+		// Checked here — once per accept_under_claim() invocation — rather
+		// than once in accept(): the CAS retry recurses back into
+		// accept_under_claim() from the top, so this line runs again on
+		// every re-decide, closing the window a single upfront check would
+		// leave open across MAX_SWAP_ATTEMPTS retries. Still a residual,
+		// unavoidable microseconds-wide window between this check and the
+		// write it guards — the same one holds_site_claim()'s own docblock
+		// names.
+		if ( ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			return new WP_Error(
+				'aura_site_busy',
+				__( 'Another Aura operation holds this site; retry shortly.', 'digitizer-site-worker' ),
+				array( 'status' => 503 )
+			);
+		}
 		$swapped = self::swap( $current, $record );
 		if ( true !== $swapped ) {
 			if ( is_wp_error( $swapped ) ) {
@@ -1188,17 +1219,33 @@ class Aura_Worker_Rules {
 		if ( isset( $current['site_ref'] ) && $current['site_ref'] === $site_ref ) {
 			return true; // already complete
 		}
-		$record             = $current;
-		$record['site_ref'] = $site_ref;
-		$swapped            = self::swap( $current, $record );
-		if ( true === $swapped ) {
-			return true;
+		// #434 review round 1 (I3): this write raced Aura_Worker_Rules::accept()
+		// at the option layer — a genuine, unclaimed writer of the SAME store
+		// every accept() now serialises through the site-wide claim. Closing
+		// that here costs little: this function already treats a lost write
+		// as success (below), so a refused claim is simply this function's
+		// existing "retry next request" contract (plugins_loaded calls it on
+		// every load until the version marker advances) — busy just means
+		// "not this request."
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		if ( '' === $fence ) {
+			return false;
 		}
-		// A lost swap or a refused write: decide on the RECORD, not on the
-		// return value. A racer's newer record already carries the field, and
-		// that is the outcome this function is asked about.
-		$after = self::stored();
-		return is_array( $after ) && isset( $after['site_ref'] );
+		try {
+			$record             = $current;
+			$record['site_ref'] = $site_ref;
+			$swapped            = self::swap( $current, $record );
+			if ( true === $swapped ) {
+				return true;
+			}
+			// A lost swap or a refused write: decide on the RECORD, not on the
+			// return value. A racer's newer record already carries the field, and
+			// that is the outcome this function is asked about.
+			$after = self::stored();
+			return is_array( $after ) && isset( $after['site_ref'] );
+		} finally {
+			Aura_Worker_Magic_Link::release_site( $fence );
+		}
 	}
 
 	/**

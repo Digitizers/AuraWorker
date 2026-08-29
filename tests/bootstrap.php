@@ -1479,23 +1479,34 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			}
 
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
-				if ( true === $GLOBALS['_db_query_error'] ) {
+				list( , $name, $value, ) = array_map( 'stripslashes', $m );
+				// This exact SQL shape is also Aura_Worker_Magic_Link::claim_magic_link()'s
+				// statement (the site-wide claim, per-link claims) — and, since
+				// #434, accept() takes the site claim before it ever touches
+				// the ruleset row. A seam armed to fail/race/inspect "the
+				// ruleset's first insert" must not instead fire on an
+				// unrelated claim row that happens to be the FIRST matching
+				// statement of the request; every seam below is therefore
+				// scoped to the ruleset option specifically.
+				$is_ruleset_insert = ( Aura_Worker_Rules::OPTION === $name );
+				if ( $is_ruleset_insert && true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
-				sa_before_swap();
-				// A second request inserting between this caller's own
-				// existence check (there is none — that's the point of a real
-				// conditional INSERT) and this statement running.
-				if ( ! empty( $GLOBALS['_insert_racer'] ) ) {
-					$racer                    = $GLOBALS['_insert_racer'];
-					$GLOBALS['_insert_racer'] = null;
-					Aura_Worker_Rules::accept( $racer );
+				if ( $is_ruleset_insert ) {
+					sa_before_swap();
+					// A second request inserting between this caller's own
+					// existence check (there is none — that's the point of a
+					// real conditional INSERT) and this statement running.
+					if ( ! empty( $GLOBALS['_insert_racer'] ) ) {
+						$racer                    = $GLOBALS['_insert_racer'];
+						$GLOBALS['_insert_racer'] = null;
+						Aura_Worker_Rules::accept( $racer );
+					}
 				}
-				list( , $name, $value, ) = array_map( 'stripslashes', $m );
 				// The row as the DATABASE holds it — $_rows, else an $_options
 				// value a test seeded directly (sa_read_option_uncached()).
 				if ( null !== sa_read_option_uncached( $name ) ) {
-					if ( 'duplicate' === $GLOBALS['_db_query_error'] ) {
+					if ( $is_ruleset_insert && 'duplicate' === $GLOBALS['_db_query_error'] ) {
 						// The race decided by the unique index rather than by
 						// the NOT EXISTS subquery: MySQL 1062, reported by
 						// $wpdb->query() as false with last_error set. The
@@ -1609,11 +1620,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_notoptions']       = array(); // Core's negative option cache — see get_option().
 	$GLOBALS['_rows']             = array(); // Raw, serialized bytes — the "database" the ruleset CAS reads/writes.
 	$GLOBALS['_rows_autoload']    = array(); // Per-option autoload flag for rows this stub actually tracks (add_option/update_option and the claim-fenced INSERT branch).
-	$GLOBALS['_cas_racer']        = null;
-	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_cas_racer']         = null;
+	$GLOBALS['_insert_racer']      = null;
 	$GLOBALS['_sa_gateway_secret'] = null; // sa_install_gateway_key()'s default signing key for sa_sign_ruleset().
-	$GLOBALS['_cas_always_lose']  = false;
-	$GLOBALS['_db_query_error']   = false;
+	$GLOBALS['_cas_always_lose']   = false;
+	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -2140,11 +2151,11 @@ function sa_reset_state(): void {
 	$GLOBALS['_notoptions']       = array(); // Core's negative option cache — see get_option().
 	$GLOBALS['_rows']             = array();
 	$GLOBALS['_rows_autoload']    = array(); // Per-option autoload flag — see the top-level init above.
-	$GLOBALS['_cas_racer']        = null;
-	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_cas_racer']         = null;
+	$GLOBALS['_insert_racer']      = null;
 	$GLOBALS['_sa_gateway_secret'] = null; // sa_install_gateway_key()'s default signing key for sa_sign_ruleset().
-	$GLOBALS['_cas_always_lose']  = false;
-	$GLOBALS['_db_query_error']   = false;
+	$GLOBALS['_cas_always_lose']   = false;
+	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
