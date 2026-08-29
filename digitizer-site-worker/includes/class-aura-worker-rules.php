@@ -457,11 +457,12 @@ class Aura_Worker_Rules {
 	/**
 	 * Accept a signed ruleset if it verifies and is newer than what we hold.
 	 *
-	 * Whole document every time, so there is no delta to misapply and no order
-	 * to get wrong. `seq` is monotonic: an older document is refused even when
-	 * validly signed, because replaying one is exactly how a released rule
-	 * would come back or a new one would vanish. Any failure leaves the stored
-	 * record untouched — last-known-good is the contract.
+	 * Runs the whole decision under the site-wide claim (#434): an unbind
+	 * (Task 3) writes under the same claim, and the two must never interleave
+	 * — a ruleset landing mid-unbind, or an unbind landing mid-push, would
+	 * leave the site's enforced state and Aura's record of it disagreeing.
+	 * A caller that cannot take the claim is told to retry, not queued: this
+	 * is a REST request, not a job.
 	 *
 	 * @param string $envelope Signed document from the gateway.
 	 * @param int    $attempt  Internal: how many times this call has re-decided
@@ -469,6 +470,35 @@ class Aura_Worker_Rules {
 	 * @return true|WP_Error
 	 */
 	public static function accept( $envelope, $attempt = 0 ) {
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		if ( '' === $fence ) {
+			return new WP_Error(
+				'aura_site_busy',
+				__( 'Another Aura operation holds this site; retry shortly.', 'digitizer-site-worker' ),
+				array( 'status' => 503 )
+			);
+		}
+		try {
+			return self::accept_under_claim( $envelope, $attempt, $fence );
+		} finally {
+			Aura_Worker_Magic_Link::release_site( $fence );
+		}
+	}
+
+	/**
+	 * The former accept() body, verbatim, run under a site claim the caller
+	 * already holds. $fence is unused here today; Task 3's unbind check reads
+	 * it. Never call this without first taking the claim — the CAS retry
+	 * branch below recurses HERE, not into accept(), so the claim is taken
+	 * exactly once per request and never re-entered.
+	 *
+	 * @param string $envelope Signed document from the gateway.
+	 * @param int    $attempt  How many times this call has re-decided after
+	 *                         losing the compare-and-swap.
+	 * @param string $fence    This request's site-claim fence.
+	 * @return true|WP_Error
+	 */
+	private static function accept_under_claim( $envelope, $attempt, $fence ) {
 		$doc = Aura_Worker_Grant::verify_signed_document( (string) $envelope );
 		if ( ! is_array( $doc ) ) {
 			return new WP_Error( 'aura_ruleset_rejected', 'Ruleset refused: ' . $doc, array( 'status' => 400 ) );
@@ -622,7 +652,7 @@ class Aura_Worker_Rules {
 					array( 'status' => 503 )
 				);
 			}
-			return self::accept( $envelope, $attempt + 1 );
+			return self::accept_under_claim( $envelope, $attempt + 1, $fence );
 		}
 		// A new ruleset retires rules, and a retired rule's daily claim is
 		// named after a key nothing will visit again. Retired ones only: a rule

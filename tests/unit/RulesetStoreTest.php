@@ -134,10 +134,33 @@ final class RulesetStoreTest extends TestCase {
 		// Two pushes overlap: a retry of seq 6 has already passed the seq check
 		// against the stored seq 5 when a fresh seq 7 lands. Without a
 		// compare-and-swap the retry writes last and policy rolls backwards —
-		// the block the operator added in seq 7 silently disappears. The racer
-		// is injected by the $wpdb stub between this call's read and its write.
+		// the block the operator added in seq 7 silently disappears.
+		//
+		// #434: accept() now runs its whole decision under the site-wide
+		// claim, so a SECOND accept() can no longer land between this one's
+		// read and its write — the claim itself serializes that (a nested
+		// accept() here would just meet 503 aura_site_busy, same as the
+		// tests above named after it). What the CAS still defends against is
+		// the stored row changing by some OTHER means while a decision is in
+		// flight, so the racer is modeled as a direct row mutation — via the
+		// same after-store-read seam the connect-interleaving tests below use
+		// — landing exactly between this call's read and its write.
 		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
-		$GLOBALS['_cas_racer'] = $this->ruleset( 7, array( $this->freeze() ) );
+		$racing_record = array(
+			'envelope'    => $this->ruleset( 7, array( $this->freeze() ) ),
+			'client'      => 'client-1',
+			'token_hash'  => $this->site(),
+			'site_ref'    => '',
+			'seq'         => 7,
+			'issued_at'   => gmdate( 'c', 1_800_000_007 ),
+			'received_at' => time(),
+			'rules'       => array( $this->freeze() ),
+		);
+		$GLOBALS['_sa_after_store_read'] = function () use ( $racing_record ) {
+			$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ]    = maybe_serialize( $racing_record );
+			$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = $racing_record;
+			$GLOBALS['_sa_after_store_read'] = null;
+		};
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 6 ) );
 
@@ -255,7 +278,16 @@ final class RulesetStoreTest extends TestCase {
 		// the INSERT, which waits the full innodb_lock_wait_timeout again —
 		// up to MAX_SWAP_ATTEMPTS times, minutes for one REST request. One
 		// statement, one 500; Aura retries later, this request does not.
-		$GLOBALS['_db_query_error'] = true;
+		//
+		// #434: accept() now takes the site claim first, which issues its
+		// OWN conditional INSERT — armed immediately, the blanket error flag
+		// would fail THAT and never reach the ruleset's own insert. Arm it
+		// via the before-swap seam, which fires once per matching query and
+		// so lands right after the claim's insert has already succeeded.
+		$GLOBALS['_sa_before_swap'] = function () {
+			$GLOBALS['_db_query_error'] = true;
+			$GLOBALS['_sa_before_swap'] = null;
+		};
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
 
@@ -263,7 +295,7 @@ final class RulesetStoreTest extends TestCase {
 		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
 		$inserts = array_filter(
 			$GLOBALS['_db_queries'],
-			static fn( $q ) => false !== strpos( $q, 'WHERE NOT EXISTS' )
+			static fn( $q ) => false !== strpos( $q, 'WHERE NOT EXISTS' ) && false !== strpos( $q, Aura_Worker_Rules::OPTION )
 		);
 		$this->assertCount( 1, $inserts, 'a failed INSERT with no row behind it was retried' );
 	}
@@ -275,7 +307,14 @@ final class RulesetStoreTest extends TestCase {
 		// statement" (false — a hard error). Reporting contention here would
 		// send Aura chasing a race that never happened while the site holds
 		// no policy at all.
-		$GLOBALS['_db_query_error'] = true;
+		//
+		// #434: armed via before-swap so the site claim's own insert (which
+		// now precedes every accept()) still succeeds; only the ruleset's
+		// own insert meets the injected error.
+		$GLOBALS['_sa_before_swap'] = function () {
+			$GLOBALS['_db_query_error'] = true;
+			$GLOBALS['_sa_before_swap'] = null;
+		};
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
 
@@ -327,7 +366,12 @@ final class RulesetStoreTest extends TestCase {
 		// nothing". Reading both as "lost the race" would retry a broken
 		// database until the stack gives out.
 		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
-		$GLOBALS['_db_query_error'] = true;
+		// #434: armed via before-swap so the site claim's own insert still
+		// succeeds; only the ruleset's UPDATE meets the injected error.
+		$GLOBALS['_sa_before_swap'] = function () {
+			$GLOBALS['_db_query_error'] = true;
+			$GLOBALS['_sa_before_swap'] = null;
+		};
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 6 ) );
 
@@ -490,8 +534,16 @@ final class RulesetStoreTest extends TestCase {
 		// And refused on the FIRST pass, without attempting a write: read
 		// token-then-store, this document would pass wrong_site against the
 		// pre-connect token, swap, lose, and only then re-decide.
+		//
+		// #434: accept() now issues its OWN insert first, to take the site
+		// claim — an unrelated option (aura_worker_connect_lock), which the
+		// filter below must not mistake for a write against the ruleset.
 		$this->assertEmpty(
-			array_filter( $GLOBALS['_db_queries'], static fn( $q ) => false !== strpos( $q, 'UPDATE ' ) || false !== strpos( $q, 'INSERT ' ) ),
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static fn( $q ) => ( false !== strpos( $q, 'UPDATE ' ) || false !== strpos( $q, 'INSERT ' ) )
+					&& false !== strpos( $q, Aura_Worker_Rules::OPTION )
+			),
 			'the token was read before the store: a write was attempted against a value the connect had already replaced'
 		);
 	}
