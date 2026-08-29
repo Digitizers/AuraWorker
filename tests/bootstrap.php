@@ -976,7 +976,15 @@ if ( ! function_exists( 'apply_filters' ) ) {
 			}
 		);
 		foreach ( $hooks as $hook ) {
-			$value = ( $hook['callback'] )( $value, ...$args );
+			// Same arity rule as do_action(): a filter receives $value plus
+			// accepted_args - 1 of the extra arguments, so a listener declared
+			// `10, 1` never sees the request/handler arguments a `10, 3`
+			// registration would. Half-applying this (actions only) would leave
+			// the core-REST seam's filters — rest_request_before_callbacks and
+			// friends, registered at 5, 3 — with an invisible arity regression
+			// (#434 Task 3 re-review M7).
+			$extra = isset( $hook['accepted_args'] ) ? array_slice( $args, 0, max( 0, (int) $hook['accepted_args'] - 1 ) ) : $args;
+			$value = ( $hook['callback'] )( $value, ...$extra );
 		}
 		return $value;
 	}
@@ -1572,7 +1580,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! empty( $GLOBALS['_sa_option_write_divert'][ $name ] ) ) {
 					// Same seam as the UPDATE above; on an INSERT there is no
 					// prior value, so `true` means "store the empty row" and a
-					// callable decides. See the comment there.
+					// callable decides. See the comment there. No test drives
+					// this half today (the verified writes it models are all
+					// updates) — it exists so an INSERT-path verification can
+					// be pinned without reshaping the stub (#434 Task 3
+					// re-review M8).
 					$divert = $GLOBALS['_sa_option_write_divert'][ $name ];
 					$value  = is_callable( $divert ) ? (string) $divert( $value ) : '';
 				}
