@@ -294,4 +294,116 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertSame( 412, $resp->get_status() );
 		$this->assertSame( 'no_gateway_key', $resp->get_data()['code'] );
 	}
+
+	// -----------------------------------------------------------------------
+	// Task 3 review round 1 — I1, I3, M1.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * I1. The production source of the authenticating UUID had no coverage at
+	 * all: every other test injects it through
+	 * _set_authenticating_uuid_for_tests(), so deleting the registration and
+	 * gutting the callback left the suite green. A wrong hook name, or the
+	 * arity dropped from 2 to 1 (which silently discards the $item the uuid
+	 * rides in), would then ship unnoticed — and Task 5/6's core-REST seam
+	 * would keep accepting /wp/v2/* writes made with a manually connected or
+	 * PATCH-installed Application Password against an unbound site, the exact
+	 * case spec §2.3's app_password_uuids[] exists to close.
+	 */
+	public function test_the_plugin_registers_the_application_password_capture_hook(): void {
+		( new Aura_Worker() )->init();
+
+		$entries = $GLOBALS['_filters']['application_password_did_authenticate'] ?? array();
+		$this->assertCount( 1, $entries, 'registered exactly once, under the name WordPress fires' );
+		$this->assertSame( array( 'Aura_Worker_Security', 'capture_app_password' ), $entries[0]['callback'] );
+		$this->assertSame( 10, $entries[0]['priority'] );
+		$this->assertSame( 2, $entries[0]['accepted_args'], 'the uuid rides the SECOND argument; arity 1 would drop it' );
+	}
+
+	public function test_a_fired_application_password_hook_records_the_uuid(): void {
+		( new Aura_Worker() )->init();
+
+		do_action( 'application_password_did_authenticate', (object) array( 'ID' => 3 ), array( 'uuid' => 'uuid-from-wp', 'name' => 'Aura SiteAgent' ) );
+
+		$this->assertSame( 'uuid-from-wp', Aura_Worker_Security::authenticating_app_password_uuid() );
+	}
+
+	public function test_a_password_item_with_no_uuid_records_nothing(): void {
+		( new Aura_Worker() )->init();
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'stale' );
+
+		do_action( 'application_password_did_authenticate', (object) array( 'ID' => 3 ), 'not an item at all' );
+
+		$this->assertNull( Aura_Worker_Security::authenticating_app_password_uuid(), 'an unreadable item must clear, never keep, a stale uuid' );
+	}
+
+	/**
+	 * The whole chain, with nothing injected: WordPress fires the hook, the
+	 * plugin's own registration catches it, and the uuid lands in the marker
+	 * the unbind writes.
+	 */
+	public function test_a_uuid_captured_from_the_real_hook_reaches_the_marker(): void {
+		( new Aura_Worker() )->init();
+		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		$GLOBALS['_current_user_id'] = 5;
+
+		do_action( 'application_password_did_authenticate', (object) array( 'ID' => 5 ), array( 'uuid' => 'uuid-manual' ) );
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+
+		$this->assertSame( true, $res['unbound'] );
+		$m = Aura_Worker_Unbind::read();
+		$this->assertSame( array( 'uuid-manual' ), $m['app_password_uuids'] );
+		$this->assertSame( 5, $m['app_password_users']['uuid-manual'] );
+	}
+
+	/**
+	 * I3. The dangerous variant of the fail-closed case, which the
+	 * unbind-document test above cannot reach: the marker IS set, its read
+	 * fails, and an ORDINARY ruleset push arrives. Without step 0's fail-closed
+	 * branch the push sails through every remaining check — the marker is the
+	 * only thing that knows this site is unbound — and installs rules on a site
+	 * Aura has already disconnected.
+	 *
+	 * The read failure is scoped to the marker's own row: the ruleset store
+	 * must still be readable, or the request would fail closed for the wrong
+	 * reason and the test would prove nothing.
+	 */
+	public function test_an_unreadable_marker_refuses_an_ordinary_push_and_installs_nothing(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9 ) );
+		$env = sa_sign_ruleset( array( 'v' => 1, 'client' => 'c1', 'site' => sa_token_hash(), 'site_ref' => 'r1', 'seq' => 10, 'issued_at' => 'x', 'rules' => array( array( 'key' => 'rule/x', 'effect' => 'block', 'target' => 'site:*' ) ) ) );
+		$before = get_option( Aura_Worker_Rules::OPTION );
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$res = Aura_Worker_Rules::accept( $env );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
+		$this->assertSame( 500, $res->get_error_data()['status'] );
+		$this->assertNull( Aura_Worker_Rules::current(), 'no rules may be installed on an unbound site' );
+		$this->assertSame( $before, get_option( Aura_Worker_Rules::OPTION ) );
+		$this->assertSame( sa_token_hash(), Aura_Worker_Unbind::read()['site'], 'the marker is untouched' );
+	}
+
+	/**
+	 * M1. The append's own verification, isolated. write_under_claim()'s
+	 * read-back compares site + seq — fields an append does not change — so it
+	 * reports success whether or not the uuid landed. Only
+	 * append_authenticating_uuid()'s re-read of app_password_uuids can tell,
+	 * and this is the one seam that can prove it: the claimed write REPORTS
+	 * SUCCESS while the stored row keeps its old value.
+	 */
+	public function test_the_append_is_refused_when_the_write_lands_without_the_uuid(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9, 'app_password_uuids' => array( 'uuid-managed' ), 'app_password_users' => array( 'uuid-managed' => 3 ) ) );
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-second' );
+		$GLOBALS['_sa_option_write_divert'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_unbind_store_failed', $res->get_error_code() );
+		$this->assertSame( 500, $res->get_error_data()['status'] );
+		$this->assertSame( array( 'uuid-managed' ), Aura_Worker_Unbind::read()['app_password_uuids'], 'the uuid genuinely did not land' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'nothing proceeded to cleanup' );
+	}
 }

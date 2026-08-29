@@ -342,12 +342,6 @@ class Aura_Worker_Grant {
 	}
 
 	/**
-	 * URL-safe base64 decode (strict).
-	 *
-	 * @param string $s
-	 * @return string|false
-	 */
-	/**
 	 * The payload of a signed envelope WITHOUT verifying it.
 	 *
 	 * For the one caller that has no key to verify with: the unbind marker's
@@ -374,6 +368,12 @@ class Aura_Worker_Grant {
 		return is_array( $doc ) ? $doc : array();
 	}
 
+	/**
+	 * URL-safe base64 decode (strict).
+	 *
+	 * @param string $s
+	 * @return string|false
+	 */
 	private static function b64url_decode( $s ) {
 		$s   = strtr( (string) $s, '-_', '+/' );
 		$pad = strlen( $s ) % 4;

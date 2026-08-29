@@ -695,6 +695,20 @@ class Aura_Worker_Rules {
 			// Claim-fenced and verified by read-back; a failed write is a
 			// retryable 500 with nothing else touched — never a silent unbind
 			// that no boundary can see.
+			//
+			// DELIBERATELY WEAKER than append_authenticating_uuid()'s check,
+			// and only safe HERE. write_under_claim()'s read-back proves "the
+			// row now names my site at my seq" — it says nothing about the
+			// UUIDs. That is sufficient at THIS call site and nowhere else,
+			// because step 0 already established the marker is ABSENT: there
+			// is no prior row whose site+seq could match while this write's
+			// other fields were lost, so a write that did not land reads back
+			// as no row at all and the read-back fails. Tasks 4/8: any write
+			// to a marker that may ALREADY EXIST — an append, a re-mark, a
+			// Phase-B rewrite — must verify the field it changed, the way
+			// append_authenticating_uuid() re-reads and checks the UUID
+			// (rules.php, `append_authenticating_uuid()`). Do not copy the
+			// bare form below into that context.
 			if ( ! Aura_Worker_Unbind::write_under_claim( $marker, $fence ) ) {
 				return self::unbind_store_failed();
 			}

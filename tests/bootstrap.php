@@ -888,8 +888,21 @@ if ( ! function_exists( 'do_action' ) ) {
 			}
 		);
 		foreach ( $hooks as $hook ) {
-			( $hook['callback'] )( ...$args );
+			// WordPress passes each listener only as many arguments as its
+			// registration declared. A bare callable pushed straight onto
+			// $GLOBALS['_filters'] declared nothing, so it keeps them all.
+			$pass = isset( $hook['accepted_args'] ) ? array_slice( $args, 0, (int) $hook['accepted_args'] ) : $args;
+			( $hook['callback'] )( ...$pass );
 		}
+	}
+}
+
+if ( ! function_exists( 'is_admin' ) ) {
+	// Aura_Worker::init() branches on this to register the settings screen and
+	// the admin-ajax handlers. Defaults to false — a REST request, which is
+	// what every test here models.
+	function is_admin(): bool {
+		return (bool) ( $GLOBALS['_is_admin'] ?? false );
 	}
 }
 
@@ -923,9 +936,15 @@ if ( ! function_exists( 'add_filter' ) ) {
 		// priority 5) must run lowest-priority-first regardless of which
 		// add_filter() call happened to run last.
 		$GLOBALS['_filters'][ $tag ][] = array(
-			'priority' => $priority,
-			'seq'      => count( $GLOBALS['_filters'][ $tag ] ?? array() ),
-			'callback' => $callback,
+			'priority'      => $priority,
+			'seq'           => count( $GLOBALS['_filters'][ $tag ] ?? array() ),
+			'callback'      => $callback,
+			// Recorded so do_action() can slice the arguments the way WordPress
+			// does, and so a test can assert the arity a registration declared:
+			// add_action( $tag, $cb, 10, 1 ) on a two-argument hook silently
+			// drops the second argument in production, and a stub that always
+			// passed both would hide exactly that bug.
+			'accepted_args' => $accepted_args,
 		);
 		return true;
 	}
@@ -1511,6 +1530,20 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
 				}
+				// A claimed write that REPORTS SUCCESS while the stored value
+				// diverges from what the caller asked for — a silently lost or
+				// rewritten write (a replication lag, a filter, a trigger),
+				// which _sa_option_write_fail cannot model because it fails the
+				// statement outright. `true` keeps the row exactly as it was;
+				// a CALLABLE receives the raw value the caller tried to write
+				// and returns the raw value that actually lands. Either way the
+				// statement answers 1, so only a caller that VERIFIES by
+				// re-reading the field it changed can tell.
+				if ( ! empty( $GLOBALS['_sa_option_write_divert'][ $name ] ) ) {
+					$divert = $GLOBALS['_sa_option_write_divert'][ $name ];
+					$kept   = sa_read_option_uncached( $name );
+					$value  = is_callable( $divert ) ? (string) $divert( $value ) : (string) $kept;
+				}
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
 				$GLOBALS['_option_writes'][]  = array( 'set', $name );
@@ -1535,6 +1568,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null !== sa_read_option_uncached( $name ) ) {
 					return 0;
+				}
+				if ( ! empty( $GLOBALS['_sa_option_write_divert'][ $name ] ) ) {
+					// Same seam as the UPDATE above; on an INSERT there is no
+					// prior value, so `true` means "store the empty row" and a
+					// callable decides. See the comment there.
+					$divert = $GLOBALS['_sa_option_write_divert'][ $name ];
+					$value  = is_callable( $divert ) ? (string) $divert( $value ) : '';
 				}
 				$GLOBALS['_rows'][ $name ]          = $value;
 				$GLOBALS['_options'][ $name ]       = maybe_unserialize( $value );
@@ -1693,6 +1733,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
+	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
@@ -2233,6 +2274,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
+	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
@@ -2260,6 +2302,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_ability_categories'] = array();
 	$GLOBALS['_scheduled']    = array();
 	$GLOBALS['_sa_state']     = array();
+	$GLOBALS['_is_admin']       = false; // is_admin() — see the stub above.
 	$GLOBALS['_is_multisite']   = false;
 	$GLOBALS['_site_options']   = array();
 	$GLOBALS['_user_meta']      = array();
