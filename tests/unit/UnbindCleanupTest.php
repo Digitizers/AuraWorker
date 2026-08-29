@@ -79,6 +79,18 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
 		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
 		$this->assertNotContains( 'token', $GLOBALS['_unbind_trace'], 'a `final` call still stops short of the token' );
+		// Round-1 I1: ONLY step (5) is gated. Steps (1)-(4) are best-effort and
+		// all attempted — a credential the host will never let go of must not
+		// pin the departed client's ruleset, dashboard url and gateway key on
+		// the site forever, which is what an abort here would do (maybe_finish()
+		// would re-enter the same abort every 300 s).
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant' ), $GLOBALS['_unbind_trace'] );
+		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ), 'the rest of step (1) ran' );
+		$this->assertFalse( get_option( 'aura_worker_dashboard_url' ), 'step (2) ran anyway' );
+		$this->assertFalse( get_option( 'aura_worker_connect_user_id' ), 'step (2) ran anyway' );
+		$this->assertNull( Aura_Worker_Rules::stored_uncached(), 'step (3) ran anyway' );
+		$this->assertFalse( get_option( 'aura_worker_grant_pubkey' ), 'step (4) ran anyway' );
+		$this->assertSame( array( 'app_passwords' ), Aura_Worker_Unbind::leftovers(), 'and nothing else is owed' );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
@@ -207,6 +219,72 @@ final class UnbindCleanupTest extends TestCase {
 		$fence = Aura_Worker_Magic_Link::claim_site();
 		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
 		$this->assertFalse( sa_app_password_exists( 3, 'uuid-manual' ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * Round-1 C1. `??` falls through on null, never on an integer 0 — and 0 is
+	 * exactly what the marker records for a managed row whose `user_id` half
+	 * never landed. Such a uuid must be reported, never skipped: reported as
+	 * clean, the gate would open and step (5) would delete the token while a
+	 * live administrator Application Password remained, with no token left for
+	 * any retry to be matched to the marker.
+	 */
+	public function test_a_uuid_whose_owner_cannot_be_resolved_is_never_reported_clean(): void {
+		sa_set_marker(
+			array(
+				'site'               => sa_token_hash(),
+				'connect_user_id'    => 0,                                   // and no fallback either
+				'app_password_uuids' => array( 'uuid-managed' ),
+				'app_password_users' => array( 'uuid-managed' => 0 ),        // the half-written record's shape
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
+
+		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
+		$this->assertTrue( sa_app_password_exists( 3, 'uuid-managed' ), 'the credential is still live — which is the point' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token must survive' );
+		$this->assertNotContains( 'token', $GLOBALS['_unbind_trace'] );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * The other half of the same resolution: owner 0 FALLS THROUGH to
+	 * connect_user_id (it must not short-circuit to "unresolvable" either), so
+	 * a marker that still knows who connected revokes normally and completes.
+	 */
+	public function test_owner_zero_falls_through_to_the_connect_user(): void {
+		sa_set_marker(
+			array(
+				'site'               => sa_token_hash(),
+				'connect_user_id'    => 3,
+				'app_password_uuids' => array( 'uuid-managed' ),
+				'app_password_users' => array( 'uuid-managed' => 0 ),
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
+		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * Round-1 M3. A ruleset row that no longer parses as a record is still a
+	 * row: stored_uncached() maps it to null, so accounting on that would
+	 * report step (3) complete while the row survived the teardown.
+	 */
+	public function test_a_malformed_ruleset_row_is_still_a_leftover_and_is_cleared(): void {
+		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ] = 'not-a-record';
+		unset( $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] );
+		$this->assertNull( Aura_Worker_Rules::stored_uncached(), 'the row does not parse — the premise of the bug' );
+
+		$this->assertContains( 'ruleset', Aura_Worker_Unbind::leftovers() );
+
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
+		$this->assertNull( Aura_Worker_Rules::read_option_uncached( Aura_Worker_Rules::OPTION ), 'the row itself is gone' );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 

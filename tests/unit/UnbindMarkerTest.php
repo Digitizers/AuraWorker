@@ -63,6 +63,33 @@ final class UnbindMarkerTest extends TestCase {
 		$this->assertNull( Aura_Worker_Unbind::read() );
 	}
 
+	/**
+	 * Round-1 M1. The two tests above pass with write_under_claim()'s own
+	 * guard removed — write_option_if_claimed()'s SQL predicate refuses a
+	 * foreign fence too, so the RETURN VALUE cannot tell the two apart. What
+	 * the guard uniquely buys is that no statement is issued at all, so that
+	 * is what is asserted: it is the one claim guard in this file no test
+	 * would otherwise notice disappearing, while cleanup()'s equivalent is
+	 * pinned.
+	 */
+	public function test_write_under_a_foreign_fence_issues_no_statement_at_all(): void {
+		Aura_Worker_Magic_Link::claim_site();                      // someone else holds the site
+		$GLOBALS['_db_queries'] = array();
+
+		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( $this->marker(), 'not-the-fence' ) );
+
+		$writes = array_values(
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static function ( $q ) {
+					return 0 === strncmp( (string) $q, 'UPDATE', 6 ) || 0 === strncmp( (string) $q, 'INSERT', 6 );
+				}
+			)
+		);
+		$this->assertSame( array(), $writes, 'the guard refuses before any write statement is issued' );
+		$this->assertNull( Aura_Worker_Unbind::read() );
+	}
+
 	public function test_delete_under_claim_only(): void {
 		$fence = Aura_Worker_Magic_Link::claim_site();
 		Aura_Worker_Unbind::write_under_claim( $this->marker(), $fence );

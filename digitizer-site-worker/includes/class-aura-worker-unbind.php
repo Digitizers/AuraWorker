@@ -186,6 +186,32 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
+	 * The user a marker's Application Password belongs to, or 0 when the
+	 * marker cannot say. ONE resolution for the revoke loop and for the
+	 * accounting that gates the token delete — they must never disagree about
+	 * whether a credential is identifiable (round-1 C1).
+	 *
+	 * `??` does NOT fall through an integer 0, and 0 is exactly what the
+	 * marker records for a managed row whose `user_id` half never landed
+	 * (`class-aura-worker-rules.php`, the `(int) ( $managed['user_id'] ?? 0 )`
+	 * copy; the half-written record `Aura_Worker_Magic_Link::
+	 * tracking_is_incomplete()` exists to detect). So each source is tested
+	 * for a POSITIVE id in turn, and "the marker names owner 0" falls through
+	 * to `connect_user_id` like a missing key does.
+	 *
+	 * @param array  $m    The marker.
+	 * @param string $uuid The password's uuid.
+	 * @return int The owner's user id, or 0 when it cannot be resolved.
+	 */
+	private static function password_owner( array $m, string $uuid ): int {
+		$user = isset( $m['app_password_users'][ $uuid ] ) ? (int) $m['app_password_users'][ $uuid ] : 0;
+		if ( $user <= 0 ) {
+			$user = isset( $m['connect_user_id'] ) ? (int) $m['connect_user_id'] : 0;
+		}
+		return $user > 0 ? $user : 0;
+	}
+
+	/**
 	 * Is that option's row gone from the database? ONE "is it removed" read for
 	 * every step of Phase B, and it FAILS CLOSED: read_option_uncached()
 	 * answers null for an absent row and a WP_Error for a read that could not
@@ -223,8 +249,15 @@ final class Aura_Worker_Unbind {
 		}
 		$left = array();
 		foreach ( $m['app_password_uuids'] as $uuid ) {
-			$user = (int) ( $m['app_password_users'][ $uuid ] ?? $m['connect_user_id'] ?? 0 );
-			if ( $user > 0 && ! Aura_Worker_Magic_Link::password_gone( $user, (string) $uuid ) ) {
+			$uuid = (string) $uuid;
+			$user = self::password_owner( $m, $uuid );
+			// An UNRESOLVABLE owner is not evidence of absence (round-1 C1).
+			// "I cannot identify whose password this is" is the same kind of
+			// answer as the unreadable marker above — unknown, not clean — and
+			// reporting it as clean would let step (5) delete the token while a
+			// live administrator credential remains, with no token left for any
+			// retry to be matched against.
+			if ( 0 === $user || ! Aura_Worker_Magic_Link::password_gone( $user, $uuid ) ) {
 				$left[] = 'app_passwords';
 				break;
 			}
@@ -232,11 +265,13 @@ final class Aura_Worker_Unbind {
 		if ( ! self::option_absent( 'aura_worker_dashboard_url' ) || ! self::option_absent( 'aura_worker_connect_user_id' ) ) {
 			$left[] = 'options';
 		}
-		// The ROW, not Aura_Worker_Rules::current(): current() maps the
-		// connect's seq-0 sentinel to null, so a store that still binds this
-		// site to its departed client would read as already cleared. A
-		// WP_Error is non-null and therefore still owed — fail closed.
-		if ( null !== Aura_Worker_Rules::stored_uncached() ) {
+		// The ROW, not Aura_Worker_Rules::current() and not stored_uncached():
+		// current() maps the connect's seq-0 sentinel to null and BOTH map a
+		// present-but-malformed row to null, so a store that still holds
+		// something would read as already cleared (round-1 M3). option_absent()
+		// asks the only question step (3) is actually about — is the row gone —
+		// and fails closed on a read error.
+		if ( ! self::option_absent( Aura_Worker_Rules::OPTION ) ) {
 			$left[] = 'ruleset';
 		}
 		if ( ! self::option_absent( 'aura_worker_grant_pubkey' ) ) {
@@ -272,6 +307,14 @@ final class Aura_Worker_Unbind {
 	 * remove is left", which for a `final` call includes an uncached read
 	 * proving the token row is gone.
 	 *
+	 * @internal The `aura_worker_unbind_step` action fired below is an INTERNAL
+	 *           test seam that reports which step was ENTERED (not that it
+	 *           succeeded). It is not a supported extension point: this is an
+	 *           irreversible path running under the site claim, and a listener
+	 *           that throws aborts the teardown. Nothing outside this plugin's
+	 *           own test suite may hook it, and its name, arguments and firing
+	 *           points may change without notice.
+	 *
 	 * @param bool   $final Whether this request may delete the site token.
 	 * @param string $fence The caller's site-claim fence.
 	 * @return bool True once every step this call was allowed to take is
@@ -297,8 +340,16 @@ final class Aura_Worker_Unbind {
 		if ( class_exists( 'WP_Application_Passwords' ) ) {
 			foreach ( $m['app_password_uuids'] as $uuid ) {
 				$uuid = (string) $uuid;
-				$user = (int) ( $m['app_password_users'][ $uuid ] ?? $m['connect_user_id'] ?? 0 );
-				if ( $user > 0 && ! Aura_Worker_Magic_Link::password_gone( $user, $uuid ) ) {
+				$user = self::password_owner( $m, $uuid );
+				if ( 0 === $user ) {
+					// Nothing can be deleted without an owner — but this is not
+					// a silent skip: leftovers() names 'app_passwords' for the
+					// same entry, so the gate below refuses step (5) and the
+					// site keeps its token, its marker and therefore its ability
+					// to be retried and repaired (round-1 C1).
+					continue;
+				}
+				if ( ! Aura_Worker_Magic_Link::password_gone( $user, $uuid ) ) {
 					// The return value is not the proof (it is false for a
 					// failed user-meta write as well as for "not there");
 					// leftovers() re-reads the owner's list below.
@@ -313,8 +364,11 @@ final class Aura_Worker_Unbind {
 		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_connect_user_id', $claim, $fence );
 
 		// (3) The ruleset store — the departed client's block and warn policy.
+		// Conditioned on the ROW, the same question leftovers() asks: a row
+		// that no longer parses as a record is still a row, and step (3) is
+		// what removes it (round-1 M3).
 		do_action( 'aura_worker_unbind_step', 'ruleset' );
-		if ( null !== Aura_Worker_Rules::stored_uncached() ) {
+		if ( ! self::option_absent( Aura_Worker_Rules::OPTION ) ) {
 			Aura_Worker_Magic_Link::clear_ruleset_verified( $claim, $fence );
 		}
 

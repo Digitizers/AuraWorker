@@ -311,6 +311,36 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'the retry finished the teardown the first attempt started' );
 	}
 
+	/**
+	 * Round-1 C1, end to end through a real accept(): a managed record whose
+	 * `user_id` half never landed. rules.php copies it into the marker as
+	 * `(int) ( $managed['user_id'] ?? 0 )` — owner 0 — and with no
+	 * `aura_worker_connect_user_id` to fall back to, Phase B cannot identify
+	 * whose credential it is. It must therefore refuse to finish: the token
+	 * survives, `cleanup_complete` is false, and the leftover is named, which
+	 * is the `aura_unbind_incomplete` signal Task 7's rebind consults before it
+	 * removes the marker (and with it the core-REST seam that is the only thing
+	 * still refusing that password).
+	 */
+	public function test_a_marker_uuid_with_no_resolvable_owner_blocks_the_teardown(): void {
+		$token_hash = sa_token_hash();
+		Aura_Worker_Rules::bind( 'c1', $token_hash );
+		// The half-written record tracking_is_incomplete() exists to detect:
+		// a uuid with no usable user_id, and no connect user to fall back to.
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
+		sa_add_app_password( 3, 'uuid-managed' );
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );          // final: true
+
+		$this->assertSame( true, $res['unbound'] );
+		$this->assertFalse( $res['cleanup_complete'], 'an unidentifiable credential is not a finished teardown' );
+		$this->assertSame( 0, Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'], 'owner 0 really is what was recorded' );
+		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
+		$this->assertTrue( sa_app_password_exists( 3, 'uuid-managed' ), 'the administrator credential is still live' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays and the retry path stays open' );
+		$this->assertNotContains( 'token', $GLOBALS['_unbind_trace'] );
+	}
+
 	public function test_receive_rules_still_412s_a_marker_less_unkeyed_site(): void {
 		delete_option( 'aura_worker_grant_pubkey' );
 		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
