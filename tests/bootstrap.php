@@ -627,6 +627,69 @@ function sa_read_option_uncached( string $name ) {
 }
 
 /**
+ * Base64url-encode, no padding — the envelope-segment encoding every signed
+ * document (grant, ruleset) uses.
+ *
+ * @param string $s Raw bytes.
+ * @return string
+ */
+function sa_b64url( string $s ): string {
+	return rtrim( strtr( base64_encode( $s ), '+/', '-_' ), '=' );
+}
+
+/**
+ * Install a fresh Ed25519 gateway keypair the way a real connect would:
+ * the public half into `aura_worker_grant_pubkey` (what the site verifies
+ * signed documents against), the secret half stashed as sa_sign_ruleset()'s
+ * default so a test doesn't have to thread it through every call. Callers
+ * that need a second, untrusted key (e.g. "signed by someone else") still
+ * get one back to pass explicitly.
+ *
+ * Requires ext-sodium; callers check function_exists('sodium_crypto_sign_keypair')
+ * and skip themselves the way RulesetStoreTest does — this helper does not
+ * skip on their behalf.
+ *
+ * @return string The raw secret key.
+ */
+function sa_install_gateway_key(): string {
+	$keypair = sodium_crypto_sign_keypair();
+	$secret  = sodium_crypto_sign_secretkey( $keypair );
+	$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( sodium_crypto_sign_publickey( $keypair ) );
+	$GLOBALS['_sa_gateway_secret'] = $secret;
+	return $secret;
+}
+
+/**
+ * Sign an arbitrary payload the way Aura signs a ruleset (or grant)
+ * envelope: JSON, detached Ed25519 signature, both segments base64url,
+ * joined with a dot. Defaults to the secret sa_install_gateway_key() last
+ * installed.
+ *
+ * @param array       $payload Document to sign.
+ * @param string|null $secret  Secret key, or null to use the installed one.
+ * @return string
+ */
+function sa_sign_ruleset( array $payload, ?string $secret = null ): string {
+	$json = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+	$sig  = sodium_crypto_sign_detached( $json, $secret ?? ( $GLOBALS['_sa_gateway_secret'] ?? '' ) );
+	return sa_b64url( $json ) . '.' . sa_b64url( $sig );
+}
+
+/**
+ * This site's own token hash — the value a ruleset's `site` field must
+ * match. Installs a fixed raw token's hash under `aura_worker_site_token`
+ * the first time it's asked for, so repeated calls in one test agree.
+ *
+ * @return string
+ */
+function sa_token_hash(): string {
+	if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
+		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'raw-site-token' );
+	}
+	return (string) $GLOBALS['_options']['aura_worker_site_token'];
+}
+
+/**
  * The seam that runs between a caller's read and its compare-and-swap — the
  * window in which a concurrent connect writes its binding. A test sets
  * $GLOBALS['_sa_before_swap'] to a callable (which clears itself, so it fires
@@ -1548,6 +1611,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_rows_autoload']    = array(); // Per-option autoload flag for rows this stub actually tracks (add_option/update_option and the claim-fenced INSERT branch).
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_sa_gateway_secret'] = null; // sa_install_gateway_key()'s default signing key for sa_sign_ruleset().
 	$GLOBALS['_cas_always_lose']  = false;
 	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
@@ -2078,6 +2142,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_rows_autoload']    = array(); // Per-option autoload flag — see the top-level init above.
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;
+	$GLOBALS['_sa_gateway_secret'] = null; // sa_install_gateway_key()'s default signing key for sa_sign_ruleset().
 	$GLOBALS['_cas_always_lose']  = false;
 	$GLOBALS['_db_query_error']   = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().

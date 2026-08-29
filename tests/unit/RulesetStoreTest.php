@@ -18,20 +18,12 @@ final class RulesetStoreTest extends TestCase {
 		if ( ! function_exists( 'sodium_crypto_sign_keypair' ) ) {
 			$this->markTestSkipped( 'ext-sodium is not available.' );
 		}
-		$kp           = sodium_crypto_sign_keypair();
-		$this->secret = sodium_crypto_sign_secretkey( $kp );
-		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( sodium_crypto_sign_publickey( $kp ) );
-	}
-
-	private function b64url( string $s ): string {
-		return rtrim( strtr( base64_encode( $s ), '+/', '-_' ), '=' );
+		$this->secret = sa_install_gateway_key();
 	}
 
 	/** Sign an arbitrary array the way Aura signs a ruleset. */
 	private function sign( array $payload, ?string $secret = null ): string {
-		$json = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
-		$sig  = sodium_crypto_sign_detached( $json, $secret ?? $this->secret );
-		return $this->b64url( $json ) . '.' . $this->b64url( $sig );
+		return sa_sign_ruleset( $payload, $secret ?? $this->secret );
 	}
 
 	public function test_a_validly_signed_document_decodes(): void {
@@ -78,10 +70,7 @@ final class RulesetStoreTest extends TestCase {
 
 	/** This site's token hash — the ruleset is bound to it exactly as grants are. */
 	private function site(): string {
-		if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
-			$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'raw-site-token' );
-		}
-		return (string) $GLOBALS['_options']['aura_worker_site_token'];
+		return sa_token_hash();
 	}
 
 	private function ruleset( int $seq, array $rules = array(), ?string $secret = null, ?string $client = null, ?string $site = null, ?string $site_ref = null ): string {
