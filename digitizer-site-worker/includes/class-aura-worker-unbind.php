@@ -22,6 +22,9 @@ final class Aura_Worker_Unbind {
 	/** Minimum seconds between Phase-B attempts (Task 4). */
 	const FINISH_THROTTLE = 300;
 
+	/** The error code read() answers with for a marker row that exists but cannot be trusted. */
+	const MALFORMED_CODE = 'aura_unbind_marker_malformed';
+
 	/**
 	 * Wire the init-hooked Phase B sweep: a site whose unbind was interrupted
 	 * (the network died between Aura's tombstone and the site's answer, the
@@ -75,6 +78,33 @@ final class Aura_Worker_Unbind {
 			// absent: nobody ever wrote a marker here.
 			return null;
 		}
+		return self::validated( $m );
+	}
+
+	/**
+	 * The marker row as a raw array — whatever it holds — or null when the row
+	 * is absent, unreadable or not an array. Used by read() and by
+	 * status_fragment(), which must still report what it CAN read out of a
+	 * marker read() has rejected (round-3 I4).
+	 *
+	 * @return array|null
+	 */
+	private static function marker_array(): ?array {
+		$raw = Aura_Worker_Rules::read_option_uncached( self::OPTION );
+		if ( is_wp_error( $raw ) ) {
+			return null;
+		}
+		$m = is_string( $raw ) ? maybe_unserialize( $raw ) : $raw;
+		return is_array( $m ) ? $m : null;
+	}
+
+	/**
+	 * Validate and normalise a marker array.
+	 *
+	 * @param array $m The raw marker.
+	 * @return array|WP_Error
+	 */
+	private static function validated( array $m ) {
 		if ( ! self::field_is( $m, 'at', 'string' )
 			|| ! self::field_is( $m, 'site', 'string' )
 			|| ! self::field_is( $m, 'site_ref', 'string' )
@@ -85,17 +115,29 @@ final class Aura_Worker_Unbind {
 		$m['app_password_uuids'] = isset( $m['app_password_uuids'] ) && is_array( $m['app_password_uuids'] )
 			? array_values( array_map( 'strval', $m['app_password_uuids'] ) )
 			: array();
-		$m['app_password_users'] = isset( $m['app_password_users'] ) && is_array( $m['app_password_users'] )
-			? $m['app_password_users']
-			: array();
+		// Owners are normalised to a POSITIVE int or an explicit null meaning
+		// "this site does not know whose password this is" (round-3). Anything
+		// else — 0, '', a string, an object, a marker written by an earlier
+		// build — is that same unknown, never a user id: Phase B's single
+		// lookup is authoritative ONLY against an owner the site actually
+		// recorded, so a value that names nobody must not be passed off as one.
+		$users = isset( $m['app_password_users'] ) && is_array( $m['app_password_users'] ) ? $m['app_password_users'] : array();
+		$m['app_password_users'] = array();
+		foreach ( $users as $uuid => $owner ) {
+			$owner                                       = is_int( $owner ) || ( is_string( $owner ) && ctype_digit( $owner ) ) ? (int) $owner : 0;
+			$m['app_password_users'][ (string) $uuid ] = $owner > 0 ? $owner : null;
+		}
 		return $m;
 	}
 
 	/**
-	 * Is that marker field present AND of the type the marker writes? Presence
-	 * is `array_key_exists()`, never `isset()`: a field that is present and
-	 * null is a CORRUPTED marker, not a missing one, and the two must not be
-	 * collapsed (round-2 I3).
+	 * Is that marker field present AND of the type the marker writes? The TYPE
+	 * check is what closes round-2 I3: a field that is present and null is a
+	 * CORRUPTED marker, not a missing one, and both answer false here so the
+	 * caller can tell them apart from "no marker at all". `array_key_exists()`
+	 * rather than `isset()` says the presence question literally — either
+	 * avoids the undefined-key warning, and with the type check in place the
+	 * two cannot differ in outcome (re-review round 2).
 	 *
 	 * @param array  $m    The candidate marker.
 	 * @param string $key  Field name.
@@ -160,23 +202,45 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
-	 * The two fields `/status` reports — never the whole marker, which carries
-	 * the app-password UUIDs and the connecting user. `/status` is a witness,
-	 * not a gate: a WP_Error from read() (a DB failure, not "no marker") is
-	 * reported the same as "no marker" here — status must not claim certainty
-	 * it does not have.
+	 * The fields `/status` reports — never the whole marker, which carries the
+	 * app-password UUIDs and the connecting user. `/status` is a witness, not
+	 * a gate: a DB read failure (not "no marker") is reported the same as "no
+	 * marker" here — status must not claim certainty it does not have.
 	 *
-	 * @return array{at:string,site_ref:string}|null
+	 * A MALFORMED marker is the one unknown that must still be reported
+	 * (round-3 I4). Aura's PATCH and manual-connect preflight keys on the
+	 * PRESENCE of `unbound`, so a site that refuses every local boundary while
+	 * `/status` says nothing lets Aura write a binding to a site that will
+	 * refuse everything. The row exists, therefore the site is unbound, and
+	 * the witness says so — reporting only the fields it can actually read and
+	 * omitting the rest. That keeps "never claim certainty about the VALUES"
+	 * while no longer denying the STATE. An empty object is a correct answer.
+	 *
+	 * @return array{at?:string,site_ref?:string}|null Null only when there is
+	 *                                                 no marker, or the read
+	 *                                                 itself failed.
 	 */
 	public static function status_fragment(): ?array {
 		$m = self::read();
-		if ( ! is_array( $m ) ) {
-			return null;
+		if ( is_array( $m ) ) {
+			return array(
+				'at'       => (string) $m['at'],
+				'site_ref' => (string) $m['site_ref'],
+			);
 		}
-		return array(
-			'at'       => (string) $m['at'],
-			'site_ref' => (string) $m['site_ref'],
-		);
+		if ( ! is_wp_error( $m ) || self::MALFORMED_CODE !== $m->get_error_code() ) {
+			return null; // absent, or a read this request could not complete
+		}
+		$raw  = self::marker_array();
+		$part = array();
+		if ( null !== $raw ) {
+			foreach ( array( 'at', 'site_ref' ) as $field ) {
+				if ( self::field_is( $raw, $field, 'string' ) ) {
+					$part[ $field ] = (string) $raw[ $field ];
+				}
+			}
+		}
+		return $part;
 	}
 
 	/**
@@ -246,118 +310,37 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
-	 * How many administrators the owner search enumerates before it declines
-	 * to conclude anything. Bounded on purpose: the search can run under
-	 * `init` on an unbound site, and an unbounded user enumeration is not
-	 * something a page load may pay. A site with more administrators than this
-	 * answers "inconclusive", which names the leftover and refuses the token
-	 * delete — the safe direction.
-	 */
-	const OWNER_SEARCH_LIMIT = 200;
-
-	/**
-	 * WHO currently holds that Application Password, and whether the search
-	 * for it was conclusive (round-2 C2).
+	 * The user this marker RECORDED as the owner of that Application Password,
+	 * or null when the site does not know (round-3).
 	 *
-	 * `Aura_Worker_Magic_Link::password_gone( $guess, $uuid )` answers true
-	 * whenever the uuid is not in the GUESSED user's list — which is exactly
-	 * what happens when the guess is wrong. Reading that as "the password is
-	 * gone" deleted the site token beside a live administrator credential
-	 * belonging to a DIFFERENT admin. So absence is never inferred from a
-	 * guess: the uuid is SEARCHED for, and only "found in nobody's list, over
-	 * a search that could see everybody it needed to" is evidence of absence.
+	 * Phase B does not search for an owner and does not guess one. An
+	 * Application Password lives in exactly one user's meta, so an owner the
+	 * marker recorded is decisive: the password is either in that user's list
+	 * (revoke it there) or it is gone. Three rounds of review found the same
+	 * failure each time — a skipped entry, a lookup against a guessed owner,
+	 * and a closing set enumerated by ROLE while the mint authorises by
+	 * CAPABILITY — all of them attempts to prove a NEGATIVE ("nobody holds
+	 * this") from evidence that cannot carry it. Aura cannot prove a negative
+	 * about a user it never recorded, so it no longer tries: the resolution
+	 * happens at WRITE time, in Phase A, where the request knows who
+	 * authenticated and what the managed record says, and an owner that could
+	 * not be resolved there is stored as an explicit null.
 	 *
-	 * Candidates, in order:
-	 *   1. the owner the marker recorded for this uuid, when positive — the
-	 *      authoritative one (an Application Password lives in exactly one
-	 *      user's meta, and that is where this one was seen), so the ordinary
-	 *      path is ONE lookup;
-	 *   2. `connect_user_id` — a guess, and useful only for what it FINDS;
-	 *   3. the site's administrators — a managed credential can belong only to
-	 *      one of them (mint_app_password() refuses a non-administrator), and
-	 *      this is the set that closes the search.
-	 *
-	 * Conclusive when the recorded owner was positive (candidate 1 is
-	 * authoritative for that uuid), or when the administrators could be
-	 * enumerated completely. Otherwise "not found" is unknown, and the caller
-	 * must treat it as still owed.
-	 *
-	 * `??` is deliberately not used to read either id: it does NOT fall
-	 * through an integer 0, and 0 is exactly what the marker records for a
-	 * managed row whose `user_id` half never landed — the half-written record
-	 * Aura_Worker_Magic_Link::tracking_is_incomplete() exists to detect
-	 * (round-1 C1). Each source is tested for a POSITIVE id instead.
+	 * An unknown owner therefore blocks the teardown for good — leftovers()
+	 * names `app_passwords`, `cleanup_complete` stays false, and step (5)
+	 * never runs — until the operator clears it (Task 9's removal panel).
+	 * That is the whole point: a false "clean" here deletes the site token
+	 * while a live `manage_options` REST credential remains, with no token
+	 * left for any retry and nothing for Task 7's rebind to refuse on.
 	 *
 	 * @param array  $m    The marker.
 	 * @param string $uuid The password's uuid.
-	 * @return array{holder:int,conclusive:bool} The user who holds it (0 when
-	 *                                           nobody reachable does), and
-	 *                                           whether that is evidence.
+	 * @return int|null The recorded owner, or null when unknown.
 	 */
-	private static function password_search( array $m, string $uuid ): array {
-		$recorded  = isset( $m['app_password_users'][ $uuid ] ) ? (int) $m['app_password_users'][ $uuid ] : 0;
-		$connector = isset( $m['connect_user_id'] ) ? (int) $m['connect_user_id'] : 0;
-
-		$candidates = array();
-		if ( $recorded > 0 ) {
-			$candidates[] = $recorded;
-		}
-		if ( $connector > 0 ) {
-			$candidates[] = $connector;
-		}
-		$admins = self::administrators();
-		foreach ( (array) $admins as $admin ) {
-			if ( (int) $admin > 0 ) {
-				$candidates[] = (int) $admin;
-			}
-		}
-		foreach ( array_unique( $candidates ) as $user ) {
-			if ( ! Aura_Worker_Magic_Link::password_gone( $user, $uuid ) ) {
-				// Found. How far the search could have reached no longer matters.
-				return array(
-					'holder'     => (int) $user,
-					'conclusive' => true,
-				);
-			}
-		}
-		return array(
-			'holder'     => 0,
-			'conclusive' => $recorded > 0 || null !== $admins,
-		);
-	}
-
-	/**
-	 * The site's administrators, or NULL when they could not be enumerated —
-	 * which is a different answer from "these are they" and must not be
-	 * flattened into a list, or "there was nobody to ask" would read as
-	 * "nobody has it".
-	 *
-	 * NULL for three cases, all of them "the search cannot close here":
-	 * no `get_users()` at all; a result that is not a list; and an EMPTY
-	 * result — a WordPress site always has at least one administrator, so an
-	 * empty answer means the enumeration did not work, never that the set is
-	 * genuinely empty. Bounded by OWNER_SEARCH_LIMIT: one row over the limit
-	 * also comes back as "could not enumerate".
-	 *
-	 * @return int[]|null
-	 */
-	private static function administrators(): ?array {
-		if ( ! function_exists( 'get_users' ) ) {
-			return null;
-		}
-		$ids = get_users(
-			array(
-				'role'    => 'administrator',
-				'number'  => self::OWNER_SEARCH_LIMIT + 1,
-				'orderby' => 'ID',
-				'order'   => 'ASC',
-				'fields'  => 'ID',
-			)
-		);
-		if ( ! is_array( $ids ) || array() === $ids || count( $ids ) > self::OWNER_SEARCH_LIMIT ) {
-			return null;
-		}
-		return array_map( 'intval', $ids );
+	private static function password_owner( array $m, string $uuid ): ?int {
+		// read() has already normalised every entry to a positive int or null;
+		// a uuid with no entry at all is the same unknown.
+		return isset( $m['app_password_users'][ $uuid ] ) ? (int) $m['app_password_users'][ $uuid ] : null;
 	}
 
 	/**
@@ -398,15 +381,13 @@ final class Aura_Worker_Unbind {
 		}
 		$left = array();
 		foreach ( $m['app_password_uuids'] as $uuid ) {
-			$found = self::password_search( $m, (string) $uuid );
-			// Still owed when somebody holds it (round-1 C1) AND when the
-			// search could not prove nobody does (round-2 C2). "I could not
-			// look everywhere" is the same kind of answer as the unreadable
-			// marker above — unknown, not clean — and reporting it as clean
-			// would let step (5) delete the token while a live administrator
-			// credential remains, with no token left for any retry to be
-			// matched against.
-			if ( 0 !== $found['holder'] || ! $found['conclusive'] ) {
+			$uuid  = (string) $uuid;
+			$owner = self::password_owner( $m, $uuid );
+			// Owed when the owner is unknown — no proof is attempted, and an
+			// unknown is never reported clean (rounds 1-3) — and owed when the
+			// recorded owner still holds it. Only "the owner this site
+			// recorded no longer has it" is evidence of absence.
+			if ( null === $owner || ! Aura_Worker_Magic_Link::password_gone( $owner, $uuid ) ) {
 				$left[] = 'app_passwords';
 				break;
 			}
@@ -489,22 +470,22 @@ final class Aura_Worker_Unbind {
 		if ( class_exists( 'WP_Application_Passwords' ) ) {
 			foreach ( $m['app_password_uuids'] as $uuid ) {
 				$uuid  = (string) $uuid;
-				$found = self::password_search( $m, $uuid );
-				if ( 0 === $found['holder'] ) {
-					// Nobody the search could reach holds it: either it is
-					// genuinely gone, or the search was inconclusive — and the
-					// second case is not a silent skip, because leftovers()
+				$owner = self::password_owner( $m, $uuid );
+				if ( null === $owner ) {
+					// Nothing can be deleted from a user the site cannot name,
+					// and nothing may be guessed. Not a silent skip: leftovers()
 					// names 'app_passwords' for the same entry, so the gate
 					// below refuses step (5) and the site keeps its token, its
-					// marker and therefore its ability to be retried and
-					// repaired (round-1 C1, round-2 C2).
+					// marker and therefore its ability to be repaired
+					// (rounds 1-3).
 					continue;
 				}
-				// Deleted where it was FOUND, never from a guess. The return
-				// value is not the proof either (it is false for a failed
-				// user-meta write as well as for "not there"), so leftovers()
-				// searches again below.
-				WP_Application_Passwords::delete_application_password( $found['holder'], $uuid );
+				if ( ! Aura_Worker_Magic_Link::password_gone( $owner, $uuid ) ) {
+					// The return value is not the proof (it is false for a
+					// failed user-meta write as well as for "not there"), so
+					// leftovers() looks again below.
+					WP_Application_Passwords::delete_application_password( $owner, $uuid );
+				}
 			}
 		}
 

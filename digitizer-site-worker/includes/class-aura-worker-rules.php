@@ -685,12 +685,12 @@ class Aura_Worker_Rules {
 			if ( is_array( $managed ) && ! empty( $managed['uuid'] ) ) {
 				$uuid                                  = (string) $managed['uuid'];
 				$marker['app_password_uuids'][]        = $uuid;
-				$marker['app_password_users'][ $uuid ] = (int) ( $managed['user_id'] ?? 0 );
+				$marker['app_password_users'][ $uuid ] = self::marker_password_owner( $uuid, (int) ( $managed['user_id'] ?? 0 ), (int) $marker['connect_user_id'] );
 			}
 			$auth = Aura_Worker_Security::authenticating_app_password_uuid();
 			if ( is_string( $auth ) && '' !== $auth && ! in_array( $auth, $marker['app_password_uuids'], true ) ) {
 				$marker['app_password_uuids'][]        = $auth;
-				$marker['app_password_users'][ $auth ] = (int) get_current_user_id();
+				$marker['app_password_users'][ $auth ] = self::marker_password_owner( $auth, (int) get_current_user_id(), (int) $marker['connect_user_id'] );
 			}
 			// Claim-fenced and verified by read-back; a failed write is a
 			// retryable 500 with nothing else touched — never a silent unbind
@@ -861,6 +861,47 @@ class Aura_Worker_Rules {
 	}
 
 	/**
+	 * The owner Phase A records for one of the marker's Application Passwords:
+	 * a user id this request actually KNOWS, or null — an explicit unknown.
+	 * Never 0, which is not a user and was read as one for three review rounds
+	 * (#434 Task 4, C1/C2/C3).
+	 *
+	 * Phase B does exactly one lookup, against the owner recorded here, and an
+	 * Application Password lives in exactly one user's meta — so that lookup is
+	 * decisive only if what is written here is knowledge rather than a guess.
+	 * Resolution therefore belongs at WRITE time, where the request has the
+	 * facts:
+	 *
+	 *   - `$claimed` — the user WordPress says the password authenticated as
+	 *     (`get_current_user_id()` beside the captured uuid), or the `user_id`
+	 *     the managed record wrote beside its own uuid. Either is a statement
+	 *     by the writer about that exact password: authoritative.
+	 *   - the connecting user — a CANDIDATE, not a statement. Recorded only
+	 *     once this request has CONFIRMED the password really is in that user's
+	 *     list; an unconfirmed guess would be read as authoritative later, and
+	 *     a lookup against a wrong owner answering "not there" is precisely how
+	 *     round 2 deleted the site token beside a live administrator credential.
+	 *   - otherwise null. Phase B will not attempt a proof it cannot make: the
+	 *     teardown stops short of the token and waits for the operator.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $uuid            The password's uuid.
+	 * @param int    $claimed         The owner the writer names, if any.
+	 * @param int    $connect_user_id The connecting user, as a candidate.
+	 * @return int|null
+	 */
+	private static function marker_password_owner( $uuid, $claimed, $connect_user_id ) {
+		if ( $claimed > 0 ) {
+			return (int) $claimed;
+		}
+		if ( $connect_user_id > 0 && ! Aura_Worker_Magic_Link::password_gone( $connect_user_id, (string) $uuid ) ) {
+			return (int) $connect_user_id;
+		}
+		return null;
+	}
+
+	/**
 	 * Add the Application Password that authenticated THIS request to the
 	 * marker, if it is not already there. The fast path calls this on every
 	 * visit (spec §2.3): two legacy rows sharing one token leave two
@@ -892,7 +933,7 @@ class Aura_Worker_Rules {
 		$users   = isset( $marker['app_password_users'] ) && is_array( $marker['app_password_users'] )
 			? $marker['app_password_users']
 			: array();
-		$users[ $auth ] = (int) get_current_user_id();
+		$users[ $auth ] = self::marker_password_owner( $auth, (int) get_current_user_id(), (int) ( $marker['connect_user_id'] ?? 0 ) );
 
 		$updated                       = $marker;
 		$updated['app_password_uuids'] = $uuids;

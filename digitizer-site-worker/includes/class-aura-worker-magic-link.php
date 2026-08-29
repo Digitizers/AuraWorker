@@ -1256,11 +1256,17 @@ class Aura_Worker_Magic_Link {
 
 	/**
 	 * Is that Application Password gone from that user's list? The public form
-	 * of managed_password_gone(), for the ONE caller outside this class that
-	 * needs the same proof: #434's Phase B revokes every credential the unbind
+	 * of managed_password_gone(), for the callers outside this class that need
+	 * the same proof: #434's Phase B revokes every credential the unbind
 	 * marker names — the managed one AND any password that authenticated an
 	 * unbind — and, like every step of that cleanup, may report a step
-	 * complete only on evidence, never on a delete's return value.
+	 * complete only on evidence, never on a delete's return value; and Phase A
+	 * uses it to CONFIRM a candidate owner before recording it, so that Phase
+	 * B's single lookup is authoritative.
+	 *
+	 * Answers only about the user it is ASKED about. It is not, and cannot be
+	 * made into, evidence that nobody else holds the password — three review
+	 * rounds of #434 Task 4 turned on exactly that mistake.
 	 *
 	 * A WordPress with no Application Passwords class holds no such password
 	 * and can authenticate nobody with one, so there is nothing left to

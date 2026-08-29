@@ -329,13 +329,12 @@ final class UnbindAcceptTest extends TestCase {
 		// a uuid with no usable user_id, and no connect user to fall back to.
 		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
 		sa_add_app_password( 3, 'uuid-managed' );
-		$GLOBALS['_admins'] = array();                                    // and the owner search cannot close either
 
 		$res = Aura_Worker_Rules::accept( $this->unbind_env() );          // final: true
 
 		$this->assertSame( true, $res['unbound'] );
 		$this->assertFalse( $res['cleanup_complete'], 'an unidentifiable credential is not a finished teardown' );
-		$this->assertSame( 0, Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'], 'owner 0 really is what was recorded' );
+		$this->assertNull( Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'], 'an owner that could not be resolved is recorded as an explicit unknown, never 0' );
 		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
 		$this->assertTrue( sa_app_password_exists( 3, 'uuid-managed' ), 'the administrator credential is still live' );
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays and the retry path stays open' );
@@ -343,50 +342,98 @@ final class UnbindAcceptTest extends TestCase {
 	}
 
 	/**
-	 * Round-2 C2, end to end and exactly as the re-review probed it: admin 7
-	 * owns the managed Application Password, admin 3 is the connector, and the
-	 * record's `user_id` half never landed so the marker carries owner 0.
-	 * Falling back to the connector and asking "is it in ITS list" answered
-	 * "gone" — and Phase B deleted the site token while admin 7's
-	 * administrator-level credential stayed live, with no token left for any
-	 * retry and nothing for Task 7's rebind to refuse on. The password must be
-	 * found where it actually is.
+	 * Round-3, the C2/C3 scenario end to end: the managed record's `user_id`
+	 * half never landed, and the password belongs to user 7 — not to the
+	 * connecting user 3, and (C3) not necessarily to anybody an
+	 * administrator-role query would return. Phase A tries the connector as a
+	 * CANDIDATE, does not find the password there, and therefore records an
+	 * explicit unknown instead of a guess. Phase B then makes no claim at all:
+	 * the token stays, `cleanup_complete` is false, and the leftover is named
+	 * — which is the `aura_unbind_incomplete` signal Task 7's rebind consults
+	 * before it removes the marker and with it the core-REST seam that is the
+	 * only thing still refusing that password.
 	 */
-	public function test_a_password_owned_by_another_admin_is_revoked_not_assumed_gone(): void {
+	public function test_an_unconfirmed_owner_is_recorded_unknown_and_stops_the_teardown(): void {
 		$token_hash = sa_token_hash();
 		Aura_Worker_Rules::bind( 'c1', $token_hash );
-		update_option( 'aura_worker_connect_user_id', 3 );                 // the connector
-		$GLOBALS['_admins'] = array( 3, 7 );
+		update_option( 'aura_worker_connect_user_id', 3 );                 // the connector…
 		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
-		sa_add_app_password( 7, 'uuid-managed' );                          // …but admin 7 owns the password
+		sa_add_app_password( 7, 'uuid-managed' );                          // …but user 7 owns the password
 
 		$res = Aura_Worker_Rules::accept( $this->unbind_env() );           // final: true
 
-		$this->assertSame( 0, Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'], 'owner 0 is what the record produced' );
-		$this->assertFalse( sa_app_password_exists( 7, 'uuid-managed' ), 'the other admin\'s credential is revoked' );
-		$this->assertTrue( $res['cleanup_complete'] );
+		$this->assertNull( Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'], 'an unconfirmed guess is not recorded as knowledge' );
+		// The RAW row, not read()'s normalisation of it: what Phase A STORES
+		// must itself be the explicit unknown. `0` normalises to the same
+		// answer today, but it is a user id in shape, and the whole point of
+		// rounds 1-3 is that a value which names nobody must never be written
+		// where a user id is read.
+		$stored = maybe_unserialize( sa_read_option_uncached( Aura_Worker_Unbind::OPTION ) );
+		$this->assertArrayHasKey( 'uuid-managed', $stored['app_password_users'], 'the entry is recorded…' );
+		$this->assertNull( $stored['app_password_users']['uuid-managed'], '…as null, never 0' );
+		$this->assertFalse( $res['cleanup_complete'] );
+		$this->assertTrue( sa_app_password_exists( 7, 'uuid-managed' ), 'the credential is still live' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays' );
+		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
 	}
 
 	/**
-	 * The same, with the revoke refused: the teardown must NOT finish. This is
-	 * the pairing C2 is really about — a deleted token beside a live
-	 * administrator credential is the outcome that must be impossible.
+	 * The other half of Phase A's resolution: the connecting user is a
+	 * candidate, and when the password really IS in that user's list this
+	 * request has CONFIRMED it — so the owner is knowledge, gets recorded, and
+	 * Phase B revokes it with its single authoritative lookup.
 	 */
-	public function test_another_admins_unrevocable_password_stops_the_teardown(): void {
+	public function test_a_confirmed_connect_user_becomes_the_recorded_owner(): void {
 		$token_hash = sa_token_hash();
 		Aura_Worker_Rules::bind( 'c1', $token_hash );
 		update_option( 'aura_worker_connect_user_id', 3 );
-		$GLOBALS['_admins'] = array( 3, 7 );
 		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
-		sa_add_app_password( 7, 'uuid-managed' );
-		$GLOBALS['_fail_delete_app_password'] = 'uuid-managed';
+		sa_add_app_password( 3, 'uuid-managed' );                          // the connector really does hold it
 
 		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
 
-		$this->assertFalse( $res['cleanup_complete'] );
-		$this->assertTrue( sa_app_password_exists( 7, 'uuid-managed' ), 'still live' );
-		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays' );
-		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
+		$this->assertSame( 3, Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'] );
+		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ), 'and it is revoked' );
+		$this->assertTrue( $res['cleanup_complete'] );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	/**
+	 * The managed record's own `user_id` is a statement by the writer about
+	 * that exact password, so it is recorded as-is — no confirmation lookup,
+	 * and no consultation of the connector.
+	 */
+	public function test_the_managed_records_own_user_id_is_recorded_as_written(): void {
+		$token_hash = sa_token_hash();
+		Aura_Worker_Rules::bind( 'c1', $token_hash );
+		update_option( 'aura_worker_connect_user_id', 3 );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed', 'user_id' => 9 );
+		sa_add_app_password( 9, 'uuid-managed' );
+
+		Aura_Worker_Rules::accept( $this->unbind_env() );
+
+		$this->assertSame( 9, Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'] );
+		$this->assertFalse( sa_app_password_exists( 9, 'uuid-managed' ) );
+	}
+
+	/**
+	 * The fast path's append records the SAME way: WordPress named the user
+	 * that password authenticated as, so that is knowledge — and when it
+	 * cannot be named at all (no current user), an explicit unknown, never 0.
+	 */
+	public function test_an_appended_uuid_with_no_current_user_records_an_explicit_unknown(): void {
+		sa_set_marker( array( 'site' => sa_token_hash(), 'seq' => 9, 'connect_user_id' => 0 ) );
+		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-second' );
+		$GLOBALS['_current_user_id'] = 0;
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env( array( 'seq' => 12 ) ) );
+
+		$this->assertSame( true, $res['unbound'] );
+		$this->assertNull( Aura_Worker_Unbind::read()['app_password_users']['uuid-second'] );
+		$stored = maybe_unserialize( sa_read_option_uncached( Aura_Worker_Unbind::OPTION ) );
+		$this->assertNull( $stored['app_password_users']['uuid-second'], 'the append stores the explicit unknown too, never 0' );
+		$this->assertFalse( $res['cleanup_complete'], 'and an unknown owner stops the teardown' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
 	}
 
 	public function test_receive_rules_still_412s_a_marker_less_unkeyed_site(): void {

@@ -144,9 +144,15 @@ final class UnbindMarkerTest extends TestCase {
 
 		$this->assertInstanceOf( WP_Error::class, $res );
 		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
-		$this->assertNull( Aura_Worker_Unbind::status_fragment() );
 		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'a corrupted marker still means unbound' );
 		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Unbind::is_set_strict(), 'and an enforcement boundary fails closed on it' );
+		// Round-3 I4: the witness reports the STATE (the row exists, so the
+		// site is unbound) and omits the field it cannot read — the original
+		// intent, that nothing reads a missing `at` through, is unchanged.
+		$fragment = Aura_Worker_Unbind::status_fragment();
+		$this->assertIsArray( $fragment );
+		$this->assertArrayNotHasKey( 'at', $fragment );
+		$this->assertSame( 'res1', $fragment['site_ref'] );
 	}
 
 	/**
@@ -166,7 +172,10 @@ final class UnbindMarkerTest extends TestCase {
 		$this->assertInstanceOf( WP_Error::class, $res, 'present-but-null is corrupted, not absent' );
 		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
 		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'the site keeps refusing' );
-		$this->assertNull( Aura_Worker_Unbind::status_fragment() );
+		$fragment = Aura_Worker_Unbind::status_fragment();
+		$this->assertIsArray( $fragment, 'and /status still reports the site unbound' );
+		$this->assertArrayNotHasKey( 'site_ref', $fragment );
+		$this->assertSame( '2026-08-29T10:00:00Z', $fragment['at'] );
 	}
 
 	public function test_a_null_client_reads_malformed_never_absent(): void {
@@ -203,6 +212,54 @@ final class UnbindMarkerTest extends TestCase {
 		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( 42 );
 		$this->assertNull( Aura_Worker_Unbind::read() );
 		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * Round-3 I4. Aura's PATCH and manual-connect preflight keys on the
+	 * PRESENCE of `unbound` in /status. A malformed marker refuses every local
+	 * boundary, so a silent witness would let Aura write a binding to a site
+	 * that will refuse everything — worse than before the marker was corrupted,
+	 * when the site was at least consistently bound. The key must be there even
+	 * when its contents cannot be.
+	 */
+	public function test_status_still_reports_unbound_for_a_malformed_marker(): void {
+		$marker             = $this->marker();
+		$marker['site_ref'] = null;
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( $marker );
+
+		$api  = new Aura_Worker_API( new Aura_Worker_Security() );
+		$body = $api->get_status( new WP_REST_Request( 'GET', '/aura/v1/status' ) )->get_data();
+
+		$this->assertArrayHasKey( 'unbound', $body, 'the gate and the witness must agree' );
+	}
+
+	/**
+	 * A marker so corrupted that not one field is readable still reports the
+	 * state: an EMPTY object is a correct answer, because the preflight keys
+	 * on the key, not on its contents.
+	 */
+	public function test_status_reports_an_empty_object_when_no_field_is_readable(): void {
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( array( 'at' => null, 'site_ref' => null, 'site' => null, 'client' => null, 'seq' => null ) );
+
+		$api  = new Aura_Worker_API( new Aura_Worker_Security() );
+		$body = $api->get_status( new WP_REST_Request( 'GET', '/aura/v1/status' ) )->get_data();
+
+		$this->assertArrayHasKey( 'unbound', $body );
+		$this->assertSame( array(), $body['unbound'] );
+	}
+
+	/**
+	 * And the line the witness must NOT cross: a read it could not complete is
+	 * still reported as nothing at all. "The database blipped" is not evidence
+	 * that this site is unbound, and /status must not claim it.
+	 */
+	public function test_status_still_says_nothing_when_the_read_itself_failed(): void {
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$fragment = Aura_Worker_Unbind::status_fragment();
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertNull( $fragment );
 	}
 
 	/**

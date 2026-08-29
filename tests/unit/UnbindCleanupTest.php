@@ -20,11 +20,9 @@ final class UnbindCleanupTest extends TestCase {
 
 	protected function setUp(): void {
 		sa_reset_state();
-		// A real WordPress always has at least one administrator, and the owner
-		// search (round-2 C2) closes on that set. User 3 is this fixture's
-		// connecting administrator; the tests that model a site whose
-		// administrators CANNOT be enumerated empty this deliberately.
-		$GLOBALS['_admins'] = array( 3 );
+		// No administrator fixture: since round 3 Phase B enumerates nobody. It
+		// looks ONCE, at the owner the marker recorded, and an owner it does
+		// not know is never proven gone.
 		$GLOBALS['_options']['aura_worker_grant_pubkey'] = 'a-gateway-public-key';
 		update_option( 'aura_worker_connect_user_id', 3 );
 		update_option( 'aura_worker_dashboard_url', 'https://app.example' );
@@ -208,43 +206,51 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/**
-	 * A password the marker names but whose owner it does not: the connecting
-	 * user is the fallback, and a marker naming neither leaves the credential
-	 * alone rather than guessing at user 0.
+	 * A uuid the marker names but whose owner it does not: Phase B does NOT
+	 * fall back to the connecting user, and does not search — that resolution
+	 * moved to Phase A (round 3), where the request still knows who
+	 * authenticated. Here the marker simply says "unknown", so nothing is
+	 * revoked, nothing is proven, and the teardown stops short of the token.
 	 */
-	public function test_a_uuid_with_no_recorded_user_falls_back_to_the_connect_user(): void {
+	public function test_a_uuid_with_no_recorded_owner_is_never_proven_gone(): void {
 		sa_set_marker(
 			array(
 				'site'               => sa_token_hash(),
-				'connect_user_id'    => 3,
+				'connect_user_id'    => 3,                                 // even though the connector DOES hold it
 				'app_password_uuids' => array( 'uuid-manual' ),
 				'app_password_users' => array(),
 			)
 		);
 		$fence = Aura_Worker_Magic_Link::claim_site();
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertFalse( sa_app_password_exists( 3, 'uuid-manual' ) );
+
+		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
+
+		$this->assertSame( array( 'app_passwords' ), Aura_Worker_Unbind::leftovers() );
+		$this->assertTrue( sa_app_password_exists( 3, 'uuid-manual' ), 'nothing is deleted from a user the marker did not name' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+		$this->assertNotContains( 'token', $GLOBALS['_unbind_trace'] );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
 	/**
-	 * Round-1 C1. `??` falls through on null, never on an integer 0 — and 0 is
-	 * exactly what the marker records for a managed row whose `user_id` half
-	 * never landed. Such a uuid must be reported, never skipped: reported as
-	 * clean, the gate would open and step (5) would delete the token while a
-	 * live administrator Application Password remained, with no token left for
-	 * any retry to be matched to the marker.
+	 * Round-1 C1, restated for the round-3 mechanism: `0` is not a user id. It
+	 * is what an earlier build recorded for a managed row whose `user_id` half
+	 * never landed, so read() normalises it to the explicit unknown it always
+	 * was — and an unknown is never reported clean. Reported clean, the gate
+	 * would open and step (5) would delete the token while a live
+	 * administrator Application Password remained, with no token left for any
+	 * retry to be matched to the marker.
 	 */
 	public function test_a_uuid_whose_owner_cannot_be_resolved_is_never_reported_clean(): void {
-		$GLOBALS['_admins'] = array();                                    // and the search cannot close: no enumerable administrators
 		sa_set_marker(
 			array(
 				'site'               => sa_token_hash(),
-				'connect_user_id'    => 0,                                   // and no fallback either
+				'connect_user_id'    => 0,
 				'app_password_uuids' => array( 'uuid-managed' ),
-				'app_password_users' => array( 'uuid-managed' => 0 ),        // the half-written record's shape
+				'app_password_users' => array( 'uuid-managed' => 0 ),      // the half-written record's shape
 			)
 		);
+		$this->assertNull( Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'], '0 reads as unknown, never as a user' );
 		$fence = Aura_Worker_Magic_Link::claim_site();
 
 		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
@@ -257,64 +263,65 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/**
-	 * The other half of the same resolution: owner 0 FALLS THROUGH to
-	 * connect_user_id (it must not short-circuit to "unresolvable" either), so
-	 * a marker that still knows who connected revokes normally and completes.
+	 * Round-3 C3. The holder here has `manage_options` through a CUSTOM role,
+	 * so no administrator-role query would ever have found him — which is how
+	 * the round-2 search declared a live credential conclusively absent and
+	 * deleted the token. Phase B no longer searches at all: an owner the
+	 * marker does not name is simply never proven gone, whoever holds it and
+	 * whatever roles the site has.
 	 */
-	public function test_owner_zero_falls_through_to_the_connect_user(): void {
+	public function test_an_unknown_owner_blocks_the_teardown_whoever_actually_holds_it(): void {
+		$GLOBALS['_app_passwords'] = array();
+		sa_add_app_password( 11, 'uuid-managed' );                          // a custom admin-equivalent role
 		sa_set_marker(
 			array(
 				'site'               => sa_token_hash(),
 				'connect_user_id'    => 3,
 				'app_password_uuids' => array( 'uuid-managed' ),
-				'app_password_users' => array( 'uuid-managed' => 0 ),
+				'app_password_users' => array( 'uuid-managed' => null ),
 			)
 		);
 		$fence = Aura_Worker_Magic_Link::claim_site();
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ) );
+
+		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
+
+		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
+		$this->assertTrue( sa_app_password_exists( 11, 'uuid-managed' ) );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
 	/**
-	 * Round-2 C2. The `connect_user_id` fallback is a GUESS, and
-	 * password_gone( guess, uuid ) answers true whenever the uuid is not in
-	 * the guessed user's list — which is exactly what happens when the guess
-	 * is wrong. Admin 7 owns the managed password, admin 3 is the connector,
-	 * the marker recorded owner 0: inferring absence from the guess deleted
-	 * the token beside admin 7's live administrator credential. Absence is
-	 * proven by SEARCHING, so the password is found where it actually is and
-	 * revoked there.
+	 * A KNOWN owner is decisive in both directions. An Application Password
+	 * lives in exactly one user's meta, so the one lookup at the recorded
+	 * owner both finds it (revoke it there) and, once it is gone, proves it.
 	 */
-	public function test_a_password_owned_by_another_administrator_is_found_and_revoked(): void {
-		$GLOBALS['_admins'] = array( 3, 7 );
-		$GLOBALS['_app_passwords'] = array();                              // admin 7 owns it, nobody else
+	public function test_a_recorded_owner_is_revoked_and_then_proven_gone(): void {
+		$GLOBALS['_app_passwords'] = array();
 		sa_add_app_password( 7, 'uuid-managed' );
 		sa_set_marker(
 			array(
 				'site'               => sa_token_hash(),
-				'connect_user_id'    => 3,                                 // the guess — and the WRONG user
+				'connect_user_id'    => 3,                                 // NOT the owner, and never consulted
 				'app_password_uuids' => array( 'uuid-managed' ),
-				'app_password_users' => array( 'uuid-managed' => 0 ),      // the half-written record
+				'app_password_users' => array( 'uuid-managed' => 7 ),
 			)
 		);
 		$fence = Aura_Worker_Magic_Link::claim_site();
 
-		$done = Aura_Worker_Unbind::cleanup( true, $fence );
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
 
-		$this->assertFalse( sa_app_password_exists( 7, 'uuid-managed' ), 'revoked where it actually lives' );
-		$this->assertTrue( $done );
+		$this->assertFalse( sa_app_password_exists( 7, 'uuid-managed' ), 'revoked at the recorded owner' );
 		$this->assertSame( array(), Aura_Worker_Unbind::leftovers() );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
 	/**
-	 * The same scenario with the revoke refused: never a deleted token beside
-	 * a live credential. This is the assertion that matters most in C2 — the
-	 * teardown may finish only when the credential is genuinely gone.
+	 * The same, with the revoke refused: never a deleted token beside a live
+	 * credential. This is the pairing every round of this finding is about.
 	 */
-	public function test_another_administrators_password_that_cannot_be_revoked_keeps_the_token(): void {
-		$GLOBALS['_admins'] = array( 3, 7 );
+	public function test_a_recorded_owners_password_that_cannot_be_revoked_keeps_the_token(): void {
 		$GLOBALS['_app_passwords'] = array();
 		sa_add_app_password( 7, 'uuid-managed' );
 		$GLOBALS['_fail_delete_app_password'] = 'uuid-managed';
@@ -323,7 +330,7 @@ final class UnbindCleanupTest extends TestCase {
 				'site'               => sa_token_hash(),
 				'connect_user_id'    => 3,
 				'app_password_uuids' => array( 'uuid-managed' ),
-				'app_password_users' => array( 'uuid-managed' => 0 ),
+				'app_password_users' => array( 'uuid-managed' => 7 ),
 			)
 		);
 		$fence = Aura_Worker_Magic_Link::claim_site();
@@ -338,14 +345,12 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/**
-	 * Round-2 I2: the blocking state must CONVERGE. §2.3 tells the operator to
-	 * revoke the credential by hand in Users -> Profile; once they have, the
-	 * next sweep must be able to prove it is gone and finish the teardown —
-	 * before the C2 fix, "unresolvable owner" named the leftover
-	 * unconditionally and Phase B refused forever.
+	 * Round-2 I2: the blocking state must CONVERGE for an owner the site
+	 * knows. §2.3 tells the operator to revoke the credential by hand in
+	 * Users -> Profile; once they have, the next sweep's single lookup finds
+	 * nothing and the teardown finishes.
 	 */
 	public function test_a_hand_revoked_password_lets_the_teardown_converge(): void {
-		$GLOBALS['_admins'] = array( 3, 7 );
 		$GLOBALS['_app_passwords'] = array();
 		sa_add_app_password( 7, 'uuid-managed' );
 		$GLOBALS['_fail_delete_app_password'] = 'uuid-managed';            // Phase B cannot revoke it
@@ -354,7 +359,7 @@ final class UnbindCleanupTest extends TestCase {
 				'site'               => sa_token_hash(),
 				'connect_user_id'    => 3,
 				'app_password_uuids' => array( 'uuid-managed' ),
-				'app_password_users' => array( 'uuid-managed' => 0 ),
+				'app_password_users' => array( 'uuid-managed' => 7 ),
 			)
 		);
 		$fence = Aura_Worker_Magic_Link::claim_site();
@@ -365,54 +370,6 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( array(), Aura_Worker_Unbind::leftovers(), 'nothing is owed any more' );
 		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ), 'and the teardown completes' );
 		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
-	/**
-	 * The bound on the search: a site with more administrators than
-	 * OWNER_SEARCH_LIMIT cannot be swept on a page load, so the search does
-	 * not conclude — and an inconclusive search names the leftover rather than
-	 * reporting clean.
-	 */
-	public function test_an_unenumerable_administrator_set_is_inconclusive(): void {
-		$GLOBALS['_admins'] = range( 1, Aura_Worker_Unbind::OWNER_SEARCH_LIMIT + 1 );
-		$GLOBALS['_app_passwords'] = array();                              // nobody holds it at all
-		sa_set_marker(
-			array(
-				'site'               => sa_token_hash(),
-				'connect_user_id'    => 0,
-				'app_password_uuids' => array( 'uuid-managed' ),
-				'app_password_users' => array( 'uuid-managed' => 0 ),
-			)
-		);
-		$fence = Aura_Worker_Magic_Link::claim_site();
-		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
-		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
-	/**
-	 * And the ordinary path stays ONE lookup: when the marker records the
-	 * right owner, the search finds the password at candidate 1 and never
-	 * enumerates anybody. Pinned through the enumeration itself — with no
-	 * administrators enumerable at all, a search that needed them could not
-	 * conclude, yet this one completes.
-	 */
-	public function test_the_recorded_owner_is_authoritative_and_needs_no_enumeration(): void {
-		$GLOBALS['_admins'] = array();                                     // nothing to enumerate
-		sa_set_marker(
-			array(
-				'site'               => sa_token_hash(),
-				'connect_user_id'    => 0,
-				'app_password_uuids' => array( 'uuid-managed' ),
-				'app_password_users' => array( 'uuid-managed' => 3 ),      // recorded, and right
-			)
-		);
-		$fence = Aura_Worker_Magic_Link::claim_site();
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ) );
-		$this->assertSame( array(), Aura_Worker_Unbind::leftovers() );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
