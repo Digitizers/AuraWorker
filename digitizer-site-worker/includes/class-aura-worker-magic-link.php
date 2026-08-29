@@ -1529,7 +1529,16 @@ class Aura_Worker_Magic_Link {
 		if ( false === $pipe ) {
 			return false; // No timestamp on record: never seizable.
 		}
-		$age = time() - (int) substr( $existing, $pipe + 1 );
+		$stamp = substr( $existing, $pipe + 1 );
+		if ( '' === $stamp || ! ctype_digit( $stamp ) ) {
+			// A pipe with no digits after it is not a timestamp either. Without
+			// this, `(int)` would read "abc|xyz" as age = now and seize it at
+			// once — the exact opposite of what the docblock above promises,
+			// and a guarantee a test was asserting but the code did not deliver
+			// (#434 Task 2 re-review N1).
+			return false;
+		}
+		$age = time() - (int) $stamp;
 		if ( $age <= $takeover_after ) {
 			return false;
 		}

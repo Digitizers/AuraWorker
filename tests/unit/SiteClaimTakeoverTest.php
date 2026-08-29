@@ -69,6 +69,23 @@ final class SiteClaimTakeoverTest extends TestCase {
 		Aura_Worker_Magic_Link::release_site( $original );
 	}
 
+	/**
+	 * The docblock promises a value with no recorded timestamp is never
+	 * seized. A pipe followed by non-digits is exactly that case, and before
+	 * the N1 fix `(int) "xyz"` read as 0 made such a row look infinitely old —
+	 * so it was seized on sight, contradicting the guarantee (#434 Task 2
+	 * re-review N1).
+	 */
+	public function test_a_claim_whose_suffix_is_not_a_timestamp_is_never_seizable(): void {
+		foreach ( array( 'abc|xyz', 'abc|', 'abc| 12' ) as $value ) {
+			sa_reset_state();
+			$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = $value;
+			$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = $value;
+			$this->assertSame( '', Aura_Worker_Magic_Link::claim_site(), $value );
+			$this->assertSame( $value, $GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ], $value );
+		}
+	}
+
 	public function test_a_seized_claims_original_holder_can_no_longer_write(): void {
 		$original = Aura_Worker_Magic_Link::claim_site();
 		$this->backdate_claim( $original, 121 );
