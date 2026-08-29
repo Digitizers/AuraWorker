@@ -1375,11 +1375,14 @@ class Aura_Worker_Magic_Link {
 	 * gating an irreversible step: the site token deleted beside a live
 	 * `manage_options` credential.
 	 *
-	 * So absence is confirmed the way `Aura_Worker_Unbind::option_absent()`
-	 * confirms an option's: with an error-surfacing raw read (the pattern
-	 * `Aura_Worker_Rules::read_option_uncached()` follows — `$wpdb->last_error`
-	 * is the one thing that tells "no such row" from "the database is
-	 * broken"). Core's own list still answers PRESENT, so any filter or
+	 * So absence is confirmed by a raw read that PROVES IT RAN: the statement
+	 * carries a per-call nonce and echoes it back, so a row that does not
+	 * return our nonce is somebody else's and settles nothing. (It does not
+	 * consult `$wpdb->ready`, `last_query` or `last_error` — those are a
+	 * database drop-in's to get wrong, and reading them that way stranded
+	 * Phase B on every drop-in that never sets `ready`. The proof is a
+	 * property of the ANSWER, not of wpdb's bookkeeping.) Core's own list
+	 * still answers PRESENT, so any filter or
 	 * alternative meta store keeps its say over the positive; the raw probe
 	 * runs only on the path about to conclude absence, and can only turn that
 	 * conclusion into 'present' or 'unknown' — never the other way.
@@ -1403,9 +1406,11 @@ class Aura_Worker_Magic_Link {
 	 * The confirming raw read: does that user's Application Passwords meta row
 	 * really not carry that uuid, or could the row not be read?
 	 *
-	 * Uncached and error-surfacing, deliberately: the value core just consulted
+	 * Uncached and self-proving, deliberately: the value core just consulted
 	 * may itself be a cached empty array left behind by a failed query, so a
-	 * second trip through the meta cache would repeat the same wrong answer.
+	 * second trip through the meta cache would repeat the same wrong answer —
+	 * and a statement that never ran would hand back the PREVIOUS one's rows,
+	 * which only the returned nonce can tell apart.
 	 *
 	 * Absence is answered only from a statement this call is able to show RAN
 	 * (#434 M12/N1) — the proof is carried IN BAND, by a per-call nonce the
@@ -1445,7 +1450,18 @@ class Aura_Worker_Magic_Link {
 		// no nonce at all, because the stale row a probe meets is another
 		// probe's. wp_generate_uuid4() is neither pluggable nor filtered, and
 		// never throws (it falls back through wp_rand / random_int / mt_rand).
-		$nonce = wp_generate_uuid4();
+		//
+		// The counter is not belt-and-braces. Since WP 7.0 wp_generate_uuid4()
+		// draws from wp_rand(), which IS pluggable and is loaded AFTER plugins
+		// — so a third party redefining it can still pin the uuid, and we are
+		// back to a constant nonce by a longer road. $seq is function-local
+		// and monotonic within the request: nothing outside this method can
+		// make two calls of it agree, whatever it does to the randomiser.
+		// The nonce is echoed back in the same statement and is never secret;
+		// the property it must have is FRESHNESS, not unpredictability.
+		static $seq = 0;
+		++$seq;
+		$nonce = $seq . '-' . wp_generate_uuid4();
 		$sql   = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, $owner, self::APP_PASSWORD_USERMETA_KEY );
 		// A prepare() that did not return usable SQL is not issued at all —
 		// core's prepare() answers null when it refuses the call. Nothing

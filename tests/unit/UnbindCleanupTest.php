@@ -568,6 +568,55 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/**
+	 * The nonce's job is FRESHNESS, not secrecy — it is echoed back in the
+	 * same statement and is never confidential. So the only property that
+	 * matters is that two probes in one request cannot agree, and the
+	 * randomiser alone cannot promise that: since WP 7.0 wp_generate_uuid4()
+	 * draws from wp_rand(), which is pluggable and loads AFTER plugins, so a
+	 * third party can pin it. A pinned uuid would put us back where M12 began
+	 * — a constant nonce always matches, so the proof degenerates to "we got
+	 * a row", which is exactly what a stale result set provides. The
+	 * function-local counter is what nothing outside can make repeat. (#434 N4)
+	 */
+	public function test_a_pinned_randomiser_cannot_make_two_probes_share_a_nonce(): void {
+		$GLOBALS['_sa_uuid_fixed'] = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+		$GLOBALS['_db_queries']    = array();
+
+		// User 4 holds nothing, so core's list cannot short-circuit and the
+		// confirming probe — the only path that issues the statement — runs.
+		Aura_Worker_Magic_Link::password_state( 4, 'uuid-manual' );
+		Aura_Worker_Magic_Link::password_state( 4, 'uuid-manual' );
+
+		$probes = array();
+		foreach ( $GLOBALS['_db_queries'] as $q ) {
+			if ( preg_match( "/^SELECT '([^']*)' AS probe,/", (string) $q, $m ) ) {
+				$probes[] = $m[1];
+			}
+		}
+		$this->assertCount( 2, $probes, 'both probes issued their own statement' );
+		$this->assertNotSame( $probes[0], $probes[1], 'a host that pinned the randomiser still cannot make one probe answer for another' );
+	}
+
+	/**
+	 * The breadcrumb exists so an eternally pending tombstone can be
+	 * explained, and it travels wherever the site sends diagnostics — so it
+	 * carries the owner and nothing else. Naming the nonce, the uuid or the
+	 * token here would leak a credential identifier into any listener. (#434 N5)
+	 */
+	public function test_the_breadcrumb_names_the_owner_and_carries_no_secret(): void {
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;
+		$GLOBALS['_sa_wpdb_query_filtered_out']   = true;
+		Aura_Worker_Magic_Link::password_state( 3, 'uuid-manual' );
+		$GLOBALS['_sa_wpdb_query_filtered_out']   = false;
+		$GLOBALS['_sa_app_password_read_fail']    = array();
+
+		$fired = $this->probe_unproven();
+		$this->assertCount( 1, $fired );
+		$this->assertSame( array( 3 ), $fired[0]['args'], 'the owner, and only the owner' );
+		$this->assertStringNotContainsString( 'uuid-manual', wp_json_encode( $fired[0]['args'] ), 'no credential identifier rides the breadcrumb' );
+	}
+
+	/**
 	 * A handle that has declared itself not ready runs nothing: wpdb::query()
 	 * returns at its first line, before flush(), and wpdb::get_row() ignores
 	 * that return value and extracts its answer from the PREVIOUS statement's

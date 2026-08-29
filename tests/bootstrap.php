@@ -406,6 +406,13 @@ if ( ! function_exists( 'esc_attr' ) ) {
 }
 if ( ! function_exists( 'wp_generate_uuid4' ) ) {
 	function wp_generate_uuid4(): string {
+		// Since WP 7.0 core's wp_generate_uuid4() draws from wp_rand(), which
+		// IS pluggable and is loaded AFTER plugins — so a third party can pin
+		// the uuid to a constant. $GLOBALS['_sa_uuid_fixed'] models exactly
+		// that host, because a probe whose nonce cannot change is no probe.
+		if ( isset( $GLOBALS['_sa_uuid_fixed'] ) ) {
+			return (string) $GLOBALS['_sa_uuid_fixed'];
+		}
 		return sprintf( '%08x-%04x-4%03x-%04x-%012x', random_int( 0, 0xffffffff ), random_int( 0, 0xffff ), random_int( 0, 0x0fff ), random_int( 0, 0x3fff ) | 0x8000, random_int( 0, 0xffffffffffff ) );
 	}
 }
@@ -2481,6 +2488,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_current_user'] = 0;
 	$GLOBALS['_current_user_id'] = 0; // get_current_user_id()'s store — see the stub above.
 	$GLOBALS['_did_actions']  = array();
+	unset( $GLOBALS['_sa_uuid_fixed'] );
 	$GLOBALS['_filters']      = array();
 	$GLOBALS['_registered_settings'] = array();
 	$GLOBALS['_settings_fields']    = array();
