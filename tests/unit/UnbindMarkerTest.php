@@ -126,13 +126,83 @@ final class UnbindMarkerTest extends TestCase {
 	 * field) must be rejected like any other malformed marker — not read
 	 * through into status_fragment()'s unconditional `(string) $m['at']` and
 	 * trigger an undefined-key warning.
+	 *
+	 * CONTRACT CHANGE, #434 Task 4 round-2 I3: this used to read as `null`,
+	 * i.e. "no marker" — a fail-OPEN that un-refuses the site while Aura
+	 * believes it disconnected. An array in this row is an ATTEMPTED marker,
+	 * so one that does not satisfy the shape now reads as MALFORMED (a
+	 * WP_Error), which every caller already fails CLOSED on. The original
+	 * intent — status_fragment() must not read a missing field through — is
+	 * unchanged and still asserted.
 	 */
-	public function test_marker_missing_at_reads_null(): void {
+	public function test_marker_missing_at_reads_malformed_never_absent(): void {
 		$marker = $this->marker();
 		unset( $marker['at'] );
 		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( $marker );
-		$this->assertNull( Aura_Worker_Unbind::read() );
+
+		$res = Aura_Worker_Unbind::read();
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
 		$this->assertNull( Aura_Worker_Unbind::status_fragment() );
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'a corrupted marker still means unbound' );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Unbind::is_set_strict(), 'and an enforcement boundary fails closed on it' );
+	}
+
+	/**
+	 * Round-2 I3, the shape that motivated it: `isset()` is false for a key
+	 * that is PRESENT and null, so a marker with a null `site_ref` read as no
+	 * marker at all. Task 8's bare body takes `site_ref`/`client` from a
+	 * request (`$body['site_ref'] ?? null`), so this is the writer that
+	 * produces one.
+	 */
+	public function test_a_null_site_ref_reads_malformed_never_absent(): void {
+		$marker             = $this->marker();
+		$marker['site_ref'] = null;
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( $marker );
+
+		$res = Aura_Worker_Unbind::read();
+
+		$this->assertInstanceOf( WP_Error::class, $res, 'present-but-null is corrupted, not absent' );
+		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'the site keeps refusing' );
+		$this->assertNull( Aura_Worker_Unbind::status_fragment() );
+	}
+
+	public function test_a_null_client_reads_malformed_never_absent(): void {
+		$marker           = $this->marker();
+		$marker['client'] = null;
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( $marker );
+
+		$res = Aura_Worker_Unbind::read();
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
+		$this->assertTrue( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * The type half of the same check: a `seq` that arrives as a string is not
+	 * the marker Phase A writes, and the comparisons that decide a retry
+	 * (`(int) $back['seq'] === (int) $marker['seq']`) must not be handed one.
+	 */
+	public function test_a_wrong_typed_seq_reads_malformed(): void {
+		$marker        = $this->marker();
+		$marker['seq'] = '7';
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( $marker );
+
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Unbind::read() );
+	}
+
+	/**
+	 * And the other side of the line: a row that is not an array at all was
+	 * never a marker, so it stays genuinely ABSENT. Malformed and absent are
+	 * different answers and must not collapse into one.
+	 */
+	public function test_a_non_array_row_is_still_absent_not_malformed(): void {
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( 42 );
+		$this->assertNull( Aura_Worker_Unbind::read() );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
 	}
 
 	/**

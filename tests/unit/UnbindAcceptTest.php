@@ -329,6 +329,7 @@ final class UnbindAcceptTest extends TestCase {
 		// a uuid with no usable user_id, and no connect user to fall back to.
 		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
 		sa_add_app_password( 3, 'uuid-managed' );
+		$GLOBALS['_admins'] = array();                                    // and the owner search cannot close either
 
 		$res = Aura_Worker_Rules::accept( $this->unbind_env() );          // final: true
 
@@ -339,6 +340,53 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertTrue( sa_app_password_exists( 3, 'uuid-managed' ), 'the administrator credential is still live' );
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays and the retry path stays open' );
 		$this->assertNotContains( 'token', $GLOBALS['_unbind_trace'] );
+	}
+
+	/**
+	 * Round-2 C2, end to end and exactly as the re-review probed it: admin 7
+	 * owns the managed Application Password, admin 3 is the connector, and the
+	 * record's `user_id` half never landed so the marker carries owner 0.
+	 * Falling back to the connector and asking "is it in ITS list" answered
+	 * "gone" — and Phase B deleted the site token while admin 7's
+	 * administrator-level credential stayed live, with no token left for any
+	 * retry and nothing for Task 7's rebind to refuse on. The password must be
+	 * found where it actually is.
+	 */
+	public function test_a_password_owned_by_another_admin_is_revoked_not_assumed_gone(): void {
+		$token_hash = sa_token_hash();
+		Aura_Worker_Rules::bind( 'c1', $token_hash );
+		update_option( 'aura_worker_connect_user_id', 3 );                 // the connector
+		$GLOBALS['_admins'] = array( 3, 7 );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
+		sa_add_app_password( 7, 'uuid-managed' );                          // …but admin 7 owns the password
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );           // final: true
+
+		$this->assertSame( 0, Aura_Worker_Unbind::read()['app_password_users']['uuid-managed'], 'owner 0 is what the record produced' );
+		$this->assertFalse( sa_app_password_exists( 7, 'uuid-managed' ), 'the other admin\'s credential is revoked' );
+		$this->assertTrue( $res['cleanup_complete'] );
+	}
+
+	/**
+	 * The same, with the revoke refused: the teardown must NOT finish. This is
+	 * the pairing C2 is really about — a deleted token beside a live
+	 * administrator credential is the outcome that must be impossible.
+	 */
+	public function test_another_admins_unrevocable_password_stops_the_teardown(): void {
+		$token_hash = sa_token_hash();
+		Aura_Worker_Rules::bind( 'c1', $token_hash );
+		update_option( 'aura_worker_connect_user_id', 3 );
+		$GLOBALS['_admins'] = array( 3, 7 );
+		$GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] = array( 'uuid' => 'uuid-managed' );
+		sa_add_app_password( 7, 'uuid-managed' );
+		$GLOBALS['_fail_delete_app_password'] = 'uuid-managed';
+
+		$res = Aura_Worker_Rules::accept( $this->unbind_env() );
+
+		$this->assertFalse( $res['cleanup_complete'] );
+		$this->assertTrue( sa_app_password_exists( 7, 'uuid-managed' ), 'still live' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays' );
+		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
 	}
 
 	public function test_receive_rules_still_412s_a_marker_less_unkeyed_site(): void {
