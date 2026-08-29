@@ -276,6 +276,28 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password( $site_fence )', $src );
 	}
 
+	/**
+	 * #434 round-4 I5, at the caller a change to the shared proof is riskiest
+	 * for: the rotation. The delete refuses AND the owner's password list
+	 * cannot be read — so this request has not proven the credential gone.
+	 * It must answer false and KEEP the record, because the record is what the
+	 * next attempt revokes by; forgetting it here would leave an
+	 * administrator-level credential with nothing tracking it.
+	 */
+	public function test_the_rotation_keeps_the_record_when_the_owners_list_cannot_be_read(): void {
+		$this->ml->handle_connect( $this->request() );
+		$this->assertNotEmpty( $this->recordUuid() );
+		$GLOBALS['_app_passwords_delete_fail']    = true; // the delete refuses…
+		$GLOBALS['_sa_app_password_read_fail'][7] = true; // …and the list will not read
+
+		$revoked = Aura_Worker_Magic_Link::revoke_managed_password();
+
+		$GLOBALS['_app_passwords_delete_fail']  = false;
+		$GLOBALS['_sa_app_password_read_fail']  = array();
+		$this->assertFalse( $revoked, 'a read that failed is not a revocation' );
+		$this->assertNotNull( $this->record(), 'and the record survives for the next attempt' );
+	}
+
 	public function test_uninstall_revokes_the_managed_password_by_uuid_before_deleting_its_options(): void {
 		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/uninstall.php' );
 		$this->assertStringContainsString( "WP_Application_Passwords::delete_application_password( \$aura_pw_owner, \$aura_pw_uuid )", $src );
