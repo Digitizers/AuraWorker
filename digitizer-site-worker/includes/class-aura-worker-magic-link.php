@@ -1408,7 +1408,8 @@ class Aura_Worker_Magic_Link {
 	 * second trip through the meta cache would repeat the same wrong answer.
 	 *
 	 * Absence is answered only from a statement this call is able to show RAN
-	 * (#434 M12) — see the comment beside the last_query check below.
+	 * (#434 M12/N1) — the proof is carried IN BAND, by a per-call nonce the
+	 * result set has to hand back; see the comment beside it below.
 	 *
 	 * @since 2.13.0
 	 *
@@ -1421,42 +1422,43 @@ class Aura_Worker_Magic_Link {
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
 			return self::STATE_UNKNOWN; // no way to confirm: never a proof of absence
 		}
-		// A handle that has declared itself not ready refuses every statement
-		// at the top of wpdb::query(), before the database is touched, so
-		// asking it proves nothing. isset(), not a bare read: a db.php drop-in
-		// that never declares the property is expressing no opinion, and the
-		// last_query check below still decides whether ITS statement ran.
-		if ( isset( $wpdb->ready ) && ! $wpdb->ready ) {
-			return self::STATE_UNKNOWN;
-		}
-		$sql = $wpdb->prepare( "SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1", $owner, self::APP_PASSWORD_USERMETA_KEY );
+		// The proof that this statement RAN travels IN BAND, in the answer
+		// itself: a per-call nonce selected as a second column. Only our own
+		// statement can put THIS call's nonce in a result set, so a row that
+		// carries it back is a row our statement produced (#434 M12/N1).
+		//
+		// wpdb::get_row() ignores wpdb::query()'s return value and extracts
+		// from $last_result, and wpdb::query() has early returns BEFORE its
+		// flush() — an unready handle, a `query` filter that blanks the SQL —
+		// each leaving the PREVIOUS statement's result set in place. Third
+		// party db.php drop-ins (HyperDB, LudicrousDB) add their own, and
+		// assign $last_query before acquiring a connection, so neither
+		// wpdb::$ready nor wpdb::$last_query is evidence a statement ran:
+		// both are bookkeeping a drop-in is free to get wrong, and $ready in
+		// particular is `false` by declaration on every drop-in that never
+		// calls parent::__construct(). The nonce needs no such etiquette —
+		// it is a property of the ANSWER, on every handle.
+		$nonce = wp_generate_password( 20, false );
+		$sql   = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, $owner, self::APP_PASSWORD_USERMETA_KEY );
+		// A prepare() that did not return usable SQL is not issued at all —
+		// core's prepare() answers null when it refuses the call. Nothing
+		// downstream depends on this (get_row( null ) returns null, and the
+		// nonce would reject that answer anyway); it is the earlier, cheaper
+		// refusal, and it keeps "we never asked" from ever being reported as
+		// "we asked and were told nothing".
 		if ( ! is_string( $sql ) || '' === $sql ) {
 			return self::STATE_UNKNOWN; // nothing was issued, so nothing was proved
 		}
-		$wpdb->last_error = '';
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
-		$raw = $wpdb->get_var( $sql );
-		// Prove the statement RAN — "nothing reported an error" is not the same
-		// fact, and this is the read a step-(5) delete turns on (#434 M12).
-		// wpdb::query() has two early returns BEFORE its flush(): `! $ready`
-		// and a `query` filter that blanks the SQL. Each returns false leaving
-		// last_result, last_error and last_query exactly as the PREVIOUS
-		// statement left them — and wpdb::get_var() ignores query()'s return
-		// value entirely, extracting its answer from that stale last_result.
-		// So an unrelated statement's row (or its emptiness, read as null)
-		// would arrive here looking clean, because clearing last_error above
-		// removed the only accidental signal. last_query is assigned only
-		// after both early returns and holds the FILTERED text, so requiring
-		// it to be the SQL we issued rules out both paths and a filter that
-		// rewrote the query. An identical earlier statement is the single
-		// coincidence this admits, and it is the same read with the same
-		// answer.
-		if ( ! isset( $wpdb->last_query ) || (string) $sql !== (string) $wpdb->last_query ) {
+		$row = $wpdb->get_row( $sql );
+		if ( ! isset( $row->probe ) || $nonce !== (string) $row->probe ) {
+			// No row, or somebody else's row: this call proved nothing, and
+			// an unprovable probe owes app_passwords forever, so leave a
+			// breadcrumb rather than a tombstone that never explains itself.
+			do_action( 'aura_worker_app_password_probe_unproven', $owner );
 			return self::STATE_UNKNOWN;
 		}
-		if ( '' !== (string) $wpdb->last_error ) {
-			return self::STATE_UNKNOWN;
-		}
+		$raw = isset( $row->v ) ? $row->v : null;
 		if ( null === $raw ) {
 			return self::STATE_GONE; // no row at all: that user holds no Application Passwords
 		}

@@ -555,37 +555,57 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( 'unknown', $state );
 	}
 
+	/** Every `aura_worker_app_password_probe_unproven` fired so far this test. */
+	private function probe_unproven(): array {
+		return array_values(
+			array_filter(
+				$GLOBALS['_did_actions'],
+				static function ( $a ) {
+					return 'aura_worker_app_password_probe_unproven' === $a['tag'];
+				}
+			)
+		);
+	}
+
 	/**
 	 * A handle that has declared itself not ready runs nothing: wpdb::query()
-	 * returns at its first line, before flush(), and wpdb::get_var() ignores
+	 * returns at its first line, before flush(), and wpdb::get_row() ignores
 	 * that return value and extracts its answer from the PREVIOUS statement's
-	 * last_result — with last_error and last_query still that statement's too.
-	 * Here the previous statement is the SAME probe against a user with no
-	 * row, so last_query matches and only the readiness check stands between a
-	 * stale null and a proof of absence. (#434 M12)
+	 * last_result. Here that previous statement is another probe — of a user
+	 * who really holds nothing — so the stale answer is a well-formed probe
+	 * row whose `v` is null: exactly the shape a false proof of absence needs.
+	 * The only thing that tells it apart from this call's own answer is the
+	 * nonce it does not carry. (#434 M12/N1)
+	 *
+	 * The readiness check this test used to pin is GONE, and had to be: a
+	 * db.php drop-in that extends wpdb and never calls parent::__construct()
+	 * — HyperDB, LudicrousDB — inherits `public $ready = false` and keeps it
+	 * for the life of the request, so reading $ready stranded every such site
+	 * mid-unbind forever. The nonce needs no cooperation from the handle.
 	 */
 	public function test_an_unready_database_handle_is_never_asked_and_never_proves_absence(): void {
 		$wpdb = $GLOBALS['wpdb'];
 		$this->assertSame( 'gone', Aura_Worker_Magic_Link::password_state( 4, 'uuid-manual' ), 'a real statement, leaving its own empty result behind' );
 
-		$wpdb->last_error = 'MySQL server has gone away'; // another statement's complaint
-		$wpdb->ready      = false;
-		$state            = Aura_Worker_Magic_Link::password_state( 3, 'uuid-never-existed' );
-		$error_after      = $wpdb->last_error;
-		$wpdb->ready      = true;
-		$wpdb->last_error = '';
+		// User 3 really holds uuid-manual; core's cached list cannot be read,
+		// so the confirming probe is what decides. The handle then refuses it.
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;
+		$wpdb->ready                              = false;
+		$state                                    = Aura_Worker_Magic_Link::password_state( 3, 'uuid-manual' );
+		$wpdb->ready                              = true;
+		$GLOBALS['_sa_app_password_read_fail']    = array();
 
-		$this->assertSame( 'unknown', $state, 'a handle that refuses statements proves nothing' );
-		$this->assertSame( 'MySQL server has gone away', $error_after, 'and is not written to either: nothing was issued' );
+		$this->assertSame( 'unknown', $state, 'a handle that refuses statements proves nothing, and user 3 really holds uuid-manual' );
+		$this->assertCount( 1, $this->probe_unproven() );
 	}
 
 	/**
 	 * The other early return in wpdb::query(): a `query` filter that blanks
-	 * the SQL. The statement never runs, our own last_error reset guarantees
-	 * the handle looks clean, and get_var() hands back the row of whatever ran
-	 * last — here another USER's empty row. Reading that as "user 3's live
-	 * administrator credential is gone" is the whole of #434's Critical
-	 * family, arriving through the one door left open. (#434 M12)
+	 * the SQL. The statement never runs and get_row() hands back the row of
+	 * whatever ran last — here another USER's probe, answering null. Reading
+	 * that as "user 3's live administrator credential is gone" is the whole of
+	 * #434's Critical family, arriving through the one door left open; the
+	 * nonce that row does not carry is what closes it. (#434 M12/N1)
 	 */
 	public function test_a_statement_that_never_ran_is_never_proof_of_absence(): void {
 		$this->assertSame( 'gone', Aura_Worker_Magic_Link::password_state( 4, 'uuid-manual' ), 'user 4 has no row: the previous statement, and its empty answer' );
@@ -599,6 +619,49 @@ final class UnbindCleanupTest extends TestCase {
 		$GLOBALS['_sa_app_password_read_fail']    = array();
 
 		$this->assertSame( 'unknown', $state, 'the answer came from another query and is no answer at all' );
+		$this->assertCount( 1, $this->probe_unproven(), 'a probe that cannot prove itself says so: an eternally pending tombstone must be diagnosable' );
+	}
+
+	/**
+	 * The other half of the in-band proof, and a different failure entirely:
+	 * the statement ran and came back with NOTHING — a dead connection, a
+	 * driver-level error, a handle that answered false. wpdb has no result set
+	 * to extract from, so get_row() answers null. Null is not a row, so it
+	 * carries no nonce, so it proves nothing — where the round-5 probe read
+	 * exactly this shape as "no meta row, therefore no passwords". (#434 N1)
+	 */
+	public function test_a_probe_that_came_back_with_no_row_is_never_proof_of_absence(): void {
+		// User 3 really holds uuid-manual, and core's cached list cannot be
+		// read either, so this probe is the only thing deciding.
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;
+
+		$state = Aura_Worker_Magic_Link::password_state( 3, 'uuid-manual' );
+
+		$GLOBALS['_sa_app_password_read_fail'] = array();
+		$this->assertSame( 'unknown', $state, 'no row is no answer' );
+		$this->assertCount( 1, $this->probe_unproven() );
+	}
+
+	/**
+	 * And a statement that could not be BUILT is never issued. core's
+	 * prepare() answers null when it refuses the call; get_row( null ) then
+	 * answers null and the nonce would reject that answer anyway, so this
+	 * guard changes no outcome — it is the earlier, cheaper refusal, and what
+	 * it pins is that nothing is asked at all. That is why the assertion below
+	 * is on the breadcrumb: "we never issued a statement" and "we issued one
+	 * and disbelieved its answer" are both `unknown`, and the breadcrumb is
+	 * the only thing that tells them apart. Stated plainly rather than dressed
+	 * up as a safety outcome it is not (#434 N3, and N2's lesson).
+	 */
+	public function test_a_statement_that_could_not_be_prepared_is_never_issued(): void {
+		$GLOBALS['_sa_app_password_read_fail'][3] = true; // the probe is what decides
+		$GLOBALS['_sa_wpdb_prepare_null']         = true; // prepare() refuses the call
+		$state                                    = Aura_Worker_Magic_Link::password_state( 3, 'uuid-manual' );
+		$GLOBALS['_sa_wpdb_prepare_null']         = false;
+		$GLOBALS['_sa_app_password_read_fail']    = array();
+
+		$this->assertSame( 'unknown', $state, 'nothing was issued, so nothing was proved' );
+		$this->assertSame( array(), $this->probe_unproven(), 'and no statement was issued to disbelieve' );
 	}
 
 	/**

@@ -1434,6 +1434,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * the statement it was handed ever reached the database.
 		 */
 		private $sa_last_var = null;
+		/**
+		 * The same thing for get_row(). wpdb keeps ONE $last_result; modelling
+		 * the two separately is the harsher choice, because it means the stale
+		 * answer a probe can meet is always another PROBE's row — the most
+		 * dangerous shape there is — rather than some unrelated statement's.
+		 */
+		private $sa_last_row = null;
 
 		/** Used only by get_status()'s health report — a fixed stand-in, not modelled state. */
 		public function db_version(): string {
@@ -1523,33 +1530,12 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// The row, not the cache (see sa_read_option_uncached()).
 				return sa_read_option_uncached( $name );
 			}
-			// The one shape managed_password_state()'s confirming read issues
-			// (#434 Task 4, I5): a user's Application Passwords meta row, read
-			// straight from the "database" ($GLOBALS['_app_passwords'], which
-			// is what the WP_Application_Passwords stub above is backed by).
-			// Serialised, as core stores it.
-			if ( preg_match( "/^SELECT meta_value FROM \S+ WHERE user_id = (\d+) AND meta_key = '_application_passwords' LIMIT 1$/", (string) $query, $m ) ) {
-				$GLOBALS['_db_queries'][] = (string) $query;
-				$user = (int) $m[1];
-				// A read failure scoped to ONE user's row, not the whole
-				// request: a test proving THIS boundary fails closed needs the
-				// rest of the request to keep working, or a later shared
-				// failure would satisfy the assertion just as well.
-				if ( ! empty( $GLOBALS['_sa_app_password_read_fail'][ $user ] ) ) {
-					$this->last_error = 'read failed';
-					return null;
-				}
-				if ( ! isset( $GLOBALS['_app_passwords'][ $user ] ) ) {
-					return null; // no row at all
-				}
-				return serialize( $GLOBALS['_app_passwords'][ $user ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
-			}
-			// Reformatting the production query would otherwise unhook every
-			// I5/M12 test silently — they would fall through to $_db_var, read
-			// null, and go on passing while proving nothing (#434 M12). The
-			// seam fails LOUD instead. The admin-accounts audit's size
-			// pre-check is the one other shape that reads this meta key, and
-			// it is served by $_db_var like any other scalar.
+			// app_password_row_state()'s confirming read is a get_row() now
+			// (#434 N1), so NO get_var() shape may touch this meta key except
+			// the admin-accounts audit's size pre-check. Anything else means
+			// the probe was moved or reformatted, and every I5/M12 test would
+			// otherwise fall through to $_db_var, read null, and go on passing
+			// while proving nothing. The seam fails LOUD instead.
 			if (
 				! preg_match( "/^SELECT LENGTH\(meta_value\) FROM \S+ WHERE user_id = \d+ AND meta_key = '_application_passwords' LIMIT 1$/", (string) $query )
 				&& false !== strpos( (string) $query, '_application_passwords' )
@@ -1562,10 +1548,83 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			return $GLOBALS['_db_var'];
 		}
 
-		/** get_row returns the configured single row. */
+		/**
+		 * get_row, modelled the way wpdb really behaves — because this is the
+		 * shape app_password_row_state()'s confirming read issues (#434 N1).
+		 *
+		 * wpdb::get_row() ignores wpdb::query()'s return value and extracts
+		 * from $last_result, so a statement that never ran hands back the
+		 * PREVIOUS statement's row: an unready handle and a `query` filter
+		 * that blanks the SQL both return before flush(). A stub that always
+		 * ran the statement it was handed is more forgiving than WordPress,
+		 * and that is how #434 M12 hid. Both switches are off by default. A
+		 * falsy $query is the one case core answers null outright (get_row's
+		 * `else { return null; }`, unlike get_var, which reads last_result).
+		 */
 		public function get_row( $query = null, $output = OBJECT, $y = 0 ) {
+			if ( ! $query ) {
+				return null;
+			}
+			if ( ! $this->ready || ! empty( $GLOBALS['_sa_wpdb_query_filtered_out'] ) ) {
+				return $this->sa_last_row; // another statement's answer
+			}
+			$this->sa_last_row = $this->sa_get_row_ran( $query, $output, $y );
+			return $this->sa_last_row;
+		}
+
+		/** get_row()'s body for the case where the statement really is issued. */
+		private function sa_get_row_ran( $query = null, $output = OBJECT, $y = 0 ) {
 			$this->last_query = (string) $query;
+			// A driver-level failure has no result set at all, so wpdb has no
+			// row to extract and answers null — the shape the probe reads as
+			// "this proved nothing".
+			$this->last_error = (string) ( $GLOBALS['_sa_wpdb_error'] ?? '' );
+			if ( '' !== $this->last_error ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return null;
+			}
+			// The one shape app_password_row_state() issues (#434 N1): the
+			// call's own nonce as a `probe` column, beside that user's
+			// Application Passwords meta row read straight from the
+			// "database" ($GLOBALS['_app_passwords'], which is what the
+			// WP_Application_Passwords stub above is backed by). Serialised,
+			// as core stores it. The nonce is echoed back exactly as the
+			// statement asked for it — a real SELECT of a literal cannot do
+			// anything else.
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, \(SELECT meta_value FROM \S+ WHERE user_id = (\d+) AND meta_key = '_application_passwords' LIMIT 1\) AS v$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$user = (int) $m[2];
+				// A read failure scoped to ONE user's row, not the whole
+				// request: a test proving THIS boundary fails closed needs the
+				// rest of the request to keep working, or a later shared
+				// failure would satisfy the assertion just as well.
+				if ( ! empty( $GLOBALS['_sa_app_password_read_fail'][ $user ] ) ) {
+					$this->last_error = 'read failed';
+					return null; // the statement failed: no result set, no row
+				}
+				return (object) array(
+					'probe' => $m[1],
+					'v'     => isset( $GLOBALS['_app_passwords'][ $user ] )
+						? serialize( $GLOBALS['_app_passwords'][ $user ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+						: null, // no row at all
+				);
+			}
+			// Reformatting the production probe would otherwise unhook every
+			// I5/M12/N1 test silently — they would fall through to $_db_row,
+			// read null, and go on passing while proving nothing. LOUD instead.
+			if ( false !== strpos( (string) $query, '_application_passwords' ) ) {
+				throw new RuntimeException( 'wpdb stub: unrecognised _application_passwords query shape — app_password_row_state() was reformatted and its tests would prove nothing: ' . (string) $query );
+			}
 			return $GLOBALS['_db_row'];
+		}
+
+		/**
+		 * Forget what the last statement left behind, so one test's result set
+		 * can never be the stale answer another test's probe meets.
+		 */
+		public function sa_forget_last_result(): void {
+			$this->sa_last_var = null;
+			$this->sa_last_row = null;
 		}
 
 		/**
@@ -1605,6 +1664,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			}
 			$query                      = (string) $query;
 			$GLOBALS['_db_prepared'][] = array( 'query' => $query, 'args' => $args );
+			// core's prepare() answers null when it refuses the call (a
+			// placeholder/argument mismatch, an empty query). Nothing is
+			// issued then, and a caller that issued it anyway would read back
+			// whatever result set was already there (#434 N3).
+			if ( ! empty( $GLOBALS['_sa_wpdb_prepare_null'] ) ) {
+				return null;
+			}
 			$i = 0;
 			return preg_replace_callback(
 				'/%[sd]/',
@@ -1893,6 +1959,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
+	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -2437,6 +2504,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
+	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -2482,6 +2550,9 @@ function sa_reset_state(): void {
 		$GLOBALS['wpdb']->last_query = '';
 		if ( property_exists( $GLOBALS['wpdb'], 'ready' ) ) {
 			$GLOBALS['wpdb']->ready = true; // a test that took the handle down never leaks it (#434 M12)
+		}
+		if ( method_exists( $GLOBALS['wpdb'], 'sa_forget_last_result' ) ) {
+			$GLOBALS['wpdb']->sa_forget_last_result(); // no test's result set is another test's stale answer (#434 N1)
 		}
 	}
 	if ( class_exists( 'Aura_Worker_Rules' ) ) {
