@@ -821,6 +821,27 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'aura-connect-btn', $html );
 	}
 
+	public function test_an_unreadable_credential_list_is_never_painted_as_healthy(): void {
+		// #434 M13. credential_state() is the ONE caller of the tri-state that
+		// deliberately does not fail closed: an unreadable list answers 'none',
+		// exactly as it did before the third answer existed, because the advice
+		// that follows ("connect again to issue one") is harmless and
+		// self-correcting. The tempting "tidy" — treating only a PROVEN gone as
+		// missing — sends an unreadable list on to the availability branch and
+		// paints the green check and "Connected to Aura dashboard" over a read
+		// that never completed. That is the worse lie, and this pins it.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertStringContainsString( 'dashicons-yes-alt', $this->renderConnect(), 'a credential really there is healthy' );
+
+		$GLOBALS['_sa_app_password_read_fail'][7] = true;
+		$html                                     = $this->renderConnect();
+		$GLOBALS['_sa_app_password_read_fail']    = array();
+
+		$this->assertStringContainsString( 'no credential for the builder tools', $html );
+		$this->assertStringNotContainsString( 'dashicons-yes-alt', $html, 'never the green check over a read that failed' );
+		$this->assertStringContainsString( 'dashicons-warning', $html );
+	}
+
 	public function test_the_lifecycle_hooks_reach_every_site_of_a_network(): void {
 		// Round-28: a network-activated plugin's activation, deactivation and
 		// uninstall each run ONCE, in whichever blog context the request is in.

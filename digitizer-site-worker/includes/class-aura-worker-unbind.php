@@ -525,6 +525,19 @@ final class Aura_Worker_Unbind {
 
 		// (5) The token. Irreversible: nothing afterwards can authenticate as
 		// this binding, and no retry can be matched to this marker.
+		//
+		// leftovers() reports on the four things steps (1)-(4) remove and can
+		// never name the token itself, so a `final: true` request whose delete
+		// does not land answers `cleanup_complete: false` with an EMPTY
+		// leftovers list — the shape the spec otherwise reserves for
+		// `final: false` (#434 M11, recorded deliberately, not fixed). It is
+		// safe in both directions that matter: `final` is set only on the
+		// tombstone that CARRIES the token (Aura sets it when no other pending
+		// tombstone shares the same siteTokenHash), and the drain's
+		// retire-on-empty exception is scoped to a tombstone that is NOT the
+		// carrier, so the two cannot meet; and the residual is a SURVIVING
+		// token, which is the fail-safe direction — no credential outlives
+		// anything. The other early returns above answer non-empty.
 		do_action( 'aura_worker_unbind_step', 'token' );
 		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_site_token', $claim, $fence );
 		return self::option_absent( 'aura_worker_site_token' );

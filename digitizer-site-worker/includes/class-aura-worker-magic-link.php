@@ -1407,6 +1407,9 @@ class Aura_Worker_Magic_Link {
 	 * may itself be a cached empty array left behind by a failed query, so a
 	 * second trip through the meta cache would repeat the same wrong answer.
 	 *
+	 * Absence is answered only from a statement this call is able to show RAN
+	 * (#434 M12) — see the comment beside the last_query check below.
+	 *
 	 * @since 2.13.0
 	 *
 	 * @param int    $owner Owner user ID.
@@ -1418,9 +1421,39 @@ class Aura_Worker_Magic_Link {
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
 			return self::STATE_UNKNOWN; // no way to confirm: never a proof of absence
 		}
+		// A handle that has declared itself not ready refuses every statement
+		// at the top of wpdb::query(), before the database is touched, so
+		// asking it proves nothing. isset(), not a bare read: a db.php drop-in
+		// that never declares the property is expressing no opinion, and the
+		// last_query check below still decides whether ITS statement ran.
+		if ( isset( $wpdb->ready ) && ! $wpdb->ready ) {
+			return self::STATE_UNKNOWN;
+		}
+		$sql = $wpdb->prepare( "SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1", $owner, self::APP_PASSWORD_USERMETA_KEY );
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			return self::STATE_UNKNOWN; // nothing was issued, so nothing was proved
+		}
 		$wpdb->last_error = '';
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1", $owner, self::APP_PASSWORD_USERMETA_KEY ) );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
+		$raw = $wpdb->get_var( $sql );
+		// Prove the statement RAN — "nothing reported an error" is not the same
+		// fact, and this is the read a step-(5) delete turns on (#434 M12).
+		// wpdb::query() has two early returns BEFORE its flush(): `! $ready`
+		// and a `query` filter that blanks the SQL. Each returns false leaving
+		// last_result, last_error and last_query exactly as the PREVIOUS
+		// statement left them — and wpdb::get_var() ignores query()'s return
+		// value entirely, extracting its answer from that stale last_result.
+		// So an unrelated statement's row (or its emptiness, read as null)
+		// would arrive here looking clean, because clearing last_error above
+		// removed the only accidental signal. last_query is assigned only
+		// after both early returns and holds the FILTERED text, so requiring
+		// it to be the SQL we issued rules out both paths and a filter that
+		// rewrote the query. An identical earlier statement is the single
+		// coincidence this admits, and it is the same read with the same
+		// answer.
+		if ( ! isset( $wpdb->last_query ) || (string) $sql !== (string) $wpdb->last_query ) {
+			return self::STATE_UNKNOWN;
+		}
 		if ( '' !== (string) $wpdb->last_error ) {
 			return self::STATE_UNKNOWN;
 		}

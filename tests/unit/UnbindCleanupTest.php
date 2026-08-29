@@ -556,6 +556,52 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/**
+	 * A handle that has declared itself not ready runs nothing: wpdb::query()
+	 * returns at its first line, before flush(), and wpdb::get_var() ignores
+	 * that return value and extracts its answer from the PREVIOUS statement's
+	 * last_result — with last_error and last_query still that statement's too.
+	 * Here the previous statement is the SAME probe against a user with no
+	 * row, so last_query matches and only the readiness check stands between a
+	 * stale null and a proof of absence. (#434 M12)
+	 */
+	public function test_an_unready_database_handle_is_never_asked_and_never_proves_absence(): void {
+		$wpdb = $GLOBALS['wpdb'];
+		$this->assertSame( 'gone', Aura_Worker_Magic_Link::password_state( 4, 'uuid-manual' ), 'a real statement, leaving its own empty result behind' );
+
+		$wpdb->last_error = 'MySQL server has gone away'; // another statement's complaint
+		$wpdb->ready      = false;
+		$state            = Aura_Worker_Magic_Link::password_state( 3, 'uuid-never-existed' );
+		$error_after      = $wpdb->last_error;
+		$wpdb->ready      = true;
+		$wpdb->last_error = '';
+
+		$this->assertSame( 'unknown', $state, 'a handle that refuses statements proves nothing' );
+		$this->assertSame( 'MySQL server has gone away', $error_after, 'and is not written to either: nothing was issued' );
+	}
+
+	/**
+	 * The other early return in wpdb::query(): a `query` filter that blanks
+	 * the SQL. The statement never runs, our own last_error reset guarantees
+	 * the handle looks clean, and get_var() hands back the row of whatever ran
+	 * last — here another USER's empty row. Reading that as "user 3's live
+	 * administrator credential is gone" is the whole of #434's Critical
+	 * family, arriving through the one door left open. (#434 M12)
+	 */
+	public function test_a_statement_that_never_ran_is_never_proof_of_absence(): void {
+		$this->assertSame( 'gone', Aura_Worker_Magic_Link::password_state( 4, 'uuid-manual' ), 'user 4 has no row: the previous statement, and its empty answer' );
+
+		// User 3 really holds uuid-manual; core's cached list cannot be read,
+		// so the confirming probe is what decides.
+		$GLOBALS['_sa_app_password_read_fail'][3] = true;
+		$GLOBALS['_sa_wpdb_query_filtered_out']   = true;
+		$state                                    = Aura_Worker_Magic_Link::password_state( 3, 'uuid-manual' );
+		$GLOBALS['_sa_wpdb_query_filtered_out']   = false;
+		$GLOBALS['_sa_app_password_read_fail']    = array();
+
+		$this->assertSame( 'unknown', $state, 'the answer came from another query and is no answer at all' );
+	}
+
+	/**
 	 * password_gone() answers PROVEN gone and nothing else: the boolean form
 	 * every fail-closed caller in the plugin reads.
 	 */

@@ -1423,6 +1423,17 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public string $usermeta   = 'wp_usermeta';
 		public string $last_error = '';
 		public string $last_query = '';
+		/**
+		 * wpdb::$ready, modelled because production reads it: wpdb::query()
+		 * returns at its very first line when this is false (#434 M12).
+		 */
+		public bool $ready = true;
+		/**
+		 * What the LAST statement that actually ran left behind — wpdb keeps
+		 * it in $last_result, and get_var() extracts from there whether or not
+		 * the statement it was handed ever reached the database.
+		 */
+		private $sa_last_var = null;
 
 		/** Used only by get_status()'s health report — a fixed stand-in, not modelled state. */
 		public function db_version(): string {
@@ -1467,6 +1478,26 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * classification really came from a query, not from get_option().
 		 */
 		public function get_var( $query = null, $x = 0, $y = 0 ) {
+			// wpdb::query() has TWO early returns before its flush() — an
+			// unready handle, and a `query` filter that blanks the SQL — and
+			// each returns false leaving last_result, last_error and
+			// last_query exactly as the previous statement left them.
+			// wpdb::get_var() ignores that return value and extracts its
+			// answer from the stale last_result regardless. A stub that always
+			// ran the query it was handed is more forgiving than WordPress,
+			// and that is how #434 M12 hid: the probe's absence proof came
+			// from a statement that never ran. Off by default; narrowly
+			// scoped to get_var(), which is the only shape production reads a
+			// row with here.
+			if ( ! $this->ready || ! empty( $GLOBALS['_sa_wpdb_query_filtered_out'] ) ) {
+				return $this->sa_last_var; // another statement's answer
+			}
+			$this->sa_last_var = $this->sa_get_var_ran( $query, $x, $y );
+			return $this->sa_last_var;
+		}
+
+		/** get_var()'s body for the case where the statement really is issued. */
+		private function sa_get_var_ran( $query = null, $x = 0, $y = 0 ) {
 			$this->last_query = (string) $query;
 			// A driver-level failure answers null AND sets last_error — the one
 			// thing that tells "no such row" apart from "the database is
@@ -1512,6 +1543,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					return null; // no row at all
 				}
 				return serialize( $GLOBALS['_app_passwords'][ $user ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+			}
+			// Reformatting the production query would otherwise unhook every
+			// I5/M12 test silently — they would fall through to $_db_var, read
+			// null, and go on passing while proving nothing (#434 M12). The
+			// seam fails LOUD instead. The admin-accounts audit's size
+			// pre-check is the one other shape that reads this meta key, and
+			// it is served by $_db_var like any other scalar.
+			if (
+				! preg_match( "/^SELECT LENGTH\(meta_value\) FROM \S+ WHERE user_id = \d+ AND meta_key = '_application_passwords' LIMIT 1$/", (string) $query )
+				&& false !== strpos( (string) $query, '_application_passwords' )
+			) {
+				throw new RuntimeException( 'wpdb stub: unrecognised _application_passwords query shape — app_password_row_state() was reformatted and its tests would prove nothing: ' . (string) $query );
 			}
 			if ( ! empty( $GLOBALS['_db_var_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_var_queue'] );
@@ -1849,6 +1892,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
+	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -2392,6 +2436,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
+	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -2435,6 +2480,9 @@ function sa_reset_state(): void {
 	if ( isset( $GLOBALS['wpdb'] ) ) {
 		$GLOBALS['wpdb']->last_error = '';
 		$GLOBALS['wpdb']->last_query = '';
+		if ( property_exists( $GLOBALS['wpdb'], 'ready' ) ) {
+			$GLOBALS['wpdb']->ready = true; // a test that took the handle down never leaks it (#434 M12)
+		}
 	}
 	if ( class_exists( 'Aura_Worker_Rules' ) ) {
 		Aura_Worker_Rules::reset_records();
