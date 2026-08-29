@@ -1438,7 +1438,14 @@ class Aura_Worker_Magic_Link {
 		// particular is `false` by declaration on every drop-in that never
 		// calls parent::__construct(). The nonce needs no such etiquette —
 		// it is a property of the ANSWER, on every handle.
-		$nonce = wp_generate_password( 20, false );
+		//
+		// wp_generate_uuid4() and not wp_generate_password(): the latter is
+		// PLUGGABLE and runs its result through the `random_password` filter,
+		// so a third party could make it constant — and a constant nonce is
+		// no nonce at all, because the stale row a probe meets is another
+		// probe's. wp_generate_uuid4() is neither pluggable nor filtered, and
+		// never throws (it falls back through wp_rand / random_int / mt_rand).
+		$nonce = wp_generate_uuid4();
 		$sql   = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, $owner, self::APP_PASSWORD_USERMETA_KEY );
 		// A prepare() that did not return usable SQL is not issued at all —
 		// core's prepare() answers null when it refuses the call. Nothing
