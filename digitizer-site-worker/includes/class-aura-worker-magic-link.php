@@ -1135,11 +1135,15 @@ class Aura_Worker_Magic_Link {
 	 * a conditional delete that failed leaves the previous client's block and
 	 * warn policy governing the newly connected dashboard behind a 200.
 	 *
+	 * Public since 2.13.0 for #434's Phase B, which clears the same store under
+	 * the same claim and needs the same proof that the row is gone —
+	 * Aura_Worker_Rules::clear() on its own reports nothing.
+	 *
 	 * @param string $claim The claim option's name.
 	 * @param string $fence This handler's fence.
 	 * @return bool True when the store is empty.
 	 */
-	private static function clear_ruleset_verified( $claim, $fence ): bool {
+	public static function clear_ruleset_verified( $claim, $fence ): bool {
 		Aura_Worker_Rules::clear( $claim, $fence );
 		$left = Aura_Worker_Rules::read_option_uncached( Aura_Worker_Rules::OPTION );
 		return ! is_wp_error( $left ) && ( null === $left || '' === (string) $left );
@@ -1248,6 +1252,31 @@ class Aura_Worker_Magic_Link {
 		update_option( self::APP_PASSWORD_RECORD_OPTION, $record, false );
 		wp_cache_delete( self::APP_PASSWORD_RECORD_OPTION, 'options' );
 		return 1;
+	}
+
+	/**
+	 * Is that Application Password gone from that user's list? The public form
+	 * of managed_password_gone(), for the ONE caller outside this class that
+	 * needs the same proof: #434's Phase B revokes every credential the unbind
+	 * marker names — the managed one AND any password that authenticated an
+	 * unbind — and, like every step of that cleanup, may report a step
+	 * complete only on evidence, never on a delete's return value.
+	 *
+	 * A WordPress with no Application Passwords class holds no such password
+	 * and can authenticate nobody with one, so there is nothing left to
+	 * revoke: "gone", exactly as usable_password() already treats it.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int    $user Owner user ID.
+	 * @param string $uuid Password UUID.
+	 * @return bool True when nothing with that UUID remains.
+	 */
+	public static function password_gone( int $user, string $uuid ): bool {
+		if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+			return true;
+		}
+		return self::managed_password_gone( $user, $uuid );
 	}
 
 	/**

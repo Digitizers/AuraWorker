@@ -744,6 +744,56 @@ function sa_set_managed_app_password( int $user_id, string $uuid ): void {
 }
 
 /**
+ * Clear the unbind marker from the "database" — the state a site that was
+ * never unbound (or one Task 7 has rebound) is in.
+ *
+ * @return void
+ */
+function sa_clear_marker(): void {
+	unset(
+		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ],
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ],
+		$GLOBALS['_rows_autoload'][ Aura_Worker_Unbind::OPTION ]
+	);
+	$GLOBALS['_notoptions'][ Aura_Worker_Unbind::OPTION ] = true;
+}
+
+/**
+ * Add ONE Application Password to a user's list without touching the plugin's
+ * own bookkeeping row — the shape of a password SiteAgent never minted: a
+ * manually connected site's, one Aura's PATCH installed, or an unrelated
+ * credential the site owner created (which Phase B must leave alone).
+ *
+ * @param int    $user_id Owner.
+ * @param string $uuid    The password's uuid.
+ * @return void
+ */
+function sa_add_app_password( int $user_id, string $uuid ): void {
+	$GLOBALS['_app_passwords'][ $user_id ][] = array(
+		'uuid'    => $uuid,
+		'name'    => 'Manual',
+		'created' => time(),
+	);
+}
+
+/**
+ * Is that Application Password still on the user's list? The same proof
+ * Aura_Worker_Magic_Link::password_gone() uses, from the test's side.
+ *
+ * @param int    $user_id Owner.
+ * @param string $uuid    The password's uuid.
+ * @return bool
+ */
+function sa_app_password_exists( int $user_id, string $uuid ): bool {
+	foreach ( $GLOBALS['_app_passwords'][ $user_id ] ?? array() as $item ) {
+		if ( isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
  * The seam that runs between a caller's read and its compare-and-swap — the
  * window in which a concurrent connect writes its binding. A test sets
  * $GLOBALS['_sa_before_swap'] to a callable (which clears itself, so it fires
@@ -814,6 +864,8 @@ if ( ! function_exists( 'user_can' ) ) {
 $GLOBALS['_app_passwords']           = array();
 $GLOBALS['_app_passwords_available'] = true;
 $GLOBALS['_app_passwords_delete_fail'] = false;
+$GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails (#434 Task 4).
+$GLOBALS['_unbind_trace']              = array(); // Phase B's step trace; sa_reset_state() re-arms the recorder.
 if ( ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 	function wp_is_application_passwords_available_for_user( $user ): bool {
 		return (bool) $GLOBALS['_app_passwords_available'];
@@ -850,6 +902,13 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 		}
 		public static function delete_application_password( int $user_id, string $uuid ) {
 			if ( ! empty( $GLOBALS['_app_passwords_delete_fail'] ) ) {
+				return new WP_Error( 'db_update_error', 'user meta write failed' );
+			}
+			// One password whose delete fails, unlike the switch above which
+			// fails every one: Phase B walks a LIST, and a test that must prove
+			// the walk survives a single refusal (and that the token is never
+			// reached) needs the others to go through (#434 Task 4).
+			if ( isset( $GLOBALS['_fail_delete_app_password'] ) && $uuid === (string) $GLOBALS['_fail_delete_app_password'] ) {
 				return new WP_Error( 'db_update_error', 'user meta write failed' );
 			}
 			$before = count( $GLOBALS['_app_passwords'][ $user_id ] ?? array() );
@@ -2252,6 +2311,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
+	$GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails; see the stub above.
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
 	$GLOBALS['_sa_app_password_create_fails']    = false;
 	$GLOBALS['_abilities']    = array();
@@ -2343,5 +2403,17 @@ function sa_reset_state(): void {
 	// get_core_updates()/wp_get_theme() stub, in place of the intended
 	// defaults (see the stubs' own comments a few hundred lines up).
 	unset( $GLOBALS['_installed_plugins'], $GLOBALS['_core_updates'], $GLOBALS['_missing_themes'] );
+	// Phase B's own step trace (#434 Task 4). Registered HERE, after $_filters
+	// is emptied above, so every test starts with the recorder attached and an
+	// empty trace: cleanup()'s fixed order — the token strictly last — is only
+	// checkable if the order is observable, and do_action() is the one seam
+	// that reports it without the test reaching inside the class.
+	$GLOBALS['_unbind_trace'] = array();
+	add_action(
+		'aura_worker_unbind_step',
+		static function ( $step ) {
+			$GLOBALS['_unbind_trace'][] = (string) $step;
+		}
+	);
 	$_SERVER['REMOTE_ADDR']   = '203.0.113.10';
 }

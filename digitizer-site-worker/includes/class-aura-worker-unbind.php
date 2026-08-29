@@ -23,8 +23,10 @@ final class Aura_Worker_Unbind {
 	const FINISH_THROTTLE = 300;
 
 	/**
-	 * Wire the init-hooked Phase B sweep. The body is filled in Task 4 —
-	 * this task only introduces the hook registration.
+	 * Wire the init-hooked Phase B sweep: a site whose unbind was interrupted
+	 * (the network died between Aura's tombstone and the site's answer, the
+	 * request was killed mid-cleanup) finishes steps (1)-(4) on its own next
+	 * page load, throttled, without Aura having to reach it again.
 	 */
 	public static function init(): void {
 		add_action( 'init', array( __CLASS__, 'maybe_finish' ) );
@@ -184,27 +186,212 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
-	 * Phase B cleanup — revoke the marker's Application Passwords, delete the
-	 * dashboard url and connect user, clear the ruleset store, delete the
-	 * gateway key, and (only when $final and every earlier step verified)
-	 * delete the site token.
+	 * Is that option's row gone from the database? ONE "is it removed" read for
+	 * every step of Phase B, and it FAILS CLOSED: read_option_uncached()
+	 * answers null for an absent row and a WP_Error for a read that could not
+	 * be completed, and only the first of those is evidence of anything. A
+	 * database blip read as "absent" would let cleanup() report a step
+	 * complete — and, at step (5), report a token deleted that is still there.
 	 *
-	 * STUB. Task 4 implements it; it returns false here so Phase A's response
-	 * reports `cleanup_complete: false` honestly rather than claiming work
-	 * that has not happened.
-	 *
-	 * @param bool   $final Whether this request may delete the site token.
-	 * @param string $fence The caller's site-claim fence.
-	 * @return bool True once every step is verified complete.
+	 * @param string $name Option name.
+	 * @return bool True only when the row is proven absent.
 	 */
-	public static function cleanup( bool $final, string $fence ): bool {
-		unset( $final, $fence );
-		return false; // Task 4
+	private static function option_absent( string $name ): bool {
+		$raw = Aura_Worker_Rules::read_option_uncached( $name );
+		return ! is_wp_error( $raw ) && null === $raw;
 	}
 
 	/**
-	 * Phase B cleanup (Task 4). Empty for now — init() only registers the hook
-	 * this task; nothing runs from it yet.
+	 * Which of steps (1)-(4) are still owed — the same evidence cleanup() uses
+	 * to decide whether it may reach step (5), exposed so a caller (and Task
+	 * 9's teardown) can see what a site still holds.
+	 *
+	 * Fails CLOSED on an unreadable marker: with the marker unreadable nothing
+	 * can be proven gone, so every step is named rather than none. The empty
+	 * array means "proven nothing is owed", and must never mean "could not
+	 * look".
+	 *
+	 * @return string[] Any of 'app_passwords', 'options', 'ruleset', 'grant_pubkey'.
 	 */
-	public static function maybe_finish(): void {}
+	public static function leftovers(): array {
+		$m = self::read();
+		if ( is_wp_error( $m ) ) {
+			return array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
+		}
+		if ( null === $m ) {
+			return array(); // no marker: this site is not mid-unbind and owes nothing
+		}
+		$left = array();
+		foreach ( $m['app_password_uuids'] as $uuid ) {
+			$user = (int) ( $m['app_password_users'][ $uuid ] ?? $m['connect_user_id'] ?? 0 );
+			if ( $user > 0 && ! Aura_Worker_Magic_Link::password_gone( $user, (string) $uuid ) ) {
+				$left[] = 'app_passwords';
+				break;
+			}
+		}
+		if ( ! self::option_absent( 'aura_worker_dashboard_url' ) || ! self::option_absent( 'aura_worker_connect_user_id' ) ) {
+			$left[] = 'options';
+		}
+		// The ROW, not Aura_Worker_Rules::current(): current() maps the
+		// connect's seq-0 sentinel to null, so a store that still binds this
+		// site to its departed client would read as already cleared. A
+		// WP_Error is non-null and therefore still owed — fail closed.
+		if ( null !== Aura_Worker_Rules::stored_uncached() ) {
+			$left[] = 'ruleset';
+		}
+		if ( ! self::option_absent( 'aura_worker_grant_pubkey' ) ) {
+			$left[] = 'grant_pubkey';
+		}
+		return $left;
+	}
+
+	/**
+	 * Phase B — the cleanup, in ONE fixed order, idempotent, every step proven
+	 * rather than assumed (spec §2.3):
+	 *
+	 *   (1) revoke every Application Password the marker names — the managed
+	 *       one and any that authenticated an unbind — each by (user, uuid),
+	 *       proven gone by re-reading the owner's list;
+	 *   (2) delete `aura_worker_dashboard_url` and `aura_worker_connect_user_id`;
+	 *   (3) clear the ruleset store, sentinel included;
+	 *   (4) delete the gateway public key;
+	 *   (5) delete the site token — LAST, and only under all three of: this is
+	 *       an Aura request that said `final: true` ($final; maybe_finish()
+	 *       never passes it), steps (1)-(4) are proven complete on THIS
+	 *       request (leftovers() empty), and the marker was readable.
+	 *
+	 * The order is the point. The token is what a retry of this same tombstone
+	 * authenticates with and what the marker fast path matches on, so it must
+	 * outlive every step that can still fail: a site that loses its token with
+	 * work outstanding can never be told about the remainder again. Everything
+	 * before it is removable twice with the same result, so an interrupted
+	 * cleanup is simply re-run — by the retry, or by maybe_finish().
+	 *
+	 * The return value is the `cleanup_complete` Aura is told, and it is
+	 * evidence, never optimism: true means "nothing this call was allowed to
+	 * remove is left", which for a `final` call includes an uncached read
+	 * proving the token row is gone.
+	 *
+	 * @param bool   $final Whether this request may delete the site token.
+	 * @param string $fence The caller's site-claim fence.
+	 * @return bool True once every step this call was allowed to take is
+	 *              verified complete.
+	 */
+	public static function cleanup( bool $final, string $fence ): bool {
+		$m = self::read();
+		// is_array(), never `! $m`: a WP_Error is truthy. An unreadable marker
+		// is neither "no marker" nor a marker to act on — Phase B does nothing
+		// at all rather than delete credentials for a binding it cannot name.
+		if ( ! is_array( $m ) ) {
+			return false;
+		}
+		if ( '' === $fence || ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			return false;
+		}
+		$claim = Aura_Worker_Magic_Link::SITE_CLAIM;
+
+		// (1) The credentials first: everything after this is bookkeeping, and
+		// an administrator-level REST credential is the one thing that must
+		// not outlive the binding by even a failed step.
+		do_action( 'aura_worker_unbind_step', 'revoke' );
+		if ( class_exists( 'WP_Application_Passwords' ) ) {
+			foreach ( $m['app_password_uuids'] as $uuid ) {
+				$uuid = (string) $uuid;
+				$user = (int) ( $m['app_password_users'][ $uuid ] ?? $m['connect_user_id'] ?? 0 );
+				if ( $user > 0 && ! Aura_Worker_Magic_Link::password_gone( $user, $uuid ) ) {
+					// The return value is not the proof (it is false for a
+					// failed user-meta write as well as for "not there");
+					// leftovers() re-reads the owner's list below.
+					WP_Application_Passwords::delete_application_password( $user, $uuid );
+				}
+			}
+		}
+
+		// (2) The options that name the departed dashboard and its connector.
+		do_action( 'aura_worker_unbind_step', 'options' );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_dashboard_url', $claim, $fence );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_connect_user_id', $claim, $fence );
+
+		// (3) The ruleset store — the departed client's block and warn policy.
+		do_action( 'aura_worker_unbind_step', 'ruleset' );
+		if ( null !== Aura_Worker_Rules::stored_uncached() ) {
+			Aura_Worker_Magic_Link::clear_ruleset_verified( $claim, $fence );
+		}
+
+		// (4) The gateway key. After this the site can verify nothing Aura
+		// signs — which is why the fast path (rules.php) answers a retry on
+		// the TOKEN alone, before any signature work.
+		do_action( 'aura_worker_unbind_step', 'grant' );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_grant_pubkey', $claim, $fence );
+
+		if ( array() !== self::leftovers() ) {
+			return false; // something is still owed; the token stays, and so does the retry path
+		}
+		if ( ! $final ) {
+			return false; // a sibling tombstone may still need this token to identify itself
+		}
+
+		// (5) The token. Irreversible: nothing afterwards can authenticate as
+		// this binding, and no retry can be matched to this marker.
+		do_action( 'aura_worker_unbind_step', 'token' );
+		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_site_token', $claim, $fence );
+		return self::option_absent( 'aura_worker_site_token' );
+	}
+
+	/**
+	 * The init-hooked sweep that finishes an interrupted Phase B on the site's
+	 * own next page load. Steps (1)-(4) only — NEVER the token: deleting it is
+	 * Aura's decision, carried on a `final: true` request, because only Aura
+	 * knows whether a sibling tombstone still needs this token to identify
+	 * itself. The site alone may never make that call.
+	 *
+	 * Throttled by FINISH_TRANSIENT (FINISH_THROTTLE seconds) so a busy site
+	 * does not attempt it on every request; the transient is set BEFORE the
+	 * work, so a request that dies mid-cleanup does not have the next one
+	 * retry immediately behind it.
+	 *
+	 * Under the site claim, like every other lifecycle operation — and a site
+	 * a connect currently holds is simply left alone until next time.
+	 *
+	 * @return void
+	 */
+	public static function maybe_finish(): void {
+		if ( ! self::is_set() ) {
+			return;
+		}
+		if ( false !== get_transient( self::FINISH_TRANSIENT ) ) {
+			return;
+		}
+		set_transient( self::FINISH_TRANSIENT, 1, self::FINISH_THROTTLE );
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		if ( '' === $fence ) {
+			return; // a connect (or another sweep) holds the site; next time
+		}
+		try {
+			// is_set() above fails OPEN on a database error — it is the
+			// display-side convenience. Re-read here and stop on anything that
+			// is not a marker: an unreadable one must not send this sweep into
+			// a cleanup for a binding it cannot identify.
+			$m = self::read();
+			if ( ! is_array( $m ) ) {
+				return;
+			}
+			$token = Aura_Worker_Rules::site_token_uncached();
+			if ( is_wp_error( $token ) ) {
+				return; // a token that could not be read is not a token that matches
+			}
+			$token = (string) $token;
+			// An ABSENT token is the expected state after step (5) — the
+			// cleanup simply has (1)-(4) left to prove. A token that is
+			// PRESENT and hashes to something else is a reconnect that has
+			// already rebound this site: the marker is not this binding, and
+			// nothing of the new one may be touched.
+			if ( '' !== $token && ! hash_equals( (string) $m['site'], $token ) ) {
+				return;
+			}
+			self::cleanup( false, $fence );
+		} finally {
+			Aura_Worker_Magic_Link::release_site( $fence );
+		}
+	}
 }

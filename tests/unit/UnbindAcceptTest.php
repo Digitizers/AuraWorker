@@ -108,7 +108,12 @@ final class UnbindAcceptTest extends TestCase {
 	}
 
 	public function test_unbind_writes_the_marker_with_the_binding_identity(): void {
-		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );               // seq-0 sentinel, as a connect leaves it
+		// Captured BEFORE the unbind: sa_token_hash() re-seeds the token option
+		// when it is absent, and Phase B (`final: true` below) deletes that row
+		// — so calling it again after the fact would quietly put the row back
+		// and the "the token is gone" assertion would be reading its own seed.
+		$token_hash = sa_token_hash();
+		Aura_Worker_Rules::bind( 'c1', $token_hash );                   // seq-0 sentinel, as a connect leaves it
 		update_option( 'aura_worker_connect_user_id', 3 );
 		sa_set_managed_app_password( 3, 'uuid-managed' );
 		Aura_Worker_Security::_set_authenticating_uuid_for_tests( 'uuid-manual' ); // the password that authenticated THIS request
@@ -118,9 +123,19 @@ final class UnbindAcceptTest extends TestCase {
 
 		$this->assertSame( true, $res['unbound'] );
 		$this->assertSame( 9, $res['seq'] );
-		$this->assertFalse( $res['cleanup_complete'], 'Phase B is a Task 4 stub — the response must say so honestly' );
+		// Task 4: the response reports the cleanup that actually ran. Everything
+		// this site holds is removable and the document said `final: true`, so
+		// the whole of Phase B completed — proven here by the state it left,
+		// not by the flag alone.
+		$this->assertTrue( $res['cleanup_complete'] );
+		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ), 'the minted credential is revoked' );
+		$this->assertFalse( get_option( 'aura_worker_connect_user_id' ) );
+		$this->assertNull( Aura_Worker_Rules::stored_uncached(), 'the departed client\'s store is cleared' );
+		$this->assertFalse( get_option( 'aura_worker_grant_pubkey' ) );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'and the token goes last' );
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'token' ), $GLOBALS['_unbind_trace'] );
 		$m = Aura_Worker_Unbind::read();
-		$this->assertSame( sa_token_hash(), $m['site'] );
+		$this->assertSame( $token_hash, $m['site'] );
 		$this->assertSame( 'r1', $m['site_ref'] );
 		$this->assertSame( 'c1', $m['client'] );
 		$this->assertSame( 9, $m['seq'] );
@@ -197,7 +212,11 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertInstanceOf( WP_Error::class, $res );
 		$this->assertSame( 'aura_unbind_store_failed', $res->get_error_code() );
 		$this->assertSame( 500, $res->get_error_data()['status'] );
-		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'no cleanup ran' );
+		// Task 4: the token survives because Phase B never STARTED — the trace
+		// is what proves that. `final: true` above means a cleanup that ran at
+		// all would have reached step (5).
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+		$this->assertSame( array(), $GLOBALS['_unbind_trace'], 'not one cleanup step ran' );
 		$this->assertSame( array( 'uuid-managed' ), Aura_Worker_Unbind::read()['app_password_uuids'] );
 	}
 
@@ -268,7 +287,12 @@ final class UnbindAcceptTest extends TestCase {
 		$req->set_param( 'ruleset', $this->unbind_env() );
 		$resp = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req );
 		$this->assertSame( 200, $resp->get_status() );
-		$this->assertSame( array( 'success' => true, 'seq' => 9, 'unbound' => true, 'cleanup_complete' => false ), $resp->get_data() ); // false until Task 4
+		// Task 4: everything this site holds is removable and the document says
+		// `final: true`, so the transported body reports a COMPLETED Phase B —
+		// and the token it deleted is gone, which is what makes the flag mean
+		// anything.
+		$this->assertSame( array( 'success' => true, 'seq' => 9, 'unbound' => true, 'cleanup_complete' => true ), $resp->get_data() );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
 	}
 
 	/**
@@ -283,7 +307,8 @@ final class UnbindAcceptTest extends TestCase {
 		$req->set_param( 'ruleset', $this->unbind_env( array( 'seq' => 11 ) ) );
 		$resp = ( new Aura_Worker_API( new Aura_Worker_Security() ) )->receive_rules( $req );
 		$this->assertSame( 200, $resp->get_status() );
-		$this->assertSame( array( 'success' => true, 'seq' => 11, 'unbound' => true, 'cleanup_complete' => false ), $resp->get_data() );
+		$this->assertSame( array( 'success' => true, 'seq' => 11, 'unbound' => true, 'cleanup_complete' => true ), $resp->get_data() );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'the retry finished the teardown the first attempt started' );
 	}
 
 	public function test_receive_rules_still_412s_a_marker_less_unkeyed_site(): void {
@@ -404,6 +429,7 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertSame( 'aura_unbind_store_failed', $res->get_error_code() );
 		$this->assertSame( 500, $res->get_error_data()['status'] );
 		$this->assertSame( array( 'uuid-managed' ), Aura_Worker_Unbind::read()['app_password_uuids'], 'the uuid genuinely did not land' );
-		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'nothing proceeded to cleanup' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+		$this->assertSame( array(), $GLOBALS['_unbind_trace'], 'nothing proceeded to cleanup' );
 	}
 }
