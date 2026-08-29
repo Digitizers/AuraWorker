@@ -35,12 +35,26 @@ final class Aura_Worker_Unbind {
 	 * a site is unbound is a security decision, and a stale cached copy could
 	 * let a mutation through a moment after Phase A wrote the refusal.
 	 *
-	 * @return array|null The marker, or null when absent or unreadable.
+	 * Mirrors `Aura_Worker_Rules::stored_uncached()` (round-16, Codex): a
+	 * `WP_Error` from the raw read is a genuine database failure, not "no
+	 * marker" — `$wpdb->get_var()` answers null for BOTH, and collapsing the
+	 * two would let a transient DB blip read as "site is bound" instead of
+	 * the retryable failure it is. Callers that need a plain boolean use
+	 * is_set() (fails OPEN, i.e. treats the error as "unbound" — documented
+	 * there) or is_set_strict() (surfaces the error so a caller can fail
+	 * CLOSED).
+	 *
+	 * @return array|null|WP_Error The marker; null when absent or the stored
+	 *                             value is not a valid marker; WP_Error when
+	 *                             the uncached read itself failed.
 	 */
-	public static function read(): ?array {
+	public static function read() {
 		$raw = Aura_Worker_Rules::read_option_uncached( self::OPTION );
-		$m   = is_string( $raw ) ? maybe_unserialize( $raw ) : $raw;
-		if ( ! is_array( $m ) || ! isset( $m['site'], $m['site_ref'], $m['client'], $m['seq'] ) ) {
+		if ( is_wp_error( $raw ) ) {
+			return $raw;
+		}
+		$m = is_string( $raw ) ? maybe_unserialize( $raw ) : $raw;
+		if ( ! is_array( $m ) || ! isset( $m['at'], $m['site'], $m['site_ref'], $m['client'], $m['seq'] ) ) {
 			return null;
 		}
 		$m['app_password_uuids'] = isset( $m['app_password_uuids'] ) && is_array( $m['app_password_uuids'] )
@@ -53,34 +67,63 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
-	 * Is this site currently unbound?
+	 * Is this site currently unbound? FAILS OPEN on a database read error —
+	 * "unknown" is treated as "unbound" — because this is the plain-boolean
+	 * convenience for callers that only want a display/witness answer (e.g.
+	 * admin UI), not a security gate. A mutation boundary MUST NOT use this
+	 * method; use is_set_strict() and fail CLOSED on its WP_Error instead.
 	 *
 	 * @return bool
 	 */
 	public static function is_set(): bool {
-		return null !== self::read();
+		$m = self::read();
+		return is_wp_error( $m ) || null !== $m;
+	}
+
+	/**
+	 * The strict form of is_set() for enforcement boundaries (Tasks 5/6):
+	 * surfaces a database read failure as a WP_Error instead of collapsing it
+	 * to a boolean, so the caller can refuse the mutation (self::refusal())
+	 * rather than silently letting it through while the marker is unreadable.
+	 *
+	 * @return bool|WP_Error True/false once the read genuinely succeeded, or
+	 *                       the WP_Error from a failed uncached read.
+	 */
+	public static function is_set_strict() {
+		$m = self::read();
+		if ( is_wp_error( $m ) ) {
+			return $m;
+		}
+		return null !== $m;
 	}
 
 	/**
 	 * The two fields `/status` reports — never the whole marker, which carries
-	 * the app-password UUIDs and the connecting user.
+	 * the app-password UUIDs and the connecting user. `/status` is a witness,
+	 * not a gate: a WP_Error from read() (a DB failure, not "no marker") is
+	 * reported the same as "no marker" here — status must not claim certainty
+	 * it does not have.
 	 *
 	 * @return array{at:string,site_ref:string}|null
 	 */
 	public static function status_fragment(): ?array {
 		$m = self::read();
-		return $m ? array(
+		if ( ! is_array( $m ) ) {
+			return null;
+		}
+		return array(
 			'at'       => (string) $m['at'],
 			'site_ref' => (string) $m['site_ref'],
-		) : null;
+		);
 	}
 
 	/**
 	 * Write the marker only while $fence holds the site claim; verified by an
 	 * uncached read-back — the same discipline every other claim-conditional
-	 * install write in this plugin follows. The row is created with
-	 * add_option() (autoload 'no') when absent, since
-	 * write_option_if_claimed() only UPDATEs an existing row.
+	 * install write in this plugin follows. write_option_if_claimed() already
+	 * has its own conditional INSERT for a row that doesn't exist yet (it
+	 * receives 'no' as $autoload below), so no separate add_option() pre-step
+	 * is needed here.
 	 *
 	 * @param array  $marker The marker to store.
 	 * @param string $fence  The caller's site-claim fence.
@@ -90,15 +133,25 @@ final class Aura_Worker_Unbind {
 		if ( '' === $fence || ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
 			return false;
 		}
-		if ( null === Aura_Worker_Rules::read_option_uncached( self::OPTION ) ) {
-			add_option( self::OPTION, array(), '', 'no' );
-		}
 		$ok = Aura_Worker_Rules::write_option_if_claimed( self::OPTION, $marker, Aura_Worker_Magic_Link::SITE_CLAIM, $fence, 'no' );
 		if ( ! $ok ) {
 			return false;
 		}
-		$back = self::read();
-		return is_array( $back ) && $back['site'] === $marker['site'] && (int) $back['seq'] === (int) $marker['seq'];
+		// Verify against a fresh raw read, not self::read(): a WP_Error here
+		// (a DB blip exactly at verification time) must be treated as
+		// "unverified" -> false, not fall through read()'s WP_Error handling
+		// and be misreported as "marker absent" or "marker present".
+		$raw = Aura_Worker_Rules::read_option_uncached( self::OPTION );
+		if ( ! is_string( $raw ) ) {
+			return false;
+		}
+		$back = maybe_unserialize( $raw );
+		// Compare identity (site) + freshness (seq) only, deliberately not the
+		// whole marker: proof that THIS write landed is "the row now names my
+		// site at my seq", not a byte-for-byte match of every field.
+		return is_array( $back ) && isset( $back['site'], $back['seq'] )
+			&& $back['site'] === $marker['site']
+			&& (int) $back['seq'] === (int) $marker['seq'];
 	}
 
 	/**

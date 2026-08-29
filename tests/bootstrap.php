@@ -445,6 +445,11 @@ if ( ! function_exists( 'update_option' ) ) {
 		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ] = $value;
 		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
+		// Core keeps the existing autoload flag when none is passed — only
+		// record one when the caller actually supplied it.
+		if ( null !== $autoload ) {
+			$GLOBALS['_rows_autoload'][ $option ] = $autoload;
+		}
 		// Witness every write, unconditionally. An option name is caller-chosen
 		// data on the restore_snapshot path (create_snapshot accepts any
 		// `target`), so excluding an `aura_worker_*` prefix would blind the
@@ -575,8 +580,9 @@ if ( ! function_exists( 'add_option' ) ) {
 		// difference (inert when unset).
 		sa_before_swap();
 		unset( $GLOBALS['_notoptions'][ $option ] );
-		$GLOBALS['_options'][ $option ] = $value;
-		$GLOBALS['_rows'][ $option ]    = maybe_serialize( $value );
+		$GLOBALS['_options'][ $option ]       = $value;
+		$GLOBALS['_rows'][ $option ]          = maybe_serialize( $value );
+		$GLOBALS['_rows_autoload'][ $option ] = $autoload;
 		return true;
 	}
 }
@@ -592,6 +598,7 @@ if ( ! function_exists( 'delete_option' ) ) {
 	function delete_option( string $option ): bool {
 		unset( $GLOBALS['_options'][ $option ] );
 		unset( $GLOBALS['_rows'][ $option ] );
+		unset( $GLOBALS['_rows_autoload'][ $option ] );
 		// Core lists a deleted name in `notoptions` (option.php, delete_option()).
 		$GLOBALS['_notoptions'][ $option ] = true;
 		$GLOBALS['_option_writes'][] = array( 'delete', $option );
@@ -1348,7 +1355,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
 				}
-				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ] );
+				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
 				$GLOBALS['_option_writes'][] = array( 'delete', $name );
 				return 1;
 			}
@@ -1382,7 +1389,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return 1;
 			}
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM \S+ c WHERE c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' AND NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
-				list( , $name, $value, , $claim, $like ) = array_map( 'stripslashes', $m );
+				list( , $name, $value, $autoload, $claim, $like ) = array_map( 'stripslashes', $m );
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
 					// `true` fails every write; a positive INT fails that many
 					// and then lets it through, as update_option() does; a
@@ -1401,9 +1408,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! sa_claim_like_matches( $claim, $like ) || null !== sa_read_option_uncached( $name ) ) {
 					return 0;
 				}
-				$GLOBALS['_rows'][ $name ]    = $value;
-				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
-				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				$GLOBALS['_rows'][ $name ]          = $value;
+				$GLOBALS['_options'][ $name ]       = maybe_unserialize( $value );
+				$GLOBALS['_rows_autoload'][ $name ] = $autoload;
+				$GLOBALS['_option_writes'][]        = array( 'set', $name );
 				return 1;
 			}
 
@@ -1537,6 +1545,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_cache_deletes']    = array();
 	$GLOBALS['_notoptions']       = array(); // Core's negative option cache — see get_option().
 	$GLOBALS['_rows']             = array(); // Raw, serialized bytes — the "database" the ruleset CAS reads/writes.
+	$GLOBALS['_rows_autoload']    = array(); // Per-option autoload flag for rows this stub actually tracks (add_option/update_option and the claim-fenced INSERT branch).
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;
 	$GLOBALS['_cas_always_lose']  = false;
@@ -1940,8 +1949,11 @@ if ( ! function_exists( 'wp_max_upload_size' ) ) {
 }
 
 if ( ! function_exists( 'get_site_url' ) ) {
+	// A separate global from get_home_url()'s: real WordPress lets these
+	// differ (a subdirectory install), so the stub does too, even though
+	// nothing here currently sets them apart.
 	function get_site_url(): string {
-		return $GLOBALS['_home_url'] ?? 'https://example.com';
+		return $GLOBALS['_site_url'] ?? 'https://example.com';
 	}
 }
 
@@ -2063,6 +2075,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_cache_deletes']    = array();
 	$GLOBALS['_notoptions']       = array(); // Core's negative option cache — see get_option().
 	$GLOBALS['_rows']             = array();
+	$GLOBALS['_rows_autoload']    = array(); // Per-option autoload flag — see the top-level init above.
 	$GLOBALS['_cas_racer']        = null;
 	$GLOBALS['_insert_racer']     = null;
 	$GLOBALS['_cas_always_lose']  = false;
@@ -2085,6 +2098,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_user_queries'] = array();
 	$GLOBALS['_post_counts']  = array();
 	$GLOBALS['_home_url']       = 'https://example.com';
+	$GLOBALS['_site_url']       = 'https://example.com';
 	$GLOBALS['_wp_query_posts'] = array();
 	$GLOBALS['_wp_queries']     = array();
 	$GLOBALS['_post_content']   = array();
