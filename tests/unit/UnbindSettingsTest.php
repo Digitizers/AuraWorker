@@ -837,8 +837,16 @@ final class UnbindSettingsTest extends TestCase {
 		$this->assertSame( array( self::MANAGED ), $this->stored_marker()['app_password_uuids'], 'only what the sweep proved' );
 	}
 
-	/** A damaged row with no uuid list at all still repairs from the sweep. */
-	public function test_a_damaged_row_with_no_uuid_list_repairs_from_the_sweep_alone(): void {
+	/**
+	 * A damaged row with NO uuid list at all cannot be repaired (Codex
+	 * round-5 P1). The sweep is a superset of what SiteAgent minted, and the
+	 * credential this rule protects is the one it cannot see: a password an
+	 * operator connected by hand, carrying a name of somebody else's choosing.
+	 * The row was its only record. Repairing from the sweep alone would let
+	 * the teardown report success and delete the token beside a live
+	 * administrator credential.
+	 */
+	public function test_a_damaged_row_with_no_uuid_list_is_not_repaired_from_the_sweep(): void {
 		$marker = sa_set_marker( array( 'seq' => 'nine' ) );
 		unset( $marker['app_password_uuids'], $marker['app_password_users'] );
 		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = $marker;
@@ -846,8 +854,27 @@ final class UnbindSettingsTest extends TestCase {
 
 		$out = $this->remove();
 
-		$this->assertTrue( $out['success'] );
-		$this->assertFalse( sa_app_password_exists( self::ADMIN, self::MANAGED ) );
+		$this->assertFalse( $out['success'] );
+		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::MANAGED ), 'nothing was revoked on an unreadable list' );
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'and the marker stays, so the site keeps refusing' );
+	}
+
+	/**
+	 * The same rule for a list that is PRESENT and not a list — the shape
+	 * read() now calls malformed, which is what sends the row here in the
+	 * first place.
+	 */
+	public function test_a_damaged_row_whose_uuid_list_is_not_a_list_is_not_repaired(): void {
+		$marker                       = sa_set_marker( array( 'seq' => 'nine' ) );
+		$marker['app_password_uuids'] = 'uuid-manual';
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ]    = maybe_serialize( $marker );
+		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = $marker;
+
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertFalse( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::MANAGED ) );
 	}
 
 	/**

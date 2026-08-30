@@ -86,6 +86,7 @@ $GLOBALS['_transients']   = array();
 $GLOBALS['_caps']         = null;   // null = allow all (current_user_can).
 $GLOBALS['_logged_in']    = false;
 $GLOBALS['_admins']       = array();
+$GLOBALS['_capable']      = array(); // users holding a capability WITHOUT the administrator role
 $GLOBALS['_current_user'] = 0;
 $GLOBALS['_did_actions']  = array();
 $GLOBALS['_registered_settings'] = array();
@@ -734,7 +735,16 @@ function sa_token_hash(): string {
 	if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
 		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', SA_RAW_SITE_TOKEN );
 	}
-	return (string) $GLOBALS['_options']['aura_worker_site_token'];
+	$hash = (string) $GLOBALS['_options']['aura_worker_site_token'];
+	// A site whose token a test installs is a site whose token a request then
+	// presents: check_aura_token() records the hash it accepted, and Phase A
+	// refuses to mark any other (#434 Codex round-5). A test that wants the
+	// two to DIVERGE — the regenerate-under-a-paused-request window — calls
+	// Aura_Worker_Security::capture_token_auth() itself afterwards.
+	if ( class_exists( 'Aura_Worker_Security' ) ) {
+		Aura_Worker_Security::capture_token_auth( $hash );
+	}
+	return $hash;
 }
 
 /**
@@ -988,8 +998,15 @@ if ( ! function_exists( 'wp_set_current_user' ) ) {
 
 if ( ! function_exists( 'user_can' ) ) {
 	function user_can( $user, string $cap, ...$args ): bool {
-		// Administrators in $GLOBALS['_admins'] hold every capability.
-		return in_array( (int) $user, array_map( 'intval', $GLOBALS['_admins'] ), true );
+		// Two sets, deliberately (#434 Codex round-5 P2). $_admins holds the
+		// literal `administrator` ROLE — it is what get_users( role =>
+		// administrator ) answers. $_capable holds users who have a capability
+		// WITHOUT that role, through a custom role or a direct grant, which is
+		// ordinary on real sites. The fake used to conflate them, so code that
+		// asked for the role while meaning the capability read as correct here
+		// and stranded a real site.
+		$who = array_merge( (array) $GLOBALS['_admins'], (array) ( $GLOBALS['_capable'] ?? array() ) );
+		return in_array( (int) $user, array_map( 'intval', $who ), true );
 	}
 }
 
@@ -1082,6 +1099,9 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 
 if ( ! function_exists( 'get_users' ) ) {
 	function get_users( array $args = array() ): array {
+		// ROLE, not capability: see user_can() above. A user in $_capable but
+		// not in $_admins does not have the administrator role and is not
+		// returned here, exactly as on a real site.
 		return $GLOBALS['_admins'];
 	}
 }
@@ -3258,6 +3278,11 @@ function sa_reset_state(): void {
 		// token-only request as (#434 Task 6). A static, so one test's run-as
 		// would otherwise still be "the departed binding" in the next.
 		Aura_Worker_Security::_set_ran_as_for_tests( null );
+		// And the third: the site-token hash a request authenticated with
+		// (#434 Codex round-5). Phase A refuses to mark a token other than the
+		// one that authenticated, so a leftover capture would let one test's
+		// token authorise the next test's unbind.
+		Aura_Worker_Security::capture_token_auth( '' );
 	}
 	if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
 		Aura_Worker_Call_Context::reset(); // the dispatching route is a static too
@@ -3278,6 +3303,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_caps']         = null;
 	$GLOBALS['_logged_in']    = false;
 	$GLOBALS['_admins']       = array();
+	$GLOBALS['_capable']      = array(); // users holding a capability WITHOUT the administrator role
 	$GLOBALS['_current_user'] = 0;
 	$GLOBALS['_current_user_id'] = 0; // get_current_user_id()'s store — see the stub above.
 	$GLOBALS['_did_actions']  = array();

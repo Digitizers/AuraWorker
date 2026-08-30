@@ -87,6 +87,27 @@ class Aura_Worker_Security {
 	private static $ran_as = null;
 
 	/**
+	 * The sha256 of the site token that AUTHENTICATED this request, captured
+	 * where the comparison is made.
+	 *
+	 * Phase A writes a marker naming "this site's token", read uncached under
+	 * the site claim — but the claim is taken AFTER authentication, and an
+	 * administrator can regenerate the token in between. The stale request
+	 * would then read the REPLACEMENT token and mark the new binding with it,
+	 * and a `final: true` body would go on to delete that fresh token
+	 * (Codex round-5 P1). The value that closes the window is the one the
+	 * request actually presented, so it is recorded where it is checked and
+	 * never re-derived from the option afterwards.
+	 *
+	 * Null, never '': no token authenticated this request at all.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @var string|null
+	 */
+	private static $auth_token_hash = null;
+
+	/**
 	 * Register the hook that captures the authenticating Application Password.
 	 * Called from Aura_Worker::init(); WordPress fires the hook during REST
 	 * authentication, which is earlier than any route callback.
@@ -194,6 +215,32 @@ class Aura_Worker_Security {
 		// Paired: an item with no readable uuid names no password, so the user
 		// beside it identifies nothing either.
 		self::$authenticating_user   = ( null !== $uuid && $user instanceof WP_User && (int) $user->ID > 0 ) ? (int) $user->ID : null;
+	}
+
+	/**
+	 * Record the site-token hash a request authenticated with. Called by
+	 * check_aura_token() at the moment the comparison succeeds — and by tests,
+	 * which cannot reach that private method.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $hash The sha256 of the presented token.
+	 * @return void
+	 */
+	public static function capture_token_auth( string $hash ) {
+		self::$auth_token_hash = '' === $hash ? null : $hash;
+	}
+
+	/**
+	 * The site-token hash that authenticated this request, or null when no
+	 * token did.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return string|null
+	 */
+	public static function authenticated_token_hash() {
+		return self::$auth_token_hash;
 	}
 
 	/**
@@ -485,15 +532,17 @@ class Aura_Worker_Security {
 		// Successful auth clears the failure counter for this IP.
 		delete_transient( $this->token_failure_key() );
 
+		self::capture_token_auth( self::hash_token( $provided_token ) );
 		return true;
 	}
 
 	/**
 	 * Resolve the administrator to run token-only requests as.
 	 *
-	 * Prefers the stored connecting admin; falls back to the first administrator.
-	 * The returned user MUST hold manage_options so a token can never grant more
-	 * than an administrator already has.
+	 * Prefers the stored connecting admin, then the identity the unbind marker
+	 * captured, then the first administrator. The returned user MUST hold
+	 * manage_options so a token can never grant more than an administrator
+	 * already has.
 	 *
 	 * @return int User ID, or 0 if no suitable administrator exists.
 	 */
@@ -501,6 +550,29 @@ class Aura_Worker_Security {
 		$stored = (int) get_option( 'aura_worker_connect_user_id', 0 );
 		if ( $stored > 0 && user_can( $stored, 'manage_options' ) ) {
 			return $stored;
+		}
+
+		// THE MARKER REMEMBERS WHO THIS SITE RAN AS (Codex round-5 P2).
+		//
+		// Phase B step (2) deletes `aura_worker_connect_user_id` while the
+		// token deliberately lives on, so from that moment a marked site
+		// resolves through the fallback below — which asks for the literal
+		// `administrator` ROLE. Every other check in this plugin asks for the
+		// CAPABILITY, and the two are not the same set: a site whose connecting
+		// user holds manage_options through a custom role, with nobody holding
+		// the administrator role, resolves NOBODY. Its own token-only /rules
+		// retry then fails before it can reach the marker's fast path, and the
+		// final cleanup can never be delivered — the site keeps its token and
+		// its marker forever.
+		//
+		// Phase A captured the identity before the delete. It is the same fact,
+		// still true, and still gated on the capability below.
+		if ( class_exists( 'Aura_Worker_Unbind' ) ) {
+			$marker = Aura_Worker_Unbind::read();
+			$marked = is_array( $marker ) ? (int) ( $marker['connect_user_id'] ?? 0 ) : 0;
+			if ( $marked > 0 && user_can( $marked, 'manage_options' ) ) {
+				return $marked;
+			}
 		}
 
 		$admins = get_users(

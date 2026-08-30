@@ -37,6 +37,53 @@ final class UnbindUnkeyedTest extends TestCase {
 	 * @param array $over Fields to override; a value of null unsets the field.
 	 * @return WP_REST_Request
 	 */
+	/**
+	 * THE TOKEN CAN MOVE UNDER A PAUSED REQUEST (Codex round-5 P1).
+	 *
+	 * Authentication happens before the site claim is taken, so a bare unbind
+	 * that authenticated with the OLD token and then paused while an
+	 * administrator pressed Regenerate Token would read the REPLACEMENT token
+	 * under the claim and mark the new binding with it — and a `final: true`
+	 * body would go on to delete that fresh token. An unbind for a binding
+	 * that had already ended, executed against the one that replaced it.
+	 */
+	public function test_a_token_regenerated_mid_request_is_never_the_one_marked(): void {
+		$old = $this->hash;
+		// The administrator regenerates while this request is in flight: the
+		// row now holds a different token, and the capture still holds the one
+		// the request actually presented.
+		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'the-replacement-token' );
+		$GLOBALS['_rows']['aura_worker_site_token']    = hash( 'sha256', 'the-replacement-token' );
+		Aura_Worker_Security::capture_token_auth( $old );
+
+		$res = $this->api()->receive_rules( $this->bare() );
+
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_site_token_changed', $res->get_data()['code'] );
+		$this->assertFalse( Aura_Worker_Unbind::is_set(), 'no marker was written for the replacement binding' );
+		$this->assertSame(
+			hash( 'sha256', 'the-replacement-token' ),
+			sa_read_option_uncached( 'aura_worker_site_token' ),
+			'and the fresh token survived'
+		);
+	}
+
+	/**
+	 * The other half of the same rule: a Phase A that cannot say WHICH token
+	 * authenticated it marks nothing. Both Phase A paths run behind
+	 * check_aura_token(), so this state is unreachable for a real request —
+	 * and treating it as permission would be the fail-open the check exists
+	 * to close.
+	 */
+	public function test_a_phase_a_with_no_authenticated_token_marks_nothing(): void {
+		Aura_Worker_Security::capture_token_auth( '' );
+
+		$res = $this->api()->receive_rules( $this->bare() );
+
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
 	private function bare( array $over = array() ): WP_REST_Request {
 		$req    = new WP_REST_Request( 'POST', '/aura/v2/rules' );
 		$fields = array_merge(

@@ -662,7 +662,10 @@ final class Aura_Worker_Unbind {
 			return false; // a credential list nobody could prove is not a list
 		}
 		$found = self::merged_with_damaged_row( $found );
-		$who   = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
+		if ( null === $found ) {
+			return false; // the row cannot say which credentials this binding held
+		}
+		$who = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
 		$who = is_wp_error( $who ) ? 0 : (int) maybe_unserialize( (string) $who );
 		$ok  = self::write_under_claim(
 			array(
@@ -715,12 +718,31 @@ final class Aura_Worker_Unbind {
 	 * @since 2.13.0
 	 *
 	 * @param array<string,int|null> $found uuid => owner, from the sweep.
-	 * @return array<string,int|null> The merged list.
+	 * @return array<string,int|null>|null The merged list, or null when the row
+	 *                                     cannot say what this binding held.
 	 */
-	private static function merged_with_damaged_row( array $found ): array {
+	private static function merged_with_damaged_row( array $found ): ?array {
 		$raw = self::marker_array();
 		if ( null === $raw || ! isset( $raw['app_password_uuids'] ) || ! is_array( $raw['app_password_uuids'] ) ) {
-			return $found; // nothing legible to add
+			// AN ILLEGIBLE LIST IS NOT AN EMPTY ONE (Codex round-5 P1). The
+			// sweep is a superset of what SiteAgent MINTED — it looks for the
+			// name mint_app_password() stamps — and the credential this rule
+			// protects is precisely the one it cannot see: a password an
+			// operator connected by hand, or one Aura's PATCH installed,
+			// carrying a name of somebody else's choosing. The row was its only
+			// record. Repairing from the sweep alone would hand the teardown a
+			// list that looks complete, let it report success, and delete the
+			// token and the marker beside a live administrator credential —
+			// the same inference three rounds have been spent removing, one
+			// layer further in.
+			//
+			// Enumerating EVERY Application Password on the site instead is
+			// worse, not better: it would sweep the site owner's unrelated
+			// credentials into the marker for the teardown to revoke. So the
+			// repair refuses, the marker stays malformed, and the site keeps
+			// refusing — which is the honest state of a site whose credential
+			// list has been destroyed.
+			return null;
 		}
 		foreach ( $raw['app_password_uuids'] as $uuid ) {
 			if ( ! is_string( $uuid ) && ! is_int( $uuid ) ) {

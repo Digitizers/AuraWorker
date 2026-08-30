@@ -666,6 +666,9 @@ class Aura_Worker_Rules {
 			// fresh read. A retry is matched against this after the stored
 			// record is gone.
 			$marker = self::new_marker( $ours, $site_ref, $client, (int) $doc['seq'] );
+			if ( is_wp_error( $marker ) ) {
+				return $marker; // the token moved under this request; nothing is written
+			}
 			// Claim-fenced and verified by read-back; a failed write is a
 			// retryable 500 with nothing else touched — never a silent unbind
 			// that no boundary can see.
@@ -871,9 +874,35 @@ class Aura_Worker_Rules {
 	 * @param string $site_ref This site's id in Aura's vocabulary, '' when unknown.
 	 * @param string $client   The departing client.
 	 * @param int    $seq      The unbind's seq.
-	 * @return array The marker.
+	 * @return array|WP_Error The marker, or a refusal when the token this
+	 *                        marker would name is not the one that
+	 *                        authenticated the request.
 	 */
 	private static function new_marker( string $site, string $site_ref, string $client, int $seq ) {
+		// THE MARKER NAMES THE TOKEN THAT AUTHENTICATED THIS REQUEST, and
+		// refuses to name any other (Codex round-5 P1).
+		//
+		// `$site` is read from the option uncached under the site claim — but
+		// the claim is taken AFTER authentication, and an administrator can
+		// press Regenerate Token in between. A request that paused there would
+		// otherwise mark the REPLACEMENT binding with the replacement's own
+		// token, and on the unkeyed path a `final: true` body would then go on
+		// to delete that fresh token: an unbind for a binding that had already
+		// ended, executed against the one that replaced it.
+		//
+		// Absence is refused as firmly as a mismatch. Both Phase A paths run
+		// under /aura/v2/rules, whose permission callback cannot be reached
+		// without check_aura_token(), so "no token authenticated this request"
+		// is not a state a real Phase A can be in — and treating it as
+		// permission would be the fail-open this whole file is about.
+		$authenticated = Aura_Worker_Security::authenticated_token_hash();
+		if ( null === $authenticated || '' === $site || ! hash_equals( $site, $authenticated ) ) {
+			return new WP_Error(
+				'aura_site_token_changed',
+				__( 'This site token changed while the request was in flight; retry the unbind.', 'digitizer-site-worker' ),
+				array( 'status' => 409 )
+			);
+		}
 		$marker = array(
 			'at'                 => gmdate( 'c' ),
 			'site'               => $site,
@@ -1137,6 +1166,9 @@ class Aura_Worker_Rules {
 		}
 
 		$marker = self::new_marker( $ours, $fields['site_ref'], $fields['client'], $fields['seq'] );
+		if ( is_wp_error( $marker ) ) {
+			return $marker; // the token moved under this request; nothing is written
+		}
 		// write_under_claim()'s read-back proves only "the row now names my
 		// site at my seq", which is sufficient here for the same reason it is
 		// in the enveloped path and nowhere else: the fast path above returned
