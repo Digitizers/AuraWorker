@@ -567,13 +567,28 @@ final class Aura_Worker_Unbind {
 	 *     and the only things fabricated here;
 	 *   - the credential list rebuilt from the SITE
 	 *     (Aura_Worker_Magic_Link::minted_passwords()), never invented: an
-	 *     unprovable sweep refuses the whole repair.
+	 *     unprovable sweep refuses the whole repair;
+	 *   - MERGED WITH what the damaged row itself still legibly holds
+	 *     (round-2 N1). "The row is malformed" is not "the row holds nothing
+	 *     usable", any more than an unresolvable owner was evidence of absence
+	 *     in Task 4: validated() rejects a row on its five SCALARS, and
+	 *     `app_password_uuids` / `app_password_users` are not type-checked at
+	 *     all, so a damaged row very often still carries a perfectly readable
+	 *     credential list. That list is the ONLY record of the authenticating
+	 *     uuid Phase A appends (Aura_Worker_Rules::new_marker()) for a password
+	 *     Aura never minted — the manual credential the name sweep cannot see —
+	 *     and rebuilding from the sweep alone would drop it, complete the
+	 *     teardown, lift the refusal and leave it live, while telling the
+	 *     operator it worked. marker_array() exists for exactly this reading,
+	 *     and the merge adds no inference: an entry whose SHAPE cannot be
+	 *     trusted is dropped, an owner that names nobody becomes the explicit
+	 *     null Phase A itself writes, and an unattributed uuid then goes
+	 *     through resolve_unknown_owners() like any other.
 	 *
-	 * What it CANNOT recover is an authenticating uuid Phase A appended for a
-	 * password Aura never minted — a manually supplied credential under a name
-	 * of somebody else's choosing. Nothing on the site records it once the
-	 * marker is unreadable. The teardown tells the operator so, before
-	 * anything is removed.
+	 * What it CANNOT recover is a uuid list that is itself unreadable — the key
+	 * absent, holding a scalar, or its entries not scalars. Then a manually
+	 * supplied credential really is unrecorded by anything on this site, and
+	 * the teardown says so to the operator before removing anything.
 	 *
 	 * @since 2.13.0
 	 *
@@ -586,9 +601,21 @@ final class Aura_Worker_Unbind {
 			return false;
 		}
 		// Twice, and both must say MALFORMED. A transient read failure answers
-		// a different code and repairs nothing; a row that reads fine on the
-		// second look is a marker somebody else just wrote, and rewriting it
-		// would throw away a real Phase A.
+		// a different code and repairs nothing.
+		//
+		// The second read NARROWS the window in which a concurrent well-formed
+		// write could be overwritten; it does not close it, and the comment
+		// here used to claim it did (round-2 LOW-4). What actually excludes
+		// that interleaving is the SITE CLAIM, which covers the whole window:
+		// every writer of this option in the plugin goes through
+		// write_under_claim(), which is claim-conditional in SQL, and the
+		// operator holds the fence from before the first read until after the
+		// write — so a concurrent Phase A cannot land at all, and if the claim
+		// were taken away (the 120s stale takeover, an activation eviction)
+		// this repair's own write refuses. What is left is the residual
+		// holds_site_claim() already names plugin-wide: a handler descheduled
+		// between its check and its write. The second read is belt-and-braces
+		// over that, not the guard.
 		if ( ! self::is_malformed() || ! self::is_malformed() ) {
 			return false;
 		}
@@ -600,7 +627,8 @@ final class Aura_Worker_Unbind {
 		if ( null === $found ) {
 			return false; // a credential list nobody could prove is not a list
 		}
-		$who = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
+		$found = self::merged_with_damaged_row( $found );
+		$who   = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
 		$who = is_wp_error( $who ) ? 0 : (int) maybe_unserialize( (string) $who );
 		$ok  = self::write_under_claim(
 			array(
@@ -619,6 +647,57 @@ final class Aura_Worker_Unbind {
 		// is exactly what a repair changes — but not that the result PARSES.
 		// The whole point is a marker the teardown can read, so read it.
 		return $ok && is_array( self::read() );
+	}
+
+	/**
+	 * Add what the damaged row still legibly says about credentials to what the
+	 * sweep found (round-2 N1) — a strict superset, never a replacement.
+	 *
+	 * The sweep is a superset of what Aura MINTED and cannot see anything else;
+	 * the row is the only record of the authenticating uuid Phase A appended
+	 * for a password it did not mint. Neither is complete alone, so both are
+	 * used, and everything here is a READ of what is there rather than an
+	 * inference about what is not:
+	 *
+	 *  - a uuid entry that is not a scalar names nothing this code can act on
+	 *    and is dropped rather than coerced (`array` to string is a warning and
+	 *    a lie; an object is worse);
+	 *  - an owner that is not a positive integer becomes the explicit null
+	 *    Phase A itself writes for an owner the site never knew — which is not
+	 *    a dead end, because resolve_unknown_owners() runs in the same teardown
+	 *    and settles exactly that case;
+	 *  - a uuid the sweep already attributed keeps the sweep's OWNER, which was
+	 *    read from that user's own list moments ago, over the row's older one.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param array<string,int|null> $found uuid => owner, from the sweep.
+	 * @return array<string,int|null> The merged list.
+	 */
+	private static function merged_with_damaged_row( array $found ): array {
+		$raw = self::marker_array();
+		if ( null === $raw || ! isset( $raw['app_password_uuids'] ) || ! is_array( $raw['app_password_uuids'] ) ) {
+			return $found; // nothing legible to add
+		}
+		$owners = isset( $raw['app_password_users'] ) && is_array( $raw['app_password_users'] )
+			? $raw['app_password_users']
+			: array();
+		foreach ( $raw['app_password_uuids'] as $uuid ) {
+			if ( ! is_string( $uuid ) && ! is_int( $uuid ) ) {
+				continue; // a shape that names no credential
+			}
+			$uuid = (string) $uuid;
+			if ( '' === $uuid || array_key_exists( $uuid, $found ) ) {
+				continue;
+			}
+			$owner = isset( $owners[ $uuid ] ) ? $owners[ $uuid ] : null;
+			// The same normalisation validated() applies on the way back out,
+			// applied here so what is WRITTEN already means what it will be
+			// read as: a positive int, or an explicit unknown. Never 0.
+			$owner          = is_int( $owner ) || ( is_string( $owner ) && ctype_digit( $owner ) ) ? (int) $owner : 0;
+			$found[ $uuid ] = $owner > 0 ? $owner : null;
+		}
+		return $found;
 	}
 
 	/**

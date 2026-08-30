@@ -176,7 +176,7 @@ class Aura_Worker_Magic_Link {
 			// BOTH halves, because the rebuilt list is a superset of what Aura
 			// minted and NOT a subset of what it may remove. An operator who
 			// reads only one of these sentences is misled either way.
-			echo '<p>' . esc_html__( 'The damaged record cannot name an Application Password that was supplied by hand rather than issued by Aura: revoke any such password yourself under Users → Profile → Application Passwords.', 'digitizer-site-worker' ) . '</p>';
+			echo '<p>' . esc_html__( 'A damaged record may no longer name an Application Password that was supplied by hand rather than issued by Aura: revoke any such password yourself under Users → Profile → Application Passwords.', 'digitizer-site-worker' ) . '</p>';
 			echo '<p>' . esc_html__( 'Every Application Password on this site named “Aura SiteAgent” will be removed, including one you created yourself under that name.', 'digitizer-site-worker' ) . '</p>';
 		} else {
 			echo '<p>' . esc_html__( 'This site cannot determine what the previous connection left behind.', 'digitizer-site-worker' ) . '</p>';

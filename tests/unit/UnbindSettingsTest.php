@@ -603,6 +603,116 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
+	 * N1, AND IT IS THIS PROJECT'S OWN FAMILY LANDING INSIDE THE REPAIR.
+	 *
+	 * validated() rejects a row on its five SCALARS; `app_password_uuids` is
+	 * not type-checked at all, so a damaged row usually still carries a
+	 * perfectly readable credential list — including the authenticating uuid
+	 * Phase A appends for a password Aura never minted, under a name of
+	 * somebody else's choosing, which the sweep cannot see. Rebuilding from the
+	 * sweep alone dropped it, completed the teardown, lifted the refusal and
+	 * left that administrator credential LIVE while reporting success.
+	 *
+	 * The row is merged, not replaced. The manual uuid arrives unattributed,
+	 * which is not a dead end: resolve_unknown_owners() is in the same teardown
+	 * and settles exactly that.
+	 */
+	public function test_a_manual_credential_the_damaged_row_names_is_removed_not_dropped(): void {
+		sa_add_app_password( 9, 'manual-uuid-1' ); // a name of the operator's choosing
+		sa_set_marker(
+			array(
+				'seq'                => 'nine', // the row is damaged…
+				'app_password_uuids' => array( 'manual-uuid-1' ), // …but this is legible
+				'app_password_users' => array(),
+			)
+		);
+
+		$out = $this->remove();
+
+		$this->assertTrue( $out['success'] );
+		$this->assertFalse( sa_app_password_exists( 9, 'manual-uuid-1' ), 'the refusal must not lift over a live credential' );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	/** …and it is in the repaired row itself, unattributed rather than guessed. */
+	public function test_the_repaired_row_carries_the_damaged_rows_uuids(): void {
+		sa_add_app_password( 9, 'manual-uuid-1' );
+		sa_set_marker(
+			array(
+				'seq'                => 'nine',
+				'app_password_uuids' => array( 'manual-uuid-1', self::MANAGED ),
+				'app_password_users' => array( self::MANAGED => self::ADMIN ),
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$raw = $this->stored_marker();
+		$this->assertContains( 'manual-uuid-1', $raw['app_password_uuids'] );
+		$this->assertContains( self::MANAGED, $raw['app_password_uuids'] );
+		$this->assertNull( $raw['app_password_users']['manual-uuid-1'], 'an owner nobody recorded is an explicit unknown, never a guess' );
+		$this->assertSame( self::ADMIN, $raw['app_password_users'][ self::MANAGED ], 'and a known owner survives' );
+	}
+
+	/**
+	 * The merge normalises the way validated() does: an owner that names nobody
+	 * — 0, a word, an object — is the explicit unknown Phase A writes, not a
+	 * user id Phase B would then treat as knowledge.
+	 */
+	public function test_an_owner_the_damaged_row_cannot_name_becomes_an_explicit_unknown(): void {
+		sa_add_app_password( 9, 'manual-uuid-1' );
+		sa_set_marker(
+			array(
+				'seq'                => 'nine',
+				'app_password_uuids' => array( 'manual-uuid-1' ),
+				'app_password_users' => array( 'manual-uuid-1' => 0 ),
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertNull( $this->stored_marker()['app_password_users']['manual-uuid-1'] );
+	}
+
+	/**
+	 * A shape the row cannot be read out of is DROPPED, never coerced: casting
+	 * an array to a string is a warning and a lie, and a uuid nothing can act
+	 * on would only wedge the teardown for good.
+	 */
+	public function test_a_uuid_list_that_cannot_be_read_is_dropped_not_guessed(): void {
+		sa_set_marker(
+			array(
+				'seq'                => 'nine',
+				'app_password_uuids' => array( array( 'nested' ), '' ),
+				'app_password_users' => 'not an array either',
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertSame( array( self::MANAGED ), $this->stored_marker()['app_password_uuids'], 'only what the sweep proved' );
+	}
+
+	/** A damaged row with no uuid list at all still repairs from the sweep. */
+	public function test_a_damaged_row_with_no_uuid_list_repairs_from_the_sweep_alone(): void {
+		$marker = sa_set_marker( array( 'seq' => 'nine' ) );
+		unset( $marker['app_password_uuids'], $marker['app_password_users'] );
+		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = $marker;
+		unset( $GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] );
+
+		$out = $this->remove();
+
+		$this->assertTrue( $out['success'] );
+		$this->assertFalse( sa_app_password_exists( self::ADMIN, self::MANAGED ) );
+	}
+
+	/**
 	 * The name sweep is a superset of what Aura MINTED, not of what it
 	 * RECORDED: an operator who renames the managed password takes it out of
 	 * the sweep, and the plugin's own record is the only thing that still names
@@ -653,6 +763,10 @@ final class UnbindSettingsTest extends TestCase {
 		$this->assertSame( 'aura_unbind_unrepairable', $out['data']['code'] );
 		$this->assertSame( 'nine', $this->stored_marker()['seq'] );
 		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::MANAGED ), 'nothing was revoked' );
+		// Every other refusal in this handler releases the site claim on the
+		// way out; this one is no different, and a leak here would block the
+		// operator's own retry until the 120s takeover (round-2 LOW-5).
+		$this->assertFalse( get_option( Aura_Worker_Magic_Link::SITE_CLAIM ), 'the claim is released' );
 	}
 
 	/** The same, one step later: a candidate whose own list will not read. */
