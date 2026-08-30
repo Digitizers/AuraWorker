@@ -68,6 +68,7 @@ To create an installable ZIP: `cd` to the repo root and run `zip -r digitizer-si
 | `Aura_Worker_Magic_Link` | `includes/class-aura-worker-magic-link.php` | Short-lived one-time admin login links |
 | `Aura_Worker_MCP` | `includes/class-aura-worker-mcp.php` | MCP server endpoint + tool registration |
 | `Aura_Worker_Tools` | `includes/class-aura-worker-tools.php` | MCP tool base class (`Aura_Tool_Base`) + registry; individual tools live in `includes/tools/` |
+| `Aura_Worker_Unbind` | `includes/class-aura-worker-unbind.php` | The site-unbind marker (`aura_worker_unbound`) + Phase B cleanup: `read`/`is_set`/`is_set_strict`, `write_under_claim`, `delete_under_claim`, `refusal`, `status_fragment`, `leftovers`, `cleanup`, `maybe_finish` |
 
 ### Initialization Flow
 
@@ -86,6 +87,7 @@ Every REST request passes through three checks in order:
 2. **Domain Whitelist** (`check_domain_whitelist`) — If domains are configured, the request's `Origin` or `Referer` header must match.
 3. **Aura Site Token** (`check_aura_token`) — `X-Aura-Token` header is SHA-256 hashed and compared with `hash_equals()` against the stored hash (timing-safe). The raw token is never stored. Per-IP brute-force throttling blocks after `MAX_TOKEN_FAILURES` failures within `TOKEN_FAILURE_WINDOW`. Legacy plaintext tokens are migrated to a hash on first successful auth.
 4. **WordPress Capability** — All endpoints require `manage_options` (or the relevant `update_*` capability).
+5. **Unbind refusal (2.13.0)** — `Aura_Worker_Security::refuse_if_unbound()` runs on every *mutating* permission callback, **after** `validate_request()` (a caller who cannot prove it holds the token learns nothing about the binding). While the marker `aura_worker_unbound` is set, every mutation answers `403 aura_site_unbound`; reads keep working, and `POST /aura/v2/rules` is exempt so the site can still be told things — including that it is unbound. The marker is read **uncached** and an unreadable marker counts as unbound (`is_set()` is TRUE on `WP_Error`), so a database blip cannot re-open writes on a disconnected site. `Aura_Worker_Grant::verify()` and the core-REST seam (`rest_request_before_callbacks`) apply the same refusal — the latter identifies *the departed binding* by the marker's Application Password UUIDs or the site-token run-as path, never by whatever credentials are currently live.
 
 ### Magic-Link Connect Signing
 
@@ -122,6 +124,49 @@ All routes are under `/wp-json/aura/v1/`.
 | `POST` | `/update/translations` | — | Bulk update all translations |
 | `POST` | `/update/database` | — | Run `wp_upgrade()` / `dbDelta()` |
 
+### `aura/v2` — operator ruleset and unbind
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/rules` | Aura's signed operator ruleset. Carrying `unbind: true` it ends this site's binding instead (#434) |
+
+**Unbind (2.13.0, #434).** Phase A writes the marker under the site claim; Phase B revokes
+the managed Application Password(s), clears the ruleset store, gateway key and connect
+bookkeeping, and deletes the site token **last**, only on `final: true`. Idempotent, one
+fixed order, continues past a failed step; an interrupted unbind finishes itself from
+`init` (`maybe_finish()`, throttled 300 s, under the claim, never deleting a token that
+differs from the marker's). Two request forms: the **enveloped** (signed) one, and the
+**bare** `{ unbind, client, site_ref, seq, final }` body accepted only by a site with no
+usable gateway key (a keyed site answers `400 aura_ruleset_rejected`). Both answer
+`{ success, seq, unbound, cleanup_complete, leftovers[] }` — `leftovers` names what is
+still owed (`app_passwords`, `options`, `ruleset`, `grant_pubkey`); empty means only the
+shared token was outstanding, and an *absent* list means "something may be owed"
+(`Aura_Worker_API::unbind_response()` defaults to the full fail-closed list).
+
+Both rebind paths — the magic-link `/connect` callback and **Regenerate Token** — run
+`finish_before_rebind()` (Phase B steps 1–4) *before* installing a new token, and delete
+the marker only after the replacement binding is installed and read back; a failed swap
+leaves the marker still refusing the old binding. The settings screen shows
+"Disconnected by Aura at …" and offers **Remove remaining Aura data**
+(`wp_ajax_aura_worker_remove_aura_data`), which **repairs** a malformed marker under the
+claim rather than deleting it, then tears the site down through the ordinary path.
+
+**Error codes (2.13.0).** `aura_site_unbound` (403), `aura_site_busy` (503, retryable),
+`aura_ruleset_client_mismatch` (409 — now checked on the bare form too),
+`aura_unbind_store_failed` (500), `aura_unbind_marker_malformed` (500). From the admin
+teardown: `aura_unbind_incomplete` (409, with `leftover[]`/`unattributed[]`),
+`aura_unbind_unreadable` (409 — the record could not be *read*, distinct from an
+incomplete cleanup: nothing is claimed or changed), `aura_unbind_unrepairable` (409),
+`aura_not_unbound` (409), `aura_unbind_marker_stuck` (500). Pre-existing ruleset codes are
+unchanged: `aura_ruleset_rejected` (400), `no_gateway_key` (412 — skipped for the bare
+form and for an already-unbound site), `aura_ruleset_wrong_site` (403),
+`aura_ruleset_stale` (409), `aura_ruleset_contended` (503), `aura_ruleset_store_failed` (500).
+
+**`GET /status` fragments (2.13.0).** `unbound: { at, site_ref }` while the marker is set,
+and `app_password_probe_unproven: { count, at, owner }` (bounded, saturating) when a probe
+could not prove an Application Password gone. Both are always JSON **objects** — the key's
+presence is the signal, and the shape must not change with its contents.
+
 ---
 
 ## WordPress Options
@@ -134,6 +179,10 @@ All routes are under `/wp-json/aura/v1/`.
 | `aura_worker_dashboard_url` | Aura dashboard base URL (magic-link / callback target) |
 | `aura_worker_activated` | Activation timestamp |
 | `aura_worker_version` | Plugin version at activation |
+| `aura_worker_ruleset` | The signed operator ruleset this site holds (seq, client, site_ref) |
+| `aura_worker_grant_pubkey` | The gateway's Ed25519 public key; empty = an unkeyed (manual) site |
+| `aura_worker_unbound` | **2.13.0** — the unbind marker: `{ at, site, site_ref, client, seq, app_password_uuids[], app_password_users{} }`. Autoload `no`, read uncached; its presence refuses every mutation |
+| `aura_worker_app_password_probe_unproven` | **2.13.0** — bounded `{ count, at, owner }`: a probe that could not prove an Application Password gone |
 
 All options are cleaned up in `uninstall.php`.
 
