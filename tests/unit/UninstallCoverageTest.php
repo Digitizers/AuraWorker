@@ -748,6 +748,47 @@ final class UninstallCoverageTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_worker_site_token', false ), 'everything else still went' );
 	}
 
+	/**
+	 * A READ THAT FAILED IS NOT A REVOCATION (Codex round-10 P1).
+	 * `WP_Application_Passwords::get_user_application_passwords()` answers an
+	 * empty array for a user who holds none AND for a usermeta read that could
+	 * not be completed, so uninstall believed a credential revoked because the
+	 * list it asked came back empty — and swept away the only record of it.
+	 */
+	public function test_a_marker_whose_revocation_cannot_be_proven_outlives_the_uninstall(): void {
+		$GLOBALS['_app_passwords'][7]                = array( array( 'uuid' => 'uuid-manual', 'name' => 'Somebody' ) );
+		$GLOBALS['_app_passwords_delete_fail']       = true;
+		$GLOBALS['_sa_app_password_read_fail'][7]    = true; // and the confirming read fails too
+		update_option(
+			Aura_Worker_Unbind::OPTION,
+			array(
+				'unbound_at'         => gmdate( 'c' ),
+				'app_password_uuids' => array( 'uuid-manual' ),
+				'app_password_users' => array( 'uuid-manual' => 7 ),
+			)
+		);
+		update_option( 'aura_worker_site_token', 'hash' );
+
+		self::run_uninstall();
+
+		$this->assertNotFalse( get_option( Aura_Worker_Unbind::OPTION, false ), 'an unreadable list was believed as an absence' );
+		$this->assertFalse( get_option( 'aura_worker_site_token', false ), 'everything else still went' );
+	}
+
+	/** The plugin's own record fails closed on the same evidence. */
+	public function test_an_app_password_record_whose_revocation_cannot_be_proven_is_kept(): void {
+		$GLOBALS['_app_passwords'][7]             = array( array( 'uuid' => 'uuid-1', 'name' => 'Aura SiteAgent' ) );
+		$GLOBALS['_app_passwords_delete_fail']    = true;
+		$GLOBALS['_sa_app_password_read_fail'][7] = true;
+		update_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, array( 'user_id' => 7, 'uuid' => 'uuid-1' ) );
+		update_option( 'aura_worker_site_token', 'hash' );
+
+		self::run_uninstall();
+
+		$this->assertIsArray( get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null ) );
+		$this->assertFalse( get_option( 'aura_worker_site_token', false ) );
+	}
+
 	private static function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 			define( 'WP_UNINSTALL_PLUGIN', 'digitizer-site-worker/digitizer-site-worker.php' );

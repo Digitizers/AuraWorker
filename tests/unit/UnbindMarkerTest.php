@@ -464,7 +464,7 @@ final class UnbindMarkerTest extends TestCase {
 	/**
 	 * A NON-SCALAR ENTRY MAKES THE WHOLE LIST UNREADABLE — it is not dropped
 	 * (Codex round-6 P1, and the rule now lives in one place:
-	 * includes/unbind-credential-list.php).
+	 * includes/credential-rules.php).
 	 *
 	 * Dropping the entry and returning the rest asserts that the dropped one
 	 * named no credential, which is precisely the claim the row cannot make:

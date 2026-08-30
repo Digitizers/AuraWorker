@@ -1694,46 +1694,12 @@ class Aura_Worker_Magic_Link {
 	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
 	 */
 	private static function managed_password_state( int $owner, string $uuid ): string {
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $owner ) as $item ) {
-			if ( is_array( $item ) && isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
-				return self::STATE_PRESENT;
-			}
-		}
-		return self::app_password_row_state( $owner, $uuid );
+		// ONE implementation, in includes/credential-rules.php — uninstall.php
+		// asks this same question and must not load the plugin to do it
+		// (#434 Codex round-10). The two-stage reasoning above lives there.
+		return aura_worker_app_password_state( $owner, $uuid );
 	}
 
-	/**
-	 * The confirming raw read: does that user's Application Passwords meta row
-	 * really not carry that uuid, or could the row not be read?
-	 *
-	 * Uncached and self-proving, deliberately: the value core just consulted
-	 * may itself be a cached empty array left behind by a failed query, so a
-	 * second trip through the meta cache would repeat the same wrong answer —
-	 * and a statement that never ran would hand back the PREVIOUS one's rows,
-	 * which only the returned nonce can tell apart.
-	 *
-	 * Absence is answered only from a statement this call is able to show RAN
-	 * (#434 M12/N1) — the proof is carried IN BAND, by a per-call nonce the
-	 * result set has to hand back; see the comment beside it below.
-	 *
-	 * @since 2.13.0
-	 *
-	 * @param int    $owner Owner user ID.
-	 * @param string $uuid  Password UUID.
-	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
-	 */
-	private static function app_password_row_state( int $owner, string $uuid ): string {
-		$list = self::app_password_list( $owner );
-		if ( null === $list ) {
-			return self::STATE_UNKNOWN; // nothing was proved; never absence
-		}
-		foreach ( $list as $item ) {
-			if ( is_array( $item ) && isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
-				return self::STATE_PRESENT;
-			}
-		}
-		return self::STATE_GONE;
-	}
 
 	/**
 	 * That user's Application Passwords, from the ROW, proven to have been
@@ -1741,7 +1707,7 @@ class Aura_Worker_Magic_Link {
 	 * can read the whole list rather than ask about one uuid).
 	 *
 	 * The statement, the nonce and every reason for both are unchanged — this
-	 * is the same read app_password_row_state() has always issued, with the
+	 * is the same read aura_worker_app_password_list() has always issued, with the
 	 * uuid question moved out of it. Its answers are: the list (empty for a
 	 * user with no row, or a row that does not hold an array — core reads both
 	 * as "no passwords"), or NULL for a read that proved nothing, which no
@@ -1753,71 +1719,11 @@ class Aura_Worker_Magic_Link {
 	 * @return array|null The list, or null when nothing was proved.
 	 */
 	private static function app_password_list( int $owner ): ?array {
-		global $wpdb;
-		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
-			return null; // no way to confirm: never a proof of absence
-		}
-		// The proof that this statement RAN travels IN BAND, in the answer
-		// itself: a per-call nonce selected as a second column. Only our own
-		// statement can put THIS call's nonce in a result set, so a row that
-		// carries it back is a row our statement produced (#434 M12/N1).
-		//
-		// wpdb::get_row() ignores wpdb::query()'s return value and extracts
-		// from $last_result, and wpdb::query() has early returns BEFORE its
-		// flush() — an unready handle, a `query` filter that blanks the SQL —
-		// each leaving the PREVIOUS statement's result set in place. Third
-		// party db.php drop-ins (HyperDB, LudicrousDB) add their own, and
-		// assign $last_query before acquiring a connection, so neither
-		// wpdb::$ready nor wpdb::$last_query is evidence a statement ran:
-		// both are bookkeeping a drop-in is free to get wrong, and $ready in
-		// particular is `false` by declaration on every drop-in that never
-		// calls parent::__construct(). The nonce needs no such etiquette —
-		// it is a property of the ANSWER, on every handle.
-		//
-		// wp_generate_uuid4() and not wp_generate_password(): the latter is
-		// PLUGGABLE and runs its result through the `random_password` filter,
-		// so a third party could make it constant — and a constant nonce is
-		// no nonce at all, because the stale row a probe meets is another
-		// probe's. wp_generate_uuid4() is neither pluggable nor filtered, and
-		// never throws (it falls back through wp_rand / random_int / mt_rand).
-		//
-		// The counter is not belt-and-braces. Since WP 7.0 wp_generate_uuid4()
-		// draws from wp_rand(), which IS pluggable and is loaded AFTER plugins
-		// — so a third party redefining it can still pin the uuid, and we are
-		// back to a constant nonce by a longer road. $seq is function-local
-		// and monotonic within the request: nothing outside this method can
-		// make two calls of it agree, whatever it does to the randomiser.
-		// The nonce is echoed back in the same statement and is never secret;
-		// the property it must have is FRESHNESS, not unpredictability.
-		static $seq = 0;
-		++$seq;
-		$nonce = $seq . '-' . wp_generate_uuid4();
-		$sql   = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, $owner, self::APP_PASSWORD_USERMETA_KEY );
-		// A prepare() that did not return usable SQL is not issued at all —
-		// core's prepare() answers null when it refuses the call. Nothing
-		// downstream depends on this (get_row( null ) returns null, and the
-		// nonce would reject that answer anyway); it is the earlier, cheaper
-		// refusal, and it keeps "we never asked" from ever being reported as
-		// "we asked and were told nothing".
-		if ( ! is_string( $sql ) || '' === $sql ) {
-			return null; // nothing was issued, so nothing was proved
-		}
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
-		$row = $wpdb->get_row( $sql );
-		if ( ! isset( $row->probe ) || $nonce !== (string) $row->probe ) {
-			// No row, or somebody else's row: this call proved nothing, and
-			// an unprovable probe owes app_passwords forever, so leave a
-			// breadcrumb rather than a tombstone that never explains itself.
-			do_action( 'aura_worker_app_password_probe_unproven', $owner );
-			return null;
-		}
-		$raw = isset( $row->v ) ? $row->v : null;
-		if ( null === $raw ) {
-			return array(); // no row at all: that user holds no Application Passwords
-		}
-		$list = maybe_unserialize( $raw );
-		// core reads a non-array the same way: no passwords.
-		return is_array( $list ) ? $list : array();
+		// ONE implementation, in includes/credential-rules.php, because
+		// uninstall.php has to ask this same question and must not load the
+		// plugin to do it (#434 Codex round-10). The statement, the nonce and
+		// every reason for both live there.
+		return aura_worker_app_password_list( $owner );
 	}
 
 	/**
@@ -1841,7 +1747,7 @@ class Aura_Worker_Magic_Link {
 	 * is indexed, so the scan covers the users who have Application Passwords
 	 * at all, not every row of usermeta.
 	 *
-	 * The `probe` nonce is the in-band proof app_password_row_state() uses, for
+	 * The `probe` nonce is the in-band proof aura_worker_app_password_list() uses, for
 	 * the identical reason: wpdb::get_row() extracts from the PREVIOUS
 	 * statement's result set when this one never ran, so only a value this call
 	 * invented can tell "nobody holds it" from "nothing was asked".

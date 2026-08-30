@@ -123,7 +123,7 @@ final class Aura_Worker_Unbind {
 			return self::malformed();
 		}
 		// THE credential list, asked of the one rule that reads it
-		// (includes/unbind-credential-list.php). A list this build cannot read
+		// (includes/credential-rules.php). A list this build cannot read
 		// proves nothing, and a marker whose credentials cannot be read is
 		// malformed — not one that held none.
 		$uuids = aura_worker_credential_list( $m['app_password_uuids'] ?? null );

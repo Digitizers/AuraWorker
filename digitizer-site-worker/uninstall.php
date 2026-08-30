@@ -16,7 +16,7 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 // with no class, no hooks and no bootstrap — the only plugin code this file
 // loads, and it loads it precisely so the rule cannot drift between the plugin
 // and its uninstall (#434).
-require_once __DIR__ . '/includes/unbind-credential-list.php';
+require_once __DIR__ . '/includes/credential-rules.php';
 
 // A network-activated plugin's uninstall runs ONCE (round-28). Every subsite has
 // its own options table and therefore its own Application Password record, so
@@ -49,9 +49,18 @@ $aura_uninstall_site = static function () {
 			$aura_intents_all_gone = false; // nothing here can settle it
 			continue;
 		}
+		// The PROVEN list, never get_user_application_passwords(): core answers
+		// an empty array for a user who holds none AND for a usermeta read that
+		// failed, and this file cannot tell those apart on its own
+		// (#434 Codex round-10 P1).
+		$aura_intent_list = aura_worker_app_password_list( $aura_intent_owner );
+		if ( null === $aura_intent_list ) {
+			$aura_intents_all_gone = false; // nothing was read, so nothing is settled
+			continue;
+		}
 		$aura_intent_uuid = '';
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_intent_owner ) as $aura_pw_item ) {
-			if ( '' !== (string) ( $aura_pw_item['app_id'] ?? '' ) && (string) $aura_intent_app_id === (string) $aura_pw_item['app_id'] && ! empty( $aura_pw_item['uuid'] ) ) {
+		foreach ( $aura_intent_list as $aura_pw_item ) {
+			if ( is_array( $aura_pw_item ) && '' !== (string) ( $aura_pw_item['app_id'] ?? '' ) && (string) $aura_intent_app_id === (string) $aura_pw_item['app_id'] && ! empty( $aura_pw_item['uuid'] ) ) {
 				$aura_intent_uuid = (string) $aura_pw_item['uuid'];
 				break;
 			}
@@ -72,11 +81,8 @@ $aura_uninstall_site = static function () {
 		// failed user-meta write too, and an intent discarded over an unproven
 		// delete takes with it the only app_id that identifies a live
 		// administrator credential.
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_intent_owner ) as $aura_pw_item ) {
-			if ( $aura_intent_uuid === (string) ( $aura_pw_item['uuid'] ?? '' ) ) {
-				$aura_intents_all_gone = false;
-				break;
-			}
+		if ( 'gone' !== aura_worker_app_password_state( $aura_intent_owner, $aura_intent_uuid ) ) {
+			$aura_intents_all_gone = false; // present, or a read that proved nothing
 		}
 	}
 
@@ -95,13 +101,7 @@ $aura_uninstall_site = static function () {
 		// irrecoverably forgotten. Left in place, a reinstall can finish the job.
 		// …and only together with every pending mint: the record carries both,
 		// so it goes only when nothing it describes is left.
-		$aura_pw_gone = $aura_intents_all_gone;
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_pw_owner ) as $aura_pw_item ) {
-			if ( isset( $aura_pw_item['uuid'] ) && $aura_pw_uuid === (string) $aura_pw_item['uuid'] ) {
-				$aura_pw_gone = false;
-				break;
-			}
-		}
+		$aura_pw_gone = $aura_intents_all_gone && 'gone' === aura_worker_app_password_state( $aura_pw_owner, $aura_pw_uuid );
 	}
 	if ( $aura_pw_gone ) {
 		delete_option( 'aura_worker_app_password' );
@@ -157,11 +157,12 @@ $aura_uninstall_site = static function () {
 			continue;
 		}
 		WP_Application_Passwords::delete_application_password( $aura_marker_owner, $aura_marker_uuid );
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_marker_owner ) as $aura_pw_item ) {
-			if ( $aura_marker_uuid === (string) ( $aura_pw_item['uuid'] ?? '' ) ) {
-				$aura_marker_settled = false;
-				break;
-			}
+		// PROVEN gone, and only that: the delete's return value is false for a
+		// failed user-meta write as well as for "not there", and core's list
+		// reader collapses a failed READ to an empty list. Either one, believed,
+		// deletes the last record of a live administrator credential.
+		if ( 'gone' !== aura_worker_app_password_state( $aura_marker_owner, $aura_marker_uuid ) ) {
+			$aura_marker_settled = false;
 		}
 	}
 

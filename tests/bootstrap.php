@@ -2643,7 +2643,7 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-magic-link.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-call-context.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-abilities.php';
-require_once SA_PLUGIN_DIR . '/includes/unbind-credential-list.php';
+require_once SA_PLUGIN_DIR . '/includes/credential-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-unbind.php';
 // The plugin's admin/settings class: registers settings and owns the token
 // regeneration handler (#67).

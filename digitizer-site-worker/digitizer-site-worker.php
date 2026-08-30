@@ -26,7 +26,7 @@ define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 // The one rule the marker's credential list is read by — a pure function file
 // with no side effects, so uninstall.php can require it without loading the
 // plugin (#434).
-require_once AURA_WORKER_DIR . 'includes/unbind-credential-list.php';
+require_once AURA_WORKER_DIR . 'includes/credential-rules.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-api.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-updater.php';

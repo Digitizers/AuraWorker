@@ -10,7 +10,7 @@
  * "a list I could not read is a list that holds nothing" — in five different
  * readers, because each one decided for itself what an unreadable list meant.
  *
- * The rule lives in includes/unbind-credential-list.php now. This file is the
+ * The rule lives in includes/credential-rules.php now. This file is the
  * guard that keeps it there: a reader that re-derives it is caught here rather
  * than in the next review round, or on a customer's site.
  *
@@ -50,7 +50,7 @@ final class CredentialListRuleTest extends TestCase {
 	public function test_no_reader_decides_the_shape_of_the_credential_list_for_itself(): void {
 		$offenders = array();
 		foreach ( self::sources() as $path ) {
-			if ( 'unbind-credential-list.php' === basename( $path ) ) {
+			if ( 'credential-rules.php' === basename( $path ) ) {
 				continue; // the rule itself
 			}
 			foreach ( explode( "\n", (string) file_get_contents( $path ) ) as $n => $line ) {
@@ -98,7 +98,7 @@ final class CredentialListRuleTest extends TestCase {
 	public function test_both_worlds_load_the_one_rule(): void {
 		foreach ( array( 'digitizer-site-worker.php', 'uninstall.php' ) as $entry ) {
 			$this->assertStringContainsString(
-				'unbind-credential-list.php',
+				'credential-rules.php',
 				(string) file_get_contents( SA_PLUGIN_DIR . '/' . $entry ),
 				"{$entry} does not load the credential-list rule, so it is free to invent its own"
 			);
@@ -116,7 +116,7 @@ final class CredentialListRuleTest extends TestCase {
 	public function test_no_file_reads_a_credential_owner_without_asking_the_rule(): void {
 		$offenders = array();
 		foreach ( self::sources() as $path ) {
-			if ( 'unbind-credential-list.php' === basename( $path ) ) {
+			if ( 'credential-rules.php' === basename( $path ) ) {
 				continue;
 			}
 			$src = (string) file_get_contents( $path );
