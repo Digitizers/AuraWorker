@@ -1825,8 +1825,31 @@ class Aura_Worker_Magic_Link {
 		static $seq = 0;
 		++$seq;
 		$nonce = $seq . '-' . wp_generate_uuid4();
-		$sql   = $wpdb->prepare(
-			"SELECT %s AS probe, (SELECT GROUP_CONCAT(user_id) FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s) AS v",
+		// The owners come back as ROWS, never as an aggregate of them.
+		//
+		// This statement used to read GROUP_CONCAT(user_id). That is a BOUNDED
+		// aggregate: MySQL stops concatenating at `group_concat_max_len`
+		// (1024 bytes by default — about 170 ids) and reports the cut only in
+		// a warning nothing here reads. A site with enough Application
+		// Password holders would hand this code a list that LOOKS well formed
+		// and is missing owners, and the teardown would report every
+		// credential accounted for while the omitted ones stayed usable. A
+		// list cannot testify that it is complete, and counting the same rows
+		// to check it only narrows the window — a cut landing mid-number
+		// yields the right number of ids, one of them wrong. So the bound is
+		// gone rather than measured.
+		//
+		// One row per owner needs no bound; the leading UNION member is a
+		// SENTINEL that guarantees the statement answers with at least one
+		// row even when nobody holds the needle, which is what lets an empty
+		// result stay readable as "the statement did not run" rather than as
+		// an absence. Every row carries the nonce, so provenance is proved for
+		// the whole answer and not just its head — wpdb::get_results() has the
+		// same stale-`last_result` seam the per-user probe was hardened
+		// against.
+		$sql = $wpdb->prepare(
+			"SELECT %s AS probe, 0 AS user_id UNION ALL SELECT %s AS probe, user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s",
+			$nonce,
 			$nonce,
 			self::APP_PASSWORD_USERMETA_KEY,
 			'%' . $wpdb->esc_like( $needle ) . '%'
@@ -1835,30 +1858,41 @@ class Aura_Worker_Magic_Link {
 			return null; // nothing was issued, so nothing was proved
 		}
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
-		$row = $wpdb->get_row( $sql );
-		if ( ! isset( $row->probe ) || $nonce !== (string) $row->probe ) {
-			// No row, or somebody else's: this call proved nothing. Same
-			// breadcrumb the per-user probe leaves, with no owner to name.
+		$rows = $wpdb->get_results( $sql );
+		if ( ! is_array( $rows ) || array() === $rows ) {
+			// The sentinel makes an empty answer impossible for a statement
+			// that ran, so this is the statement failing. Same breadcrumb the
+			// per-user probe leaves, with no owner to name.
 			do_action( 'aura_worker_app_password_probe_unproven', 0 );
 			return null;
 		}
-		$raw = isset( $row->v ) ? (string) $row->v : '';
-		if ( '' === $raw ) {
-			return array(); // proven: no Application Password list on this site carries it
-		}
-		$users = array();
-		foreach ( explode( ',', $raw ) as $id ) {
-			$id = (int) trim( $id );
+		$users    = array();
+		$sentinel = false;
+		foreach ( $rows as $row ) {
+			if ( ! isset( $row->probe ) || $nonce !== (string) $row->probe ) {
+				// Somebody else's result set, in whole or in part.
+				do_action( 'aura_worker_app_password_probe_unproven', 0 );
+				return null;
+			}
+			$id = isset( $row->user_id ) ? (int) $row->user_id : 0;
 			if ( $id > 0 ) {
 				$users[] = $id;
+				continue;
 			}
+			// The sentinel. WordPress never issues user id 0, so orphaned
+			// usermeta owning nobody is indistinguishable from it here — and
+			// owns no credential either way.
+			$sentinel = true;
 		}
-		// Rows matched but named nobody this code can use (a truncated
-		// GROUP_CONCAT, a user_id of 0). That is not the empty answer above —
-		// it is an answer that could not be read, and reporting it as "nobody
-		// holds it" would be absence inferred from evidence that says the
-		// opposite.
-		return array() === $users ? null : $users;
+		if ( ! $sentinel ) {
+			// The one row this statement cannot fail to return did not come
+			// back, so what did come back is not this statement's answer.
+			do_action( 'aura_worker_app_password_probe_unproven', 0 );
+			return null;
+		}
+		// Proven, and complete: EMPTY means no Application Password list on
+		// this site carries the needle.
+		return array_values( array_unique( $users ) );
 	}
 
 	/**

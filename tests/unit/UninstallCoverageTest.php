@@ -594,6 +594,26 @@ final class UninstallCoverageTest extends TestCase {
 	}
 
 	/** Run uninstall.php the way WordPress does — the file loads no plugin code. */
+	/**
+	 * THE SWEEP MATCHES ITS OWN NAMESPACE, NOT A PATTERN THAT LOOKS LIKE IT
+	 * (Codex on PR #76, round 2). `_transient_` is framed by underscores and
+	 * an unescaped underscore is a LIKE wildcard, so a prefix concatenated
+	 * onto an already-escaped one matched `xtransientYaura_worker_foreign`
+	 * too — a third-party row that then failed both `_transient_` guards and
+	 * was deleted as a plain option.
+	 */
+	public function test_a_foreign_option_shaped_like_the_transient_prefix_survives(): void {
+		$foreign = 'xtransientYaura_worker_foreign';
+		$GLOBALS['_rows'][ $foreign ]    = maybe_serialize( 'somebody else\'s' );
+		$GLOBALS['_options'][ $foreign ] = 'somebody else\'s';
+		update_option( 'aura_worker_site_token', 'hash' );
+
+		self::run_uninstall();
+
+		$this->assertArrayHasKey( $foreign, $GLOBALS['_options'], "uninstall took another owner's option with it" );
+		$this->assertFalse( get_option( 'aura_worker_site_token', false ), 'the plugin\'s own row still went' );
+	}
+
 	private static function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 			define( 'WP_UNINSTALL_PLUGIN', 'digitizer-site-worker/digitizer-site-worker.php' );

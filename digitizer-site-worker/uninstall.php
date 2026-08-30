@@ -137,9 +137,14 @@ $aura_uninstall_site = static function () {
 	$aura_keep = $aura_pw_gone ? array() : array( 'aura_worker_app_password' );
 
 	global $wpdb;
+	// The WHOLE literal is escaped, never a prefix concatenated onto an
+	// already-escaped one: the underscores framing `_transient_` are LIKE
+	// wildcards, and appending them after esc_like() left them so — matching
+	// `xtransientXaura_worker_foreign` too, a third-party row that then fell
+	// past both `_transient_` guards below and was deleted as an option.
 	foreach ( $aura_prefixes as $aura_prefix ) {
-		$aura_like = $wpdb->esc_like( $aura_prefix ) . '%';
-		foreach ( array( $aura_like, '_transient_' . $aura_like, '_transient_timeout_' . $aura_like ) as $aura_pattern ) {
+		foreach ( array( '', '_transient_', '_transient_timeout_' ) as $aura_scope ) {
+			$aura_pattern = $wpdb->esc_like( $aura_scope . $aura_prefix ) . '%';
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Enumerating the plugin's own rows by prefix is the point of this file; there is no core API that lists options by name, and nothing is left to cache after it.
 			$aura_names = $wpdb->get_col( $wpdb->prepare( "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s", $aura_pattern ) );
 			foreach ( (array) $aura_names as $aura_name ) {

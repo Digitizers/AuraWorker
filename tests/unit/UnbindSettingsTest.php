@@ -415,14 +415,13 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
-	 * ROWS MATCHED, AND THE ANSWER NAMED NOBODY. GROUP_CONCAT truncates at
-	 * `group_concat_max_len` and MySQL reports it in a warning nothing here
-	 * reads, so a scan CAN come back with a list this code cannot use. That is
-	 * an unreadable answer, not the empty one — the statement found rows — and
-	 * reading it as "nobody holds it" would retire a uuid on evidence that says
-	 * the opposite.
+	 * THE SENTINEL IS THE PROOF THE STATEMENT RAN, so a result set without it
+	 * is not this statement's answer. Without that check an empty-looking
+	 * result — a stale set, a driver that answered a different query — would
+	 * read as "no list on this site carries it" and retire a uuid whose
+	 * credential is still usable.
 	 */
-	public function test_a_scan_answer_that_names_nobody_is_not_an_absence(): void {
+	public function test_a_result_set_without_the_sentinel_is_not_an_absence(): void {
 		sa_add_app_password( 9, 'uuid-ghost' );
 		sa_set_marker(
 			array(
@@ -430,7 +429,8 @@ final class UnbindSettingsTest extends TestCase {
 				'app_password_users' => array(),
 			)
 		);
-		$GLOBALS['_sa_app_password_scan_answer'] = '0'; // a row, naming no usable user
+		// Rows, but not the one the statement cannot fail to return.
+		$GLOBALS['_sa_app_password_scan_answer'] = array( (object) array( 'user_id' => 9 ) );
 
 		$out = $this->remove();
 
@@ -438,6 +438,58 @@ final class UnbindSettingsTest extends TestCase {
 		$this->assertSame( array( 'uuid-ghost' ), $out['data']['unattributed'] );
 		$this->assertSame( array( 'uuid-ghost' ), $this->stored_marker()['app_password_uuids'] );
 		$this->assertTrue( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * PROVENANCE IS PROVED FOR THE WHOLE ANSWER, not just its first row. A
+	 * result set whose sentinel is this call's but whose owner rows are
+	 * somebody else's names the wrong users, so it proves nothing at all.
+	 */
+	public function test_a_result_set_carrying_a_foreign_probe_is_not_an_absence(): void {
+		sa_add_app_password( 9, 'uuid-ghost' );
+		sa_set_marker(
+			array(
+				'app_password_uuids' => array( 'uuid-ghost' ),
+				'app_password_users' => array(),
+			)
+		);
+		$GLOBALS['_sa_app_password_scan_rewrite_probe'] = 'somebody-elses-nonce';
+
+		$out = $this->remove();
+
+		$this->assertFalse( $out['success'] );
+		$this->assertSame( array( 'uuid-ghost' ), $out['data']['unattributed'] );
+		$this->assertSame( array( 'uuid-ghost' ), $this->stored_marker()['app_password_uuids'] );
+		$this->assertTrue( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * THE SWEEP IS UNBOUNDED. `GROUP_CONCAT` stopped at
+	 * `group_concat_max_len` — 1024 bytes by default, about 170 ids — and said
+	 * so only in a warning nothing here reads, so on a large site the scan
+	 * handed back a list that looked well formed and was missing owners; the
+	 * teardown then reported every credential accounted for while the omitted
+	 * ones stayed usable. One row per owner has no such bound: every holder
+	 * comes back, however many there are.
+	 */
+	public function test_every_holder_comes_back_however_many_there_are(): void {
+		$holders = range( 1000, 1399 ); // far past any GROUP_CONCAT bound
+		foreach ( $holders as $user ) {
+			sa_add_app_password( $user, 'uuid-ghost' );
+		}
+		sa_set_marker(
+			array(
+				'app_password_uuids' => array( 'uuid-ghost' ),
+				'app_password_users' => array(),
+			)
+		);
+
+		$out = $this->remove();
+
+		$this->assertTrue( $out['success'], 'no holder was left unattributed, so the teardown completed' );
+		foreach ( $holders as $user ) {
+			$this->assertFalse( sa_app_password_exists( $user, 'uuid-ghost' ), "holder {$user} was swept" );
+		}
 	}
 
 	/**

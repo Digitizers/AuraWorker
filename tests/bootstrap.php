@@ -376,6 +376,42 @@ if ( ! function_exists( 'get_option' ) ) {
 }
 
 /**
+ * A MySQL LIKE pattern, as a PCRE that matches the way MySQL would.
+ *
+ * The stub used to "apply" a LIKE by undoing esc_like()'s backslashes and
+ * then prefix-matching the result literally, which quietly made every `_` in
+ * a pattern a LITERAL underscore. Real LIKE does the opposite: an unescaped
+ * `_` matches ANY single character. Production code that forgot to escape a
+ * prefix therefore over-matched on a real site and matched exactly right
+ * here, so no test could see it — the fake was the reason the bug was
+ * invisible (#434 Task 10, Codex round-2 P2).
+ *
+ * @param string $like The LIKE pattern, already free of SQL-literal escaping.
+ * @return string A PCRE anchored at both ends.
+ */
+function sa_like_to_regex( string $like ): string {
+	$out = '';
+	$len = strlen( $like );
+	for ( $i = 0; $i < $len; $i++ ) {
+		$c = $like[ $i ];
+		if ( '\\' === $c && $i + 1 < $len ) {
+			$out .= preg_quote( $like[ ++$i ], '/' ); // \_ and \% stand for themselves
+			continue;
+		}
+		if ( '_' === $c ) {
+			$out .= '.';
+			continue;
+		}
+		if ( '%' === $c ) {
+			$out .= '.*';
+			continue;
+		}
+		$out .= preg_quote( $c, '/' );
+	}
+	return '/^' . $out . '$/s';
+}
+
+/**
  * Does the claim row named $claim exist with a value matching the LIKE pattern
  * the caller built from its fence? Mirrors MySQL's LIKE for the one shape the
  * plugin issues: an esc_like()'d prefix followed by '%'.
@@ -385,8 +421,7 @@ function sa_claim_like_matches( string $claim, string $like ): bool {
 	if ( ! is_string( $held ) ) {
 		return false;
 	}
-	$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), rtrim( $like, '%' ) );
-	return 0 === strpos( $held, $prefix );
+	return 1 === preg_match( sa_like_to_regex( $like ), $held );
 }
 
 // --- Admin-screen escaping/nonce stubs (render_connect_section) -------------
@@ -982,7 +1017,8 @@ $GLOBALS['_app_passwords_delete_fail'] = false;
 $GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails (#434 Task 4).
 $GLOBALS['_sa_app_password_read_fail'] = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
 $GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
-$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's answer outright (#434 Task 9).
+$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's result SET outright — an array of rows (#434 Task 9).
+$GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).
 $GLOBALS['_unbind_trace']              = array(); // Phase B's step trace; sa_reset_state() re-arms the recorder.
 if ( ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 	function wp_is_application_passwords_available_for_user( $user ): bool {
@@ -1646,11 +1682,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// a prefix, read against the "database" ($_rows, else $_options).
 			if ( preg_match( "/^SELECT option_name, option_value FROM \S+ WHERE option_name LIKE '([^']+)%'$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
-				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
-				$out    = array();
+				$re    = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
+				$out   = array();
 				$names = array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) );
 				foreach ( $names as $name ) {
-					if ( 0 === strpos( (string) $name, $prefix ) ) {
+					if ( preg_match( $re, (string) $name ) ) {
 						$out[] = array(
 							'option_name'  => (string) $name,
 							'option_value' => (string) sa_read_option_uncached( (string) $name ),
@@ -1658,6 +1694,51 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					}
 				}
 				return $out;
+			}
+			// The site-wide holder statement (#434 Task 9, reshaped in Task 10's
+			// fix round): the same nonce proof, asked of every Application
+			// Password list at once, answering with ONE ROW PER OWNER behind a
+			// sentinel row rather than with a bounded GROUP_CONCAT. Modelled
+			// over $GLOBALS['_app_passwords'] the way MySQL would run the LIKE
+			// — the uuid appears literally in the serialized list — so a
+			// password nobody recorded an owner for is still found.
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, 0 AS user_id UNION ALL SELECT '([^']*)' AS probe, user_id FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				// A statement that failed at the driver: no result set at all,
+				// nothing proved — not even the sentinel comes back. Separate
+				// from _sa_app_password_read_fail, which scopes a failure to
+				// ONE user's row.
+				if ( ! empty( $GLOBALS['_sa_app_password_scan_fail'] ) ) {
+					$this->last_error = 'scan failed';
+					return array();
+				}
+				$needle = str_replace( array( '\\_', '\\%', '\\\\' ), array( '_', '%', '\\' ), stripslashes( $m[3] ) );
+				$rows   = array( (object) array( 'probe' => $m[1], 'user_id' => 0 ) ); // the sentinel
+				// A result set whose OWNER rows came from somebody else's
+				// statement while the sentinel is this call's: the shape a
+				// check that read only the first row would wave through.
+				$owner_probe = empty( $GLOBALS['_sa_app_password_scan_rewrite_probe'] )
+					? $m[2]
+					: (string) $GLOBALS['_sa_app_password_scan_rewrite_probe'];
+				foreach ( $GLOBALS['_app_passwords'] as $user => $list ) {
+					// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+					if ( false !== strpos( serialize( $list ), $needle ) ) {
+						$rows[] = (object) array( 'probe' => $owner_probe, 'user_id' => (int) $user );
+					}
+				}
+				// _sa_app_password_scan_answer replaces the answer outright, so
+				// a test can hand this code a result set no fake would produce
+				// on its own — a foreign result set, or one the sentinel never
+				// reached.
+				return array_key_exists( '_sa_app_password_scan_answer', $GLOBALS ) && null !== $GLOBALS['_sa_app_password_scan_answer']
+					? $GLOBALS['_sa_app_password_scan_answer']
+					: $rows;
+			}
+			// Reformatting the site-wide holder statement would otherwise
+			// unhook every test that depends on it silently — they would fall
+			// through to $_db_rows and go on passing while proving nothing.
+			if ( false !== strpos( (string) $query, '_application_passwords' ) ) {
+				throw new RuntimeException( 'wpdb stub: unrecognised _application_passwords query shape — usermeta_holders() was reformatted and its tests would prove nothing: ' . (string) $query );
 			}
 			if ( ! empty( $GLOBALS['_db_results_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_results_queue'] );
@@ -1805,41 +1886,6 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 						: null, // no row at all
 				);
 			}
-			// The site-wide holder statement (#434 Task 9): the same nonce
-			// proof, asked of every Application Password list at once. Modelled
-			// over $GLOBALS['_app_passwords'] the way MySQL would run the LIKE
-			// — the uuid appears literally in the serialized list — so a
-			// password nobody recorded an owner for is still found.
-			if ( preg_match( "/^SELECT '([^']*)' AS probe, \(SELECT GROUP_CONCAT\(user_id\) FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%'\) AS v$/", (string) $query, $m ) ) {
-				$GLOBALS['_db_queries'][] = (string) $query;
-				// A statement that failed at the driver: no result set, no row,
-				// nothing proved. Separate from _sa_app_password_read_fail,
-				// which scopes a failure to ONE user's row.
-				if ( ! empty( $GLOBALS['_sa_app_password_scan_fail'] ) ) {
-					$this->last_error = 'scan failed';
-					return null;
-				}
-				$needle = str_replace( array( '\\_', '\\%', '\\\\' ), array( '_', '%', '\\' ), stripslashes( $m[2] ) );
-				$found  = array();
-				foreach ( $GLOBALS['_app_passwords'] as $user => $list ) {
-					// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
-					if ( false !== strpos( serialize( $list ), $needle ) ) {
-						$found[] = (int) $user;
-					}
-				}
-				return (object) array(
-					'probe' => $m[1],
-					// GROUP_CONCAT over no rows is NULL, never an empty string.
-					// _sa_app_password_scan_answer replaces the answer outright:
-					// GROUP_CONCAT truncates at group_concat_max_len and MySQL
-					// says so only in a warning, so "rows matched but the list
-					// came back unusable" is a real answer this stub could not
-					// otherwise produce.
-					'v'     => array_key_exists( '_sa_app_password_scan_answer', $GLOBALS ) && null !== $GLOBALS['_sa_app_password_scan_answer']
-						? $GLOBALS['_sa_app_password_scan_answer']
-						: ( array() === $found ? null : implode( ',', $found ) ),
-				);
-			}
 			// Reformatting the production probe would otherwise unhook every
 			// I5/M12/N1 test silently — they would fall through to $_db_row,
 			// read null, and go on passing while proving nothing. LOUD instead.
@@ -1873,24 +1919,24 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// real site, which is the whole point of asking the table rather
 			// than a list of names somebody maintained.
 			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%'$/", (string) $query, $m ) ) {
-				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				$re = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
 				return array_values(
 					array_filter(
 						array_keys( $GLOBALS['_rows'] ),
-						static function ( $k ) use ( $prefix ) {
-							return 0 === strpos( $k, $prefix );
+						static function ( $k ) use ( $re ) {
+							return 1 === preg_match( $re, (string) $k );
 						}
 					)
 				);
 			}
 			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", (string) $query, $m ) ) {
-				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				$re     = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
 				$before = stripslashes( $m[2] );
 				return array_values(
 					array_filter(
 						array_keys( $GLOBALS['_rows'] ),
-						static function ( $k ) use ( $prefix, $before ) {
-							return 0 === strpos( $k, $prefix ) && strcmp( $k, $before ) < 0;
+						static function ( $k ) use ( $re, $before ) {
+							return 1 === preg_match( $re, (string) $k ) && strcmp( (string) $k, $before ) < 0;
 						}
 					)
 				);
@@ -2171,10 +2217,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// escaped the string for SQL, and esc_like() escaped `_` and
 				// `%` for LIKE beforehand — and every option name here is full
 				// of underscores.
-				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
-				$n      = 0;
+				$re = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
+				$n  = 0;
 				foreach ( array_keys( $GLOBALS['_options'] ) as $k ) {
-					if ( 0 === strpos( $k, $prefix ) && strcmp( $k, stripslashes( $m[2] ) ) < 0 ) {
+					if ( preg_match( $re, (string) $k ) && strcmp( (string) $k, stripslashes( $m[2] ) ) < 0 ) {
 						unset( $GLOBALS['_options'][ $k ], $GLOBALS['_rows'][ $k ] );
 						++$n;
 					}
@@ -3171,7 +3217,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails; see the stub above.
 	$GLOBALS['_sa_app_password_read_fail']  = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
 	$GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
-	$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's answer outright (#434 Task 9).
+	$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's result SET outright — an array of rows (#434 Task 9).
+	$GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
 	$GLOBALS['_sa_app_password_create_fails']    = false;
 	$GLOBALS['_abilities']    = array();
