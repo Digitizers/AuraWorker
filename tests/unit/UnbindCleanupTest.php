@@ -493,14 +493,40 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertFalse( get_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT ), 'the site is no longer one with no marker' );
 	}
 
-	/** A write that did NOT land leaves the negative alone — nothing changed. */
-	public function test_a_failed_phase_a_leaves_the_negative_throttle_alone(): void {
+	/**
+	 * A write that did NOT LAND leaves the negative alone — nothing changed, so
+	 * nothing is invalidated. The claim-fenced statement reports success while
+	 * the row diverges (_sa_option_write_divert), which is the only seam that
+	 * reaches the read-back at all: a foreign fence is refused several guards
+	 * earlier and would prove nothing about this branch.
+	 */
+	public function test_a_phase_a_that_did_not_land_leaves_the_negative_throttle_alone(): void {
 		sa_clear_marker();
 		Aura_Worker_Unbind::maybe_finish();
-
-		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( array( 'site' => 'x', 'seq' => 1 ), 'not-the-fence' ) );
-
 		$this->assertNotFalse( get_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT ) );
+
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$GLOBALS['_sa_option_write_divert'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$this->assertFalse(
+			Aura_Worker_Unbind::write_under_claim(
+				array(
+					'at'                 => '2026-08-29T10:00:00Z',
+					'site'               => sa_token_hash(),
+					'site_ref'           => 'res1',
+					'client'             => 'c1',
+					'seq'                => 9,
+					'connect_user_id'    => 3,
+					'app_password_uuids' => array(),
+					'app_password_users' => array(),
+				),
+				$fence
+			)
+		);
+
+		$GLOBALS['_sa_option_write_divert'] = array();
+		Aura_Worker_Magic_Link::release_site( $fence );
+		$this->assertNotFalse( get_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT ), 'no marker landed, so nothing was invalidated' );
 	}
 
 	public function test_maybe_finish_releases_the_claim(): void {
