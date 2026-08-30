@@ -679,6 +679,59 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
+	 * WHERE THE TWO SOURCES DISAGREE, THE FRESHER ONE WINS. The sweep read this
+	 * owner out of that user's own list moments ago; the damaged row's copy is
+	 * older and, here, unusable. Letting the row overwrite it would turn
+	 * knowledge back into an unknown — Phase B's single authoritative lookup
+	 * replaced by the site-wide resolution, for a credential nobody was unsure
+	 * about.
+	 */
+	public function test_the_swept_owner_survives_a_damaged_rows_worse_one(): void {
+		sa_set_marker(
+			array(
+				'seq'                => 'nine',
+				'app_password_uuids' => array( self::MANAGED ),
+				'app_password_users' => array( self::MANAGED => 'nobody' ),
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertSame(
+			array( self::MANAGED => self::ADMIN ),
+			$this->stored_marker()['app_password_users'],
+			'the owner the sweep proved is not replaced by one the row cannot state'
+		);
+	}
+
+	/**
+	 * "Legible" means exactly what validated() means by it. An owners map that
+	 * is an OBJECT rather than an array is a shape this class ignores
+	 * everywhere else — validated() would drop it too — so the repair does not
+	 * quietly widen its own notion of readable to reach inside one. The uuid
+	 * still survives, unattributed, and the teardown's site-wide resolution
+	 * settles it.
+	 */
+	public function test_an_owners_map_that_is_not_an_array_is_not_read(): void {
+		sa_add_app_password( 9, 'manual-uuid-1' );
+		sa_set_marker(
+			array(
+				'seq'                => 'nine',
+				'app_password_uuids' => array( 'manual-uuid-1' ),
+				'app_password_users' => (object) array( 'manual-uuid-1' => 9 ),
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertNull( $this->stored_marker()['app_password_users']['manual-uuid-1'] );
+	}
+
+	/**
 	 * A shape the row cannot be read out of is DROPPED, never coerced: casting
 	 * an array to a string is a warning and a lie, and a uuid nothing can act
 	 * on would only wedge the teardown for good.
