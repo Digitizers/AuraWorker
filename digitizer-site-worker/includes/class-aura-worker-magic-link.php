@@ -721,6 +721,12 @@ class Aura_Worker_Magic_Link {
 				500
 			);
 		}
+		// The lease is refreshed the moment the longest step is behind us
+		// (#434 Codex round-8). The mint is where a slow host spends its
+		// seconds, and a connect that overran SITE_CLAIM_TAKEOVER_AFTER while
+		// legitimately working became seizable — so the tail below runs on a
+		// lease measured from HERE rather than from the claim.
+		self::touch_site_claim( $site_fence );
 		// The mint's own bookkeeping — the LAST fallible write of the install,
 		// and therefore ahead of the marker release below (round-1 NIT): the
 		// bracket's discipline is that nothing that can fail sits after the
@@ -794,6 +800,26 @@ class Aura_Worker_Magic_Link {
 		if ( ! Aura_Worker_Unbind::release_marker_after_rebind( $site_fence ) ) {
 			$release(); // keep the transient — this connect is retryable
 			return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous disconnect record could not be cleared; retry.', 'code' => 'aura_unbind_store_failed' ), 500 );
+		}
+		// OWNERSHIP IS PROVEN ONCE MORE, IMMEDIATELY BEFORE SUCCESS (#434
+		// Codex round-8). Every step above verifies the claim when it acts, but
+		// the LAST such check still had a tail after it — and a handler evicted
+		// in that tail would answer 200 carrying a token and a password the
+		// replacement connect had already revoked, leaving Aura holding
+		// credentials that authenticate nothing. The lease refresh above makes
+		// the eviction unlikely; this makes reporting it impossible.
+		do_action( 'aura_worker_connect_before_success', $site_fence );
+		if ( ! self::holds_site_claim( $site_fence ) ) {
+			$release(); // conditional on the fence: somebody else's claim is untouched
+			// The transient is KEPT: this connect never completed, so the link
+			// must stay usable for the retry that follows.
+			return new WP_REST_Response(
+				array(
+					'error' => 'Connect not completed: another connect took this site while this one was finishing; retry.',
+					'code'  => 'aura_site_taken',
+				),
+				409
+			);
 		}
 		// Consumed only now (the round-23 orphan rule still holds: the claim is
 		// released with it below). Nothing fallible remains: the transient
@@ -1146,6 +1172,47 @@ class Aura_Worker_Magic_Link {
 	 */
 	public static function claim_site() {
 		return self::claim_magic_link( self::SITE_CLAIM, self::SITE_CLAIM_TAKEOVER_AFTER );
+	}
+
+	/**
+	 * REFRESH THE LEASE WHILE THE WORK IS STILL RUNNING (#434 Codex round-8).
+	 *
+	 * seize_stale_claim() bounds a claim stranded by a fatal to
+	 * SITE_CLAIM_TAKEOVER_AFTER seconds, and its own docblock says a claim "a
+	 * live request refreshing it" cannot be seized — but nothing refreshed one.
+	 * A connect that legitimately ran past the window (a slow host, a mint that
+	 * waited on the database, and since #434 a full Phase B cleanup before the
+	 * rebind) therefore became seizable while it was still working, and a
+	 * replacement connect could revoke the credentials the first one was about
+	 * to return.
+	 *
+	 * The same conditional compare-and-swap the seizure uses, in the other
+	 * direction: the UPDATE names the exact bytes just read, so a claim already
+	 * seized, released or refreshed by somebody else loses and answers false.
+	 * A caller that gets false has lost the site and must not report success.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $fence The value claim_site() returned.
+	 * @return bool True while this fence still holds the site.
+	 */
+	public static function touch_site_claim( $fence ) {
+		global $wpdb;
+		if ( '' === (string) $fence ) {
+			return false;
+		}
+		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::SITE_CLAIM ) );
+		if ( ! is_string( $held ) || 0 !== strpos( $held, $fence . '|' ) ) {
+			return false;
+		}
+		$fresh = $fence . '|' . time();
+		if ( $held === $fresh ) {
+			return true; // same second: the lease is already as fresh as it gets
+		}
+		$rows = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s", $fresh, self::SITE_CLAIM, $held ) );
+		wp_cache_delete( self::SITE_CLAIM, 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		return 1 === (int) $rows && '' === (string) $wpdb->last_error;
 	}
 
 	/**

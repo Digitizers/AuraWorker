@@ -102,8 +102,10 @@ final class UninstallCoverageTest extends TestCase {
 	 *
 	 * - includes/class-aura-worker.php (2) — the site token, written
 	 *   conditionally on the site claim: 'aura_worker_site_token'.
-	 * - includes/class-aura-worker-magic-link.php (2) — the site claim itself:
-	 *   'aura_worker_connect_lock'.
+	 * - includes/class-aura-worker-magic-link.php (3) — the site claim itself:
+	 *   'aura_worker_connect_lock'. Taken, seized when stale, and — since
+	 *   #434 Codex round-8 — refreshed while a long connect is still working,
+	 *   all three as compare-and-swaps on that one key.
 	 * - includes/class-aura-worker-rules.php (5) — the hourly rule counters
 	 *   ('aura_worker_rules_blocked_h<hour>' / '…warned_h<hour>', an
 	 *   INSERT … ON DUPLICATE KEY UPDATE that no scan of function calls could
@@ -111,7 +113,7 @@ final class UninstallCoverageTest extends TestCase {
 	 *   'aura_worker_ruleset'.
 	 */
 	private const ACKNOWLEDGED_RAW_OPTION_WRITES = array(
-		'includes/class-aura-worker-magic-link.php' => 2,
+		'includes/class-aura-worker-magic-link.php' => 3,
 		'includes/class-aura-worker-rules.php'      => 5,
 		'includes/class-aura-worker.php'            => 2,
 	);
