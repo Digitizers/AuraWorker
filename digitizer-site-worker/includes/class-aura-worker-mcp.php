@@ -158,6 +158,25 @@ class Aura_Worker_MCP {
 			// could dump the database. Read tools that don't require approval are
 			// exempt (a leaked token may still read).
 			$needs_grant = empty( $annotations['read_only'] ) || ! empty( $annotations['requires_approval'] );
+			// An unbound site refuses the tool BEFORE the grant question is
+			// asked (Codex round-6 P1). Phase B step (4) deletes the gateway
+			// key while the site is still marked, so from that moment
+			// is_enforced() is false and this whole block was skipped —
+			// carrying the marker refusal with it. Reads that need no grant
+			// keep working, exactly as they do at every other boundary.
+			if ( $needs_grant ) {
+				$unbound = Aura_Worker_Grant::refusal_if_unbound();
+				if ( null !== $unbound ) {
+					return new WP_REST_Response(
+						array(
+							'success' => false,
+							'code'    => $unbound->get_error_code(),
+							'error'   => $unbound->get_error_message(),
+						),
+						403
+					);
+				}
+			}
 			if ( $needs_grant && Aura_Worker_Grant::is_enforced() ) {
 				// The grant is bound to `params`, which is exactly what this handler
 				// executes. The gateway also sends a `parameters` alias (identical to

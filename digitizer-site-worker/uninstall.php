@@ -12,6 +12,12 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 	exit;
 }
 
+// The ONE rule the marker's credential list is read by. A pure function file
+// with no class, no hooks and no bootstrap — the only plugin code this file
+// loads, and it loads it precisely so the rule cannot drift between the plugin
+// and its uninstall (#434).
+require_once __DIR__ . '/includes/unbind-credential-list.php';
+
 // A network-activated plugin's uninstall runs ONCE (round-28). Every subsite has
 // its own options table and therefore its own Application Password record, so
 // the cleanup below is run in each site's context — otherwise administrator
@@ -120,11 +126,20 @@ $aura_uninstall_site = static function () {
 	// reinstall, which is what it is for — the settings screen names the debt
 	// and offers to finish it, and that is the honest state of a site whose
 	// credential really is still out there.
+	// The list is read through the ONE rule that reads it, required as a pure
+	// function so this file is bound by it without loading the plugin
+	// (#434 Codex round-6 P1). This file used to map an unreadable list to an
+	// empty array and call the marker settled — the same inference, in the one
+	// place where acting on it deletes the last record of a live credential.
 	$aura_marker         = get_option( 'aura_worker_unbound', null ); // mirrors Aura_Worker_Unbind::OPTION
-	$aura_marker_uuids   = ( is_array( $aura_marker ) && isset( $aura_marker['app_password_uuids'] ) && is_array( $aura_marker['app_password_uuids'] ) ) ? $aura_marker['app_password_uuids'] : array();
+	$aura_marker_present = ( null !== $aura_marker && false !== $aura_marker && '' !== $aura_marker );
+	$aura_marker_uuids   = is_array( $aura_marker ) ? aura_worker_credential_list( $aura_marker['app_password_uuids'] ?? null ) : null;
 	$aura_marker_users   = ( is_array( $aura_marker ) && isset( $aura_marker['app_password_users'] ) && is_array( $aura_marker['app_password_users'] ) ) ? $aura_marker['app_password_users'] : array();
-	$aura_marker_settled = true;
-	foreach ( $aura_marker_uuids as $aura_marker_uuid ) {
+	// A marker that is THERE and whose credential list cannot be read is an
+	// unsettled debt, not an absent one: it may be the only record of a
+	// manually supplied Application Password that is still live.
+	$aura_marker_settled = ! $aura_marker_present || null !== $aura_marker_uuids;
+	foreach ( (array) $aura_marker_uuids as $aura_marker_uuid ) {
 		$aura_marker_uuid  = (string) $aura_marker_uuid;
 		$aura_marker_owner = (int) ( $aura_marker_users[ $aura_marker_uuid ] ?? 0 );
 		if ( '' === $aura_marker_uuid || $aura_marker_owner <= 0 || ! class_exists( 'WP_Application_Passwords' ) ) {

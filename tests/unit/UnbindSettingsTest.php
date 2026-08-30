@@ -817,11 +817,13 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
-	 * A shape the row cannot be read out of is DROPPED, never coerced: casting
-	 * an array to a string is a warning and a lie, and a uuid nothing can act
-	 * on would only wedge the teardown for good.
+	 * A shape the row cannot be read out of makes the LIST unreadable, and an
+	 * unreadable list is not a repairable one (Codex round-6 P1). Coercing it
+	 * was never the alternative — casting an array to a string is a warning
+	 * and a lie — but neither is dropping it: the entry named a credential
+	 * this build cannot see, and the sweep cannot stand in for it.
 	 */
-	public function test_a_uuid_list_that_cannot_be_read_is_dropped_not_guessed(): void {
+	public function test_a_uuid_list_that_cannot_be_read_is_not_repaired(): void {
 		sa_set_marker(
 			array(
 				'seq'                => 'nine',
@@ -831,10 +833,10 @@ final class UnbindSettingsTest extends TestCase {
 		);
 		$fence = Aura_Worker_Magic_Link::claim_site();
 
-		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		$this->assertFalse( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
 		Aura_Worker_Magic_Link::release_site( $fence );
 
-		$this->assertSame( array( self::MANAGED ), $this->stored_marker()['app_password_uuids'], 'only what the sweep proved' );
+		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::MANAGED ), 'nothing was revoked' );
 	}
 
 	/**

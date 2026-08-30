@@ -122,33 +122,15 @@ final class Aura_Worker_Unbind {
 			|| ! self::field_is( $m, 'seq', 'int' ) ) {
 			return self::malformed();
 		}
-		// A missing or non-array credential list is MALFORMED, never an empty
-		// one (Codex round-4 P1). Every writer supplies the array — the
-		// disconnect that opens the marker, the repair that rebuilds it, the
-		// retirement that shortens it — so a shape that is not an array is a
-		// row this build cannot read, and reading it as "this binding held no
-		// credentials" would let cleanup() report step (1) complete, delete
-		// the token, and leave departed_binding_request() blind to a live
-		// Application Password. The one field whose emptiness IS a security
-		// claim may not be inferred from a field that could not be read.
-		if ( ! isset( $m['app_password_uuids'] ) || ! is_array( $m['app_password_uuids'] ) ) {
+		// THE credential list, asked of the one rule that reads it
+		// (includes/unbind-credential-list.php). A list this build cannot read
+		// proves nothing, and a marker whose credentials cannot be read is
+		// malformed — not one that held none.
+		$uuids = aura_worker_credential_list( $m['app_password_uuids'] ?? null );
+		if ( null === $uuids ) {
 			return self::malformed();
 		}
-		$uuids = $m['app_password_uuids'];
-		// Non-scalar entries are DROPPED, not stringified (final round LOW-1).
-		// `strval()` on an object without __toString is a PHP 8 Error thrown
-		// straight out of read() — which runs on nearly every request at a
-		// marked site, and at the core-REST seam — so a hand-corrupted row would
-		// fatal the boundary instead of refusing at it. An array entry degraded
-		// to the string "Array". Neither shape can name a credential, so the
-		// same rule merged_with_damaged_row() already applies is applied here:
-		// a uuid is a string or an int, and anything else is not one.
-		$m['app_password_uuids'] = array();
-		foreach ( $uuids as $uuid ) {
-			if ( is_string( $uuid ) || is_int( $uuid ) ) {
-				$m['app_password_uuids'][] = (string) $uuid;
-			}
-		}
+		$m['app_password_uuids'] = $uuids;
 		// Owners are normalised to a POSITIVE int or an explicit null meaning
 		// "this site does not know whose password this is" (round-3). Anything
 		// else — 0, '', a string, an object, a marker written by an earlier
@@ -722,8 +704,9 @@ final class Aura_Worker_Unbind {
 	 *                                     cannot say what this binding held.
 	 */
 	private static function merged_with_damaged_row( array $found ): ?array {
-		$raw = self::marker_array();
-		if ( null === $raw || ! isset( $raw['app_password_uuids'] ) || ! is_array( $raw['app_password_uuids'] ) ) {
+		$raw   = self::marker_array();
+		$uuids = null === $raw ? null : aura_worker_credential_list( $raw['app_password_uuids'] ?? null );
+		if ( null === $uuids ) {
 			// AN ILLEGIBLE LIST IS NOT AN EMPTY ONE (Codex round-5 P1). The
 			// sweep is a superset of what SiteAgent MINTED — it looks for the
 			// name mint_app_password() stamps — and the credential this rule
@@ -744,12 +727,8 @@ final class Aura_Worker_Unbind {
 			// list has been destroyed.
 			return null;
 		}
-		foreach ( $raw['app_password_uuids'] as $uuid ) {
-			if ( ! is_string( $uuid ) && ! is_int( $uuid ) ) {
-				continue; // a shape that names no credential
-			}
-			$uuid = (string) $uuid;
-			if ( '' === $uuid || array_key_exists( $uuid, $found ) ) {
+		foreach ( $uuids as $uuid ) {
+			if ( array_key_exists( $uuid, $found ) ) {
 				continue;
 			}
 			// Null, never the row's `app_password_users` entry: see above.

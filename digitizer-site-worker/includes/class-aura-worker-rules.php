@@ -1264,9 +1264,16 @@ class Aura_Worker_Rules {
 		if ( ! is_string( $auth ) || '' === $auth ) {
 			return true; // a token-only request carries no password to record
 		}
-		$uuids = isset( $marker['app_password_uuids'] ) && is_array( $marker['app_password_uuids'] )
-			? array_values( array_map( 'strval', $marker['app_password_uuids'] ) )
-			: array();
+		// The list this append EXTENDS is read through the one rule that reads
+		// it. `$marker` arrives from Aura_Worker_Unbind::read(), so today the
+		// field is always a clean list — and "already validated upstream" is
+		// exactly the assumption that turns into the next round's finding. A
+		// list that cannot be read is not one to append to: fail closed, and
+		// the caller answers a retryable 500 with nothing written.
+		$uuids = aura_worker_credential_list( $marker['app_password_uuids'] ?? null );
+		if ( null === $uuids ) {
+			return false;
+		}
 		if ( in_array( $auth, $uuids, true ) ) {
 			return true;
 		}

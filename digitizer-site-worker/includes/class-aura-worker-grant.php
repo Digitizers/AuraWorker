@@ -106,9 +106,24 @@ class Aura_Worker_Grant {
 	 *                              render the reason into a message must handle
 	 *                              the WP_Error — concatenating it is a fatal.
 	 */
+	/**
+	 * The unbind refusal, when this site is marked — asked in ONE place so
+	 * every caller answers it the same way, whether or not it goes on to ask
+	 * about a grant.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return WP_Error|null The 403 aura_site_unbound refusal, or null when
+	 *                       this site is still bound.
+	 */
+	public static function refusal_if_unbound() {
+		return Aura_Worker_Unbind::is_set() ? Aura_Worker_Unbind::refusal() : null;
+	}
+
 	public static function verify( $header, $tool, $params ) {
-		if ( Aura_Worker_Unbind::is_set() ) {
-			return Aura_Worker_Unbind::refusal();
+		$unbound = self::refusal_if_unbound();
+		if ( null !== $unbound ) {
+			return $unbound;
 		}
 
 		if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
@@ -285,6 +300,18 @@ class Aura_Worker_Grant {
 	 * @return true|WP_Error  True when allowed; WP_Error(403) when a grant is required and missing/invalid.
 	 */
 	public static function require_for( $request, $action, $params ) {
+		// THE UNBOUND SITE IS ANSWERED BEFORE THE GRANT QUESTION (Codex
+		// round-6 P1). verify() refuses a marked site, but both of its callers
+		// SKIP verify() when no gateway key is configured — and Phase B step
+		// (4) deletes that key while the site is still marked. A mutating
+		// request that had already passed its permission callback would then
+		// find no key, skip the grant path entirely, and never meet the marker
+		// at all. The refusal is not a verdict about a grant, so it does not
+		// live behind the question "is a grant required".
+		$unbound = self::refusal_if_unbound();
+		if ( null !== $unbound ) {
+			return $unbound;
+		}
 		if ( ! self::is_enforced() ) {
 			return true;
 		}
@@ -293,6 +320,13 @@ class Aura_Worker_Grant {
 		}
 		$grant  = (string) $request->get_header( 'X-Aura-Approval-Grant' );
 		$reason = self::verify( $grant, (string) $action, $params );
+		if ( is_wp_error( $reason ) ) {
+			// Not a verdict about the GRANT — a refusal with its own code and
+			// status (an unbound site). Concatenating it below would be a
+			// fatal; the MCP caller already answers it first, and so does this
+			// one now.
+			return $reason;
+		}
 		if ( true !== $reason ) {
 			// Distinct forensic signal for a refused write (kept separate from the
 			// power-execute hook, which means a tool actually ran).

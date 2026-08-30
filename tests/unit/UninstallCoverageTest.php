@@ -686,6 +686,40 @@ final class UninstallCoverageTest extends TestCase {
 		$this->assertFalse( Aura_Worker_Unbind::is_set(), 'and nothing is owed, so the marker goes' );
 	}
 
+	/**
+	 * A MARKER WHOSE CREDENTIAL LIST CANNOT BE READ IS AN UNSETTLED DEBT
+	 * (Codex round-6 P1). This file used to map an unreadable list to an empty
+	 * array and call the marker settled, which swept away what may be the only
+	 * record of a still-live manually supplied Application Password.
+	 *
+	 * @dataProvider unreadable_credential_lists
+	 *
+	 * @param mixed $value What the field holds.
+	 */
+	public function test_a_marker_whose_credential_list_is_unreadable_outlives_the_uninstall( $value ): void {
+		$marker = array( 'unbound_at' => gmdate( 'c' ), 'app_password_users' => array() );
+		if ( '__missing__' !== $value ) {
+			$marker['app_password_uuids'] = $value;
+		}
+		update_option( Aura_Worker_Unbind::OPTION, $marker );
+		update_option( 'aura_worker_site_token', 'hash' );
+
+		self::run_uninstall();
+
+		$this->assertNotFalse( get_option( Aura_Worker_Unbind::OPTION, false ), 'the marker was swept on a list nothing could read' );
+		$this->assertFalse( get_option( 'aura_worker_site_token', false ), 'everything else still went' );
+	}
+
+	/** @return array<string,array{0:mixed}> */
+	public static function unreadable_credential_lists(): array {
+		return array(
+			'missing'          => array( '__missing__' ),
+			'not a list'       => array( 'uuid-manual' ),
+			'a nested entry'   => array( array( array( 'nested' ) ) ),
+			'an empty entry'   => array( array( '' ) ),
+		);
+	}
+
 	private static function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 			define( 'WP_UNINSTALL_PLUGIN', 'digitizer-site-worker/digitizer-site-worker.php' );

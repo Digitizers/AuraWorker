@@ -462,17 +462,22 @@ final class UnbindMarkerTest extends TestCase {
 	}
 
 	/**
-	 * Final round LOW-1. `app_password_uuids` is the one marker field
-	 * validated() does not type-check per entry, and it used to be
-	 * `array_map( 'strval', … )`: an OBJECT entry threw a PHP 8 Error straight
-	 * out of read() — which runs on nearly every request at a marked site and
-	 * at the core-REST seam — and an ARRAY entry degraded to the string
-	 * "Array". Only a hand-corrupted row can produce either, and both failed
-	 * hard rather than open, but a fatal at the refusal boundary is worse than
-	 * a refusal. A uuid is a string or an int; every other shape names no
-	 * credential and is dropped, exactly as merged_with_damaged_row() does.
+	 * A NON-SCALAR ENTRY MAKES THE WHOLE LIST UNREADABLE — it is not dropped
+	 * (Codex round-6 P1, and the rule now lives in one place:
+	 * includes/unbind-credential-list.php).
+	 *
+	 * Dropping the entry and returning the rest asserts that the dropped one
+	 * named no credential, which is precisely the claim the row cannot make:
+	 * the entry is unreadable, and the Application Password it named may be
+	 * live. leftovers() would then report no debt and a final cleanup would
+	 * delete the token beside it.
+	 *
+	 * The original intent of this test — final round LOW-1 — is unchanged and
+	 * still asserted: the boundary REFUSES rather than fatals. `strval()` on an
+	 * object without __toString is a PHP 8 Error thrown straight out of read(),
+	 * which runs on nearly every request at a marked site.
 	 */
-	public function test_a_non_scalar_uuid_entry_is_dropped_rather_than_fataling(): void {
+	public function test_a_non_scalar_uuid_entry_makes_the_marker_malformed_never_fatal(): void {
 		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = array(
 			'at'                 => '2026-08-29T10:00:00Z',
 			'site'               => str_repeat( 'a', 64 ),
@@ -485,8 +490,23 @@ final class UnbindMarkerTest extends TestCase {
 
 		$m = Aura_Worker_Unbind::read();
 
-		$this->assertIsArray( $m, 'the marker still reads — the row is corrupt, not the request' );
-		$this->assertSame( array( 'u-1', '7' ), $m['app_password_uuids'] );
+		$this->assertInstanceOf( WP_Error::class, $m, 'refused, not fataled' );
+		$this->assertSame( 'aura_unbind_marker_malformed', $m->get_error_code() );
 		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'and the site still refuses everything' );
+	}
+
+	/** A list of readable uuids still reads, and reads normalised. */
+	public function test_a_readable_uuid_list_reads_normalised(): void {
+		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = array(
+			'at'                 => '2026-08-29T10:00:00Z',
+			'site'               => str_repeat( 'a', 64 ),
+			'site_ref'           => 'res1',
+			'client'             => 'c1',
+			'seq'                => 7,
+			'app_password_uuids' => array( 'u-1', 7, 'u-1' ),
+			'app_password_users' => array( 'u-1' => 3 ),
+		);
+
+		$this->assertSame( array( 'u-1', '7' ), Aura_Worker_Unbind::read()['app_password_uuids'] );
 	}
 }
