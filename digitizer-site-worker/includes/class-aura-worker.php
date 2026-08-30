@@ -148,15 +148,19 @@ class Aura_Worker {
 		// The marker's three states, answered before anything is claimed or
 		// deleted, because they are three different situations for the person
 		// reading the screen:
-		$marker = Aura_Worker_Unbind::read();
-		if ( is_wp_error( $marker ) ) {
-			// Unreadable or malformed. Everything below would refuse anyway —
-			// cleanup() does nothing at all for a marker it cannot read — but
-			// it would refuse with `aura_unbind_incomplete` and a list of four
-			// steps nobody has established are owed. What is actually true is
-			// that the record could not be READ, which is what this says, and
-			// it carries no leftover list for the same reason
-			// finish_before_rebind() carries none (#434 Task 7).
+		$marker    = Aura_Worker_Unbind::read();
+		$malformed = is_wp_error( $marker ) && Aura_Worker_Unbind::MALFORMED_CODE === $marker->get_error_code();
+		if ( is_wp_error( $marker ) && ! $malformed ) {
+			// A read that did not complete. NOT the same thing as a damaged
+			// row, and the difference is the whole of fix round 1: read()
+			// answers one WP_Error for both, so a teardown that treated them
+			// alike would repair — and then tear down — a perfectly healthy
+			// marker with real outstanding debts, on a database blip. This
+			// branch is the transient one: nothing is claimed, nothing is
+			// changed, and it refuses with its own story rather than with
+			// `aura_unbind_incomplete` and a list of four steps nobody has
+			// established are owed — the same reasoning finish_before_rebind()
+			// uses (#434 Task 7).
 			wp_send_json_error(
 				array(
 					'message' => __( 'This site cannot read its own disconnect record, so it cannot tell what is left to remove. Check the site for database errors and try again.', 'digitizer-site-worker' ),
@@ -182,6 +186,21 @@ class Aura_Worker {
 		$fence = Aura_Worker_Magic_Link::claim_site();
 		if ( '' === $fence ) {
 			wp_send_json_error( array( 'message' => __( 'A connection to Aura is being installed right now, so nothing was removed. Try again in a moment.', 'digitizer-site-worker' ) ), 409 );
+		}
+
+		// A damaged row is REPAIRED, never deleted: rebuilt from the site's own
+		// state into a marker the teardown below runs against unchanged, so the
+		// marker still outlives everything it names and still goes last. It
+		// gates on MALFORMED_CODE itself, and reads twice.
+		if ( $malformed && ! Aura_Worker_Unbind::repair_malformed_marker( $fence ) ) {
+			Aura_Worker_Magic_Link::release_site( $fence );
+			wp_send_json_error(
+				array(
+					'message' => __( 'This site could not repair its damaged disconnect record, so nothing was removed. Check the site for database errors and try again.', 'digitizer-site-worker' ),
+					'code'    => 'aura_unbind_unrepairable',
+				),
+				409
+			);
 		}
 
 		$unattributed = Aura_Worker_Unbind::resolve_unknown_owners( $fence );
@@ -235,7 +254,12 @@ class Aura_Worker {
 	 */
 	private function token_present(): bool {
 		$raw = Aura_Worker_Rules::read_option_uncached( 'aura_worker_site_token' );
-		return is_wp_error( $raw ) || null !== $raw;
+		// `null` is the ONE answer that means the row is gone: a WP_Error from
+		// a read that did not complete is not null and is therefore reported as
+		// present, which is the fail-closed direction. Written as the single
+		// comparison it is — an `is_wp_error( $raw ) ||` in front would read
+		// like a second guard while being dead code (round-1 LOW-1).
+		return null !== $raw;
 	}
 
 	/**

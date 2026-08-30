@@ -157,15 +157,19 @@ final class Aura_Worker_Unbind {
 	 * from read() — is_set() reports unbound, is_set_strict() surfaces it,
 	 * status_fragment() answers null, cleanup()/maybe_finish() do nothing and
 	 * leftovers() names every step — which is exactly the handling a corrupted
-	 * marker needs. A site cannot repair this itself; Task 9's removal panel is
-	 * the operator's escape hatch.
+	 * marker needs.
+	 *
+	 * The message names the way out, and since fix round 1 that promise can
+	 * actually be kept: "Remove remaining Aura data" REPAIRS a damaged row
+	 * (repair_malformed_marker()) and then tears the site down through the
+	 * ordinary path. It used to point at a control that would refuse.
 	 *
 	 * @return WP_Error
 	 */
 	private static function malformed(): WP_Error {
 		return new WP_Error(
 			'aura_unbind_marker_malformed',
-			__( 'This site is disconnected, but its disconnect record is unreadable; remove the remaining Aura data from the site\'s SiteAgent settings.', 'digitizer-site-worker' ),
+			__( 'This site is disconnected and its disconnect record is damaged; use “Remove remaining Aura data” on the site\'s SiteAgent settings screen to rebuild the record and clear the connection.', 'digitizer-site-worker' ),
 			array( 'status' => 500 )
 		);
 	}
@@ -531,6 +535,102 @@ final class Aura_Worker_Unbind {
 	private static function option_absent( string $name ): bool {
 		$raw = Aura_Worker_Rules::read_option_uncached( $name );
 		return ! is_wp_error( $raw ) && null === $raw;
+	}
+
+	/**
+	 * REPAIR A MALFORMED MARKER SO THE TEARDOWN CAN RUN (#434 Task 9, fix round 1).
+	 *
+	 * A marker row this build cannot parse is the worst state in the whole
+	 * design: `departed_binding_request()` refuses EVERY agent REST write from
+	 * ANY Application Password — Aura's and the site owner's alike — both
+	 * rebinds refuse (Task 7), and `cleanup()` does nothing at all for a marker
+	 * it cannot read, so nothing on the site can ever change that. The site's
+	 * whole API-automation surface is dead, permanently.
+	 *
+	 * The obvious exit — let the operator delete the marker — is the failure
+	 * family this project has made six times, because read() answers ONE
+	 * WP_Error for two different worlds: a row that is genuinely malformed,
+	 * and a healthy row whose single uncached read hit a database blip. A
+	 * teardown gated on `is_wp_error()` would delete a perfectly good marker,
+	 * with real outstanding debts, on a transient failure. So this gates on
+	 * MALFORMED_CODE specifically — the codes ARE separable, a failed read
+	 * answers Aura_Worker_Rules::option_raw()'s store error — and it reads
+	 * TWICE, because one read that says "malformed" is one read.
+	 *
+	 * And it does not delete anything. It REBUILDS the row into a marker the
+	 * existing, already-reviewed teardown can run against unchanged:
+	 *
+	 *   - `site` = the live token hash, so maybe_finish() goes on recognising
+	 *     this site and the marker still names the credential Aura holds;
+	 *   - `seq` 0 and empty `site_ref`/`client` — the fields that only ever
+	 *     matched a retry of the same tombstone, moot once the token is gone,
+	 *     and the only things fabricated here;
+	 *   - the credential list rebuilt from the SITE
+	 *     (Aura_Worker_Magic_Link::minted_passwords()), never invented: an
+	 *     unprovable sweep refuses the whole repair.
+	 *
+	 * What it CANNOT recover is an authenticating uuid Phase A appended for a
+	 * password Aura never minted — a manually supplied credential under a name
+	 * of somebody else's choosing. Nothing on the site records it once the
+	 * marker is unreadable. The teardown tells the operator so, before
+	 * anything is removed.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $fence The caller's site-claim fence.
+	 * @return bool True once the repaired marker is stored and reads back
+	 *              well-formed.
+	 */
+	public static function repair_malformed_marker( string $fence ): bool {
+		if ( '' === $fence || ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			return false;
+		}
+		// Twice, and both must say MALFORMED. A transient read failure answers
+		// a different code and repairs nothing; a row that reads fine on the
+		// second look is a marker somebody else just wrote, and rewriting it
+		// would throw away a real Phase A.
+		if ( ! self::is_malformed() || ! self::is_malformed() ) {
+			return false;
+		}
+		$token = Aura_Worker_Rules::site_token_uncached();
+		if ( is_wp_error( $token ) ) {
+			return false; // the repaired marker must name the token this site holds
+		}
+		$found = Aura_Worker_Magic_Link::minted_passwords();
+		if ( null === $found ) {
+			return false; // a credential list nobody could prove is not a list
+		}
+		$who = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
+		$who = is_wp_error( $who ) ? 0 : (int) maybe_unserialize( (string) $who );
+		$ok  = self::write_under_claim(
+			array(
+				'at'                 => gmdate( 'c' ),
+				'site'               => (string) $token,
+				'site_ref'           => '',
+				'client'             => '',
+				'seq'                => 0,
+				'connect_user_id'    => $who > 0 ? $who : 0,
+				'app_password_uuids' => array_keys( $found ),
+				'app_password_users' => $found,
+			),
+			$fence
+		);
+		// write_under_claim() proves the row names this site at this seq, which
+		// is exactly what a repair changes — but not that the result PARSES.
+		// The whole point is a marker the teardown can read, so read it.
+		return $ok && is_array( self::read() );
+	}
+
+	/**
+	 * Is the marker row present and unparseable — as opposed to unreadable?
+	 * The distinction the repair turns on, asked in one place so both reads
+	 * ask it the same way.
+	 *
+	 * @return bool
+	 */
+	private static function is_malformed(): bool {
+		$m = self::read();
+		return is_wp_error( $m ) && self::MALFORMED_CODE === $m->get_error_code();
 	}
 
 	/**

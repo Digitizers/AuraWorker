@@ -345,15 +345,14 @@ final class UnbindCoreRestTest extends TestCase {
 			);
 		}
 
-		// The teardown's own gate, read out of the source: its delete is
-		// reached only under `true !== $done` having been passed. A truthiness
-		// test, or a `false !==`, would let a `cleanup()` that answered
-		// something other than proof delete the marker.
-		$this->assertMatchesRegularExpression(
-			'/\$done\s*=\s*Aura_Worker_Unbind::cleanup\(\s*true,\s*\$fence\s*\);\s*if\s*\(\s*true\s*!==\s*\$done\s*\)/',
-			$sources[ SA_PLUGIN_DIR . '/includes/class-aura-worker.php' ],
-			'the teardown must gate its delete on cleanup() returning exactly true'
-		);
+		// The teardown's own gate is NOT pinned here (round-1 LOW-2). It was,
+		// by a regex over this file's source text, and that was a style pin
+		// wearing a guard's clothes: `cleanup()` returns bool, so `! $done` is
+		// semantically identical and the regex killed it anyway, while a
+		// reformat — an intervening comment, a wrapped call, a renamed local —
+		// would have fired it for nothing. The real gate dies on nine
+		// behavioural tests in UnbindSettingsTest, starting with
+		// test_remove_aura_data_keeps_the_marker_when_the_token_delete_fails.
 	}
 
 	/**
@@ -376,6 +375,21 @@ final class UnbindCoreRestTest extends TestCase {
 			array( 'class-aura-worker.php' ),
 			self::files_calling( $sources, 'resolve_unknown_owners' ),
 			'…and that resolution runs only from the operator teardown'
+		);
+
+		// The repair path (round 1) is the same shape of privilege: it rewrites
+		// a marker row from a NAME sweep, which is evidence about candidates
+		// rather than about a credential, so it must never be reachable from a
+		// sweep or a request nobody asked for.
+		$this->assertSame(
+			array( 'class-aura-worker-unbind.php' ),
+			self::files_calling( $sources, 'minted_passwords' ),
+			'the name sweep has ONE caller — repair_malformed_marker()'
+		);
+		$this->assertSame(
+			array( 'class-aura-worker.php' ),
+			self::files_calling( $sources, 'repair_malformed_marker' ),
+			'…and the repair runs only from the operator teardown'
 		);
 	}
 

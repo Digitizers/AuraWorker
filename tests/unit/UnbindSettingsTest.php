@@ -470,6 +470,184 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/* ------------------------------------------------------------------ */
+	/* The damaged record — repair, never delete (fix round 1)             */
+	/* ------------------------------------------------------------------ */
+
+	/** Leave the marker row present but unparseable: `seq` is not an int. */
+	private function damage_the_marker(): void {
+		sa_set_marker( array( 'seq' => 'nine' ) );
+		$read = Aura_Worker_Unbind::read();
+		$this->assertTrue( is_wp_error( $read ) && Aura_Worker_Unbind::MALFORMED_CODE === $read->get_error_code() );
+	}
+
+	/**
+	 * THE WORST STATE IN THE DESIGN, AND THE WAY OUT.
+	 *
+	 * An unparseable marker refuses every agent REST write from every
+	 * Application Password on the site, Aura's and the owner's alike; both
+	 * rebinds refuse; cleanup() does nothing at all. The teardown rebuilds the
+	 * row from the site — the live token hash, and the credentials the name
+	 * sweep proves are there — and then runs the ordinary path against it.
+	 *
+	 * The ghost here is on a NON-administrator and is not in the plugin's
+	 * record: it exists only in the sweep.
+	 */
+	public function test_a_damaged_record_is_repaired_and_then_torn_down(): void {
+		$GLOBALS['_app_passwords'][9][] = array( 'uuid' => 'uuid-swept', 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'created' => time() );
+		$this->damage_the_marker();
+
+		$out = $this->remove();
+
+		$this->assertTrue( $out['success'] );
+		$this->assertFalse( sa_app_password_exists( 9, 'uuid-swept' ), 'the swept credential is gone' );
+		$this->assertFalse( sa_app_password_exists( self::ADMIN, self::MANAGED ), 'and so is the recorded one' );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * THE GATE, DIRECTION ONE: a transient read failure is NOT a damaged row.
+	 * read() answers one WP_Error for both, so a teardown that acted on
+	 * `is_wp_error()` alone would repair — and then tear down — a healthy
+	 * marker with real outstanding debts, on one database blip.
+	 */
+	public function test_a_transient_read_failure_repairs_nothing_and_removes_nothing(): void {
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$out = $this->remove();
+
+		$this->assertFalse( $out['success'] );
+		$this->assertSame( 'aura_unbind_unreadable', $out['data']['code'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertSame( 9, $this->stored_marker()['seq'], 'the healthy marker is untouched' );
+		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::MANAGED ) );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	/** …and the repair itself refuses it, not merely the handler above it. */
+	public function test_the_repair_refuses_a_read_that_did_not_complete(): void {
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$this->assertFalse( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		Aura_Worker_Magic_Link::release_site( $fence );
+		$this->assertSame( 9, $this->stored_marker()['seq'], 'nothing was rewritten' );
+	}
+
+	/** THE GATE, DIRECTION TWO: a damaged row IS repaired. */
+	public function test_the_repair_rebuilds_the_row_from_the_site(): void {
+		$this->damage_the_marker();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$raw = $this->stored_marker();
+		$this->assertSame( sa_token_hash(), $raw['site'], 'the repaired marker names the live token' );
+		$this->assertSame( 0, $raw['seq'] );
+		$this->assertSame( '', $raw['site_ref'] );
+		$this->assertSame( '', $raw['client'] );
+		$this->assertSame( array( self::MANAGED ), $raw['app_password_uuids'] );
+		$this->assertSame( array( self::MANAGED => self::ADMIN ), $raw['app_password_users'], 'each credential with its real owner' );
+		$this->assertIsArray( Aura_Worker_Unbind::read(), 'and the result parses' );
+	}
+
+	/**
+	 * A repaired marker must still be the SITE's: maybe_finish() bails on a
+	 * hash mismatch, so a repair that named anything but the live token would
+	 * disarm the sweep it just re-enabled. A token read that did not complete
+	 * therefore repairs nothing.
+	 */
+	public function test_the_repair_refuses_when_the_token_cannot_be_read(): void {
+		$this->damage_the_marker();
+		$GLOBALS['_sa_option_read_fail']['aura_worker_site_token'] = true;
+
+		$out = $this->remove();
+
+		$this->assertFalse( $out['success'] );
+		$this->assertSame( 'aura_unbind_unrepairable', $out['data']['code'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertSame( 'nine', $this->stored_marker()['seq'], 'the damaged row is left as it was' );
+	}
+
+	/**
+	 * A credential list nobody could prove is not an empty one. A repair that
+	 * wrote a SHORTER list than the site holds would hand the teardown
+	 * something it could complete while an administrator credential stayed
+	 * live — the one outcome this whole plan exists to prevent.
+	 */
+	public function test_an_unprovable_sweep_refuses_the_repair(): void {
+		$this->damage_the_marker();
+		$GLOBALS['_sa_app_password_scan_fail'] = true;
+
+		$out = $this->remove();
+
+		$this->assertFalse( $out['success'] );
+		$this->assertSame( 'aura_unbind_unrepairable', $out['data']['code'] );
+		$this->assertSame( 'nine', $this->stored_marker()['seq'] );
+		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::MANAGED ), 'nothing was revoked' );
+	}
+
+	/** The same, one step later: a candidate whose own list will not read. */
+	public function test_a_candidate_list_that_cannot_be_read_refuses_the_repair(): void {
+		$GLOBALS['_app_passwords'][9][] = array( 'uuid' => 'uuid-swept', 'name' => Aura_Worker_Magic_Link::APP_PASSWORD_NAME, 'created' => time() );
+		$this->damage_the_marker();
+		$GLOBALS['_sa_app_password_read_fail'][9] = true;
+
+		$out = $this->remove();
+
+		$this->assertFalse( $out['success'] );
+		$this->assertSame( 'aura_unbind_unrepairable', $out['data']['code'] );
+		$this->assertTrue( sa_app_password_exists( 9, 'uuid-swept' ) );
+	}
+
+	/**
+	 * Nothing is FABRICATED about credentials: a site that holds none gets a
+	 * repaired marker naming none, and the teardown completes.
+	 */
+	public function test_a_repair_invents_no_credentials(): void {
+		$GLOBALS['_app_passwords'] = array();
+		unset( $GLOBALS['_options'][ Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION ] );
+		$this->damage_the_marker();
+
+		$out = $this->remove();
+
+		$this->assertTrue( $out['success'] );
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * THE WARNING, BOTH HALVES. The rebuilt list is a superset of what Aura
+	 * minted and NOT a subset of what the teardown removes, and an operator who
+	 * reads only one of those sentences is misled either way.
+	 */
+	public function test_the_panel_states_both_halves_of_the_name_sweep(): void {
+		$this->damage_the_marker();
+
+		$html = $this->panel();
+
+		$this->assertStringContainsString( 'record on this site is damaged', $html );
+		$this->assertStringContainsString( 'supplied by hand', $html );
+		$this->assertStringContainsString( 'revoke any such password yourself', $html );
+		$this->assertStringContainsString( 'Aura SiteAgent', $html, 'and that the name itself is the sweep' );
+		$this->assertStringContainsString( 'including one you created yourself under that name', $html );
+		$this->assertStringContainsString( 'Remove remaining Aura data', $html );
+	}
+
+	/**
+	 * The shipped WP_Error a damaged marker travels in tells the operator to
+	 * use this control. Until round 1 that control would have refused; the
+	 * promise is only keepable because the repair exists.
+	 */
+	public function test_the_malformed_error_names_a_control_that_now_works(): void {
+		$this->damage_the_marker();
+
+		$this->assertStringContainsString( 'Remove remaining Aura data', Aura_Worker_Unbind::read()->get_error_message() );
+	}
+
+	/* ------------------------------------------------------------------ */
 	/* The unprovable-probe breadcrumb — obligation 2                      */
 	/* ------------------------------------------------------------------ */
 

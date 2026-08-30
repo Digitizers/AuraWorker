@@ -138,8 +138,9 @@ class Aura_Worker_Magic_Link {
 	 * @return void
 	 */
 	private static function render_unbound_panel(): void {
-		$marker = Aura_Worker_Unbind::read();
-		$at     = is_array( $marker ) ? (string) $marker['at'] : '';
+		$marker    = Aura_Worker_Unbind::read();
+		$at        = is_array( $marker ) ? (string) $marker['at'] : '';
+		$malformed = is_wp_error( $marker ) && Aura_Worker_Unbind::MALFORMED_CODE === $marker->get_error_code();
 		echo '<div class="notice notice-warning aura-unbound"><p>';
 		if ( '' !== $at ) {
 			printf(
@@ -147,6 +148,8 @@ class Aura_Worker_Magic_Link {
 				esc_html__( 'Disconnected by Aura at %s', 'digitizer-site-worker' ),
 				'<time datetime="' . esc_attr( $at ) . '">' . esc_html( $at ) . '</time>' // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- attribute and text are escaped inline, immediately above.
 			);
+		} elseif ( $malformed ) {
+			echo esc_html__( 'Disconnected by Aura. The disconnect record on this site is damaged, so it cannot say when — removing the remaining Aura data will rebuild the record from this site and then clear it.', 'digitizer-site-worker' );
 		} else {
 			echo esc_html__( 'Disconnected by Aura. This site cannot read its own disconnect record, so it cannot say when, or exactly what is left to remove.', 'digitizer-site-worker' );
 		}
@@ -154,9 +157,13 @@ class Aura_Worker_Magic_Link {
 
 		$leftovers = Aura_Worker_Unbind::leftovers();
 		$token     = Aura_Worker_Rules::read_option_uncached( 'aura_worker_site_token' );
-		// Unreadable is not absent — the same rule Phase B's own step proofs
-		// follow. A token row nobody could read leaves the control on offer.
-		$has_token = is_wp_error( $token ) || null !== $token;
+		// `null` is the ONE answer that means the row is gone: a WP_Error from
+		// a read that did not complete is not null, so an unreadable token row
+		// leaves the control on offer — unreadable is not absent, the same rule
+		// Phase B's own step proofs follow. Written as the single comparison it
+		// is; an `is_wp_error( $token ) ||` in front would read like a second
+		// guard while being dead code (round-1 LOW-1).
+		$has_token = null !== $token;
 		if ( array() === $leftovers && ! $has_token ) {
 			echo '<p>' . esc_html__( 'Nothing of the previous connection remains on this site.', 'digitizer-site-worker' ) . '</p>';
 			return;
@@ -165,6 +172,12 @@ class Aura_Worker_Magic_Link {
 		if ( is_array( $marker ) ) {
 			echo '<p>' . esc_html__( 'Some of the previous connection is still on this site:', 'digitizer-site-worker' ) . ' ';
 			echo '<code>' . esc_html( implode( ', ', array_merge( $leftovers, $has_token ? array( 'token' ) : array() ) ) ) . '</code></p>';
+		} elseif ( $malformed ) {
+			// BOTH halves, because the rebuilt list is a superset of what Aura
+			// minted and NOT a subset of what it may remove. An operator who
+			// reads only one of these sentences is misled either way.
+			echo '<p>' . esc_html__( 'The damaged record cannot name an Application Password that was supplied by hand rather than issued by Aura: revoke any such password yourself under Users → Profile → Application Passwords.', 'digitizer-site-worker' ) . '</p>';
+			echo '<p>' . esc_html__( 'Every Application Password on this site named “Aura SiteAgent” will be removed, including one you created yourself under that name.', 'digitizer-site-worker' ) . '</p>';
 		} else {
 			echo '<p>' . esc_html__( 'This site cannot determine what the previous connection left behind.', 'digitizer-site-worker' ) . '</p>';
 		}
@@ -1638,9 +1651,39 @@ class Aura_Worker_Magic_Link {
 	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
 	 */
 	private static function app_password_row_state( int $owner, string $uuid ): string {
+		$list = self::app_password_list( $owner );
+		if ( null === $list ) {
+			return self::STATE_UNKNOWN; // nothing was proved; never absence
+		}
+		foreach ( $list as $item ) {
+			if ( is_array( $item ) && isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
+				return self::STATE_PRESENT;
+			}
+		}
+		return self::STATE_GONE;
+	}
+
+	/**
+	 * That user's Application Passwords, from the ROW, proven to have been
+	 * read (#434 Task 4's discipline, extracted in Task 9 so the repair path
+	 * can read the whole list rather than ask about one uuid).
+	 *
+	 * The statement, the nonce and every reason for both are unchanged — this
+	 * is the same read app_password_row_state() has always issued, with the
+	 * uuid question moved out of it. Its answers are: the list (empty for a
+	 * user with no row, or a row that does not hold an array — core reads both
+	 * as "no passwords"), or NULL for a read that proved nothing, which no
+	 * caller may treat as an absence.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int $owner Owner user ID.
+	 * @return array|null The list, or null when nothing was proved.
+	 */
+	private static function app_password_list( int $owner ): ?array {
 		global $wpdb;
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
-			return self::STATE_UNKNOWN; // no way to confirm: never a proof of absence
+			return null; // no way to confirm: never a proof of absence
 		}
 		// The proof that this statement RAN travels IN BAND, in the answer
 		// itself: a per-call nonce selected as a second column. Only our own
@@ -1685,7 +1728,7 @@ class Aura_Worker_Magic_Link {
 		// refusal, and it keeps "we never asked" from ever being reported as
 		// "we asked and were told nothing".
 		if ( ! is_string( $sql ) || '' === $sql ) {
-			return self::STATE_UNKNOWN; // nothing was issued, so nothing was proved
+			return null; // nothing was issued, so nothing was proved
 		}
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
 		$row = $wpdb->get_row( $sql );
@@ -1694,22 +1737,15 @@ class Aura_Worker_Magic_Link {
 			// an unprovable probe owes app_passwords forever, so leave a
 			// breadcrumb rather than a tombstone that never explains itself.
 			do_action( 'aura_worker_app_password_probe_unproven', $owner );
-			return self::STATE_UNKNOWN;
+			return null;
 		}
 		$raw = isset( $row->v ) ? $row->v : null;
 		if ( null === $raw ) {
-			return self::STATE_GONE; // no row at all: that user holds no Application Passwords
+			return array(); // no row at all: that user holds no Application Passwords
 		}
 		$list = maybe_unserialize( $raw );
-		if ( ! is_array( $list ) ) {
-			return self::STATE_GONE; // core reads a non-array the same way: no passwords
-		}
-		foreach ( $list as $item ) {
-			if ( is_array( $item ) && isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
-				return self::STATE_PRESENT;
-			}
-		}
-		return self::STATE_GONE;
+		// core reads a non-array the same way: no passwords.
+		return is_array( $list ) ? $list : array();
 	}
 
 	/**
@@ -1753,8 +1789,37 @@ class Aura_Worker_Magic_Link {
 	 *                    null when nothing was proved at all.
 	 */
 	public static function password_holders( string $uuid ) {
+		return self::usermeta_holders( $uuid );
+	}
+
+	/**
+	 * The same statement, asked about the Application Password NAME this
+	 * plugin mints under (#434 Task 9's repair path). Kept private: a name is
+	 * user-controllable and therefore evidence about a CANDIDATE, never about
+	 * a specific credential — only the repair, which tells the operator
+	 * exactly that in so many words, may act on it.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return int[]|null Users whose list may carry an Aura-named password,
+	 *                    empty when the statement proved none does, null when
+	 *                    nothing was proved.
+	 */
+	private static function password_name_holders() {
+		return self::usermeta_holders( self::APP_PASSWORD_NAME );
+	}
+
+	/**
+	 * ONE statement over every Application Password list on the site, looking
+	 * for a literal string. See password_holders() above for why this may
+	 * exist at all and what its answers mean.
+	 *
+	 * @param string $needle The literal to look for in the serialized list.
+	 * @return int[]|null
+	 */
+	private static function usermeta_holders( string $needle ) {
 		global $wpdb;
-		if ( '' === $uuid || ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
+		if ( '' === $needle || ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
 			return null; // no way to ask: never a proof of absence
 		}
 		static $seq = 0;
@@ -1764,7 +1829,7 @@ class Aura_Worker_Magic_Link {
 			"SELECT %s AS probe, (SELECT GROUP_CONCAT(user_id) FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s) AS v",
 			$nonce,
 			self::APP_PASSWORD_USERMETA_KEY,
-			'%' . $wpdb->esc_like( $uuid ) . '%'
+			'%' . $wpdb->esc_like( $needle ) . '%'
 		);
 		if ( ! is_string( $sql ) || '' === $sql ) {
 			return null; // nothing was issued, so nothing was proved
@@ -1794,6 +1859,70 @@ class Aura_Worker_Magic_Link {
 		// holds it" would be absence inferred from evidence that says the
 		// opposite.
 		return array() === $users ? null : $users;
+	}
+
+	/**
+	 * EVERY Application Password on this site that a repaired marker must name
+	 * (#434 Task 9's repair path) — uuid => owner.
+	 *
+	 * A marker whose row is malformed names nothing this site can act on, so
+	 * the repair has to rebuild the credential list from the site itself. Two
+	 * sources, both of them evidence rather than inference:
+	 *
+	 *  - the NAME sweep. mint_app_password() is the only caller of
+	 *    create_new_application_password() in this plugin and it always stamps
+	 *    APP_PASSWORD_NAME, so every credential SiteAgent has ever minted
+	 *    carries that name: the sweep is a SUPERSET of them. It is NOT a
+	 *    subset — the name is user-controllable, so a password an operator
+	 *    happened to give the same name is swept too, and the teardown says so
+	 *    to the operator in as many words before anything is removed.
+	 *  - the plugin's own record (`aura_worker_app_password`), which names the
+	 *    managed credential and its owner outright. Added even when the sweep
+	 *    did not return it: a password whose name was changed afterwards is
+	 *    still this binding's, and a uuid already gone costs one delete that
+	 *    matches nothing.
+	 *
+	 * FAILS CLOSED, everywhere. A sweep that proved nothing, or a candidate
+	 * whose list could not be read, answers null — and the repair refuses
+	 * rather than write a marker that names fewer credentials than the site
+	 * holds, which would hand the teardown a list it could complete while a
+	 * live administrator credential stayed behind.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return array<string,int>|null uuid => owner, or null when nothing was
+	 *                                proved.
+	 */
+	public static function minted_passwords(): ?array {
+		$holders = self::password_name_holders();
+		if ( null === $holders ) {
+			return null;
+		}
+		$record = self::password_record();
+		if ( null !== $record ) {
+			$holders[] = (int) $record['user_id'];
+		}
+		$found = array();
+		foreach ( array_unique( $holders ) as $owner ) {
+			$owner = (int) $owner;
+			if ( $owner <= 0 ) {
+				continue;
+			}
+			$list = self::app_password_list( $owner );
+			if ( null === $list ) {
+				return null; // a list that could not be read is not an empty one
+			}
+			foreach ( $list as $item ) {
+				if ( is_array( $item ) && ! empty( $item['uuid'] ) && isset( $item['name'] )
+					&& self::APP_PASSWORD_NAME === (string) $item['name'] ) {
+					$found[ (string) $item['uuid'] ] = $owner;
+				}
+			}
+		}
+		if ( null !== $record && ! isset( $found[ $record['uuid'] ] ) ) {
+			$found[ (string) $record['uuid'] ] = (int) $record['user_id'];
+		}
+		return $found;
 	}
 
 	/**
