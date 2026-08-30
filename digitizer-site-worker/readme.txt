@@ -259,6 +259,11 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   — is answered `403 aura_site_unbound` until the site is reconnected. Reads
   keep working, `/status` keeps answering, and Aura's own ruleset endpoint
   stays reachable so the disconnect can be finished or retried.
+* Feature: **a departing connection's Application Password stops working
+  everywhere, not just on the REST API.** WordPress authenticates Application
+  Passwords on XML-RPC as well, so a credential the disconnect could not revoke
+  is now refused where WordPress decides whether it authenticates at all. Your
+  own Application Passwords are untouched, and so is admin login.
 * Feature: **the cleanup is proven, not assumed.** SiteAgent revokes the
   Application Password(s) Aura minted, clears the stored ruleset and the
   gateway public key, forgets the connect bookkeeping, and deletes the site

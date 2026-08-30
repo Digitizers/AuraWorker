@@ -1177,6 +1177,33 @@ if ( ! function_exists( 'add_action' ) ) {
 	}
 }
 
+if ( ! function_exists( 'has_filter' ) ) {
+	/**
+	 * Core's has_filter(): the priority a callback is registered at, or false.
+	 * A registration nothing asserts is a registration a refactor can drop in
+	 * silence — the boundary then stops existing without one test noticing.
+	 */
+	function has_filter( string $tag, $callback = false ) {
+		$found = false;
+		foreach ( $GLOBALS['_filters'][ $tag ] ?? array() as $entry ) {
+			$cb = ( is_array( $entry ) && array_key_exists( 'callback', $entry ) ) ? $entry['callback'] : $entry;
+			if ( false === $callback ) {
+				return true;
+			}
+			if ( $cb === $callback ) {
+				$found = ( is_array( $entry ) && isset( $entry['priority'] ) ) ? (int) $entry['priority'] : 10;
+			}
+		}
+		return $found;
+	}
+}
+
+if ( ! function_exists( 'has_action' ) ) {
+	function has_action( string $tag, $callback = false ) {
+		return has_filter( $tag, $callback );
+	}
+}
+
 if ( ! function_exists( 'apply_filters' ) ) {
 	function apply_filters( string $tag, $value, ...$args ) {
 		$hooks = array();
@@ -1429,6 +1456,7 @@ if ( ! class_exists( 'WP_Error' ) ) {
 		private string $code;
 		private string $message;
 		private $data;
+		private array $codes = array();
 
 		public function __construct( string $code = '', string $message = '', $data = '' ) {
 			$this->code    = $code;
@@ -1446,6 +1474,29 @@ if ( ! class_exists( 'WP_Error' ) ) {
 
 		public function get_error_data( string $code = '' ) {
 			return $this->data;
+		}
+
+		/**
+		 * Core's WP_Error accumulates codes; the plugin's application-password
+		 * refusal is handed the running error object and ADDS to it, so the
+		 * stub has to accumulate too — a fake that only ever holds one code
+		 * would make "already refused by somebody else" untestable.
+		 */
+		public function add( string $code, string $message = '', $data = '' ): void {
+			if ( '' === $this->code ) {
+				$this->code    = $code;
+				$this->message = $message;
+				$this->data    = $data;
+			}
+			$this->codes[] = $code;
+		}
+
+		public function has_errors(): bool {
+			return '' !== $this->code || array() !== $this->codes;
+		}
+
+		public function get_error_codes(): array {
+			return array() !== $this->codes ? $this->codes : ( '' === $this->code ? array() : array( $this->code ) );
 		}
 	}
 }

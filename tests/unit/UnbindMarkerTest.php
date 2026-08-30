@@ -100,10 +100,63 @@ final class UnbindMarkerTest extends TestCase {
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
-	public function test_garbage_marker_reads_null(): void {
+	/**
+	 * A row that exists and holds something that is not a marker is MALFORMED,
+	 * never absent (Codex round-4 P1). This option name is the marker's alone,
+	 * so a present row means something wrote here; answering "absent" would
+	 * reopen every mutation boundary and let accept_under_claim() take an
+	 * ordinary ruleset for a binding Aura has already disconnected — the one
+	 * fail-open this file exists to avoid. The state is recoverable: a
+	 * malformed marker is exactly what the operator's repair path acts on.
+	 */
+	public function test_garbage_marker_reads_malformed(): void {
 		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = 'not-an-array';
 		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ]    = 'not-an-array';
-		$this->assertNull( Aura_Worker_Unbind::read() );
+
+		$res = Aura_Worker_Unbind::read();
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
+		$this->assertTrue( Aura_Worker_Unbind::is_set() );
+	}
+
+	/**
+	 * THE CREDENTIAL LIST IS NOT OPTIONAL (Codex round-4 P1). Its emptiness is
+	 * a security CLAIM — cleanup() reads it to decide step (1) is complete and
+	 * then deletes the token, and departed_binding_request() reads it to
+	 * recognise a still-live Application Password. A missing or non-array
+	 * field is a row this build cannot read, and normalising it to `array()`
+	 * would assert that claim from evidence that says nothing.
+	 *
+	 * @dataProvider damaged_uuid_lists
+	 *
+	 * @param mixed $value What the field holds.
+	 */
+	public function test_a_damaged_credential_list_reads_malformed( $value ): void {
+		$marker = $this->marker();
+		if ( '__missing__' === $value ) {
+			unset( $marker['app_password_uuids'] );
+		} else {
+			$marker['app_password_uuids'] = $value;
+		}
+		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( $marker );
+
+		$res = Aura_Worker_Unbind::read();
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'a marker whose credentials cannot be read still means unbound' );
+	}
+
+	/** @return array<string,array{0:mixed}> */
+	public static function damaged_uuid_lists(): array {
+		return array(
+			'missing'    => array( '__missing__' ),
+			'null'       => array( null ),
+			'a string'   => array( 'u-1' ),
+			'an int'     => array( 0 ),
+			'false'      => array( false ),
+		);
 	}
 
 	public function test_status_reports_the_marker(): void {
@@ -209,12 +262,16 @@ final class UnbindMarkerTest extends TestCase {
 	}
 
 	/**
-	 * And the other side of the line: a row that is not an array at all was
-	 * never a marker, so it stays genuinely ABSENT. Malformed and absent are
-	 * different answers and must not collapse into one.
+	 * And the other side of the line: ABSENT is the absence of a ROW, and
+	 * nothing else. Malformed and absent are still different answers — the
+	 * difference is now drawn where the evidence actually is.
 	 */
-	public function test_a_non_array_row_is_still_absent_not_malformed(): void {
+	public function test_only_a_missing_row_reads_absent(): void {
 		$GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ] = maybe_serialize( 42 );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Unbind::read(), 'a row holding a scalar is a row' );
+		$this->assertTrue( Aura_Worker_Unbind::is_set() );
+
+		unset( $GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ], $GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] );
 		$this->assertNull( Aura_Worker_Unbind::read() );
 		$this->assertFalse( Aura_Worker_Unbind::is_set() );
 	}
@@ -356,7 +413,15 @@ final class UnbindMarkerTest extends TestCase {
 		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( $this->marker(), $fence ) );
 
 		$GLOBALS['_sa_option_write_divert'] = array();
-		$this->assertNull( Aura_Worker_Unbind::read(), 'and nothing claims the site is marked' );
+		// The diverted INSERT left an EMPTY row where the marker should be.
+		// Since round-4 a row that exists and holds no marker reads malformed
+		// rather than absent — the row is evidence something wrote here, and
+		// the site fails closed on it. Either way nothing reports the site
+		// marked at Phase A's seq, which is what write_under_claim() refusing
+		// above is there to prevent.
+		$res = Aura_Worker_Unbind::read();
+		$this->assertInstanceOf( WP_Error::class, $res, 'and nothing claims the site is marked' );
+		$this->assertSame( 'aura_unbind_marker_malformed', $res->get_error_code() );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 

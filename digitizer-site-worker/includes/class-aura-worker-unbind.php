@@ -74,9 +74,19 @@ final class Aura_Worker_Unbind {
 		}
 		$m = is_string( $raw ) ? maybe_unserialize( $raw ) : $raw;
 		if ( ! is_array( $m ) ) {
-			// Not a marker at all — the row holds something else. Genuinely
-			// absent: nobody ever wrote a marker here.
-			return null;
+			if ( null === $raw ) {
+				// No ROW. Genuinely absent: nobody ever wrote a marker here.
+				return null;
+			}
+			// A row that exists and does not decode to a marker — a value
+			// truncated in the column, a hand-edited row, anything. This
+			// option name is the marker's alone, so SOMETHING wrote here, and
+			// answering null would say the site is bound: the mutation
+			// boundaries would reopen and accept_under_claim() would take an
+			// ordinary ruleset for a binding Aura has already disconnected.
+			// Undecodable is the same unknown a failed read is (Codex
+			// round-4 P1).
+			return self::malformed();
 		}
 		return self::validated( $m );
 	}
@@ -112,7 +122,19 @@ final class Aura_Worker_Unbind {
 			|| ! self::field_is( $m, 'seq', 'int' ) ) {
 			return self::malformed();
 		}
-		$uuids = isset( $m['app_password_uuids'] ) && is_array( $m['app_password_uuids'] ) ? $m['app_password_uuids'] : array();
+		// A missing or non-array credential list is MALFORMED, never an empty
+		// one (Codex round-4 P1). Every writer supplies the array — the
+		// disconnect that opens the marker, the repair that rebuilds it, the
+		// retirement that shortens it — so a shape that is not an array is a
+		// row this build cannot read, and reading it as "this binding held no
+		// credentials" would let cleanup() report step (1) complete, delete
+		// the token, and leave departed_binding_request() blind to a live
+		// Application Password. The one field whose emptiness IS a security
+		// claim may not be inferred from a field that could not be read.
+		if ( ! isset( $m['app_password_uuids'] ) || ! is_array( $m['app_password_uuids'] ) ) {
+			return self::malformed();
+		}
+		$uuids = $m['app_password_uuids'];
 		// Non-scalar entries are DROPPED, not stringified (final round LOW-1).
 		// `strval()` on an object without __toString is a PHP 8 Error thrown
 		// straight out of read() — which runs on nearly every request at a

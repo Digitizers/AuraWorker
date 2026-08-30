@@ -95,6 +95,76 @@ class Aura_Worker_Security {
 	 */
 	public static function init() {
 		add_action( 'application_password_did_authenticate', array( __CLASS__, 'capture_app_password' ), 10, 2 );
+		add_filter( 'wp_authenticate_application_password_errors', array( __CLASS__, 'refuse_departed_credential' ), 10, 3 );
+	}
+
+	/**
+	 * REFUSE A DEPARTED BINDING'S CREDENTIAL WHEREVER IT AUTHENTICATES
+	 * (Codex round-4 P1).
+	 *
+	 * Phase B revokes the Application Passwords the departed binding used, and
+	 * when it cannot prove one gone the marker keeps the debt — the credential
+	 * stays live until an operator settles it. Until this hook, everything that
+	 * refused it was gated behind `is_agent_rest_request()`: the whole refusal
+	 * surface was REST. But WordPress authenticates Application Passwords on
+	 * every API surface it recognises, XML-RPC included, so the departed
+	 * administrator credential could go on creating, editing and deleting
+	 * content through `xmlrpc.php` for as long as the debt stood.
+	 *
+	 * The answer is the RULE rather than one more surface: refuse the
+	 * credential where WordPress decides whether it authenticates at all, so a
+	 * surface nobody has thought of yet is covered on the day core adds it.
+	 *
+	 * REST is left to its own seam, which answers 403 `aura_site_unbound` and
+	 * says why; a denial here would answer 401 and lose that. The test is "not
+	 * REST" rather than "is XML-RPC" for the same reason as above — and when
+	 * `REST_REQUEST` is not defined the request is refused, which is the safe
+	 * direction to be wrong in.
+	 *
+	 * An UNREADABLE marker refuses every Application Password on these
+	 * surfaces, not just a named one. It is the same ruling
+	 * `Aura_Worker_Rules::departed_binding_request()` already makes — unreadable
+	 * is not innocent — and it is stricter here only because authentication
+	 * cannot see whether an XML-RPC call means to read or to write. A site in
+	 * that state is one Aura has disconnected and whose credential list cannot
+	 * be read; cookie-authenticated admin access is untouched, and the settings
+	 * screen's repair is how it ends.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param WP_Error|mixed $error The running error object WordPress passes.
+	 * @param WP_User|mixed  $user  The user the password belongs to.
+	 * @param array|mixed    $item  The application password item, with its uuid.
+	 * @return WP_Error|mixed The error object, with a refusal added when due.
+	 */
+	public static function refuse_departed_credential( $error, $user = null, $item = null ) {
+		if ( ! is_wp_error( $error ) || $error->has_errors() ) {
+			return $error; // already refused by somebody with a better reason
+		}
+		// The SAME seam is_agent_rest_request() resolves REST through, so the
+		// two boundaries can never disagree about what a REST request is.
+		$is_rest = ( class_exists( 'Aura_Worker_Rules' ) && null !== Aura_Worker_Rules::$rest_request_override )
+			? (bool) Aura_Worker_Rules::$rest_request_override
+			: ( defined( 'REST_REQUEST' ) && REST_REQUEST );
+		if ( $is_rest ) {
+			return $error;
+		}
+		if ( ! class_exists( 'Aura_Worker_Unbind' ) ) {
+			return $error;
+		}
+		$marker = Aura_Worker_Unbind::read();
+		if ( null === $marker ) {
+			return $error; // no marker: this site is bound, and none of this applies
+		}
+		$uuid = is_array( $item ) && ! empty( $item['uuid'] ) ? (string) $item['uuid'] : '';
+		if ( is_array( $marker ) && ( '' === $uuid || ! in_array( $uuid, $marker['app_password_uuids'], true ) ) ) {
+			return $error; // a readable marker names its debts, and this is not one
+		}
+		$error->add(
+			'aura_site_unbound',
+			__( 'This site was disconnected from Aura. This credential belonged to the disconnected connection and no longer authenticates.', 'digitizer-site-worker' )
+		);
+		return $error;
 	}
 
 	/**
