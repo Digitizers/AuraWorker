@@ -313,10 +313,45 @@ class Aura_Worker_API {
 			'callback'            => array( $this, 'receive_rules' ),
 			'permission_callback' => array( $this->security, 'check_admin_permission' ),
 			'args'                => array(
-				'ruleset' => array(
-					'required'          => true,
+				// NOT required (#434 Task 8). An unkeyed site — one that holds
+				// no gateway public key and can therefore verify nothing — ends
+				// its binding with a bare `{ unbind: true, … }` body and no
+				// envelope at all; with `required => true` WordPress's own
+				// argument validation would 400 that body before
+				// receive_rules() ever ran. WHICH of the two forms a request is
+				// is decided in the handler, the one place both a dispatched
+				// request and a direct call reach.
+				'ruleset'  => array(
+					'required'          => false,
 					'type'              => 'string',
 					'sanitize_callback' => 'sanitize_text_field',
+				),
+				// The bare unbind body (#434 Task 8). Declared for the schema;
+				// NOTHING downstream trusts these to have been validated or
+				// sanitized here — a direct call reaches the handler without
+				// core's argument pipeline, so Aura_Worker_Rules
+				// ::accept_bare_unbind() validates every one of them itself.
+				'unbind'   => array(
+					'required' => false,
+					'type'     => 'boolean',
+				),
+				'site_ref' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+				'client'   => array(
+					'required'          => false,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+				),
+				'seq'      => array(
+					'required' => false,
+					'type'     => 'integer',
+				),
+				'final'    => array(
+					'required' => false,
+					'type'     => 'boolean',
 				),
 			),
 		) );
@@ -387,6 +422,29 @@ class Aura_Worker_API {
 			'server_software'     => isset( $_SERVER['SERVER_SOFTWARE'] ) ? sanitize_text_field( wp_unslash( $_SERVER['SERVER_SOFTWARE'] ) ) : '',
 			'timestamp'           => gmdate( 'c' ),
 		);
+
+		$unbound = Aura_Worker_Unbind::status_fragment();
+		if ( null !== $unbound ) {
+			// An OBJECT on the wire, always (#434 Task 4, M10). PHP's empty
+			// array serialises as JSON `[]`, so the "no field was readable"
+			// answer would reach Aura as an array where every other answer is
+			// an object — and a strict parse of `unbound` as {at, site_ref}
+			// would reject it and read the site as bound again. The key's
+			// PRESENCE is the signal; its shape must not change with its
+			// contents.
+			$status['unbound'] = (object) $unbound;
+		}
+
+		// Why a tombstone will not finish (#434 Task 9). An Application
+		// Password probe that cannot prove itself owes `app_passwords` forever
+		// — cleanup_complete stays false and Aura waits on a site that will
+		// never converge — and until now the reason was visible nowhere. The
+		// key's PRESENCE is the signal; an object, like `unbound` above, so its
+		// shape never changes with its contents.
+		$probe = Aura_Worker_Magic_Link::probe_unproven_report();
+		if ( null !== $probe ) {
+			$status['app_password_probe_unproven'] = (object) $probe;
+		}
 
 		return rest_ensure_response( $status );
 	}
@@ -910,7 +968,42 @@ class Aura_Worker_API {
 	 * @return WP_REST_Response
 	 */
 	public function receive_rules( $request ) {
-		if ( ! Aura_Worker_Grant::has_usable_key() ) {
+		// WHICH of the two forms this request is (#434 Task 8). Decided here,
+		// not in a route-level validate_callback: the handler is the one place
+		// BOTH a dispatched request and a direct call reach, and a second copy
+		// of the rule in the route args could drift from this one.
+		//
+		// Strict: only an unambiguous `true` opts into the bare form. Anything
+		// else falls through to the ruleset form and is answered by the shape
+		// check below — never treated as an unbind on a guess.
+		$bare = self::says_unbind( $request->get_param( 'unbind' ) );
+
+		// Neither form. Answered BEFORE the 412: "send one of the two forms" is
+		// the accurate answer for an empty body, where "reconnect this site to
+		// Aura" would send the operator after a problem the site does not have.
+		$ruleset = $request->get_param( 'ruleset' );
+		if ( ! $bare && ( ! is_string( $ruleset ) || '' === trim( $ruleset ) ) ) {
+			return new WP_REST_Response(
+				array(
+					'success' => false,
+					'code'    => 'aura_ruleset_rejected',
+					'error'   => 'Ruleset refused: send a signed `ruleset`, or the bare unbind body (`unbind`, `client`, `seq`).',
+				),
+				400
+			);
+		}
+
+		// The 412 below must NOT pre-empt the unbind marker's fast path (#434,
+		// spec §2.3): Phase B deletes the gateway key BEFORE the site token, so
+		// a tombstone retried after a partial cleanup would otherwise be
+		// stranded on "reconnect the site" forever — for a site Aura has
+		// already disconnected. is_set() is the loose probe on purpose: it says
+		// only "let accept() decide", and accept()'s step 0 does the strict,
+		// fail-closed read (is_set_strict()) that actually rules.
+		// …nor the bare unkeyed form (#434 Task 8), whose whole precondition is
+		// that this site holds no usable key: answering it 412 "reconnect" is
+		// exactly the dead end that form exists to open.
+		if ( ! $bare && ! Aura_Worker_Unbind::is_set() && ! Aura_Worker_Grant::has_usable_key() ) {
 			// No USABLE gateway key on this site: nothing can be verified.
 			// Deliberately not is_enforced(), which means only "the option is
 			// non-empty" — a truncated or corrupt key would then answer 400 on
@@ -926,7 +1019,23 @@ class Aura_Worker_API {
 				412
 			);
 		}
-		$res = Aura_Worker_Rules::accept( (string) $request->get_param( 'ruleset' ) );
+		// Both forms answer through the SAME mapping below — the unbind body,
+		// the WP_Error transport and the ordinary 200 — so the bare form's
+		// response cannot drift from the enveloped one's shape (#434 Task 8).
+		// The raw body values travel; accept_bare_unbind() validates them.
+		$res = $bare
+			? Aura_Worker_Rules::accept_bare_unbind(
+				array(
+					'site_ref' => $request->get_param( 'site_ref' ),
+					'client'   => $request->get_param( 'client' ),
+					'seq'      => $request->get_param( 'seq' ),
+					'final'    => $request->get_param( 'final' ),
+				)
+			)
+			: Aura_Worker_Rules::accept( (string) $ruleset );
+		if ( is_array( $res ) && ! empty( $res['unbound'] ) ) {
+			return self::unbind_response( $res );
+		}
 		if ( is_wp_error( $res ) ) {
 			$data = $res->get_error_data();
 			return new WP_REST_Response(
@@ -956,6 +1065,74 @@ class Aura_Worker_API {
 			),
 			200
 		);
+	}
+
+	/**
+	 * The unbind answer, on the wire (#434). `seq` is the one THIS request
+	 * carried, so Aura can retire the tombstone it actually sent;
+	 * `cleanup_complete` says whether Phase B finished — false leaves the
+	 * tombstone pending and the site finishes the job itself. Authenticated by
+	 * the token before Phase B deleted it.
+	 *
+	 * `leftovers` names what is still owed (#434 Task 4, M9). A false
+	 * `cleanup_complete` has two opposite causes — something could not be
+	 * proven removed, or the token was deliberately kept because the document
+	 * was not `final` — and Aura cannot separate them from the bool alone.
+	 * Empty exactly when nothing is owed; a non-empty list means a credential
+	 * or a store this site still holds, and the tombstone must stay.
+	 *
+	 * Its default is the FAIL-CLOSED list, not `array()` (#434 Task 8). An
+	 * empty list is a CLAIM — "this site is proven to owe nothing" — and Aura
+	 * retires the tombstone on it; an answer that carries no list at all has
+	 * made no such claim, and reading one into it is exactly how a tombstone
+	 * naming a live administrator credential gets retired. Both of today's
+	 * producers always send the list, and their own tests pin that, so the
+	 * default answers a THIRD one that forgets — which is why this mapping is
+	 * a separately callable function: a defence no caller can currently reach
+	 * is a defence no test can pin, and an unpinned one is indistinguishable
+	 * from a wrong one (round-1 LOW-2).
+	 *
+	 * @internal Transport only — a pure function of the answer it is handed.
+	 *           Public solely so its own contract can be tested directly.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param array $res The unbind answer from Aura_Worker_Rules.
+	 * @return WP_REST_Response
+	 */
+	public static function unbind_response( array $res ) {
+		$leftovers = ( isset( $res['leftovers'] ) && is_array( $res['leftovers'] ) )
+			? $res['leftovers']
+			: array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
+		return new WP_REST_Response(
+			array(
+				'success'          => true,
+				'seq'              => (int) $res['seq'],
+				'unbound'          => true,
+				'cleanup_complete' => (bool) $res['cleanup_complete'],
+				'leftovers'        => array_values( array_map( 'strval', $leftovers ) ),
+			),
+			200
+		);
+	}
+
+	/**
+	 * Does this request opt into the bare unbind form (#434 Task 8)?
+	 *
+	 * Strict on purpose. A form-encoded body carries `true` as the string
+	 * '1' or 'true', so those count; everything else — absent, false, '0',
+	 * 'yes', an array — does not. The cost of reading an ambiguous value as
+	 * "not an unbind" is a 400 telling the caller to send one of the two
+	 * forms; the cost of reading one as an unbind is a marker written from a
+	 * body nobody meant as one.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param mixed $value The `unbind` parameter, raw.
+	 * @return bool
+	 */
+	private static function says_unbind( $value ) {
+		return true === $value || 1 === $value || '1' === $value || 'true' === $value;
 	}
 
 	/**

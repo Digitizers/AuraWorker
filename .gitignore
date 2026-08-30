@@ -32,3 +32,6 @@ node_modules/
 *.log
 debug.log
 error_log
+
+# Agent workspace (SDD ledger/briefs/reviews) — never committed
+.superpowers/

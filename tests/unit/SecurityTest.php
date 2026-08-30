@@ -39,6 +39,49 @@ final class SecurityTest extends TestCase {
 		return $req;
 	}
 
+	// --- resolve_connect_user -------------------------------------------------
+
+	/**
+	 * A MARKED SITE'S OWN RETRY MUST STILL RESOLVE (Codex round-5 P2).
+	 *
+	 * Phase B step (2) deletes `aura_worker_connect_user_id` while the token
+	 * deliberately lives on, so from that moment the fallback decides — and it
+	 * asks for the literal `administrator` ROLE, while every other check in
+	 * this plugin asks for the CAPABILITY. On a site whose connecting user
+	 * holds manage_options through a custom role, with nobody holding the
+	 * administrator role, that resolved nobody: the token-only /rules retry
+	 * failed before it could reach the marker's fast path, and the final
+	 * cleanup could never be delivered. The marker captured the identity
+	 * before the delete.
+	 */
+	public function test_a_marked_site_resolves_the_run_as_from_the_marker(): void {
+		$GLOBALS['_admins']  = array();        // nobody holds the administrator ROLE
+		$GLOBALS['_capable'] = array( 5 );     // the connecting user holds manage_options via a custom role
+		sa_set_marker( array( 'connect_user_id' => 5 ) );
+		delete_option( 'aura_worker_connect_user_id' ); // Phase B step (2) already ran
+
+		$this->assertSame( 5, $this->call_private( 'resolve_connect_user' ) );
+	}
+
+	/** The capability gate still applies to the marker's identity. */
+	public function test_the_markers_identity_is_refused_without_the_capability(): void {
+		$GLOBALS['_admins']  = array();
+		$GLOBALS['_capable'] = array();
+		sa_set_marker( array( 'connect_user_id' => 5 ) );
+		delete_option( 'aura_worker_connect_user_id' );
+
+		$this->assertSame( 0, $this->call_private( 'resolve_connect_user' ) );
+	}
+
+	/** And a bound site is unaffected: the stored option still wins. */
+	public function test_the_stored_connect_user_still_wins(): void {
+		$GLOBALS['_admins']  = array( 9 );
+		$GLOBALS['_capable'] = array( 5 );
+		update_option( 'aura_worker_connect_user_id', 5 );
+
+		$this->assertSame( 5, $this->call_private( 'resolve_connect_user' ) );
+	}
+
 	// --- hash_token -----------------------------------------------------------
 
 	public function test_hash_token_is_deterministic_sha256(): void {

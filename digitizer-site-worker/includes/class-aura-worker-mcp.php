@@ -158,6 +158,25 @@ class Aura_Worker_MCP {
 			// could dump the database. Read tools that don't require approval are
 			// exempt (a leaked token may still read).
 			$needs_grant = empty( $annotations['read_only'] ) || ! empty( $annotations['requires_approval'] );
+			// An unbound site refuses the tool BEFORE the grant question is
+			// asked (Codex round-6 P1). Phase B step (4) deletes the gateway
+			// key while the site is still marked, so from that moment
+			// is_enforced() is false and this whole block was skipped —
+			// carrying the marker refusal with it. Reads that need no grant
+			// keep working, exactly as they do at every other boundary.
+			if ( $needs_grant ) {
+				$unbound = Aura_Worker_Grant::refusal_if_unbound();
+				if ( null !== $unbound ) {
+					return new WP_REST_Response(
+						array(
+							'success' => false,
+							'code'    => $unbound->get_error_code(),
+							'error'   => $unbound->get_error_message(),
+						),
+						403
+					);
+				}
+			}
 			if ( $needs_grant && Aura_Worker_Grant::is_enforced() ) {
 				// The grant is bound to `params`, which is exactly what this handler
 				// executes. The gateway also sends a `parameters` alias (identical to
@@ -179,6 +198,21 @@ class Aura_Worker_MCP {
 				}
 				$grant  = (string) $request->get_header( 'X-Aura-Approval-Grant' );
 				$reason = Aura_Worker_Grant::verify( $grant, $tool_name, $params );
+				// A WP_Error is not a verdict about the GRANT — it is a refusal
+				// that has nothing to do with one (an unbound site, #434 Task 5).
+				// It carries its own code and status, and concatenating it into
+				// the message below would be a fatal, so it is answered first.
+				if ( is_wp_error( $reason ) ) {
+					$data = $reason->get_error_data();
+					return new WP_REST_Response(
+						array(
+							'success' => false,
+							'code'    => $reason->get_error_code(),
+							'error'   => $reason->get_error_message(),
+						),
+						( is_array( $data ) && isset( $data['status'] ) ) ? (int) $data['status'] : 403
+					);
+				}
 				if ( true !== $reason ) {
 					return new WP_REST_Response(
 						array(

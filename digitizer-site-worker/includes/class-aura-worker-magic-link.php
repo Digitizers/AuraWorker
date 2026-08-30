@@ -45,7 +45,12 @@ class Aura_Worker_Magic_Link {
 		// rather than from a marker some path forgot to set.
 		$state     = self::credential_state();
 		$connected = ( $dashboard_url && $site_token );
-		if ( $connected ) {
+		if ( 'unbound' === $state ) {
+			// Aura has disconnected this site: both write boundaries refuse
+			// every mutation, so the connected block below would describe a
+			// connection that no longer does anything (#434 Task 9).
+			self::render_unbound_panel();
+		} elseif ( $connected ) {
 			$healthy = ( 'delivered' === $state || 'unavailable' === $state );
 			echo '<p style="color:' . ( $healthy ? '#2e7d32' : '#b26a00' ) . ';">';
 			echo '<span class="dashicons dashicons-' . ( $healthy ? 'yes-alt' : 'warning' ) . '"></span> ';
@@ -102,6 +107,119 @@ class Aura_Worker_Magic_Link {
 					status.style.color = '#c62828';
 					status.textContent = <?php echo wp_json_encode( __( 'Network error. Please try again.', 'digitizer-site-worker' ) ); ?>;
 				});
+			});
+		})();
+		</script>
+		<?php
+	}
+
+	/**
+	 * The "Disconnected by Aura" panel and its teardown control (#434 Task 9).
+	 *
+	 * The one screen a site whose dashboard is gone still has. Everything on it
+	 * is read from the site's own state, uncached, and reported at exactly the
+	 * confidence that state supports:
+	 *
+	 *  - The TIME comes from the marker read as a tri-state, never from
+	 *    is_set(): a marker that could not be read still refuses every mutation
+	 *    (which is why credential_state() sent us here), but it names no
+	 *    moment, and printing an empty timestamp — or worse, inventing one —
+	 *    would be a claim this site cannot make. It says so instead.
+	 *  - The LEFTOVERS are named only for a marker that was actually read.
+	 *    leftovers() fails closed and answers all four steps for an unreadable
+	 *    one, which is right for a GATE and wrong for a screen: rendered as a
+	 *    list it would report four specific debts nobody has established
+	 *    (#434 Task 4 review, Task 9's half).
+	 *  - The BUTTON is offered while anything remains, and "anything" includes
+	 *    the site token, which leftovers() tracks steps (1)-(4) only and can
+	 *    never name. An unreadable token row counts as present: absence has to
+	 *    be proven.
+	 *
+	 * @return void
+	 */
+	private static function render_unbound_panel(): void {
+		$marker    = Aura_Worker_Unbind::read();
+		$at        = is_array( $marker ) ? (string) $marker['at'] : '';
+		$malformed = is_wp_error( $marker ) && Aura_Worker_Unbind::MALFORMED_CODE === $marker->get_error_code();
+		echo '<div class="notice notice-warning aura-unbound"><p>';
+		if ( '' !== $at ) {
+			printf(
+				/* translators: %s: the moment Aura disconnected this site, ISO-8601. */
+				esc_html__( 'Disconnected by Aura at %s', 'digitizer-site-worker' ),
+				'<time datetime="' . esc_attr( $at ) . '">' . esc_html( $at ) . '</time>' // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- attribute and text are escaped inline, immediately above.
+			);
+		} elseif ( $malformed ) {
+			echo esc_html__( 'Disconnected by Aura. The disconnect record on this site is damaged, so it cannot say when — removing the remaining Aura data will rebuild the record from this site and then clear it.', 'digitizer-site-worker' );
+		} else {
+			echo esc_html__( 'Disconnected by Aura. This site cannot read its own disconnect record, so it cannot say when, or exactly what is left to remove.', 'digitizer-site-worker' );
+		}
+		echo '</p></div>';
+
+		$leftovers = Aura_Worker_Unbind::leftovers();
+		$token     = Aura_Worker_Rules::read_option_uncached( 'aura_worker_site_token' );
+		// `null` is the ONE answer that means the row is gone: a WP_Error from
+		// a read that did not complete is not null, so an unreadable token row
+		// leaves the control on offer — unreadable is not absent, the same rule
+		// Phase B's own step proofs follow. Written as the single comparison it
+		// is; an `is_wp_error( $token ) ||` in front would read like a second
+		// guard while being dead code (round-1 LOW-1).
+		$has_token = null !== $token;
+		if ( array() === $leftovers && ! $has_token ) {
+			echo '<p>' . esc_html__( 'Nothing of the previous connection remains on this site.', 'digitizer-site-worker' ) . '</p>';
+			return;
+		}
+
+		if ( is_array( $marker ) ) {
+			echo '<p>' . esc_html__( 'Some of the previous connection is still on this site:', 'digitizer-site-worker' ) . ' ';
+			echo '<code>' . esc_html( implode( ', ', array_merge( $leftovers, $has_token ? array( 'token' ) : array() ) ) ) . '</code></p>';
+		} elseif ( $malformed ) {
+			// BOTH halves, because the rebuilt list is a superset of what Aura
+			// minted and NOT a subset of what it may remove. An operator who
+			// reads only one of these sentences is misled either way.
+			echo '<p>' . esc_html__( 'A damaged record may no longer name an Application Password that was supplied by hand rather than issued by Aura: revoke any such password yourself under Users → Profile → Application Passwords.', 'digitizer-site-worker' ) . '</p>';
+			echo '<p>' . esc_html__( 'Every Application Password on this site named “Aura SiteAgent” will be removed, including one you created yourself under that name.', 'digitizer-site-worker' ) . '</p>';
+		} else {
+			echo '<p>' . esc_html__( 'This site cannot determine what the previous connection left behind.', 'digitizer-site-worker' ) . '</p>';
+		}
+
+		$nonce = wp_create_nonce( 'aura_worker_remove_aura_data' );
+		?>
+		<button type="button" id="aura-remove-data-btn" class="button"
+				data-nonce="<?php echo esc_attr( $nonce ); ?>">
+			<?php esc_html_e( 'Remove remaining Aura data', 'digitizer-site-worker' ); ?>
+		</button>
+		<span id="aura-remove-data-status" style="margin-left:10px;"></span>
+		<p class="description">
+			<?php esc_html_e( 'Removes the Application Passwords, options, ruleset and site token this connection installed. Anything that cannot be removed is named instead, and nothing is forgotten until all of it is gone.', 'digitizer-site-worker' ); ?>
+		</p>
+		<script>
+		(function() {
+			var btn = document.getElementById('aura-remove-data-btn');
+			if ( ! btn ) { return; }
+			btn.addEventListener('click', function() {
+				if ( ! window.confirm(<?php echo wp_json_encode( __( 'Remove the remaining Aura data from this site? This cannot be undone.', 'digitizer-site-worker' ) ); ?>) ) { return; }
+				var status = document.getElementById('aura-remove-data-status');
+				btn.disabled = true;
+				status.textContent = <?php echo wp_json_encode( __( 'Removing…', 'digitizer-site-worker' ) ); ?>;
+				var data = new FormData();
+				data.append('action', 'aura_worker_remove_aura_data');
+				data.append('nonce', btn.getAttribute('data-nonce'));
+				fetch(<?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>, { method: 'POST', body: data })
+					.then(function(r) { return r.json(); })
+					.then(function(res) {
+						if ( res.success ) {
+							window.location.reload();
+						} else {
+							btn.disabled = false;
+							status.style.color = '#c62828';
+							status.textContent = (res.data && res.data.message) ? res.data.message : 'Error';
+						}
+					})
+					.catch(function() {
+						btn.disabled = false;
+						status.style.color = '#c62828';
+						status.textContent = <?php echo wp_json_encode( __( 'Network error. Please try again.', 'digitizer-site-worker' ) ); ?>;
+					});
 			});
 		})();
 		</script>
@@ -308,11 +426,18 @@ class Aura_Worker_Magic_Link {
 		// application password). Falls back to the first admin if absent.
 		// Verified. From here the whole install — token, binding, key, password
 		// — is one handler's: take the site-wide claim now.
-		// An orphaned claim is NOT taken over by age (round-7): a handler the
-		// dashboard gave up on may still be running, and a takeover would let
-		// this install interleave with it. A stuck claim is released by
-		// deactivating the plugin.
-		$site_fence = self::claim_magic_link( $site_claim_key );
+		// An orphaned claim was originally NOT taken over by age at all
+		// (round-7): a handler the dashboard gave up on may still be running,
+		// and a takeover would let this install interleave with it. #434
+		// review round 1 (I2) bounds that instead of ruling it out entirely —
+		// SITE_CLAIM_TAKEOVER_AFTER seconds, well past any real request —
+		// because every write below is already claim-conditional
+		// (write_option_if_claimed()/bind()'s $claim,$fence/
+		// delete_option_if_claimed(), all the way through the mint at the
+		// end): a resumed original that lost the claim to a seize has every
+		// one of its own writes refused, not racing the replacement. Recovery
+		// of a genuinely stuck claim is no longer solely an operator action.
+		$site_fence = self::claim_magic_link( $site_claim_key, self::SITE_CLAIM_TAKEOVER_AFTER );
 		if ( '' === $site_fence ) {
 			$release();
 			return new WP_REST_Response( array( 'error' => 'A connect for this site is already in progress; retry.', 'code' => 'aura_connect_in_progress' ), 409 );
@@ -325,6 +450,34 @@ class Aura_Worker_Magic_Link {
 		if ( ! self::holds_site_claim( $site_fence ) ) {
 			$release();
 			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
+		}
+		// THE WAY BACK, first half (#434 Task 7). A site Aura unbound refuses
+		// every mutation until the marker goes, and this callback is one of the
+		// only two things that may take it away. Before any of this install is
+		// written, the DEPARTED binding's Phase-B debt is settled — under the
+		// claim this handler already holds — because the token write a few
+		// lines below permanently disarms the site's own sweep
+		// (Aura_Worker_Unbind::maybe_finish() bails on the hash mismatch a
+		// replacement token creates). An Application Password the marker names
+		// and nothing revoked would be stranded live at that point, with
+		// nothing left on the site that would ever look for it again. So a site
+		// that still owes something is not reconnected at all: 409, the
+		// leftovers named, the marker untouched, the old token still refused.
+		// FIRST, before the connect-user write below: Phase B step (2) deletes
+		// exactly that option, so settling afterwards would erase this
+		// install's own write.
+		$finished = Aura_Worker_Unbind::finish_before_rebind( $site_fence );
+		if ( is_wp_error( $finished ) ) {
+			$data = $finished->get_error_data();
+			$release();
+			return new WP_REST_Response(
+				array(
+					'error'    => $finished->get_error_message(),
+					'code'     => $finished->get_error_code(),
+					'leftover' => isset( $data['leftover'] ) && is_array( $data['leftover'] ) ? $data['leftover'] : array(),
+				),
+				409
+			);
 		}
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
@@ -533,6 +686,10 @@ class Aura_Worker_Magic_Link {
 				// so retries cannot mint more beside it, and the operator is
 				// told what to revoke.
 				WP_Application_Passwords::delete_application_password( $creator, $minted['uuid'] );
+				// "Could not read the list" is not a revocation (#434 I5):
+				// managed_password_gone() is now PROVEN gone, so an unreadable
+				// list takes this branch and the operator is told what to
+				// revoke by hand rather than being told nothing.
 				if ( ! self::managed_password_gone( $creator, $minted['uuid'] ) ) {
 					delete_transient( 'aura_magic_' . $magic_id );
 					$release();
@@ -564,8 +721,19 @@ class Aura_Worker_Magic_Link {
 				500
 			);
 		}
-		// Consumed only now (the round-23 orphan rule still holds: the claim is released with it below).
-		delete_transient( 'aura_magic_' . $magic_id );
+		// The lease is refreshed the moment the longest step is behind us
+		// (#434 Codex round-8). The mint is where a slow host spends its
+		// seconds, and a connect that overran SITE_CLAIM_TAKEOVER_AFTER while
+		// legitimately working became seizable — so the tail below runs on a
+		// lease measured from HERE rather than from the claim.
+		// The refresh is announced, not merely done: it is the one step whose
+		// absence changes nothing observable in a fast request, so without this
+		// a mutant that deletes it leaves every test green.
+		do_action( 'aura_worker_connect_lease_refreshed', self::touch_site_claim( $site_fence ) );
+		// The mint's own bookkeeping — the LAST fallible write of the install,
+		// and therefore ahead of the marker release below (round-1 NIT): the
+		// bracket's discipline is that nothing that can fail sits after the
+		// refusal is lifted.
 		if ( is_wp_error( $minted ) ) {
 			$body['app_password_unavailable'] = $minted->get_error_code();
 			// Recorded, not merely reported (round-26): a site that CANNOT issue
@@ -593,6 +761,75 @@ class Aura_Worker_Magic_Link {
 			// The uuid is the site's own bookkeeping — never part of the response.
 			$body['app_password'] = array( 'user_login' => $minted['user_login'], 'password' => $minted['password'] );
 		}
+		// THE WAY BACK, second half (#434 Task 7): the LAST fallible step of a
+		// rebind that got all the way through. The token is installed and read
+		// back, the previous credential revoked, the binding written, the
+		// dashboard URL and gateway key stored and verified, and the
+		// Application Password settled (minted, or this site proven unable to
+		// have one) — only now may the refusal be lifted. EVERY error exit
+		// above returns without reaching this line, which is the point: a
+		// half-established replacement binding leaves the marker in place, so
+		// the old token AND the half-installed new one go on being refused
+		// everywhere.
+		//
+		// Placed BEFORE the magic transient is consumed, deliberately (a
+		// deviation from the brief, which put it after): a failure here is a
+		// store failure, and the connect must stay RETRYABLE — the retry's own
+		// finish_before_rebind() finds nothing owed, revokes the password this
+		// attempt minted and installs a fresh binding. Consuming the link first
+		// would leave a live recorded administrator credential that no further
+		// attempt could reach.
+		//
+		// Scoped to a MARKED site, and symmetric with ajax_regenerate_token()
+		// (round-1 MINOR-2): "a proven rebind" has to mean the same thing in
+		// both flows. `aura_worker_connect_user_id` is the half of the binding
+		// a token-only request runs on, and Phase B DELETED it a few hundred
+		// lines above — so this install's own write of it is not the refresh it
+		// is on an ordinary connect but the only thing naming this install's
+		// administrator, and it is proven by an uncached read before the
+		// refusal is lifted. A positive id, because resolve_connect_user()
+		// ignores 0 and falls back to the first administrator, which is not the
+		// binding this connect established. On an unmarked site nothing here
+		// runs and the connect behaves exactly as it always has.
+		if ( Aura_Worker_Unbind::is_set() ) {
+			$creator_id = (int) ( $stored['connect_user_id'] ?? 0 );
+			$recorded   = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
+			$recorded   = is_wp_error( $recorded ) ? 0 : (int) maybe_unserialize( $recorded );
+			if ( $creator_id <= 0 || $recorded !== $creator_id ) {
+				$release(); // keep the transient — this connect is retryable
+				return new WP_REST_Response( array( 'error' => 'Connect not completed: the site could not record which administrator this connection runs as; retry.', 'code' => 'aura_unbind_store_failed' ), 500 );
+			}
+		}
+		if ( ! Aura_Worker_Unbind::release_marker_after_rebind( $site_fence ) ) {
+			$release(); // keep the transient — this connect is retryable
+			return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous disconnect record could not be cleared; retry.', 'code' => 'aura_unbind_store_failed' ), 500 );
+		}
+		// OWNERSHIP IS PROVEN ONCE MORE, IMMEDIATELY BEFORE SUCCESS (#434
+		// Codex round-8). Every step above verifies the claim when it acts, but
+		// the LAST such check still had a tail after it — and a handler evicted
+		// in that tail would answer 200 carrying a token and a password the
+		// replacement connect had already revoked, leaving Aura holding
+		// credentials that authenticate nothing. The lease refresh above makes
+		// the eviction unlikely; this makes reporting it impossible.
+		do_action( 'aura_worker_connect_before_success', $site_fence );
+		if ( ! self::holds_site_claim( $site_fence ) ) {
+			$release(); // conditional on the fence: somebody else's claim is untouched
+			// The transient is KEPT: this connect never completed, so the link
+			// must stay usable for the retry that follows.
+			return new WP_REST_Response(
+				array(
+					'error' => 'Connect not completed: another connect took this site while this one was finishing; retry.',
+					'code'  => 'aura_site_taken',
+				),
+				409
+			);
+		}
+		// Consumed only now (the round-23 orphan rule still holds: the claim is
+		// released with it below). Nothing fallible remains: the transient
+		// delete is not part of the binding — a delete that did not land leaves
+		// the link alive for a retry that would simply reconnect an already
+		// bound, already unmarked site.
+		delete_transient( 'aura_magic_' . $magic_id );
 		// Released only NOW (round-3): the site-wide claim exists to make token
 		// and password one handler's; released before the mint, a paused
 		// handler could resume and rotate away the password the winner just
@@ -636,15 +873,33 @@ class Aura_Worker_Magic_Link {
 	 */
 	const SITE_CLAIM = 'aura_worker_connect_lock';
 	/**
-	 * The site claim has NO timed takeover (round-7, owner decision). A
-	 * connect handler that a client timeout abandoned is not a handler that
-	 * stopped: PHP keeps running it, and an age-based takeover would let a
-	 * replacement start writing while the original may still resume — exactly
-	 * the credential-splitting race the claim exists to prevent. Recovery of
-	 * an orphaned claim is therefore an explicit operator action: deactivating
-	 * the plugin (which no handler survives) deletes it. See
-	 * aura_worker_deactivate() in digitizer-site-worker.php.
+	 * The site claim originally had NO timed takeover at all (round-7, owner
+	 * decision): a connect handler that a client timeout abandoned is not a
+	 * handler that stopped, and an age-based takeover would let a replacement
+	 * start writing while the original may still resume. That reasoning
+	 * assumed only rare, operator-initiated lifecycle operations held this
+	 * claim, with recovery as an explicit operator action (deactivate/
+	 * reactivate — aura_worker_deactivate() in digitizer-site-worker.php).
+	 *
+	 * #434 (review round 1, I2) puts a routine, gateway-driven path —
+	 * Aura_Worker_Rules::accept(), arbitrarily frequent — behind the same
+	 * lock. `finally` cannot catch an OOM kill or a max_execution_time fatal,
+	 * so without SOME recovery a single crashed push would strand the site:
+	 * every later push, and every connect, 503s until a human deactivates the
+	 * plugin. SITE_CLAIM_TAKEOVER_AFTER bounds that: claim_site() may now
+	 * seize a claim recorded stale enough, via the SAME conditional
+	 * compare-and-swap the ruleset store uses (never a blind overwrite) — see
+	 * claim_magic_link()'s $takeover_after parameter. The round-7 hazard this
+	 * guards against — a paused original resuming and writing over its
+	 * replacement — is closed by Aura_Worker_Rules::accept_under_claim()'s own
+	 * fence re-check immediately before every write (I1): a seized original's
+	 * next write meets a fence that is no longer its own and is refused, not
+	 * raced. Per-magic-link claims keep the original no-timed-takeover
+	 * behaviour unchanged — they still assume nothing about the frequency or
+	 * duration of the operation they guard, and nothing in this task changes
+	 * that reasoning for them.
 	 */
+	const SITE_CLAIM_TAKEOVER_AFTER = 120; // seconds; well above any push.
 
 	/**
 	 * The CURRENT Aura-minted Application Password's record: the user who owns
@@ -659,6 +914,37 @@ class Aura_Worker_Magic_Link {
 	 * no half state to interpret.
 	 */
 	const APP_PASSWORD_RECORD_OPTION = 'aura_worker_app_password';
+
+	/**
+	 * Core's user-meta key for a user's Application Passwords
+	 * (`WP_Application_Passwords::USERMETA_KEY_APPLICATION_PASSWORDS`), named
+	 * here so the confirming raw read does not depend on the class being
+	 * loaded. #434 Task 4, I5.
+	 */
+	const APP_PASSWORD_USERMETA_KEY = '_application_passwords';
+
+	/** password_state(): the password is in that user's list. */
+	const STATE_PRESENT = 'present';
+
+	/** password_state(): that user's list was read and does not carry it. */
+	const STATE_GONE = 'gone';
+
+	/** password_state(): the list could not be read — never evidence of absence. */
+	const STATE_UNKNOWN = 'unknown';
+
+	/**
+	 * The bounded breadcrumb an unprovable probe leaves (#434 Task 9). Not
+	 * autoloaded: written only on a failure path, read only by `/status` and
+	 * by an operator looking at a tombstone that will not finish.
+	 */
+	const PROBE_UNPROVEN_OPTION = 'aura_worker_app_password_probe_unproven';
+
+	/**
+	 * Where that count stops. "Bounded" is the requirement, and a counter that
+	 * saturates says everything the operator needs — this is happening, a lot —
+	 * without the option growing by one digit per event forever.
+	 */
+	const PROBE_UNPROVEN_MAX = 9999;
 
 
 
@@ -738,6 +1024,10 @@ class Aura_Worker_Magic_Link {
 			// it. Same proof the rotation uses — the password is gone only when
 			// it is absent from the owner's list.
 			WP_Application_Passwords::delete_application_password( $user_id, $uuid );
+			// PROVEN gone (#434 I5). A list that could not be read falls to the
+			// "still live and untracked" recovery below, which fails retryably
+			// — the safe direction: the alternative reports a connect finished
+			// beside a credential nothing recorded.
 			if ( self::managed_password_gone( $user_id, $uuid ) ) {
 				// The record must not outlive the password it named (round-14):
 				// the credential is gone, so a surviving record would make every
@@ -876,10 +1166,58 @@ class Aura_Worker_Magic_Link {
 	 * disconnected, while the callback goes on to hand out a fresh
 	 * administrator credential the UI no longer admits exists.
 	 *
+	 * Also Aura_Worker_Rules::accept()'s entry point since #434: a routine,
+	 * gateway-driven ruleset push takes this same claim for its whole
+	 * decision, so it may seize a stale one too (SITE_CLAIM_TAKEOVER_AFTER,
+	 * review round 1, I2) — see that constant's docblock.
+	 *
 	 * @return string The caller's fence when it holds the claim, else ''.
 	 */
 	public static function claim_site() {
-		return self::claim_magic_link( self::SITE_CLAIM );
+		return self::claim_magic_link( self::SITE_CLAIM, self::SITE_CLAIM_TAKEOVER_AFTER );
+	}
+
+	/**
+	 * REFRESH THE LEASE WHILE THE WORK IS STILL RUNNING (#434 Codex round-8).
+	 *
+	 * seize_stale_claim() bounds a claim stranded by a fatal to
+	 * SITE_CLAIM_TAKEOVER_AFTER seconds, and its own docblock says a claim "a
+	 * live request refreshing it" cannot be seized — but nothing refreshed one.
+	 * A connect that legitimately ran past the window (a slow host, a mint that
+	 * waited on the database, and since #434 a full Phase B cleanup before the
+	 * rebind) therefore became seizable while it was still working, and a
+	 * replacement connect could revoke the credentials the first one was about
+	 * to return.
+	 *
+	 * The same conditional compare-and-swap the seizure uses, in the other
+	 * direction: the UPDATE names the exact bytes just read, so a claim already
+	 * seized, released or refreshed by somebody else loses and answers false.
+	 * A caller that gets false has lost the site and must not report success.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $fence The value claim_site() returned.
+	 * @return bool True while this fence still holds the site.
+	 */
+	public static function touch_site_claim( $fence ) {
+		global $wpdb;
+		if ( '' === (string) $fence ) {
+			return false;
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- The bytes this swap names must be the ROW's, never the option cache's: a cached copy is exactly the stale value a seizure may already have replaced.
+		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::SITE_CLAIM ) );
+		if ( ! is_string( $held ) || 0 !== strpos( $held, $fence . '|' ) ) {
+			return false;
+		}
+		$fresh = $fence . '|' . time();
+		if ( $held === $fresh ) {
+			return true; // same second: the lease is already as fresh as it gets
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- A compare-and-swap has no storage-function equivalent; the cache is evicted immediately below, as every other writer of this row does.
+		$rows = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s", $fresh, self::SITE_CLAIM, $held ) );
+		wp_cache_delete( self::SITE_CLAIM, 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		return 1 === (int) $rows && '' === (string) $wpdb->last_error;
 	}
 
 	/**
@@ -923,6 +1261,7 @@ class Aura_Worker_Magic_Link {
 	 * one question the settings screen has to answer, read from the one option
 	 * that records it (round-26).
 	 *
+	 * 'unbound'     Aura disconnected this site; every mutation is refused
 	 * 'delivered'   a password exists and the connect that minted it returned it
 	 * 'undelivered' a password exists but no connect ever handed it over
 	 * 'unavailable' this site cannot issue one; the connection is token-only
@@ -931,6 +1270,22 @@ class Aura_Worker_Magic_Link {
 	 * @return string
 	 */
 	private static function credential_state(): string {
+		// The marker outranks every credential question below it (#434 Task 9).
+		// A disconnected site refuses every mutation at BOTH write boundaries,
+		// so whatever credential it still holds buys nothing, and painting the
+		// screen "Connected to Aura dashboard" over it — green check included —
+		// describes a connection that no longer does anything.
+		//
+		// is_set(), deliberately, not the tri-state: an unreadable marker
+		// refuses exactly as a present one does (it is the same boolean
+		// Aura_Worker_Security::refuse_if_unbound() gates on), so the screen
+		// must say the same thing about both. What must NOT be derived from
+		// this boolean is the disconnect TIME — render_unbound_panel() reads
+		// the tri-state itself for that, because a moment is a value and this
+		// answer carries none.
+		if ( Aura_Worker_Unbind::is_set() ) {
+			return 'unbound';
+		}
 		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
 		if ( is_array( $rec ) && ! empty( $rec['unavailable'] ) ) {
 			return 'unavailable';
@@ -944,7 +1299,13 @@ class Aura_Worker_Magic_Link {
 		// being deleted, changes nothing here — so the list is consulted before
 		// this screen calls the connection healthy (round-27). One read, on an
 		// admin page render.
-		if ( ! class_exists( 'WP_Application_Passwords' ) || self::managed_password_gone( $usable['user_id'], $usable['uuid'] ) ) {
+		// DELIBERATELY the only caller that does not fail closed on 'unknown'
+		// (#434 I5). This is a screen render, not a gate: an unreadable list is
+		// reported exactly as it was before the tri-state existed — 'none',
+		// whose advice ("connect again to issue one") is harmless and
+		// self-correcting on the next page load. Reporting it as healthy
+		// instead would be the worse lie. Nothing irreversible reads this.
+		if ( ! class_exists( 'WP_Application_Passwords' ) || self::STATE_PRESENT !== self::managed_password_state( $usable['user_id'], $usable['uuid'] ) ) {
 			return 'none';
 		}
 		// A password WordPress will no longer accept is not a working
@@ -1075,7 +1436,10 @@ class Aura_Worker_Magic_Link {
 			// undelivered credential is worth nothing to anybody.
 			WP_Application_Passwords::delete_application_password( $owner, $found );
 			if ( ! self::managed_password_gone( $owner, $found ) ) {
-				return false; // still live — the caller must not mint beside it
+				// Includes "the list could not be read" (#434 I5): the caller
+				// must not mint a second administrator credential beside one
+				// this request could not prove is gone.
+				return false; // still live, or not provably gone
 			}
 			$settled[] = (string) $app_id;
 		}
@@ -1105,11 +1469,15 @@ class Aura_Worker_Magic_Link {
 	 * a conditional delete that failed leaves the previous client's block and
 	 * warn policy governing the newly connected dashboard behind a 200.
 	 *
+	 * Public since 2.13.0 for #434's Phase B, which clears the same store under
+	 * the same claim and needs the same proof that the row is gone —
+	 * Aura_Worker_Rules::clear() on its own reports nothing.
+	 *
 	 * @param string $claim The claim option's name.
 	 * @param string $fence This handler's fence.
 	 * @return bool True when the store is empty.
 	 */
-	private static function clear_ruleset_verified( $claim, $fence ): bool {
+	public static function clear_ruleset_verified( $claim, $fence ): bool {
 		Aura_Worker_Rules::clear( $claim, $fence );
 		$left = Aura_Worker_Rules::read_option_uncached( Aura_Worker_Rules::OPTION );
 		return ! is_wp_error( $left ) && ( null === $left || '' === (string) $left );
@@ -1221,23 +1589,409 @@ class Aura_Worker_Magic_Link {
 	}
 
 	/**
+	 * Is that Application Password gone from that user's list? The public form
+	 * of managed_password_gone(), for the callers outside this class that need
+	 * the same proof: #434's Phase B revokes every credential the unbind
+	 * marker names — the managed one AND any password that authenticated an
+	 * unbind — and, like every step of that cleanup, may report a step
+	 * complete only on evidence, never on a delete's return value; and Phase A
+	 * uses it to CONFIRM a candidate owner before recording it, so that Phase
+	 * B's single lookup is authoritative.
+	 *
+	 * Answers only about the user it is ASKED about. It is not, and cannot be
+	 * made into, evidence that nobody else holds the password — three review
+	 * rounds of #434 Task 4 turned on exactly that mistake.
+	 *
+	 * PROVEN gone, and only that (#434 Task 4, I5): a list that could not be
+	 * read answers FALSE here, not true. See password_state() for the third
+	 * answer and for why it exists.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int    $user Owner user ID.
+	 * @param string $uuid Password UUID.
+	 * @return bool True only when that user's list was read and does not carry it.
+	 */
+	public static function password_gone( int $user, string $uuid ): bool {
+		return self::STATE_GONE === self::password_state( $user, $uuid );
+	}
+
+	/**
+	 * The tri-state behind password_gone(): 'present', 'gone' or 'unknown'.
+	 *
+	 * "Could not determine" is a THIRD answer, not a quiet 'gone' (#434 Task 4,
+	 * I5). Callers that must fail closed read `STATE_GONE !==`; the one caller
+	 * that must fail closed the OTHER way — Phase A confirming a candidate
+	 * owner — reads `STATE_PRESENT ===`. Nobody has to remember which way a
+	 * boolean leans.
+	 *
+	 * A WordPress with no Application Passwords class holds no such password
+	 * and can authenticate nobody with one, so there is nothing left to
+	 * revoke: 'gone', exactly as usable_password() already treats it.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int    $user Owner user ID.
+	 * @param string $uuid Password UUID.
+	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
+	 */
+	public static function password_state( int $user, string $uuid ): string {
+		if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+			return self::STATE_GONE;
+		}
+		return self::managed_password_state( $user, $uuid );
+	}
+
+	/**
 	 * Is the password identified by $uuid really gone from $owner's list?
 	 * delete_application_password() answers false for a failed user-meta
 	 * write as well as for "not there", so its return value alone never
 	 * proves a revocation landed — the owner's list does. ONE implementation,
 	 * used by the rotation and by the mint's cleanup.
 	 *
+	 * PROVEN gone: an unreadable list is 'unknown', which is not true here
+	 * (#434 Task 4, I5). Every caller of this form fails closed on that.
+	 *
 	 * @param int    $owner Owner user ID.
 	 * @param string $uuid  Password UUID.
-	 * @return bool True when nothing with that UUID remains.
+	 * @return bool True only when the list was read and does not carry it.
 	 */
 	private static function managed_password_gone( int $owner, string $uuid ): bool {
-		foreach ( WP_Application_Passwords::get_user_application_passwords( $owner ) as $item ) {
-			if ( isset( $item['uuid'] ) && $uuid === (string) $item['uuid'] ) {
-				return false;
+		return self::STATE_GONE === self::managed_password_state( $owner, $uuid );
+	}
+
+	/**
+	 * Is that password present in that user's list, absent from it, or is the
+	 * list not readable at all?
+	 *
+	 * The third answer is the point (#434 Task 4, I5). Core implements
+	 * `WP_Application_Passwords::get_user_application_passwords()` as a
+	 * `get_user_meta( …, true )` followed by `if ( ! is_array( $passwords ) )
+	 * return array();` — so a meta read that could not be completed (a failed
+	 * `update_meta_cache()` query caches an empty array and `get_metadata()`
+	 * then answers `''`) is INDISTINGUISHABLE at that layer from "this user
+	 * holds no Application Passwords". Every caller here was reading that as
+	 * proven absence, and in Phase B of the unbind it was the sole evidence
+	 * gating an irreversible step: the site token deleted beside a live
+	 * `manage_options` credential.
+	 *
+	 * So absence is confirmed by a raw read that PROVES IT RAN: the statement
+	 * carries a per-call nonce and echoes it back, so a row that does not
+	 * return our nonce is somebody else's and settles nothing. (It does not
+	 * consult `$wpdb->ready`, `last_query` or `last_error` — those are a
+	 * database drop-in's to get wrong, and reading them that way stranded
+	 * Phase B on every drop-in that never sets `ready`. The proof is a
+	 * property of the ANSWER, not of wpdb's bookkeeping.) Core's own list
+	 * still answers PRESENT, so any filter or
+	 * alternative meta store keeps its say over the positive; the raw probe
+	 * runs only on the path about to conclude absence, and can only turn that
+	 * conclusion into 'present' or 'unknown' — never the other way.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int    $owner Owner user ID.
+	 * @param string $uuid  Password UUID.
+	 * @return string One of STATE_PRESENT, STATE_GONE, STATE_UNKNOWN.
+	 */
+	private static function managed_password_state( int $owner, string $uuid ): string {
+		// ONE implementation, in includes/credential-rules.php — uninstall.php
+		// asks this same question and must not load the plugin to do it
+		// (#434 Codex round-10). The two-stage reasoning above lives there.
+		return aura_worker_app_password_state( $owner, $uuid );
+	}
+
+
+	/**
+	 * That user's Application Passwords, from the ROW, proven to have been
+	 * read (#434 Task 4's discipline, extracted in Task 9 so the repair path
+	 * can read the whole list rather than ask about one uuid).
+	 *
+	 * The statement, the nonce and every reason for both are unchanged — this
+	 * is the same read aura_worker_app_password_list() has always issued, with the
+	 * uuid question moved out of it. Its answers are: the list (empty for a
+	 * user with no row, or a row that does not hold an array — core reads both
+	 * as "no passwords"), or NULL for a read that proved nothing, which no
+	 * caller may treat as an absence.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param int $owner Owner user ID.
+	 * @return array|null The list, or null when nothing was proved.
+	 */
+	private static function app_password_list( int $owner ): ?array {
+		// ONE implementation, in includes/credential-rules.php, because
+		// uninstall.php has to ask this same question and must not load the
+		// plugin to do it (#434 Codex round-10). The statement, the nonce and
+		// every reason for both live there.
+		return aura_worker_app_password_list( $owner );
+	}
+
+	/**
+	 * Which users' Application Password lists carry that UUID — asked of the
+	 * WHOLE usermeta table, in ONE statement, and answered only when the
+	 * statement can prove it ran (#434 Task 9).
+	 *
+	 * THIS IS NOT THE OWNER SEARCH TASK 4 DELETED, and the difference is the
+	 * whole reason it may exist. That one walked a bounded CANDIDATE LIST — the
+	 * connecting user, then up to 200 administrators — and read "in none of
+	 * them" as absence, which stops being evidence the moment a 201st user, or
+	 * a non-administrator holder, exists. This asks the TABLE: every row that
+	 * holds an Application Password list is examined by the same statement, so
+	 * an empty answer is a fact about the site rather than about a list
+	 * somebody guessed.
+	 *
+	 * It is also on no automatic path. Phase B still does exactly one lookup,
+	 * against the owner Phase A recorded, on every sweep forever; this runs
+	 * only from the operator's explicit "Remove remaining Aura data", which is
+	 * the one place a full scan's cost is bought deliberately — and `meta_key`
+	 * is indexed, so the scan covers the users who have Application Passwords
+	 * at all, not every row of usermeta.
+	 *
+	 * The `probe` nonce is the in-band proof aura_worker_app_password_list() uses, for
+	 * the identical reason: wpdb::get_row() extracts from the PREVIOUS
+	 * statement's result set when this one never ran, so only a value this call
+	 * invented can tell "nobody holds it" from "nothing was asked".
+	 *
+	 * The LIKE over the serialized list is deliberately loose. It can name a
+	 * user who does not really hold the uuid — some other Application Password
+	 * list containing the same characters — and it cannot MISS one, because
+	 * core serialises the uuid literally. A false positive costs one delete
+	 * that removes nothing plus the confirming statement; a false negative is
+	 * the thing that must never happen here.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $uuid The password's uuid.
+	 * @return int[]|null The users whose list may hold it, EMPTY when the
+	 *                    statement proved that no list on this site does, and
+	 *                    null when nothing was proved at all.
+	 */
+	public static function password_holders( string $uuid ) {
+		return self::usermeta_holders( $uuid );
+	}
+
+	/**
+	 * The same statement, asked about the Application Password NAME this
+	 * plugin mints under (#434 Task 9's repair path). Kept private: a name is
+	 * user-controllable and therefore evidence about a CANDIDATE, never about
+	 * a specific credential — only the repair, which tells the operator
+	 * exactly that in so many words, may act on it.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return int[]|null Users whose list may carry an Aura-named password,
+	 *                    empty when the statement proved none does, null when
+	 *                    nothing was proved.
+	 */
+	private static function password_name_holders() {
+		return self::usermeta_holders( self::APP_PASSWORD_NAME );
+	}
+
+	/**
+	 * ONE statement over every Application Password list on the site, looking
+	 * for a literal string. See password_holders() above for why this may
+	 * exist at all and what its answers mean.
+	 *
+	 * @param string $needle The literal to look for in the serialized list.
+	 * @return int[]|null
+	 */
+	private static function usermeta_holders( string $needle ) {
+		global $wpdb;
+		if ( '' === $needle || ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
+			return null; // no way to ask: never a proof of absence
+		}
+		static $seq = 0;
+		++$seq;
+		$nonce = $seq . '-' . wp_generate_uuid4();
+		// The owners come back as ROWS, never as an aggregate of them.
+		//
+		// This statement used to read GROUP_CONCAT(user_id). That is a BOUNDED
+		// aggregate: MySQL stops concatenating at `group_concat_max_len`
+		// (1024 bytes by default — about 170 ids) and reports the cut only in
+		// a warning nothing here reads. A site with enough Application
+		// Password holders would hand this code a list that LOOKS well formed
+		// and is missing owners, and the teardown would report every
+		// credential accounted for while the omitted ones stayed usable. A
+		// list cannot testify that it is complete, and counting the same rows
+		// to check it only narrows the window — a cut landing mid-number
+		// yields the right number of ids, one of them wrong. So the bound is
+		// gone rather than measured.
+		//
+		// One row per owner needs no bound; the leading UNION member is a
+		// SENTINEL that guarantees the statement answers with at least one
+		// row even when nobody holds the needle, which is what lets an empty
+		// result stay readable as "the statement did not run" rather than as
+		// an absence. Every row carries the nonce, so provenance is proved for
+		// the whole answer and not just its head — wpdb::get_results() has the
+		// same stale-`last_result` seam the per-user probe was hardened
+		// against.
+		$sql = $wpdb->prepare(
+			"SELECT %s AS probe, 0 AS user_id UNION ALL SELECT %s AS probe, user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s",
+			$nonce,
+			$nonce,
+			self::APP_PASSWORD_USERMETA_KEY,
+			'%' . $wpdb->esc_like( $needle ) . '%'
+		);
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			return null; // nothing was issued, so nothing was proved
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_results( $sql );
+		if ( ! is_array( $rows ) ) {
+			do_action( 'aura_worker_app_password_probe_unproven', 0 );
+			return null;
+		}
+		$users    = array();
+		$sentinel = false;
+		foreach ( $rows as $row ) {
+			if ( ! isset( $row->probe ) || $nonce !== (string) $row->probe ) {
+				// Somebody else's result set, in whole or in part.
+				do_action( 'aura_worker_app_password_probe_unproven', 0 );
+				return null;
+			}
+			$id = isset( $row->user_id ) ? (int) $row->user_id : 0;
+			if ( $id > 0 ) {
+				$users[] = $id;
+				continue;
+			}
+			// The sentinel. WordPress never issues user id 0, so orphaned
+			// usermeta owning nobody is indistinguishable from it here — and
+			// owns no credential either way.
+			$sentinel = true;
+		}
+		if ( ! $sentinel ) {
+			// The one row this statement cannot fail to return did not come
+			// back, so what did come back is not this statement's answer. It is
+			// also how a statement that FAILED is caught — it answers with no
+			// rows at all, and no rows is no sentinel. Kept as the single test
+			// rather than as a special case beside an is-empty check, so the
+			// guard that decides this is one the suite can actually redden.
+			// Same breadcrumb the per-user probe leaves, with no owner to name.
+			do_action( 'aura_worker_app_password_probe_unproven', 0 );
+			return null;
+		}
+		// Proven, and complete: EMPTY means no Application Password list on
+		// this site carries the needle.
+		return array_values( array_unique( $users ) );
+	}
+
+	/**
+	 * EVERY Application Password on this site that a repaired marker must name
+	 * (#434 Task 9's repair path) — uuid => owner.
+	 *
+	 * A marker whose row is malformed names nothing this site can act on, so
+	 * the repair has to rebuild the credential list from the site itself. Two
+	 * sources, both of them evidence rather than inference:
+	 *
+	 *  - the NAME sweep. mint_app_password() is the only caller of
+	 *    create_new_application_password() in this plugin and it always stamps
+	 *    APP_PASSWORD_NAME, so every credential SiteAgent has ever minted
+	 *    carries that name: the sweep is a SUPERSET of them. It is NOT a
+	 *    subset — the name is user-controllable, so a password an operator
+	 *    happened to give the same name is swept too, and the teardown says so
+	 *    to the operator in as many words before anything is removed.
+	 *  - the plugin's own record (`aura_worker_app_password`), which names the
+	 *    managed credential and its owner outright. Added even when the sweep
+	 *    did not return it: a password whose name was changed afterwards is
+	 *    still this binding's, and a uuid already gone costs one delete that
+	 *    matches nothing.
+	 *
+	 * FAILS CLOSED, everywhere. A sweep that proved nothing, or a candidate
+	 * whose list could not be read, answers null — and the repair refuses
+	 * rather than write a marker that names fewer credentials than the site
+	 * holds, which would hand the teardown a list it could complete while a
+	 * live administrator credential stayed behind.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return array<string,int>|null uuid => owner, or null when nothing was
+	 *                                proved.
+	 */
+	public static function minted_passwords(): ?array {
+		$holders = self::password_name_holders();
+		if ( null === $holders ) {
+			return null;
+		}
+		$record = self::password_record();
+		if ( null !== $record ) {
+			$holders[] = (int) $record['user_id'];
+		}
+		$found = array();
+		foreach ( array_unique( $holders ) as $owner ) {
+			$owner = (int) $owner;
+			if ( $owner <= 0 ) {
+				continue;
+			}
+			$list = self::app_password_list( $owner );
+			if ( null === $list ) {
+				return null; // a list that could not be read is not an empty one
+			}
+			foreach ( $list as $item ) {
+				if ( is_array( $item ) && ! empty( $item['uuid'] ) && isset( $item['name'] )
+					&& self::APP_PASSWORD_NAME === (string) $item['name'] ) {
+					$found[ (string) $item['uuid'] ] = $owner;
+				}
 			}
 		}
-		return true;
+		if ( null !== $record && ! isset( $found[ $record['uuid'] ] ) ) {
+			$found[ (string) $record['uuid'] ] = (int) $record['user_id'];
+		}
+		return $found;
+	}
+
+	/**
+	 * Record that a probe could not prove itself (#434 Task 9).
+	 *
+	 * Task 6 left `aura_worker_app_password_probe_unproven` firing into
+	 * nothing: an unprovable probe owes `app_passwords` forever, so a tombstone
+	 * that never completes had no explanation anywhere — not in the site, not
+	 * on the wire. This is the listener, and get_status() carries it to Aura.
+	 *
+	 * BOUNDED, because the alternative writes an ever-growing option on a
+	 * failure path: three scalars, one row, a count that stops climbing at
+	 * PROBE_UNPROVEN_MAX. No list of occurrences, no per-user history — the
+	 * question this answers is "is this happening, and when did it last
+	 * happen", and a saturating counter answers it at fixed size.
+	 *
+	 * @param int $owner The user whose list could not be read, or 0 when the
+	 *                   probe was site-wide and names nobody.
+	 * @return void
+	 */
+	public static function record_probe_unproven( $owner = 0 ): void {
+		$stored = get_option( self::PROBE_UNPROVEN_OPTION, null );
+		$count  = ( is_array( $stored ) && isset( $stored['count'] ) && is_int( $stored['count'] ) && $stored['count'] > 0 )
+			? (int) $stored['count']
+			: 0;
+		if ( $count < self::PROBE_UNPROVEN_MAX ) {
+			++$count;
+		}
+		update_option(
+			self::PROBE_UNPROVEN_OPTION,
+			array(
+				'count' => $count,
+				'at'    => gmdate( 'c' ),
+				'owner' => (int) $owner > 0 ? (int) $owner : 0,
+			),
+			false
+		);
+	}
+
+	/**
+	 * What `/status` reports about unprovable probes, or null when none has
+	 * ever been recorded (#434 Task 9).
+	 *
+	 * @return array{count:int,at:string,owner:int}|null
+	 */
+	public static function probe_unproven_report(): ?array {
+		$stored = get_option( self::PROBE_UNPROVEN_OPTION, null );
+		if ( ! is_array( $stored ) || ! isset( $stored['count'] ) || (int) $stored['count'] <= 0 ) {
+			return null;
+		}
+		return array(
+			'count' => (int) $stored['count'],
+			'at'    => isset( $stored['at'] ) ? (string) $stored['at'] : '',
+			'owner' => isset( $stored['owner'] ) ? (int) $stored['owner'] : 0,
+		);
 	}
 
 	/**
@@ -1321,6 +2075,10 @@ class Aura_Worker_Magic_Link {
 		// user-chosen, so a stranger's "Aura SiteAgent" must not be nuked, and
 		// a renamed Aura password must still be found.
 		$deleted = WP_Application_Passwords::delete_application_password( $rec['user_id'], $rec['uuid'] );
+		// Not provably gone — a genuine "still there", or a list that could not
+		// be read at all (#434 I5). Either way the record must survive for the
+		// next attempt; forgetting it would leave an administrator credential
+		// with nothing tracking it.
 		if ( true !== $deleted && ! self::managed_password_gone( $rec['user_id'], $rec['uuid'] ) ) {
 			// The credential is still live, so its record must exist for the
 			// next attempt to find. Under a claim it was consumed above — put
@@ -1425,30 +2183,108 @@ class Aura_Worker_Magic_Link {
 	 *
 	 * @since 2.10.2
 	 *
-	 * @param string $claim_key Option name.
+	 * @param string $claim_key      Option name.
+	 * @param int    $takeover_after Seconds; 0 (the default, and every
+	 *                                per-magic-link caller) means no timed
+	 *                                takeover at all, exactly as before. > 0
+	 *                                (the site claim's callers, #434 review
+	 *                                round 1, I2) additionally attempts
+	 *                                seize_stale_claim() when the row is
+	 *                                already held.
 	 * @return string This handler's fence when it holds the claim, else ''.
 	 */
-	private static function claim_magic_link( $claim_key ) {
+	private static function claim_magic_link( $claim_key, $takeover_after = 0 ) {
 		global $wpdb;
 		$fence = bin2hex( random_bytes( 16 ) );
+		$value = $fence . '|' . time();
 		$rows  = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
 				$claim_key,
-				$fence . '|' . time(),
+				$value,
 				'no',
 				$claim_key
 			)
 		);
-		if ( 1 !== (int) $rows || '' !== (string) $wpdb->last_error ) {
-			return ''; // 0: a row is there. false/last_error: nothing was claimed.
+		if ( 1 === (int) $rows && '' === (string) $wpdb->last_error ) {
+			// The row was created behind the option cache's back, so evict what
+			// add_option() would have maintained: this name, and the `notoptions`
+			// entry any earlier miss on it left (see insert_if_absent()).
+			wp_cache_delete( $claim_key, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			return $fence;
 		}
-		// The row was created behind the option cache's back, so evict what
-		// add_option() would have maintained: this name, and the `notoptions`
-		// entry any earlier miss on it left (see insert_if_absent()).
+		// 0: a row is there. false/last_error: nothing was claimed (and a
+		// takeover attempt below could not tell those apart either — a
+		// database refusing this INSERT would just as likely refuse the
+		// takeover's UPDATE, which fails closed to '' on its own).
+		if ( $takeover_after > 0 && self::seize_stale_claim( $claim_key, $fence, $value, $takeover_after ) ) {
+			return $fence;
+		}
+		return '';
+	}
+
+	/**
+	 * Seize a claim recorded stale enough — #434 review round 1 (I2). A
+	 * claim row a fatal (OOM, max_execution_time — nothing `finally` can
+	 * catch) stranded would otherwise 503 every later request against this
+	 * claim forever; this bounds that to SITE_CLAIM_TAKEOVER_AFTER seconds,
+	 * via the SAME conditional compare-and-swap the ruleset store uses —
+	 * never a blind overwrite, so a claim that is genuinely still held (a
+	 * live request refreshing it, or simply not yet stale) cannot be seized
+	 * out from under it: the UPDATE names the exact bytes just read, and a
+	 * change since then — a release, a refresh, another seize — loses it.
+	 *
+	 * A row with no `|<ts>` suffix (written before this backward-compatible
+	 * format existed, or never at all) is treated as fresh and is never
+	 * seized — there is nothing to measure an age against, and reporting one
+	 * from nowhere would be worse than declining to seize.
+	 *
+	 * @param string $claim_key      Option name.
+	 * @param string $fence          This handler's fence — $new_value's prefix.
+	 * @param string $new_value      This handler's "<fence>|<ts>" to install.
+	 * @param int    $takeover_after Seconds the existing claim's age must
+	 *                                EXCEED (not merely reach) to be seizable.
+	 * @return bool True when this handler seized the claim.
+	 */
+	private static function seize_stale_claim( $claim_key, $fence, $new_value, $takeover_after ) {
+		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- The claim's AGE decides a takeover, so it must come from the row, never the option cache: a cached copy is exactly the stale value this seize exists to measure.
+		$existing = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $claim_key ) );
+		if ( ! is_string( $existing ) || '' === $existing ) {
+			return false; // Gone already, or unreadable — a plain retry is the safe next step, not a seize.
+		}
+		$pipe = strrpos( $existing, '|' );
+		if ( false === $pipe ) {
+			return false; // No timestamp on record: never seizable.
+		}
+		$stamp = substr( $existing, $pipe + 1 );
+		if ( '' === $stamp || ! ctype_digit( $stamp ) ) {
+			// A pipe with no digits after it is not a timestamp either. Without
+			// this, `(int)` would read "abc|xyz" as age = now and seize it at
+			// once — the exact opposite of what the docblock above promises,
+			// and a guarantee a test was asserting but the code did not deliver
+			// (#434 Task 2 re-review N1).
+			return false;
+		}
+		$age = time() - (int) $stamp;
+		if ( $age <= $takeover_after ) {
+			return false;
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- A compare-and-swap on the exact bytes just read; update_option() cannot express the condition, and the row is evicted from the cache below.
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				$new_value,
+				$claim_key,
+				$existing
+			)
+		);
+		if ( 1 !== (int) $rows ) {
+			return false; // Someone else released, refreshed, or seized it first.
+		}
 		wp_cache_delete( $claim_key, 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
-		return $fence;
+		return true;
 	}
 
 	/**

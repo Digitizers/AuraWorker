@@ -71,6 +71,25 @@ class Aura_Worker {
 		// app-password agent and a second MCP server actually write through.
 		Aura_Worker_Rules::init();
 
+		// Which Application Password authenticated this request (#434). Copied
+		// into the unbind marker by Phase A, before Phase B revokes it, so the
+		// core-REST seam can still recognise the departed binding. Registered
+		// here because WordPress fires the hook during REST authentication —
+		// earlier than any route callback, later than plugins_loaded.
+		Aura_Worker_Security::init();
+
+		// The unbind marker's Phase B sweep (#434) — the body is filled in
+		// once Phase A/B exist; this only registers the init hook.
+		Aura_Worker_Unbind::init();
+
+		// The breadcrumb Task 6 left behind fired into nothing until now
+		// (#434 Task 9): a probe that cannot prove itself owes `app_passwords`
+		// forever, so a tombstone that never completes had no explanation
+		// anywhere. Counted here, bounded, and carried to Aura by /status.
+		// Registered outside the is_admin() block below on purpose — the probe
+		// runs on REST requests, which is where it fails.
+		add_action( 'aura_worker_app_password_probe_unproven', array( 'Aura_Worker_Magic_Link', 'record_probe_unproven' ), 10, 1 );
+
 		// Standards-alignment: also expose tools via the WordPress Abilities API
 		// (when present) so the official MCP adapter can discover them. Additive —
 		// the aura/mcp namespace above is unaffected. The category must register
@@ -90,7 +109,157 @@ class Aura_Worker {
 			add_action( 'admin_init', array( $this, 'register_settings' ) );
 			add_action( 'admin_init', array( $this, 'add_privacy_policy_content' ) );
 			add_action( 'wp_ajax_aura_worker_regenerate_token', array( $this, 'ajax_regenerate_token' ) );
+			add_action( 'wp_ajax_aura_worker_remove_aura_data', array( $this, 'ajax_remove_aura_data' ) );
 		}
+	}
+
+	/**
+	 * AJAX handler: THE OPERATOR'S TEARDOWN of a site Aura disconnected
+	 * (#434 Task 9) — "Remove remaining Aura data" on the settings screen.
+	 *
+	 * It is the way out of every dead end Phase B is designed to sit in rather
+	 * than guess its way through: an Application Password whose owner the
+	 * marker could not name (resolved here, from the whole table, once), a
+	 * password an administrator revoked by hand, a step that failed while
+	 * nobody was watching. Aura may be gone; this screen is not.
+	 *
+	 * THE ORDER IS THE SAFETY PROPERTY, and it is the same one Phase B keeps:
+	 * the marker is what NAMES the debt, so it is deleted LAST and only on
+	 * proof there is no debt left. `cleanup( true, $fence )` returns true only
+	 * after an uncached read has shown the token row itself gone (Task 4), so
+	 * exactly `true` — never truthiness, never "no exception" — is what earns
+	 * delete_under_claim(). Anything else answers 409 with what is still here,
+	 * and the site goes on refusing every mutation, which is the whole point of
+	 * the marker it keeps.
+	 *
+	 * `leftovers()` reports on steps (1)-(4) and can never name the token, so
+	 * the token is checked here and added to the list. Unreadable counts as
+	 * present: absence is proven, never assumed.
+	 *
+	 * @return void
+	 */
+	public function ajax_remove_aura_data() {
+		check_ajax_referer( 'aura_worker_remove_aura_data', 'nonce' );
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'digitizer-site-worker' ) ), 403 );
+		}
+
+		// The marker's three states, answered before anything is claimed or
+		// deleted, because they are three different situations for the person
+		// reading the screen:
+		$marker    = Aura_Worker_Unbind::read();
+		$malformed = is_wp_error( $marker ) && Aura_Worker_Unbind::MALFORMED_CODE === $marker->get_error_code();
+		if ( is_wp_error( $marker ) && ! $malformed ) {
+			// A read that did not complete. NOT the same thing as a damaged
+			// row, and the difference is the whole of fix round 1: read()
+			// answers one WP_Error for both, so a teardown that treated them
+			// alike would repair — and then tear down — a perfectly healthy
+			// marker with real outstanding debts, on a database blip. This
+			// branch is the transient one: nothing is claimed, nothing is
+			// changed, and it refuses with its own story rather than with
+			// `aura_unbind_incomplete` and a list of four steps nobody has
+			// established are owed — the same reasoning finish_before_rebind()
+			// uses (#434 Task 7).
+			wp_send_json_error(
+				array(
+					'message' => __( 'This site cannot read its own disconnect record, so it cannot tell what is left to remove. Check the site for database errors and try again.', 'digitizer-site-worker' ),
+					'code'    => 'aura_unbind_unreadable',
+				),
+				409
+			);
+		}
+		if ( null === $marker ) {
+			wp_send_json_error(
+				array(
+					'message' => __( 'This site is not disconnected, so there is nothing to remove.', 'digitizer-site-worker' ),
+					'code'    => 'aura_not_unbound',
+				),
+				409
+			);
+		}
+
+		// Under the same claim every other lifecycle operation takes, and taken
+		// BEFORE any of the work: a connect installing a replacement binding
+		// while this teardown ran would have its fresh token deleted by step
+		// (5) and its credential revoked by step (1).
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		if ( '' === $fence ) {
+			wp_send_json_error( array( 'message' => __( 'A connection to Aura is being installed right now, so nothing was removed. Try again in a moment.', 'digitizer-site-worker' ) ), 409 );
+		}
+
+		// A damaged row is REPAIRED, never deleted: rebuilt from the site's own
+		// state into a marker the teardown below runs against unchanged, so the
+		// marker still outlives everything it names and still goes last. It
+		// gates on MALFORMED_CODE itself, and reads twice.
+		if ( $malformed && ! Aura_Worker_Unbind::repair_malformed_marker( $fence ) ) {
+			Aura_Worker_Magic_Link::release_site( $fence );
+			wp_send_json_error(
+				array(
+					'message' => __( 'This site could not repair its damaged disconnect record, so nothing was removed. Check the site for database errors and try again.', 'digitizer-site-worker' ),
+					'code'    => 'aura_unbind_unrepairable',
+				),
+				409
+			);
+		}
+
+		$unattributed = Aura_Worker_Unbind::resolve_unknown_owners( $fence );
+		$done         = Aura_Worker_Unbind::cleanup( true, $fence );
+		if ( true !== $done ) {
+			$leftover = Aura_Worker_Unbind::leftovers();
+			if ( $this->token_present() ) {
+				$leftover[] = 'token';
+			}
+			Aura_Worker_Magic_Link::release_site( $fence );
+			wp_send_json_error(
+				array(
+					'message'      => empty( $unattributed )
+						? __( 'Some of the previous connection could not be removed, so this site keeps refusing changes. The remaining items are listed; try again once they are gone.', 'digitizer-site-worker' )
+						: sprintf(
+							/* translators: %s: comma-separated Application Password UUIDs. */
+							__( 'This site could not remove the Application Passwords the previous connection used (%s), and cannot say which user holds them. Revoke them under Users → Profile → Application Passwords, then try again.', 'digitizer-site-worker' ),
+							implode( ', ', $unattributed )
+						),
+					'code'         => 'aura_unbind_incomplete',
+					'leftover'     => array_values( $leftover ),
+					'unattributed' => array_values( $unattributed ),
+				),
+				409
+			);
+		}
+
+		// Everything is proven gone, the token included. Only now may the
+		// record of the debt go with it.
+		if ( ! Aura_Worker_Unbind::delete_under_claim( $fence ) ) {
+			Aura_Worker_Magic_Link::release_site( $fence );
+			wp_send_json_error(
+				array(
+					'message' => __( 'Everything Aura installed was removed, but the disconnect record itself could not be deleted, so this site still refuses changes. Try again.', 'digitizer-site-worker' ),
+					'code'    => 'aura_unbind_marker_stuck',
+				),
+				500
+			);
+		}
+
+		Aura_Worker_Magic_Link::release_site( $fence );
+		wp_send_json_success( array( 'removed' => true ) );
+	}
+
+	/**
+	 * Is the site token row still there? Uncached, and FAILING CLOSED: a read
+	 * that could not be completed is not evidence the row is gone, and this
+	 * answer becomes the `token` entry in a teardown's leftover list.
+	 *
+	 * @return bool
+	 */
+	private function token_present(): bool {
+		$raw = Aura_Worker_Rules::read_option_uncached( 'aura_worker_site_token' );
+		// `null` is the ONE answer that means the row is gone: a WP_Error from
+		// a read that did not complete is not null and is therefore reported as
+		// present, which is the fail-closed direction. Written as the single
+		// comparison it is — an `is_wp_error( $raw ) ||` in front would read
+		// like a second guard while being dead code (round-1 LOW-1).
+		return null !== $raw;
 	}
 
 	/**
@@ -119,6 +288,29 @@ class Aura_Worker {
 		$site_fence = Aura_Worker_Magic_Link::claim_site();
 		if ( '' === $site_fence ) {
 			wp_send_json_error( array( 'message' => __( 'A connection to Aura is being installed right now, so the token was not changed. Try again in a moment.', 'digitizer-site-worker' ) ), 409 );
+		}
+
+		// THE WAY BACK, first half (#434 Task 7). "Regenerate Token" is the
+		// operator's own rebind, and the only one available to a site whose
+		// dashboard is gone. Like the connect callback, it settles the DEPARTED
+		// binding's Phase-B debt before the swap below replaces the token that
+		// identifies it — after that write, Aura_Worker_Unbind::maybe_finish()
+		// bails on the hash mismatch and nothing on this site would ever go
+		// looking for a credential the marker still names. A site that still
+		// owes something is not rotated at all: 409, the leftovers named, the
+		// marker and the old token both untouched.
+		$finished = Aura_Worker_Unbind::finish_before_rebind( $site_fence );
+		if ( is_wp_error( $finished ) ) {
+			Aura_Worker_Magic_Link::release_site( $site_fence );
+			$data = $finished->get_error_data();
+			wp_send_json_error(
+				array(
+					'message'  => $finished->get_error_message(),
+					'code'     => $finished->get_error_code(),
+					'leftover' => isset( $data['leftover'] ) && is_array( $data['leftover'] ) ? $data['leftover'] : array(),
+				),
+				409
+			);
 		}
 
 		$previous = $this->stored_token();
@@ -191,6 +383,53 @@ class Aura_Worker {
 		if ( ! is_wp_error( $current ) && is_string( $current ) && ! hash_equals( $hashed, $current ) ) {
 			Aura_Worker_Magic_Link::release_site( $site_fence );
 			wp_send_json_error( array( 'message' => __( 'Another site token was stored while this request ran, so this one changed nothing. That token is now the current one — regenerate again if you still want a new one.', 'digitizer-site-worker' ) ), 500 );
+		}
+		// THE WAY BACK, second half (#434 Task 7): the LAST fallible step, and
+		// only for a rotation that is actually a rebind. The token is swapped,
+		// the departed dashboard's URL is gone and its Application Password
+		// revoked; what remains is the half of the replacement binding a
+		// token-only request runs on — the connect user. Phase B step (2)
+		// deleted `aura_worker_connect_user_id`, so the write above is not a
+		// refresh of an existing row but the ONLY thing that names this
+		// rotation's administrator, and it is verified by an uncached read
+		// before the refusal is lifted: proof of a POSITIVE id, because
+		// resolve_connect_user() ignores 0 and falls back to the first
+		// administrator, which is not the binding this rotation established.
+		//
+		// The verification is scoped to the marked site on purpose. On an
+		// ordinary rotation that write is a refresh whose failure costs
+		// nothing (the previous value, or the first-administrator fallback,
+		// still resolves an admin), and failing the whole rotation over it
+		// would throw away a token that WAS stored — #67's rule. Here it is
+		// half of a binding that must be complete before this site starts
+		// accepting mutations again.
+		//
+		// Every earlier exit — a lost swap, a superseded rotation — returns
+		// before this line, so the marker goes on refusing the old token and
+		// the half-installed new one alike.
+		if ( Aura_Worker_Unbind::is_set() ) {
+			$who = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
+			$who = is_wp_error( $who ) ? 0 : (int) maybe_unserialize( $who );
+			if ( $who <= 0 || $who !== get_current_user_id() ) {
+				Aura_Worker_Magic_Link::release_site( $site_fence );
+				wp_send_json_error(
+					array(
+						'message' => __( 'The new token was stored but this site could not record which administrator it runs as, so it stays disconnected. Try again.', 'digitizer-site-worker' ),
+						'code'    => 'aura_unbind_store_failed',
+					),
+					500
+				);
+			}
+			if ( ! Aura_Worker_Unbind::release_marker_after_rebind( $site_fence ) ) {
+				Aura_Worker_Magic_Link::release_site( $site_fence );
+				wp_send_json_error(
+					array(
+						'message' => __( 'The new token was stored but the previous disconnect record could not be cleared, so this site still refuses changes. Try again.', 'digitizer-site-worker' ),
+						'code'    => 'aura_unbind_store_failed',
+					),
+					500
+				);
+			}
 		}
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
 		Aura_Worker_Magic_Link::release_site( $site_fence );

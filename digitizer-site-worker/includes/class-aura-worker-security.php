@@ -27,6 +27,297 @@ class Aura_Worker_Security {
 	const TOKEN_FAILURE_WINDOW = 900; // 15 minutes.
 
 	/**
+	 * The UUID of the Application Password that authenticated THIS request, or
+	 * null when the request carried no Application Password (a token-only call,
+	 * or a cookie-authenticated one). Static, because WordPress hands it over
+	 * once, on a hook, long before any handler runs.
+	 *
+	 * Load-bearing for the unbind (#434, spec §2.3): the marker must carry
+	 * every credential that authenticated an unbind BEFORE Phase B revokes
+	 * them, or the core-REST seam would stop recognising a request made with a
+	 * password it never recorded — a manually connected site, or one whose
+	 * password Aura replaced through its PATCH, was never minted by SiteAgent
+	 * and so is not in the plugin's own bookkeeping option.
+	 *
+	 * @var string|null
+	 */
+	private static $authenticating_uuid = null;
+
+	/**
+	 * The user WordPress said that Application Password authenticated as —
+	 * captured from the SAME hook call that named the uuid, never re-derived
+	 * later from `get_current_user_id()`.
+	 *
+	 * The two are not the same fact (#434 Task 4, C4). `get_current_user_id()`
+	 * is whatever the request's current user is by the time a route callback
+	 * runs, and anything on `determine_current_user` after priority 20, or any
+	 * `wp_set_current_user()` on `init` / `rest_api_init` /
+	 * `rest_authentication_errors` — user-switching, SSO, membership "view as"
+	 * and impersonation plugins all do this routinely — moves it. The unbind
+	 * marker records this owner as KNOWLEDGE, and Phase B does exactly one
+	 * lookup against it: a wrong owner answering "not there" is how the site
+	 * token gets deleted beside a live administrator credential. So the
+	 * identity is taken from the writer that has it, and never re-derived.
+	 *
+	 * Null whenever the hook did not fire, or fired with something that is not
+	 * a WP_User with a positive ID: an explicit unknown, never 0.
+	 *
+	 * @var int|null
+	 */
+	private static $authenticating_user = null;
+
+	/**
+	 * The user this request was made to run as by Layer 2.5 — the token-only
+	 * path — or null when no such thing happened.
+	 *
+	 * This is the ONE statement that a request was authorised by the SITE
+	 * TOKEN ALONE. It cannot be recovered afterwards: `wp_set_current_user()`
+	 * leaves a request indistinguishable from one an Application Password
+	 * authenticated, and `aura_worker_connect_user_id` — the option Layer 2.5
+	 * resolved through — is deleted by Phase B of an unbind while the token
+	 * still works. So the fact is recorded where it happens.
+	 *
+	 * Null, never 0: a run-as that resolved nobody never happened (Layer 2.5
+	 * returns aura_not_configured instead), and 0 is not a user (#434 C1-C4).
+	 *
+	 * @since 2.13.0
+	 *
+	 * @var int|null
+	 */
+	private static $ran_as = null;
+
+	/**
+	 * The sha256 of the site token that AUTHENTICATED this request, captured
+	 * where the comparison is made.
+	 *
+	 * Phase A writes a marker naming "this site's token", read uncached under
+	 * the site claim — but the claim is taken AFTER authentication, and an
+	 * administrator can regenerate the token in between. The stale request
+	 * would then read the REPLACEMENT token and mark the new binding with it,
+	 * and a `final: true` body would go on to delete that fresh token
+	 * (Codex round-5 P1). The value that closes the window is the one the
+	 * request actually presented, so it is recorded where it is checked and
+	 * never re-derived from the option afterwards.
+	 *
+	 * Null, never '': no token authenticated this request at all.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @var string|null
+	 */
+	private static $auth_token_hash = null;
+
+	/**
+	 * Register the hook that captures the authenticating Application Password.
+	 * Called from Aura_Worker::init(); WordPress fires the hook during REST
+	 * authentication, which is earlier than any route callback.
+	 *
+	 * @return void
+	 */
+	public static function init() {
+		add_action( 'application_password_did_authenticate', array( __CLASS__, 'capture_app_password' ), 10, 2 );
+		add_filter( 'wp_authenticate_application_password_errors', array( __CLASS__, 'refuse_departed_credential' ), 10, 3 );
+	}
+
+	/**
+	 * REFUSE A DEPARTED BINDING'S CREDENTIAL WHEREVER IT AUTHENTICATES
+	 * (Codex round-4 P1).
+	 *
+	 * Phase B revokes the Application Passwords the departed binding used, and
+	 * when it cannot prove one gone the marker keeps the debt — the credential
+	 * stays live until an operator settles it. Until this hook, everything that
+	 * refused it was gated behind `is_agent_rest_request()`: the whole refusal
+	 * surface was REST. But WordPress authenticates Application Passwords on
+	 * every API surface it recognises, XML-RPC included, so the departed
+	 * administrator credential could go on creating, editing and deleting
+	 * content through `xmlrpc.php` for as long as the debt stood.
+	 *
+	 * The answer is the RULE rather than one more surface: refuse the
+	 * credential where WordPress decides whether it authenticates at all, so a
+	 * surface nobody has thought of yet is covered on the day core adds it.
+	 *
+	 * REST is left to its own seam, which answers 403 `aura_site_unbound` and
+	 * says why; a denial here would answer 401 and lose that. The test is "not
+	 * REST" rather than "is XML-RPC" for the same reason as above — and when
+	 * `REST_REQUEST` is not defined the request is refused, which is the safe
+	 * direction to be wrong in.
+	 *
+	 * An UNREADABLE marker refuses every Application Password on these
+	 * surfaces, not just a named one. It is the same ruling
+	 * `Aura_Worker_Rules::departed_binding_request()` already makes — unreadable
+	 * is not innocent — and it is stricter here only because authentication
+	 * cannot see whether an XML-RPC call means to read or to write. A site in
+	 * that state is one Aura has disconnected and whose credential list cannot
+	 * be read; cookie-authenticated admin access is untouched, and the settings
+	 * screen's repair is how it ends.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param WP_Error|mixed $error The running error object WordPress passes.
+	 * @param WP_User|mixed  $user  The user the password belongs to.
+	 * @param array|mixed    $item  The application password item, with its uuid.
+	 * @return WP_Error|mixed The error object, with a refusal added when due.
+	 */
+	public static function refuse_departed_credential( $error, $user = null, $item = null ) {
+		if ( ! is_wp_error( $error ) || $error->has_errors() ) {
+			return $error; // already refused by somebody with a better reason
+		}
+		// The SAME seam is_agent_rest_request() resolves REST through, so the
+		// two boundaries can never disagree about what a REST request is.
+		$is_rest = ( class_exists( 'Aura_Worker_Rules' ) && null !== Aura_Worker_Rules::$rest_request_override )
+			? (bool) Aura_Worker_Rules::$rest_request_override
+			: ( defined( 'REST_REQUEST' ) && REST_REQUEST );
+		if ( $is_rest ) {
+			return $error;
+		}
+		if ( ! class_exists( 'Aura_Worker_Unbind' ) ) {
+			return $error;
+		}
+		$marker = Aura_Worker_Unbind::read();
+		if ( null === $marker ) {
+			return $error; // no marker: this site is bound, and none of this applies
+		}
+		$uuid = is_array( $item ) && ! empty( $item['uuid'] ) ? (string) $item['uuid'] : '';
+		if ( is_array( $marker ) && ( '' === $uuid || ! in_array( $uuid, $marker['app_password_uuids'], true ) ) ) {
+			return $error; // a readable marker names its debts, and this is not one
+		}
+		$error->add(
+			'aura_site_unbound',
+			__( 'This site was disconnected from Aura. This credential belonged to the disconnected connection and no longer authenticates.', 'digitizer-site-worker' )
+		);
+		return $error;
+	}
+
+	/**
+	 * Record the authenticating password's UUID. Only the UUID — never the
+	 * password, never the hash: the UUID is an opaque identifier WordPress
+	 * already stores in user meta, and it is all the marker needs to recognise
+	 * the credential again.
+	 *
+	 * The USER travels with it (#434 Task 4, C4). WordPress hands this hook the
+	 * authoritative pairing — this password, that user — and it is the only
+	 * place the pairing exists as a statement rather than as a guess about the
+	 * request. It is recorded here and used verbatim; nothing downstream may
+	 * re-derive it from `get_current_user_id()`.
+	 *
+	 * Only a WP_User with a positive ID is an identity. Anything else — a
+	 * bare int, a stdClass, false, a WP_Error — is an explicit unknown; a cast
+	 * would turn a shape this code does not understand into a user id, which
+	 * is exactly the class of mistake rounds 1-4 of #434 are about.
+	 *
+	 * @param WP_User|mixed $user The authenticated user (WordPress passes it).
+	 * @param array|mixed   $item The application password item, with its uuid.
+	 * @return void
+	 */
+	public static function capture_app_password( $user, $item ) {
+		$uuid                        = is_array( $item ) && ! empty( $item['uuid'] ) ? (string) $item['uuid'] : null;
+		self::$authenticating_uuid   = $uuid;
+		// Paired: an item with no readable uuid names no password, so the user
+		// beside it identifies nothing either.
+		self::$authenticating_user   = ( null !== $uuid && $user instanceof WP_User && (int) $user->ID > 0 ) ? (int) $user->ID : null;
+	}
+
+	/**
+	 * Record the site-token hash a request authenticated with. Called by
+	 * check_aura_token() at the moment the comparison succeeds — and by tests,
+	 * which cannot reach that private method.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $hash The sha256 of the presented token.
+	 * @return void
+	 */
+	public static function capture_token_auth( string $hash ) {
+		self::$auth_token_hash = '' === $hash ? null : $hash;
+	}
+
+	/**
+	 * The site-token hash that authenticated this request, or null when no
+	 * token did.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return string|null
+	 */
+	public static function authenticated_token_hash() {
+		return self::$auth_token_hash;
+	}
+
+	/**
+	 * The UUID of the Application Password that authenticated this request.
+	 *
+	 * @return string|null
+	 */
+	public static function authenticating_app_password_uuid() {
+		return self::$authenticating_uuid;
+	}
+
+	/**
+	 * The user WordPress named beside that Application Password, or null when
+	 * no hook fired (or it named nothing usable). Never 0 — an owner that
+	 * names nobody must not be written where a user id is read (#434 C1-C4).
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return int|null
+	 */
+	public static function authenticating_app_password_user() {
+		return self::$authenticating_user;
+	}
+
+	/**
+	 * The user Layer 2.5 ran this request as, or null when this request was
+	 * not authorised by the site token alone.
+	 *
+	 * A non-null answer is proof of the token path, and — while the unbind
+	 * marker is set — proof of the DEPARTED binding: Phase B deletes the site
+	 * token last, so the only token that can still reach Layer 2.5 at a marked
+	 * site is the one the departed binding was issued (a rebind clears the
+	 * marker before it issues another). The user id it resolved to proves
+	 * nothing on its own — see Aura_Worker_Rules::departed_binding_request().
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return int|null
+	 */
+	public static function ran_as_token() {
+		return self::$ran_as;
+	}
+
+	/**
+	 * Set the run-as user directly.
+	 *
+	 * @internal Tests only — production sets this from Layer 2.5 below.
+	 *
+	 * @param int|null $user The user id, or null for "this request took no
+	 *                       run-as path". Anything that is not a positive int
+	 *                       is that same null: a run-as that named nobody
+	 *                       never happened.
+	 * @return void
+	 */
+	public static function _set_ran_as_for_tests( $user ) {
+		self::$ran_as = ( null === $user || (int) $user <= 0 ) ? null : (int) $user;
+	}
+
+	/**
+	 * Set the captured UUID directly.
+	 *
+	 * @internal Tests only — production sets this from the WordPress hook above.
+	 *
+	 * @param string|null $uuid The uuid, or null for a token-only request.
+	 * @param int|null    $user The user WordPress named beside it, as the real
+	 *                          hook does. Omitted (or <= 0) models a uuid that
+	 *                          reached the request with no identity attached —
+	 *                          an explicit unknown, exactly as production
+	 *                          records when the hook did not fire.
+	 * @return void
+	 */
+	public static function _set_authenticating_uuid_for_tests( $uuid, $user = null ) {
+		self::$authenticating_uuid = null === $uuid ? null : (string) $uuid;
+		self::$authenticating_user = ( null === $uuid || null === $user || (int) $user <= 0 ) ? null : (int) $user;
+	}
+
+	/**
 	 * Hash a raw site token for storage / comparison.
 	 *
 	 * Tokens are stored as a SHA-256 hash so a database leak does not expose a
@@ -90,6 +381,12 @@ class Aura_Worker_Security {
 				);
 			}
 			wp_set_current_user( $run_as );
+			// Recorded here because here is the only place it is a FACT rather
+			// than a guess. After this line the request looks exactly like an
+			// application-password one, and the option that produced $run_as is
+			// deleted by Phase B of an unbind while this same token still
+			// authenticates (#434 Task 6).
+			self::$ran_as = (int) $run_as;
 
 			/**
 			 * Fires when a request is authorized by its Aura site token alone
@@ -235,15 +532,17 @@ class Aura_Worker_Security {
 		// Successful auth clears the failure counter for this IP.
 		delete_transient( $this->token_failure_key() );
 
+		self::capture_token_auth( self::hash_token( $provided_token ) );
 		return true;
 	}
 
 	/**
 	 * Resolve the administrator to run token-only requests as.
 	 *
-	 * Prefers the stored connecting admin; falls back to the first administrator.
-	 * The returned user MUST hold manage_options so a token can never grant more
-	 * than an administrator already has.
+	 * Prefers the stored connecting admin, then the identity the unbind marker
+	 * captured, then the first administrator. The returned user MUST hold
+	 * manage_options so a token can never grant more than an administrator
+	 * already has.
 	 *
 	 * @return int User ID, or 0 if no suitable administrator exists.
 	 */
@@ -251,6 +550,29 @@ class Aura_Worker_Security {
 		$stored = (int) get_option( 'aura_worker_connect_user_id', 0 );
 		if ( $stored > 0 && user_can( $stored, 'manage_options' ) ) {
 			return $stored;
+		}
+
+		// THE MARKER REMEMBERS WHO THIS SITE RAN AS (Codex round-5 P2).
+		//
+		// Phase B step (2) deletes `aura_worker_connect_user_id` while the
+		// token deliberately lives on, so from that moment a marked site
+		// resolves through the fallback below — which asks for the literal
+		// `administrator` ROLE. Every other check in this plugin asks for the
+		// CAPABILITY, and the two are not the same set: a site whose connecting
+		// user holds manage_options through a custom role, with nobody holding
+		// the administrator role, resolves NOBODY. Its own token-only /rules
+		// retry then fails before it can reach the marker's fast path, and the
+		// final cleanup can never be delivered — the site keeps its token and
+		// its marker forever.
+		//
+		// Phase A captured the identity before the delete. It is the same fact,
+		// still true, and still gated on the capability below.
+		if ( class_exists( 'Aura_Worker_Unbind' ) ) {
+			$marker = Aura_Worker_Unbind::read();
+			$marked = is_array( $marker ) ? (int) ( $marker['connect_user_id'] ?? 0 ) : 0;
+			if ( $marked > 0 && user_can( $marked, 'manage_options' ) ) {
+				return $marked;
+			}
 		}
 
 		$admins = get_users(
@@ -319,6 +641,55 @@ class Aura_Worker_Security {
 	}
 
 	/**
+	 * Refuse a mutation at an UNBOUND site (#434 Phase A).
+	 *
+	 * From the moment the marker is written under the site claim, this site is
+	 * no longer Aura's to command: every mutation is refused with
+	 * 403 aura_site_unbound while reads keep working, and it stays refused
+	 * until the site is reconnected. That has to hold against a caller holding
+	 * a perfectly valid site token — a stale automation, a queued job, a
+	 * retried run — because the credentials outlive the binding by design:
+	 * Phase B deletes the token LAST, so there is a window in which the token
+	 * still authenticates and the site must still refuse.
+	 *
+	 * Called by every mutating permission callback AFTER validate_request()
+	 * has succeeded, never before it: a caller who cannot prove it holds the
+	 * token gets the token layer's answer and learns nothing about whether
+	 * this site is bound.
+	 *
+	 * Uses is_set(), not is_set_strict(), deliberately. is_set() answers TRUE
+	 * when the marker cannot be READ, and at a refusal boundary that is the
+	 * only defensible answer: an unreadable marker is not a clean site, and a
+	 * database blip must not re-open every write on a site that was
+	 * disconnected. is_set_strict() exists for callers that need to tell a
+	 * failed read from a clean one; here the two lead to the same refusal, so
+	 * the simpler contract is the honest one.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param WP_REST_Request $request The incoming request.
+	 * @return bool|WP_Error True when the site may still act, WP_Error when it may not.
+	 */
+	public function refuse_if_unbound( $request ) {
+		if ( ! Aura_Worker_Unbind::is_set() ) {
+			return true;
+		}
+
+		// The unbind envelope — and every retry of it — arrives on
+		// /aura/v2/rules, which Task 3 answers from the marker fast path. A
+		// site that refused this route could not be told anything, including
+		// that it is unbound. The pattern (anchored at BOTH ends, round-1
+		// MINOR-3) lives on Aura_Worker_Unbind, because the core-REST boundary
+		// added in Task 6 must exempt exactly the same route and a second copy
+		// could drift.
+		if ( Aura_Worker_Unbind::is_rules_route( (string) $request->get_route() ) ) {
+			return true;
+		}
+
+		return Aura_Worker_Unbind::refusal();
+	}
+
+	/**
 	 * Permission callback for REST routes requiring admin access.
 	 *
 	 * @param WP_REST_Request $request The incoming request.
@@ -329,6 +700,12 @@ class Aura_Worker_Security {
 		$valid = $this->validate_request( $request );
 		if ( is_wp_error( $valid ) ) {
 			return $valid;
+		}
+
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
 		}
 
 		// Then check WordPress capability.
@@ -355,6 +732,12 @@ class Aura_Worker_Security {
 			return $valid;
 		}
 
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
+		}
+
 		if ( ! current_user_can( 'update_plugins' ) ) {
 			return new WP_Error(
 				'aura_insufficient_permissions',
@@ -378,6 +761,12 @@ class Aura_Worker_Security {
 			return $valid;
 		}
 
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
+		}
+
 		if ( ! current_user_can( 'update_core' ) ) {
 			return new WP_Error(
 				'aura_insufficient_permissions',
@@ -399,6 +788,12 @@ class Aura_Worker_Security {
 		$valid = $this->validate_request( $request );
 		if ( is_wp_error( $valid ) ) {
 			return $valid;
+		}
+
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
 		}
 
 		if ( ! current_user_can( 'update_themes' ) ) {

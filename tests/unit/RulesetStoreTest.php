@@ -18,20 +18,12 @@ final class RulesetStoreTest extends TestCase {
 		if ( ! function_exists( 'sodium_crypto_sign_keypair' ) ) {
 			$this->markTestSkipped( 'ext-sodium is not available.' );
 		}
-		$kp           = sodium_crypto_sign_keypair();
-		$this->secret = sodium_crypto_sign_secretkey( $kp );
-		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( sodium_crypto_sign_publickey( $kp ) );
-	}
-
-	private function b64url( string $s ): string {
-		return rtrim( strtr( base64_encode( $s ), '+/', '-_' ), '=' );
+		$this->secret = sa_install_gateway_key();
 	}
 
 	/** Sign an arbitrary array the way Aura signs a ruleset. */
 	private function sign( array $payload, ?string $secret = null ): string {
-		$json = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
-		$sig  = sodium_crypto_sign_detached( $json, $secret ?? $this->secret );
-		return $this->b64url( $json ) . '.' . $this->b64url( $sig );
+		return sa_sign_ruleset( $payload, $secret ?? $this->secret );
 	}
 
 	public function test_a_validly_signed_document_decodes(): void {
@@ -78,10 +70,7 @@ final class RulesetStoreTest extends TestCase {
 
 	/** This site's token hash — the ruleset is bound to it exactly as grants are. */
 	private function site(): string {
-		if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
-			$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'raw-site-token' );
-		}
-		return (string) $GLOBALS['_options']['aura_worker_site_token'];
+		return sa_token_hash();
 	}
 
 	private function ruleset( int $seq, array $rules = array(), ?string $secret = null, ?string $client = null, ?string $site = null, ?string $site_ref = null ): string {
@@ -108,6 +97,52 @@ final class RulesetStoreTest extends TestCase {
 			'target' => array( 'type' => 'site' ),
 			'reason' => 'deploy night',
 		);
+	}
+
+	/**
+	 * The exact record accept_under_claim() would have stored for a racing
+	 * push of $seq — built by hand, not via a nested Aura_Worker_Rules::accept()
+	 * call. #434 review round 1: accept() now takes the site-wide claim for
+	 * its whole decision, so a genuinely concurrent accept() call can no
+	 * longer land between this call's read and its write — the claim itself
+	 * refuses it (503 aura_site_busy), writing nothing. A racer modeled as a
+	 * nested accept() is therefore either silently blocked (looks like a win
+	 * but tests nothing) or, if it happens to run before the outer claim
+	 * lands, wins for the wrong reason. Every racing-write test in this file
+	 * instead arms a seam to write this shape directly into the row, at the
+	 * exact point a real racing INSERT/UPDATE would have landed.
+	 *
+	 * @param int   $seq   The racer's seq.
+	 * @param array $rules The racer's rules.
+	 * @return array
+	 */
+	private function racing_record( int $seq, array $rules = array(), string $site_ref = '' ): array {
+		return array(
+			'envelope'    => $this->ruleset( $seq, $rules, null, null, null, '' !== $site_ref ? $site_ref : null ),
+			'client'      => 'client-1',
+			'token_hash'  => $this->site(),
+			'site_ref'    => $site_ref,
+			'seq'         => $seq,
+			'issued_at'   => gmdate( 'c', 1_800_000_000 + $seq ),
+			'received_at' => time(),
+			'rules'       => $rules,
+		);
+	}
+
+	/**
+	 * Arm $seam ('_sa_before_swap' or '_sa_after_store_read') to write
+	 * $record's bytes straight into the option row, once, self-clearing —
+	 * see racing_record().
+	 *
+	 * @param string $seam   '_sa_before_swap' or '_sa_after_store_read'.
+	 * @param array  $record From racing_record().
+	 */
+	private function install_racer( string $seam, array $record ): void {
+		$GLOBALS[ $seam ] = function () use ( $seam, $record ) {
+			$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ]    = maybe_serialize( $record );
+			$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = $record;
+			$GLOBALS[ $seam ] = null;
+		};
 	}
 
 	public function test_a_first_ruleset_is_stored(): void {
@@ -145,10 +180,19 @@ final class RulesetStoreTest extends TestCase {
 		// Two pushes overlap: a retry of seq 6 has already passed the seq check
 		// against the stored seq 5 when a fresh seq 7 lands. Without a
 		// compare-and-swap the retry writes last and policy rolls backwards —
-		// the block the operator added in seq 7 silently disappears. The racer
-		// is injected by the $wpdb stub between this call's read and its write.
+		// the block the operator added in seq 7 silently disappears.
+		//
+		// #434: accept() now runs its whole decision under the site-wide
+		// claim, so a SECOND accept() can no longer land between this one's
+		// read and its write — the claim itself serializes that (a nested
+		// accept() here would just meet 503 aura_site_busy, same as the
+		// tests above named after it). What the CAS still defends against is
+		// the stored row changing by some OTHER means while a decision is in
+		// flight, so the racer is modeled as a direct row mutation — via the
+		// same after-store-read seam the connect-interleaving tests below use
+		// — landing exactly between this call's read and its write.
 		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
-		$GLOBALS['_cas_racer'] = $this->ruleset( 7, array( $this->freeze() ) );
+		$this->install_racer( '_sa_after_store_read', $this->racing_record( 7, array( $this->freeze() ) ) );
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 6 ) );
 
@@ -161,8 +205,12 @@ final class RulesetStoreTest extends TestCase {
 	public function test_a_racing_newer_push_still_installs_after_a_lost_swap(): void {
 		// The mirror image: losing the swap is not a refusal. Seq 9 re-reads,
 		// finds the racer's 7, and installs — one retry, not an error.
+		//
+		// #434 review round 1 (C2): a nested accept() call can no longer model
+		// the racer (the claim already held by the outer call blocks it), so
+		// the racer's write is modeled directly, as in the test above.
 		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
-		$GLOBALS['_cas_racer'] = $this->ruleset( 7, array( $this->freeze() ) );
+		$this->install_racer( '_sa_after_store_read', $this->racing_record( 7, array( $this->freeze() ) ) );
 
 		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 9 ) ) );
 		$this->assertSame( 9, Aura_Worker_Rules::current()['seq'] );
@@ -176,7 +224,23 @@ final class RulesetStoreTest extends TestCase {
 		// UPDATE`. When the INSERT reports 0 rows affected (a row is already
 		// there), the loser must classify that from an actual re-read of the
 		// row — a real SELECT against $wpdb — never from get_option().
-		$GLOBALS['_insert_racer'] = $this->ruleset( 8, array( $this->freeze() ) );
+		//
+		// #434 review round 1 (C1): the racer can no longer be a nested
+		// accept() call (the site claim this call already holds would refuse
+		// it, 503, writing nothing) — its win is modeled directly at the row,
+		// timed to land exactly where insert_if_absent()'s own conditional
+		// INSERT checks for one.
+		$racer                       = $this->racing_record( 8, array( $this->freeze() ) );
+		$GLOBALS['_sa_before_swap'] = function () use ( $racer ) {
+			$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ]    = maybe_serialize( $racer );
+			$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = $racer;
+			// Isolate from here: the claim's own take (just above this call in
+			// the stack) also evicts notoptions, and this assertion is
+			// specifically about insert_if_absent()'s LOSING branch doing its
+			// own eviction, not about the claim's.
+			$GLOBALS['_cache_deletes']   = array();
+			$GLOBALS['_sa_before_swap'] = null;
+		};
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
 
@@ -189,26 +253,17 @@ final class RulesetStoreTest extends TestCase {
 			static fn( $q ) => false !== strpos( $q, 'SELECT option_value' )
 		);
 		$this->assertNotEmpty( $reread, 'the lost INSERT must be classified by re-reading the row, not by trusting a cache' );
-		// insert_if_absent() must evict `notoptions` on this losing branch too,
-		// not only when it wins: real get_option() lists the key in
-		// `notoptions` on the very miss that sent us into this INSERT, and that
-		// cache entry would otherwise short-circuit every later current() in
-		// this request to null even though a valid ruleset (seq 8) now sits in
-		// the row we just lost the race for. The stub simulates the racer by
-		// calling accept() recursively (see bootstrap.php `query()`), which
-		// itself wins and evicts once via the pre-existing winning branch — so
-		// a plain "contains" check would pass even without this fix. Count the
-		// occurrences instead: the recursive winner accounts for exactly one,
-		// and this call's own losing branch must contribute a second.
+		// insert_if_absent() must evict `notoptions` on this losing branch
+		// too, not only when it wins: real get_option() lists the key in
+		// `notoptions` on the very miss that sent us into this INSERT, and
+		// that cache entry would otherwise short-circuit every later
+		// current() in this request to null even though a valid ruleset
+		// (seq 8) now sits in the row we just lost the race for.
 		$notoptions_evictions = array_filter(
 			$GLOBALS['_cache_deletes'],
 			static fn( $d ) => $d === array( 'key' => 'notoptions', 'group' => 'options' )
 		);
-		$this->assertGreaterThanOrEqual(
-			2,
-			count( $notoptions_evictions ),
-			'the losing branch itself must also evict notoptions, not only the nested race winner'
-		);
+		$this->assertNotEmpty( $notoptions_evictions, 'the losing branch itself must evict notoptions' );
 	}
 
 	public function test_two_first_pushes_racing_do_not_let_the_older_one_win(): void {
@@ -218,7 +273,10 @@ final class RulesetStoreTest extends TestCase {
 		// between. The loser must re-decide, NOT read the winner's row and
 		// swap against it — that would install seq 2 over seq 8 without ever
 		// comparing them, which is the rollback one level down.
-		$GLOBALS['_insert_racer'] = $this->ruleset( 8, array( $this->freeze() ) );
+		//
+		// #434 review round 1 (C1): modeled at the row directly — see
+		// racing_record()'s docblock.
+		$this->install_racer( '_sa_before_swap', $this->racing_record( 8, array( $this->freeze() ) ) );
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
 
@@ -239,7 +297,9 @@ final class RulesetStoreTest extends TestCase {
 		// on purpose. A lost race ends in the ordinary re-decision against
 		// the winner's row, never in 500 aura_ruleset_store_failed while the
 		// winner sits installed.
-		$GLOBALS['_insert_racer']   = $this->ruleset( 8, array( $this->freeze() ) );
+		//
+		// #434 review round 1 (C1): modeled at the row directly.
+		$this->install_racer( '_sa_before_swap', $this->racing_record( 8, array( $this->freeze() ) ) );
 		$GLOBALS['_db_query_error'] = 'duplicate';
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 2 ) );
@@ -253,7 +313,9 @@ final class RulesetStoreTest extends TestCase {
 		// The mirror image of the test above: losing the INSERT to the unique
 		// index is not a refusal. Seq 9 re-reads, finds the racer's 5, and
 		// installs over it by CAS — one retry, not an error.
-		$GLOBALS['_insert_racer']   = $this->ruleset( 5 );
+		//
+		// #434 review round 1 (C1): modeled at the row directly.
+		$this->install_racer( '_sa_before_swap', $this->racing_record( 5 ) );
 		$GLOBALS['_db_query_error'] = 'duplicate';
 
 		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 9 ) ) );
@@ -266,6 +328,11 @@ final class RulesetStoreTest extends TestCase {
 		// the INSERT, which waits the full innodb_lock_wait_timeout again —
 		// up to MAX_SWAP_ATTEMPTS times, minutes for one REST request. One
 		// statement, one 500; Aura retries later, this request does not.
+		//
+		// #434: accept() now takes the site claim first, which issues its OWN
+		// conditional INSERT — the SAME SQL shape as the ruleset's — but the
+		// stub (review round 1, C1) scopes this flag to the ruleset's own
+		// insert specifically, so setting it up front still hits only that.
 		$GLOBALS['_db_query_error'] = true;
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
@@ -274,7 +341,7 @@ final class RulesetStoreTest extends TestCase {
 		$this->assertSame( 'aura_ruleset_store_failed', $res->get_error_code() );
 		$inserts = array_filter(
 			$GLOBALS['_db_queries'],
-			static fn( $q ) => false !== strpos( $q, 'WHERE NOT EXISTS' )
+			static fn( $q ) => false !== strpos( $q, 'WHERE NOT EXISTS' ) && false !== strpos( $q, Aura_Worker_Rules::OPTION )
 		);
 		$this->assertCount( 1, $inserts, 'a failed INSERT with no row behind it was retried' );
 	}
@@ -286,6 +353,11 @@ final class RulesetStoreTest extends TestCase {
 		// statement" (false — a hard error). Reporting contention here would
 		// send Aura chasing a race that never happened while the site holds
 		// no policy at all.
+		//
+		// #434: the claim's own insert (which now precedes every accept())
+		// shares this INSERT's SQL shape, but the stub (review round 1, C1)
+		// scopes this flag to the ruleset's own insert, so it still meets
+		// only that.
 		$GLOBALS['_db_query_error'] = true;
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 1 ) );
@@ -338,6 +410,10 @@ final class RulesetStoreTest extends TestCase {
 		// nothing". Reading both as "lost the race" would retry a broken
 		// database until the stack gives out.
 		Aura_Worker_Rules::accept( $this->ruleset( 5 ) );
+		// #434: the claim's own insert (which now precedes every accept())
+		// is a different SQL shape (INSERT, not this UPDATE) and is
+		// unaffected either way; this flag meets the ruleset's own CAS
+		// UPDATE below.
 		$GLOBALS['_db_query_error'] = true;
 
 		$res = Aura_Worker_Rules::accept( $this->ruleset( 6 ) );
@@ -501,8 +577,16 @@ final class RulesetStoreTest extends TestCase {
 		// And refused on the FIRST pass, without attempting a write: read
 		// token-then-store, this document would pass wrong_site against the
 		// pre-connect token, swap, lose, and only then re-decide.
+		//
+		// #434: accept() now issues its OWN insert first, to take the site
+		// claim — an unrelated option (aura_worker_connect_lock), which the
+		// filter below must not mistake for a write against the ruleset.
 		$this->assertEmpty(
-			array_filter( $GLOBALS['_db_queries'], static fn( $q ) => false !== strpos( $q, 'UPDATE ' ) || false !== strpos( $q, 'INSERT ' ) ),
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static fn( $q ) => ( false !== strpos( $q, 'UPDATE ' ) || false !== strpos( $q, 'INSERT ' ) )
+					&& false !== strpos( $q, Aura_Worker_Rules::OPTION )
+			),
 			'the token was read before the store: a write was attempted against a value the connect had already replaced'
 		);
 	}
@@ -767,9 +851,14 @@ final class RulesetStoreTest extends TestCase {
 		// so the question the repair answers — "does the record carry it?" —
 		// is already true, and reporting failure would hold the marker back
 		// forever on a busy site.
+		//
+		// #434 review round 1 (I3): backfill_from_stored_envelope() now also
+		// takes the site claim before its write, so — same as every other
+		// racing-write test in this file — the racer can no longer be a
+		// nested accept() call; modeled at the row directly.
 		$this->assertTrue( Aura_Worker_Rules::accept( $this->ruleset( 3, array(), null, null, null, 'res_abc' ) ) );
 		$this->downgrade_record_to_2_11();
-		$GLOBALS['_cas_racer'] = $this->ruleset( 4, array(), null, null, null, 'res_abc' );
+		$this->install_racer( '_sa_before_swap', $this->racing_record( 4, array(), 'res_abc' ) );
 
 		$this->assertTrue( Aura_Worker_Rules::backfill_from_stored_envelope() );
 		$this->assertSame( 'res_abc', Aura_Worker_Rules::stored()['site_ref'] );

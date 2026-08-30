@@ -57,7 +57,8 @@ svn rm tags/2.0.0-beta.1 tags/2.0.0-beta.2
 # svn rm tags/1.3.3 tags/1.3.4 tags/1.3.5
 
 # 3. Confirm readme's Stable tag points at the current stable, never a beta.
-grep -i "Stable tag" trunk/readme.txt        # must read: Stable tag: 2.7.1
+grep -i "Stable tag" trunk/readme.txt        # must name the current stable release,
+                                             # never a beta and never a pruned tag
 
 # 4. Commit.
 svn ci -m "Prune pre-release (and legacy) tags from the wp.org dropdown"

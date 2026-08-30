@@ -3,7 +3,7 @@
  * Plugin Name:       SiteAgent for Aura
  * Plugin URI:        https://my-aura.app/siteagent
  * Description:       Remote site management agent for Aura dashboard. Enables secure updates, health monitoring, and maintenance operations via REST API.
- * Version:           2.12.0
+ * Version:           2.13.0
  * Requires at least: 6.2
  * Requires PHP:      7.4
  * Author:            Digitizer
@@ -18,11 +18,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'AURA_WORKER_VERSION', '2.12.0' );
+define( 'AURA_WORKER_VERSION', '2.13.0' );
 define( 'AURA_WORKER_FILE', __FILE__ );
 define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 
 // Load dependencies.
+// The one rule the marker's credential list is read by — a pure function file
+// with no side effects, so uninstall.php can require it without loading the
+// plugin (#434).
+require_once AURA_WORKER_DIR . 'includes/credential-rules.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-api.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-updater.php';
@@ -36,6 +40,7 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-call-context.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-rules.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-abilities.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-unbind.php';
 
 /**
  * Initialize the plugin.

@@ -105,6 +105,81 @@ Onboarding via magic link is **HMAC-signed**: the `/connect` callback carries a 
 | `GET` | `/health` | HTTP, PHP fatals, white-screen, and DB connectivity checks |
 | `POST` | `/update/batch` | Chunked batch updates with auto-rollback on health failure |
 | `POST` | `/rollback/{plugin}` | Restore a plugin from its most recent zip backup |
+| `POST` | `/snapshot` / `/snapshot/restore` / `GET` `/snapshots` | Content snapshots taken before a reversible write |
+| `POST` | `/rules` | Receive Aura's signed operator ruleset — and, carrying `unbind`, end this site's binding (see below) |
+
+### Site unbind — `POST /aura/v2/rules` with `unbind: true`
+
+Aura ends a binding in two phases. **Phase A** records a disconnect marker
+(`aura_worker_unbound`, autoload `no`) under the site claim; **Phase B** revokes the
+Application Password(s) Aura minted, clears the ruleset store, the gateway public key and
+the connect bookkeeping, and deletes the site token **last** — and only when Aura's
+document says `final: true`. Phase B is idempotent, runs in one fixed order, continues past
+a step that failed, and an interrupted unbind finishes itself on the site's next page load
+(throttled to once per 5 minutes).
+
+While the marker is set, **every mutation is refused** with `403 aura_site_unbound` —
+SiteAgent's own write routes, MCP write tools, grant verification, and WordPress core REST
+writes made *as the departed binding* (identified by the marker's Application Password
+UUIDs, or by the site-token run-as path — never by whatever credentials happen to be live).
+Reads stay reachable, and so do `POST /aura/v1/connect` (the way back), `POST /aura/mcp/tools/preview`
+and `POST /aura/v2/rules` itself.
+
+Two request forms:
+
+| Form | Body | Accepted when |
+|------|------|---------------|
+| Enveloped | the signed ruleset document, with `unbind: true` (and `final`) | the site holds a usable gateway public key |
+| Bare | `{ "unbind": true, "client", "site_ref", "seq", "final" }`, authenticated by the site token alone | the site holds **no** gateway key (a manual connect). A keyed site answers `400 aura_ruleset_rejected` |
+
+The answer (both forms):
+
+```json
+{ "success": true, "seq": 7, "unbound": true, "cleanup_complete": false,
+  "leftovers": ["app_passwords"] }
+```
+
+`leftovers` names what this site still owes — `app_passwords`, `options`, `ruleset`,
+`grant_pubkey`. **Empty** means only the shared site token was outstanding; **non-empty**
+names a credential or store the site could not *prove* released; an answer carrying **no**
+`leftovers` at all must be read as "something may be owed" (the transport's own default is
+the full fail-closed list).
+
+Reconnecting settles the debt first: both the magic-link `/connect` callback and
+**Regenerate Token** run Phase B steps 1–4 *before* installing a new token, and delete the
+marker only after the replacement binding is installed and read back — a failed swap leaves
+the marker still refusing the old binding.
+
+`GET /aura/v1/status` reports, each as a JSON object whose *presence* is the signal:
+
+| Key | Shape | Meaning |
+|-----|-------|---------|
+| `unbound` | `{ at, site_ref }` | a disconnect is outstanding (fields may be absent if the record is damaged) |
+| `app_password_probe_unproven` | `{ count, at, owner }` | bounded, saturating count of probes that could not prove an Application Password gone — the usual reason an unbind never completes |
+
+### Ruleset / unbind error codes
+
+| Code | Status | Meaning |
+|------|--------|---------|
+| `aura_ruleset_rejected` | 400 | the document (or bare unbind body) is malformed or unsupported |
+| `no_gateway_key` | 412 | this site cannot verify anything — reconnect it. Skipped for the bare unbind form and for an already-unbound site, which must stay able to finish |
+| `aura_ruleset_wrong_site` | 403 | not issued for this site |
+| `aura_ruleset_stale` | 409 | `seq` is not newer than what the site already holds |
+| `aura_ruleset_client_mismatch` | 409 | issued for a different Aura client than the one this site is bound to — checked on the bare unbind form too |
+| `aura_ruleset_contended` | 503 | another writer won the swap; retry |
+| `aura_ruleset_store_failed` | 500 | the store could not be written or read back |
+| `aura_site_busy` | 503 | another Aura operation holds the site claim; retry |
+| `aura_site_unbound` | 403 | this site was disconnected by Aura; reconnect it |
+| `aura_unbind_store_failed` | 500 | the disconnect record, or a write the reconnect depends on, could not be stored |
+| `aura_unbind_marker_malformed` | 500 | the disconnect record exists but does not parse — repairable from the settings screen |
+| `aura_unbind_incomplete` | 409 | something is still owed; the answer lists `leftover[]` and any `unattributed[]` Application Password UUIDs |
+| `aura_unbind_unreadable` | 409 | the disconnect record could not be **read** — distinct from an incomplete cleanup; nothing was claimed or changed |
+| `aura_unbind_unrepairable` | 409 | a damaged record could not be rebuilt |
+| `aura_not_unbound` | 409 | there is no disconnect to clear |
+| `aura_unbind_marker_stuck` | 500 | everything Aura installed was removed, but the record itself would not delete, so the site still refuses changes |
+
+`aura_unbind_*` codes from the admin teardown are returned by the `aura_worker_remove_aura_data`
+admin-ajax action, not by a REST route.
 
 ### MCP namespace — `/wp-json/aura/mcp/`
 
@@ -151,6 +226,82 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.13.0
+
+**Feature — two-phase site unbind.** Aura can now disconnect a site in two phases,
+and the site starts refusing changes the moment it is told to. A clear carrying
+`unbind: true` is recorded under the site claim, and from then on every mutation —
+SiteAgent's own write endpoints, MCP write tools, grant-signed calls, and any
+WordPress REST write made with the Application Password or the site token of the
+departing connection — answers `403 aura_site_unbound` until the site is reconnected.
+Reads keep working, `/status` keeps answering, and `POST /aura/v2/rules` stays
+reachable so the disconnect can be finished or retried. The cleanup that follows is
+proven rather than assumed: the Application Password(s) Aura minted are revoked, the
+ruleset store, gateway public key and connect bookkeeping are cleared, and the site
+token is deleted **last**, only when Aura says `final: true`. Every step is idempotent,
+runs in one fixed order, and continues past a step that failed; an interrupted unbind
+finishes itself on the site's next page load, throttled to once every five minutes, so
+a site Aura can no longer reach still converges.
+
+**Feature — the answer says what is still owed.** Both the enveloped and the bare
+unbind answers, and the `/rules` response, now carry `leftovers: string[]` beside
+`cleanup_complete`: an empty list means only the shared site token was outstanding, a
+non-empty one names a credential or store this site could not prove released
+(`app_passwords`, `options`, `ruleset`, `grant_pubkey`), and an answer carrying no
+list at all is read as "something may be owed" — the transport's default fails closed.
+
+**Feature — unkeyed sites, and the settings screen.** A manually connected site (no
+gateway public key, so it can verify nothing) accepts the bare
+`{ "unbind": true, "client", "site_ref", "seq", "final" }` body on `POST /aura/v2/rules`,
+authenticated by the site token alone; a keyed site refuses the bare form and requires
+the signed envelope. The settings screen shows "Disconnected by Aura at …" and offers
+**Remove remaining Aura data**, an admin-initiated teardown that runs the same proven
+cleanup and clears the disconnect record only once everything it names — the site token
+included — is gone.
+
+**Safety.** Every ruleset push now runs under the same site-wide claim the connect flow
+uses, so a push, an unbind and a reconnect can no longer interleave; a busy site answers
+`503 aura_site_busy` (retryable), and a claim stranded by a killed request is taken over
+after 120 s instead of blocking the site. Both reconnect paths — the magic-link connect
+callback and **Regenerate Token** — settle the previous binding's outstanding cleanup
+*before* installing a new token, and release the marker only after the replacement
+binding is installed and read back, so a failed swap leaves the marker still refusing the
+old binding rather than quietly reviving it.
+
+**Fix.** A disconnect record that cannot be parsed is now **repaired** — rebuilt from the
+site's own state, under the claim — and then torn down through the ordinary path. It was
+previously a permanent dead end: the site refused every change and no control could clear
+it. A record that could not be *read* is reported separately (`aura_unbind_unreadable`)
+rather than being mistaken for an incomplete cleanup, and nothing is repaired on a
+database blip.
+
+**Diagnostics.** `/status` reports `unbound: { at, site_ref }` while the marker is set —
+always a JSON object, even when no field is readable — and
+`app_password_probe_unproven: { count, at, owner }` (bounded, saturating count) when a
+probe could not prove an Application Password gone, which is the usual reason an unbind
+never completes.
+
+**New error codes:** `aura_site_unbound` (403), `aura_site_busy` (503),
+`aura_unbind_incomplete` (409, with `leftover[]` / `unattributed[]`),
+`aura_unbind_unreadable` (409), `aura_unbind_unrepairable` (409), `aura_not_unbound`
+(409), `aura_unbind_marker_stuck` (500), `aura_unbind_marker_malformed` (500),
+`aura_unbind_store_failed` (500), and `aura_ruleset_client_mismatch` (409), now checked
+by the bare unkeyed form too.
+
+**Compatibility:** a 2.13 site that is never sent an unbind behaves exactly as 2.12 did.
+
+### 2.12.0
+
+**Feature:** a rule can apply to some of a client's sites instead of all of them. Aura's
+signed ruleset names the site each document was issued for, SiteAgent stores that
+identity, and a rule that lists the sites it applies to is enforced only where it
+belongs; rules that name no sites stay client-wide. A site that cannot prove its own
+identity — an older record, a document issued before the field existed — enforces *every*
+rule rather than skipping the ones it cannot place: scoping only ever narrows on proof.
+The identity is recovered offline from the ruleset already stored, by re-verifying its
+signature locally, so no new network traffic is needed and a site whose ruleset has not
+changed is repaired on its next request.
 
 ### 2.11.0
 

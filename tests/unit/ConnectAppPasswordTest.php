@@ -276,6 +276,28 @@ final class ConnectAppPasswordTest extends TestCase {
 		$this->assertStringContainsString( 'Aura_Worker_Magic_Link::revoke_managed_password( $site_fence )', $src );
 	}
 
+	/**
+	 * #434 round-4 I5, at the caller a change to the shared proof is riskiest
+	 * for: the rotation. The delete refuses AND the owner's password list
+	 * cannot be read — so this request has not proven the credential gone.
+	 * It must answer false and KEEP the record, because the record is what the
+	 * next attempt revokes by; forgetting it here would leave an
+	 * administrator-level credential with nothing tracking it.
+	 */
+	public function test_the_rotation_keeps_the_record_when_the_owners_list_cannot_be_read(): void {
+		$this->ml->handle_connect( $this->request() );
+		$this->assertNotEmpty( $this->recordUuid() );
+		$GLOBALS['_app_passwords_delete_fail']    = true; // the delete refuses…
+		$GLOBALS['_sa_app_password_read_fail'][7] = true; // …and the list will not read
+
+		$revoked = Aura_Worker_Magic_Link::revoke_managed_password();
+
+		$GLOBALS['_app_passwords_delete_fail']  = false;
+		$GLOBALS['_sa_app_password_read_fail']  = array();
+		$this->assertFalse( $revoked, 'a read that failed is not a revocation' );
+		$this->assertNotNull( $this->record(), 'and the record survives for the next attempt' );
+	}
+
 	public function test_uninstall_revokes_the_managed_password_by_uuid_before_deleting_its_options(): void {
 		$src = file_get_contents( __DIR__ . '/../../digitizer-site-worker/uninstall.php' );
 		$this->assertStringContainsString( "WP_Application_Passwords::delete_application_password( \$aura_pw_owner, \$aura_pw_uuid )", $src );
@@ -797,6 +819,27 @@ final class ConnectAppPasswordTest extends TestCase {
 		$html = $this->renderConnect();
 		$this->assertStringContainsString( 'no credential for the builder tools', $html );
 		$this->assertStringContainsString( 'aura-connect-btn', $html );
+	}
+
+	public function test_an_unreadable_credential_list_is_never_painted_as_healthy(): void {
+		// #434 M13. credential_state() is the ONE caller of the tri-state that
+		// deliberately does not fail closed: an unreadable list answers 'none',
+		// exactly as it did before the third answer existed, because the advice
+		// that follows ("connect again to issue one") is harmless and
+		// self-correcting. The tempting "tidy" — treating only a PROVEN gone as
+		// missing — sends an unreadable list on to the availability branch and
+		// paints the green check and "Connected to Aura dashboard" over a read
+		// that never completed. That is the worse lie, and this pins it.
+		$this->ml->handle_connect( $this->request() );
+		$this->assertStringContainsString( 'dashicons-yes-alt', $this->renderConnect(), 'a credential really there is healthy' );
+
+		$GLOBALS['_sa_app_password_read_fail'][7] = true;
+		$html                                     = $this->renderConnect();
+		$GLOBALS['_sa_app_password_read_fail']    = array();
+
+		$this->assertStringContainsString( 'no credential for the builder tools', $html );
+		$this->assertStringNotContainsString( 'dashicons-yes-alt', $html, 'never the green check over a read that failed' );
+		$this->assertStringContainsString( 'dashicons-warning', $html );
 	}
 
 	public function test_the_lifecycle_hooks_reach_every_site_of_a_network(): void {

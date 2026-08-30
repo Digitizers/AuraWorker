@@ -87,12 +87,45 @@ class Aura_Worker_Grant {
 	/**
 	 * Verify a grant authorizes THIS tool + params on THIS site, right now, once.
 	 *
+	 * An UNBOUND site verifies nothing (#434 Task 5). The marker is checked
+	 * FIRST, before the signature, the window and the nonce: this is the other
+	 * way a call reaches a mutation — the WordPress Abilities path
+	 * (Aura_Worker_Call_Context) never touches the REST permission callbacks
+	 * and asks here instead — and a grant the gateway minted before the unbind
+	 * is still perfectly valid, so nothing further down would refuse it. The
+	 * nonce is deliberately NOT reserved on this path: refusing a grant is not
+	 * spending it, and a site that is rebound must still be able to run it.
+	 *
 	 * @param string $header X-Aura-Approval-Grant header value ("b64url.b64url").
 	 * @param string $tool   Tool name being executed.
 	 * @param array  $params Parameters the tool was called with.
-	 * @return true|string   True when valid; otherwise a short failure reason.
+	 * @return true|string|WP_Error True when valid; a short failure reason when
+	 *                              the grant does not verify; the shared unbind
+	 *                              refusal (403 aura_site_unbound) when this
+	 *                              site is no longer bound at all. Callers that
+	 *                              render the reason into a message must handle
+	 *                              the WP_Error — concatenating it is a fatal.
 	 */
+	/**
+	 * The unbind refusal, when this site is marked — asked in ONE place so
+	 * every caller answers it the same way, whether or not it goes on to ask
+	 * about a grant.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return WP_Error|null The 403 aura_site_unbound refusal, or null when
+	 *                       this site is still bound.
+	 */
+	public static function refusal_if_unbound() {
+		return Aura_Worker_Unbind::is_set() ? Aura_Worker_Unbind::refusal() : null;
+	}
+
 	public static function verify( $header, $tool, $params ) {
+		$unbound = self::refusal_if_unbound();
+		if ( null !== $unbound ) {
+			return $unbound;
+		}
+
 		if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
 			return 'server is missing libsodium';
 		}
@@ -267,6 +300,18 @@ class Aura_Worker_Grant {
 	 * @return true|WP_Error  True when allowed; WP_Error(403) when a grant is required and missing/invalid.
 	 */
 	public static function require_for( $request, $action, $params ) {
+		// THE UNBOUND SITE IS ANSWERED BEFORE THE GRANT QUESTION (Codex
+		// round-6 P1). verify() refuses a marked site, but both of its callers
+		// SKIP verify() when no gateway key is configured — and Phase B step
+		// (4) deletes that key while the site is still marked. A mutating
+		// request that had already passed its permission callback would then
+		// find no key, skip the grant path entirely, and never meet the marker
+		// at all. The refusal is not a verdict about a grant, so it does not
+		// live behind the question "is a grant required".
+		$unbound = self::refusal_if_unbound();
+		if ( null !== $unbound ) {
+			return $unbound;
+		}
 		if ( ! self::is_enforced() ) {
 			return true;
 		}
@@ -275,6 +320,13 @@ class Aura_Worker_Grant {
 		}
 		$grant  = (string) $request->get_header( 'X-Aura-Approval-Grant' );
 		$reason = self::verify( $grant, (string) $action, $params );
+		if ( is_wp_error( $reason ) ) {
+			// Not a verdict about the GRANT — a refusal with its own code and
+			// status (an unbound site). Concatenating it below would be a
+			// fatal; the MCP caller already answers it first, and so does this
+			// one now.
+			return $reason;
+		}
 		if ( true !== $reason ) {
 			// Distinct forensic signal for a refused write (kept separate from the
 			// power-execute hook, which means a tool actually ran).
@@ -339,6 +391,33 @@ class Aura_Worker_Grant {
 			ksort( $out );
 		}
 		return $out;
+	}
+
+	/**
+	 * The payload of a signed envelope WITHOUT verifying it.
+	 *
+	 * For the one caller that has no key to verify with: the unbind marker's
+	 * fast path (#434, spec §2.3 step 0). There, the token that already
+	 * authenticated the request is the authority and the gateway public key
+	 * may have been deleted by an earlier Phase B — so the document is read
+	 * only to learn which `seq` the retry is echoing and whether it says
+	 * `final`. NEVER use this to make a trust decision; verify_signed_document()
+	 * is the only function that answers that question.
+	 *
+	 * @param string $envelope Signed document — or anything at all.
+	 * @return array Decoded payload, or an empty array for anything that is not one.
+	 */
+	public static function peek_payload( $envelope ) {
+		$parts = explode( '.', (string) $envelope );
+		if ( '' === $parts[0] ) {
+			return array();
+		}
+		$json = self::b64url_decode( $parts[0] );
+		if ( ! is_string( $json ) || '' === $json ) {
+			return array();
+		}
+		$doc = json_decode( $json, true );
+		return is_array( $doc ) ? $doc : array();
 	}
 
 	/**

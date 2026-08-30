@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.12.0
+Stable tag: 2.13.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -60,6 +60,13 @@ Version 2 endpoints under `/wp-json/aura/v2/`:
 * `GET /health` — HTTP, PHP fatal, white-screen and DB connectivity checks
 * `POST /update/batch` — Chunked batch updates with auto-rollback on health failure
 * `POST /rollback/{plugin}` — Restore a plugin from its most recent backup
+* `POST /rules` — Receive Aura's signed operator ruleset; carrying `unbind: true` it ends this site's binding instead
+
+While a site is disconnected by Aura, every write endpoint answers
+`403 aura_site_unbound` and reads keep working; the disconnect answer carries
+`cleanup_complete` and `leftovers` (what the site still holds), and `GET /status`
+reports `unbound` until the site is reconnected or the remaining Aura data is removed
+from the settings screen.
 
 MCP tools under `/wp-json/aura/mcp/`:
 
@@ -215,7 +222,13 @@ Yes. Use **Regenerate Token** on the **Settings → SiteAgent** page. The new to
 
 = How do I disconnect a site from Aura? =
 
-Simply deactivate or delete the plugin, or remove the site from your Aura dashboard. If you deactivate the plugin, the REST API endpoints are unregistered and Aura can no longer communicate with the site.
+Remove the site from your Aura dashboard, or deactivate or delete the plugin. If you deactivate the plugin, the REST API endpoints are unregistered and Aura can no longer communicate with the site.
+
+Since 2.13.0, disconnecting from the Aura dashboard happens in two phases. The site is marked disconnected immediately and refuses every change from that moment on — reads keep working — and Aura then has it revoke the Application Password it minted, clear the stored ruleset and gateway key, and finally delete the site token. If the site was mid-disconnect when it lost contact, it finishes the job by itself on its next page load.
+
+= Aura disconnected my site but something is left behind — what do I do? =
+
+Open **Settings → SiteAgent**. A disconnected site says so ("Disconnected by Aura at …") and offers **Remove remaining Aura data**, which revokes what is left and clears the disconnect record — but only once everything it names, the site token included, is proven gone. If it tells you it cannot say which user holds an Application Password, revoke it under **Users → Profile → Application Passwords** and try again. Reconnecting the site to Aura also clears the record, after settling what the previous connection still owed.
 
 = Does Aura store my wp-admin credentials? =
 
@@ -236,6 +249,74 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 7. Connections: provider connections (Cloudways, Cloudflare, Bunny, Hostinger, Vultr, xCloud) with resource counts, status, and credential-rotation reminders.
 
 == Changelog ==
+
+= 2.13.0 =
+* Feature: **Aura can now disconnect a site in two phases, and the site
+  refuses changes the moment it is told to.** When Aura sends a disconnect,
+  SiteAgent records it and every mutation on the site — SiteAgent's own write
+  endpoints, MCP write tools, grant-signed calls, and any WordPress REST write
+  made with the Application Password or site token of the departing connection
+  — is answered `403 aura_site_unbound` until the site is reconnected. Reads
+  keep working, `/status` keeps answering, and Aura's own ruleset endpoint
+  stays reachable so the disconnect can be finished or retried.
+* Feature: **a departing connection's Application Password stops working
+  everywhere, not just on the REST API.** WordPress authenticates Application
+  Passwords on XML-RPC as well, so a credential the disconnect could not revoke
+  is now refused where WordPress decides whether it authenticates at all. Your
+  own Application Passwords are untouched, and so is admin login.
+* Feature: **the cleanup is proven, not assumed.** SiteAgent revokes the
+  Application Password(s) Aura minted, clears the stored ruleset and the
+  gateway public key, forgets the connect bookkeeping, and deletes the site
+  token LAST — and only when Aura says the disconnect is final. Every step is
+  idempotent, runs in one fixed order, and continues past a step that failed.
+  An interrupted disconnect finishes itself on the site's next page load
+  (throttled, at most once every five minutes), so a site Aura can no longer
+  reach still converges.
+* Feature: the answer to a disconnect now names what is still owed:
+  `leftovers` lists the credentials or stores this site could not prove it had
+  released (`app_passwords`, `options`, `ruleset`, `grant_pubkey`), alongside
+  `cleanup_complete`. An empty list means only the shared site token was still
+  outstanding; a non-empty one means Aura must keep waiting.
+* Feature: **the settings screen tells you when Aura disconnected the site**
+  ("Disconnected by Aura at …") and offers **Remove remaining Aura data** — an
+  admin-initiated teardown that runs the same proven cleanup, and only clears
+  the disconnect record once everything it names, the site token included, is
+  gone.
+* Feature: manually connected sites (those with no gateway public key, which
+  therefore cannot verify a signed document) can be disconnected with a bare
+  `{ "unbind": true, … }` body on `POST /wp-json/aura/v2/rules`, authenticated
+  by the site token alone. A site that DOES hold a gateway key refuses the
+  bare form and requires the signed envelope.
+* Safety: every ruleset push now runs under the site-wide claim the connect
+  flow already used, so a push, a disconnect and a reconnect can no longer
+  interleave. A site already busy answers `503 aura_site_busy`, which is
+  retryable. A claim left behind by a killed request is taken over after two
+  minutes rather than blocking the site indefinitely.
+* Safety: reconnecting (magic link) and **Regenerate Token** now settle the
+  previous connection's outstanding cleanup BEFORE installing a new token, and
+  release the disconnect record only after the replacement connection is
+  installed and read back — so a reconnect that fails halfway leaves the site
+  still refusing the departed connection instead of quietly reviving it.
+* Fix: a disconnect record damaged in the database is now REPAIRED — rebuilt
+  from the site's own state, under the claim — and then torn down through the
+  ordinary path. Previously a damaged record was a permanent dead end: the
+  site refused every change and no control could clear it.
+* Diagnostics: `/status` reports `unbound: { at, site_ref }` while a
+  disconnect is outstanding, and `app_password_probe_unproven:
+  { count, at, owner }` when the site cannot prove an Application Password was
+  revoked — the usual reason a disconnect never finishes. Both are bounded and
+  contain no secrets.
+* New error codes: `aura_site_unbound` (403 — the site is disconnected),
+  `aura_site_busy` (503 — retry), `aura_unbind_incomplete` (409 — something is
+  still owed; the answer lists it), `aura_unbind_unreadable` (409 — the
+  disconnect record could not be read, which is NOT the same as an incomplete
+  cleanup), `aura_unbind_unrepairable` (409), `aura_unbind_marker_stuck`
+  (500 — everything was removed but the record itself would not delete),
+  `aura_unbind_marker_malformed` (500), `aura_unbind_store_failed` (500) and
+  `aura_ruleset_client_mismatch` (409 — a disconnect addressed to a different
+  Aura client), which the bare unkeyed form now checks too.
+* Compatibility: a 2.13 site that is never sent a disconnect behaves exactly
+  as 2.12 did. Nothing on the site changes until Aura asks for one.
 
 = 2.12.0 =
 * Feature: **a rule can now apply to some of a client's sites instead of all
