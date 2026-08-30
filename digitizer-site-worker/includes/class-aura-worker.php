@@ -132,6 +132,29 @@ class Aura_Worker {
 			wp_send_json_error( array( 'message' => __( 'A connection to Aura is being installed right now, so the token was not changed. Try again in a moment.', 'digitizer-site-worker' ) ), 409 );
 		}
 
+		// THE WAY BACK, first half (#434 Task 7). "Regenerate Token" is the
+		// operator's own rebind, and the only one available to a site whose
+		// dashboard is gone. Like the connect callback, it settles the DEPARTED
+		// binding's Phase-B debt before the swap below replaces the token that
+		// identifies it — after that write, Aura_Worker_Unbind::maybe_finish()
+		// bails on the hash mismatch and nothing on this site would ever go
+		// looking for a credential the marker still names. A site that still
+		// owes something is not rotated at all: 409, the leftovers named, the
+		// marker and the old token both untouched.
+		$finished = Aura_Worker_Unbind::finish_before_rebind( $site_fence );
+		if ( is_wp_error( $finished ) ) {
+			Aura_Worker_Magic_Link::release_site( $site_fence );
+			$data = $finished->get_error_data();
+			wp_send_json_error(
+				array(
+					'message'  => $finished->get_error_message(),
+					'code'     => $finished->get_error_code(),
+					'leftover' => isset( $data['leftover'] ) && is_array( $data['leftover'] ) ? $data['leftover'] : array(),
+				),
+				409
+			);
+		}
+
 		$previous = $this->stored_token();
 		$raw      = wp_generate_password( 48, false );
 		$hashed   = Aura_Worker_Security::hash_token( $raw );
@@ -202,6 +225,53 @@ class Aura_Worker {
 		if ( ! is_wp_error( $current ) && is_string( $current ) && ! hash_equals( $hashed, $current ) ) {
 			Aura_Worker_Magic_Link::release_site( $site_fence );
 			wp_send_json_error( array( 'message' => __( 'Another site token was stored while this request ran, so this one changed nothing. That token is now the current one — regenerate again if you still want a new one.', 'digitizer-site-worker' ) ), 500 );
+		}
+		// THE WAY BACK, second half (#434 Task 7): the LAST fallible step, and
+		// only for a rotation that is actually a rebind. The token is swapped,
+		// the departed dashboard's URL is gone and its Application Password
+		// revoked; what remains is the half of the replacement binding a
+		// token-only request runs on — the connect user. Phase B step (2)
+		// deleted `aura_worker_connect_user_id`, so the write above is not a
+		// refresh of an existing row but the ONLY thing that names this
+		// rotation's administrator, and it is verified by an uncached read
+		// before the refusal is lifted: proof of a POSITIVE id, because
+		// resolve_connect_user() ignores 0 and falls back to the first
+		// administrator, which is not the binding this rotation established.
+		//
+		// The verification is scoped to the marked site on purpose. On an
+		// ordinary rotation that write is a refresh whose failure costs
+		// nothing (the previous value, or the first-administrator fallback,
+		// still resolves an admin), and failing the whole rotation over it
+		// would throw away a token that WAS stored — #67's rule. Here it is
+		// half of a binding that must be complete before this site starts
+		// accepting mutations again.
+		//
+		// Every earlier exit — a lost swap, a superseded rotation — returns
+		// before this line, so the marker goes on refusing the old token and
+		// the half-installed new one alike.
+		if ( Aura_Worker_Unbind::is_set() ) {
+			$who = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
+			$who = is_wp_error( $who ) ? 0 : (int) maybe_unserialize( $who );
+			if ( $who <= 0 || $who !== get_current_user_id() ) {
+				Aura_Worker_Magic_Link::release_site( $site_fence );
+				wp_send_json_error(
+					array(
+						'message' => __( 'The new token was stored but this site could not record which administrator it runs as, so it stays disconnected. Try again.', 'digitizer-site-worker' ),
+						'code'    => 'aura_unbind_store_failed',
+					),
+					500
+				);
+			}
+			if ( ! Aura_Worker_Unbind::release_marker_after_rebind( $site_fence ) ) {
+				Aura_Worker_Magic_Link::release_site( $site_fence );
+				wp_send_json_error(
+					array(
+						'message' => __( 'The new token was stored but the previous disconnect record could not be cleared, so this site still refuses changes. Try again.', 'digitizer-site-worker' ),
+						'code'    => 'aura_unbind_store_failed',
+					),
+					500
+				);
+			}
 		}
 		set_transient( 'aura_worker_token_reveal', $raw, 2 * MINUTE_IN_SECONDS );
 		Aura_Worker_Magic_Link::release_site( $site_fence );

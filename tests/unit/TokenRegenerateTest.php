@@ -247,9 +247,16 @@ final class TokenRegenerateTest extends TestCase {
 		// that revokes the previous token while showing no replacement, and the
 		// administrator is locked out with nothing to reconnect with.
 		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( 'the-previous-token' ) );
-		$GLOBALS['_sa_wpdb_error'] = 'the database is having a moment';
+		// Scoped to the token row — the one this rule is about (#434 Task 7).
+		// It used to be armed as a whole-driver failure ($_sa_wpdb_error), which
+		// also blinded the uncached read of the UNBIND MARKER that Task 7 put
+		// at the top of this handler; the rotation then refused BEFORE storing
+		// anything, which loses the operator nothing and is pinned separately
+		// (UnbindRebindTest). The assertion below is unchanged, and it is still
+		// the confirming read after the write that fails.
+		$GLOBALS['_sa_option_read_fail']['aura_worker_site_token'] = true;
 		$res = $this->regenerate();
-		$GLOBALS['_sa_wpdb_error'] = '';
+		$GLOBALS['_sa_option_read_fail'] = array();
 		$this->assertTrue( $res->success, 'the token is revealed even though nothing could be read back' );
 		$this->assertNotSame( '', (string) ( $res->data['token'] ?? '' ) );
 	}

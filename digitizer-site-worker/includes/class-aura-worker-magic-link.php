@@ -333,6 +333,34 @@ class Aura_Worker_Magic_Link {
 			$release();
 			return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
 		}
+		// THE WAY BACK, first half (#434 Task 7). A site Aura unbound refuses
+		// every mutation until the marker goes, and this callback is one of the
+		// only two things that may take it away. Before any of this install is
+		// written, the DEPARTED binding's Phase-B debt is settled — under the
+		// claim this handler already holds — because the token write a few
+		// lines below permanently disarms the site's own sweep
+		// (Aura_Worker_Unbind::maybe_finish() bails on the hash mismatch a
+		// replacement token creates). An Application Password the marker names
+		// and nothing revoked would be stranded live at that point, with
+		// nothing left on the site that would ever look for it again. So a site
+		// that still owes something is not reconnected at all: 409, the
+		// leftovers named, the marker untouched, the old token still refused.
+		// FIRST, before the connect-user write below: Phase B step (2) deletes
+		// exactly that option, so settling afterwards would erase this
+		// install's own write.
+		$finished = Aura_Worker_Unbind::finish_before_rebind( $site_fence );
+		if ( is_wp_error( $finished ) ) {
+			$data = $finished->get_error_data();
+			$release();
+			return new WP_REST_Response(
+				array(
+					'error'    => $finished->get_error_message(),
+					'code'     => $finished->get_error_code(),
+					'leftover' => isset( $data['leftover'] ) && is_array( $data['leftover'] ) ? $data['leftover'] : array(),
+				),
+				409
+			);
+		}
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
 		}
@@ -574,6 +602,28 @@ class Aura_Worker_Magic_Link {
 				),
 				500
 			);
+		}
+		// THE WAY BACK, second half (#434 Task 7): the LAST fallible step of a
+		// rebind that got all the way through. The token is installed and read
+		// back, the previous credential revoked, the binding written, the
+		// dashboard URL and gateway key stored and verified, and the
+		// Application Password settled (minted, or this site proven unable to
+		// have one) — only now may the refusal be lifted. EVERY error exit
+		// above returns without reaching this line, which is the point: a
+		// half-established replacement binding leaves the marker in place, so
+		// the old token AND the half-installed new one go on being refused
+		// everywhere.
+		//
+		// Placed BEFORE the magic transient is consumed, deliberately (a
+		// deviation from the brief, which put it after): a failure here is a
+		// store failure, and the connect must stay RETRYABLE — the retry's own
+		// finish_before_rebind() finds nothing owed, revokes the password this
+		// attempt minted and installs a fresh binding. Consuming the link first
+		// would leave a live recorded administrator credential that no further
+		// attempt could reach.
+		if ( ! Aura_Worker_Unbind::release_marker_after_rebind( $site_fence ) ) {
+			$release(); // keep the transient — this connect is retryable
+			return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous disconnect record could not be cleared; retry.', 'code' => 'aura_unbind_store_failed' ), 500 );
 		}
 		// Consumed only now (the round-23 orphan rule still holds: the claim is released with it below).
 		delete_transient( 'aura_magic_' . $magic_id );

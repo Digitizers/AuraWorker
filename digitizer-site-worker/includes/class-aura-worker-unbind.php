@@ -316,6 +316,109 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
+	 * The way back, first half: settle the departed binding's Phase-B debt
+	 * BEFORE a rebind replaces the site token (#434 Task 7).
+	 *
+	 * A rebind is the ONLY thing that clears the marker, and the two calls that
+	 * do it bracket the token install — this one before it,
+	 * release_marker_after_rebind() after the whole replacement binding is
+	 * established. The ORDER is the safety property, in both directions:
+	 *
+	 *  - The marker must OUTLIVE the old token. Every write of a rebind can
+	 *    fail, and a rebind that fails half-way has installed nothing this site
+	 *    can be governed by; while the marker stands, the old token AND the
+	 *    half-installed new one are refused at every boundary. Only a rebind
+	 *    that got all the way through may take the refusal away.
+	 *  - The debt must be settled BEFORE the token is replaced. Writing the new
+	 *    token permanently disarms maybe_finish() — the sweep bails on the hash
+	 *    mismatch a replacement token creates — so an Application Password UUID
+	 *    that Phase A recorded in the marker and Phase B never revoked would be
+	 *    stranded: a live `manage_options` credential for a departed dashboard
+	 *    with nothing left on this site that would ever go looking for it. The
+	 *    409 below is what stops that: a site that still owes something is not
+	 *    reconnected at all.
+	 *
+	 * Steps (1)-(4) only, never the token: `$final` stays false, because the
+	 * token is not this method's to delete — the rebind is about to REPLACE it,
+	 * and the flow's own write-and-verify (or the rotation's compare-and-swap)
+	 * needs to find it there.
+	 *
+	 * An unreadable or malformed marker takes the 409 branch too, and that is
+	 * deliberate: cleanup() does nothing at all for a marker it cannot name and
+	 * leftovers() then reports every step owed, so this site refuses to be
+	 * reconnected until an operator clears it (Task 9's removal panel). Refusing
+	 * the rebind is the fail-CLOSED direction — the alternative reconnects a
+	 * site whose previous dashboard may still hold a live credential.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $fence The caller's site-claim fence — both flows already
+	 *                      hold the claim, and this consumes it rather than
+	 *                      taking a second one.
+	 * @return true|WP_Error True when nothing is owed (including "this site was
+	 *                       never unbound"), else the 409 naming what is left.
+	 */
+	public static function finish_before_rebind( string $fence ) {
+		if ( ! self::is_set() ) {
+			return true; // not an unbound site: a rebind here has nothing to settle
+		}
+		// The return value is deliberately ignored: cleanup( false, … ) answers
+		// false for "the token is still here", which is exactly what this
+		// caller WANTS. leftovers() is the evidence, and it is the same
+		// evidence step (5) is gated on.
+		self::cleanup( false, $fence );
+		$left = self::leftovers();
+		if ( array() !== $left ) {
+			return new WP_Error(
+				'aura_unbind_incomplete',
+				__( 'The previous Aura binding could not be fully removed from this site, so it cannot be reconnected yet.', 'digitizer-site-worker' ),
+				array(
+					'status'   => 409,
+					'leftover' => $left,
+				)
+			);
+		}
+		return true;
+	}
+
+	/**
+	 * The way back, second half: the marker goes — and the site starts
+	 * accepting mutations again — ONLY as the last step of a rebind that
+	 * succeeded end to end (#434 Task 7).
+	 *
+	 * Call this after the replacement token is installed AND read back, the
+	 * binding written, the dashboard URL and gateway key stored and the
+	 * Application Password settled, under the SAME claim those writes ran
+	 * under. Every earlier exit of either flow must return WITHOUT calling it,
+	 * so a half-established replacement binding is still refused everywhere.
+	 *
+	 * Nothing is re-proven here about Phase B, and that is not an omission:
+	 * leftovers() is about the four things Phase B removes, and by this point
+	 * the rebind has legitimately WRITTEN two of them again (the connect user,
+	 * the dashboard URL). Asking it a second time would always answer "owed"
+	 * and could never mean anything. finish_before_rebind() is the gate, and it
+	 * is the only place the question can honestly be asked.
+	 *
+	 * A false answer is a store failure the flow must report retryably (500):
+	 * the replacement token is in place and no longer matches the marker's
+	 * `site`, so maybe_finish() will not touch the new binding and the fast
+	 * path cannot be reached — the site simply goes on refusing until the next
+	 * connect or rotation, whose own finish_before_rebind() finds nothing owed
+	 * and clears it.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $fence The caller's site-claim fence.
+	 * @return bool True once the marker is confirmed gone (or was never there).
+	 */
+	public static function release_marker_after_rebind( string $fence ): bool {
+		if ( ! self::is_set() ) {
+			return true;
+		}
+		return self::delete_under_claim( $fence );
+	}
+
+	/**
 	 * The ONE route an unbound site must still answer: the ruleset envelope.
 	 *
 	 * The unbind envelope — and every retry of it — arrives on /aura/v2/rules,
