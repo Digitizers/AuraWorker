@@ -118,6 +118,24 @@ final class UnbindUnkeyedTest extends TestCase {
 		$this->assertFalse( Aura_Worker_Unbind::is_set() );
 	}
 
+	/**
+	 * A gateway key that could not be READ is not an absent one. $wpdb->get_var()
+	 * answers null for both, so collapsing them would let a transient database
+	 * error open the very path a keyed site must refuse. Scoped to that one
+	 * option, so the rest of the request still works and the assertion cannot
+	 * be satisfied by a later shared failure.
+	 */
+	public function test_an_unreadable_gateway_key_is_not_an_absent_one(): void {
+		$GLOBALS['_sa_option_read_fail']['aura_worker_grant_pubkey'] = true;
+
+		$resp = $this->api()->receive_rules( $this->bare() );
+
+		$this->assertSame( 500, $resp->get_status() );
+		$this->assertSame( 'aura_ruleset_store_failed', $resp->get_data()['code'] );
+		$this->assertFalse( Aura_Worker_Unbind::is_set(), 'nothing was written' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
 	public function test_unkeyed_site_without_unbind_still_answers_412(): void {
 		$req = new WP_REST_Request( 'POST', '/aura/v2/rules' );
 		$req->set_param( 'ruleset', 'x' );
@@ -170,6 +188,39 @@ final class UnbindUnkeyedTest extends TestCase {
 			'seq not a number'      => array( array( 'seq' => 'four' ) ),
 			'seq a float'           => array( array( 'seq' => 4.5 ) ),
 			'seq true'              => array( array( 'seq' => true ) ),
+		);
+	}
+
+	/**
+	 * Only an unambiguous `true` opts into the bare form. A body that merely
+	 * looks truthy is NOT an unbind — reading one as an unbind writes a marker
+	 * nobody meant and disconnects a live site — so it falls through to the
+	 * ruleset form and is told to send one of the two.
+	 *
+	 * @dataProvider not_an_unbind
+	 * @param mixed $value The `unbind` value.
+	 */
+	public function test_only_an_unambiguous_true_opts_into_the_bare_form( $value ): void {
+		$req = $this->bare();
+		$req->set_param( 'unbind', $value );
+
+		$resp = $this->api()->receive_rules( $req );
+
+		$this->assertSame( 400, $resp->get_status() );
+		$this->assertSame( 'aura_ruleset_rejected', $resp->get_data()['code'] );
+		$this->assertFalse( Aura_Worker_Unbind::is_set(), 'nothing was written' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	public static function not_an_unbind(): array {
+		return array(
+			'false'      => array( false ),
+			'zero'       => array( 0 ),
+			"the string" => array( '0' ),
+			'yes'        => array( 'yes' ),
+			'no'         => array( 'no' ),
+			'an array'   => array( array( true ) ),
+			'a float'    => array( 1.0 ),
 		);
 	}
 
