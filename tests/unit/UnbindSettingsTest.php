@@ -679,12 +679,70 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
-	 * WHERE THE TWO SOURCES DISAGREE, THE FRESHER ONE WINS. The sweep read this
-	 * owner out of that user's own list moments ago; the damaged row's copy is
-	 * older and, here, unusable. Letting the row overwrite it would turn
-	 * knowledge back into an unknown — Phase B's single authoritative lookup
-	 * replaced by the site-wide resolution, for a credential nobody was unsure
-	 * about.
+	 * TASK 4'S C2, IN NEW CLOTHES, AND THE REASON A RECOVERED UUID CARRIES NO
+	 * OWNER (round 3).
+	 *
+	 * The damaged row names a uuid the sweep cannot see, and attributes it to
+	 * user 3 — a real, positive, syntactically perfect user id, and the wrong
+	 * one: the credential is user 9's. Carrying that attribution through would
+	 * make resolve_unknown_owners() SKIP the uuid ("attributed: Phase B's
+	 * single lookup stands"), and Phase B's one lookup would ask user 3's list,
+	 * be told the uuid is not there, and report a live administrator credential
+	 * revoked. `success: true`, refusal lifted, password still working — read
+	 * out of a row this code has already declared corrupted.
+	 *
+	 * With no owner carried, the same uuid is unattributed, the site-wide
+	 * resolution proves where it actually lives, and it is deleted.
+	 */
+	public function test_a_wrong_but_valid_owner_in_the_damaged_row_is_not_believed(): void {
+		sa_add_app_password( 9, 'manual-uuid-1' ); // user 9 really holds it
+		sa_set_marker(
+			array(
+				'seq'                => 'nine',
+				'app_password_uuids' => array( 'manual-uuid-1' ),
+				'app_password_users' => array( 'manual-uuid-1' => self::ADMIN ), // …the row says user 3
+			)
+		);
+
+		$out = $this->remove();
+
+		$this->assertTrue( $out['success'] );
+		$this->assertFalse(
+			sa_app_password_exists( 9, 'manual-uuid-1' ),
+			'the teardown reported success, so this credential must actually be gone'
+		);
+		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	/** …and the repaired row says the unknown out loud, rather than the row's guess. */
+	public function test_a_recovered_uuid_is_written_unattributed(): void {
+		sa_add_app_password( 9, 'manual-uuid-1' );
+		sa_set_marker(
+			array(
+				'seq'                => 'nine',
+				'app_password_uuids' => array( 'manual-uuid-1' ),
+				'app_password_users' => array( 'manual-uuid-1' => self::ADMIN ),
+			)
+		);
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertNull( $this->stored_marker()['app_password_users']['manual-uuid-1'] );
+	}
+
+	/**
+	 * THE OTHER HALF OF THE ATTRIBUTION RULE: a uuid the SWEEP attributed keeps
+	 * the sweep's owner, read from that user's own list moments ago. Only a
+	 * uuid the sweep could not see is written unattributed.
+	 *
+	 * Losing this one is the safe direction GIVEN THE GUARDS THAT ARE PRESENT —
+	 * resolve_unknown_owners() would prove the credential's real home and
+	 * delete it — not intrinsically safe (round-3): it is the same code path
+	 * whose OTHER direction, believing a wrong owner, fails open outright.
+	 * Downgrading knowledge to an unknown costs a site-wide statement for a
+	 * credential nobody was unsure about, and it is worth a test either way.
 	 */
 	public function test_the_swept_owner_survives_a_damaged_rows_worse_one(): void {
 		sa_set_marker(
@@ -707,12 +765,13 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
-	 * "Legible" means exactly what validated() means by it. An owners map that
-	 * is an OBJECT rather than an array is a shape this class ignores
-	 * everywhere else — validated() would drop it too — so the repair does not
-	 * quietly widen its own notion of readable to reach inside one. The uuid
-	 * still survives, unattributed, and the teardown's site-wide resolution
-	 * settles it.
+	 * "Legible" means exactly what validated() means by it, and since round 3
+	 * the owners map of a damaged row is not read AT ALL — a recovered uuid is
+	 * unattributed whatever the row says. This pins the outcome from the other
+	 * end: an owners map that is an OBJECT is a shape this class ignores
+	 * everywhere else, and no future reader of it may quietly become the
+	 * exception. The uuid survives, unattributed, and the teardown's site-wide
+	 * resolution settles it.
 	 */
 	public function test_an_owners_map_that_is_not_an_array_is_not_read(): void {
 		sa_add_app_password( 9, 'manual-uuid-1' );

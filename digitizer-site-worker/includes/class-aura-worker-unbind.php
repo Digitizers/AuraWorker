@@ -581,9 +581,9 @@ final class Aura_Worker_Unbind {
 	 *     teardown, lift the refusal and leave it live, while telling the
 	 *     operator it worked. marker_array() exists for exactly this reading,
 	 *     and the merge adds no inference: an entry whose SHAPE cannot be
-	 *     trusted is dropped, an owner that names nobody becomes the explicit
-	 *     null Phase A itself writes, and an unattributed uuid then goes
-	 *     through resolve_unknown_owners() like any other.
+	 *     trusted is dropped, a recovered uuid carries NO owner from the
+	 *     damaged row, and it then goes through resolve_unknown_owners() like
+	 *     any other unattributed credential.
 	 *
 	 * What it CANNOT recover is a uuid list that is itself unreadable — the key
 	 * absent, holding a scalar, or its entries not scalars. Then a manually
@@ -656,18 +656,27 @@ final class Aura_Worker_Unbind {
 	 * The sweep is a superset of what Aura MINTED and cannot see anything else;
 	 * the row is the only record of the authenticating uuid Phase A appended
 	 * for a password it did not mint. Neither is complete alone, so both are
-	 * used, and everything here is a READ of what is there rather than an
-	 * inference about what is not:
+	 * used — but they are not used for the same KIND of fact:
 	 *
 	 *  - a uuid entry that is not a scalar names nothing this code can act on
 	 *    and is dropped rather than coerced (`array` to string is a warning and
 	 *    a lie; an object is worse);
-	 *  - an owner that is not a positive integer becomes the explicit null
-	 *    Phase A itself writes for an owner the site never knew — which is not
-	 *    a dead end, because resolve_unknown_owners() runs in the same teardown
-	 *    and settles exactly that case;
 	 *  - a uuid the sweep already attributed keeps the sweep's OWNER, which was
-	 *    read from that user's own list moments ago, over the row's older one.
+	 *    read from that user's own list moments ago;
+	 *  - a uuid the sweep did NOT attribute carries NO OWNER AT ALL, whatever
+	 *    the row says (round-3). This is the rule that matters, and it is Task
+	 *    4's C2 in new clothes: `resolve_unknown_owners()` skips an ATTRIBUTED
+	 *    uuid — Phase B's single lookup stands — so an owner that is wrong but
+	 *    syntactically valid means that lookup asks the wrong user's list, is
+	 *    told "not there", and reports a live credential revoked. The row this
+	 *    owner comes from is one this code has ALREADY DECLARED CORRUPTED;
+	 *    treating an attribution from it as knowledge is exactly the inference
+	 *    three Criticals were spent removing. The explicit null Phase A itself
+	 *    writes is both honest and STRICTLY STRONGER here: the resolution then
+	 *    proves absence across the whole table and deletes the credential from
+	 *    every list holding it, where one lookup against an unverified owner
+	 *    proves nothing at all. It costs one statement per recovered uuid, on a
+	 *    single operator click.
 	 *
 	 * @since 2.13.0
 	 *
@@ -679,9 +688,6 @@ final class Aura_Worker_Unbind {
 		if ( null === $raw || ! isset( $raw['app_password_uuids'] ) || ! is_array( $raw['app_password_uuids'] ) ) {
 			return $found; // nothing legible to add
 		}
-		$owners = isset( $raw['app_password_users'] ) && is_array( $raw['app_password_users'] )
-			? $raw['app_password_users']
-			: array();
 		foreach ( $raw['app_password_uuids'] as $uuid ) {
 			if ( ! is_string( $uuid ) && ! is_int( $uuid ) ) {
 				continue; // a shape that names no credential
@@ -690,12 +696,8 @@ final class Aura_Worker_Unbind {
 			if ( '' === $uuid || array_key_exists( $uuid, $found ) ) {
 				continue;
 			}
-			$owner = isset( $owners[ $uuid ] ) ? $owners[ $uuid ] : null;
-			// The same normalisation validated() applies on the way back out,
-			// applied here so what is WRITTEN already means what it will be
-			// read as: a positive int, or an explicit unknown. Never 0.
-			$owner          = is_int( $owner ) || ( is_string( $owner ) && ctype_digit( $owner ) ) ? (int) $owner : 0;
-			$found[ $uuid ] = $owner > 0 ? $owner : null;
+			// Null, never the row's `app_password_users` entry: see above.
+			$found[ $uuid ] = null;
 		}
 		return $found;
 	}
