@@ -2537,53 +2537,73 @@ if ( ! function_exists( 'sa_register_ability' ) ) {
 }
 
 /**
- * The plugin's LIVE REST route table: every route Aura_Worker_API and
- * Aura_Worker_MCP register, as `'/aura/v1/update/core' => [ endpoint, ... ]`,
- * where each endpoint is the array the plugin handed register_rest_route()
- * (`methods`, `callback`, `permission_callback`, `args`).
+ * ONE uncached build of the plugin's REST route table, contained.
  *
- * Built by running the plugin's own bootstrap and firing the hook WordPress
- * fires — `( new Aura_Worker() )->init(); do_action( 'rest_api_init' )` — so
- * the table is whatever the plugin actually registers at runtime. Never by
- * scanning source, never by naming routes, and (round-1 IMPORTANT-1) never by
- * naming REGISTRARS either: calling Aura_Worker_API::register_routes() and
+ * Runs the plugin's own bootstrap and fires the hook WordPress fires —
+ * `( new Aura_Worker() )->init(); do_action( 'rest_api_init' )` — so the table
+ * is whatever the plugin actually registers at runtime. Never a scan of
+ * source, never a list of routes, and (round-1 IMPORTANT-1) never a list of
+ * REGISTRARS either: naming Aura_Worker_API::register_routes() and
  * Aura_Worker_MCP::register_routes() by hand made the SET OF REGISTRARS a
  * maintained list — the forbidden artefact moved up one level — and a third
  * `rest_api_init` registrar exposing an unauthenticated mutating route left
- * the whole suite green. Asking "what enumerates THAT?" has one acceptable
- * answer, and it is the system itself. The one remaining named thing is the
- * plugin's single entry point, which
- * UnbindRefusalTest::test_the_route_table_is_built_from_the_only_entry_point_that_registers_routes
- * pins against the source.
+ * the whole suite green.
  *
- * Every hook the bootstrap registers is contained: $GLOBALS['_filters'] is
- * saved whole and restored whole around the build, so none of Aura_Worker's
- * other registrations (rules' core-REST filters, the app-password capture,
- * the unbind sweep, the abilities hooks) can leak into whichever test happened
- * to trigger the build. Those init() methods do nothing BUT register hooks, so
- * that restore is complete.
+ * Two containment properties, both pinned by tests in UnbindRefusalTest
+ * (round-1 NEW-3) rather than merely asserted here:
  *
- * Memoised for the process. The table is a fact about the CODE, not about a
- * test's state — the handlers read $GLOBALS live, and Aura_Worker_Security's
- * only per-request state is a static that sa_reset_state() clears. For the
- * same reason it is NOT cleared in sa_reset_state().
+ *  1. The build registers NOTHING that outlives it. Aura_Worker::init() also
+ *     hooks up the rules' core-REST filters, the app-password capture, the
+ *     unbind sweep and the abilities hooks; $GLOBALS['_filters'] is saved and
+ *     restored WHOLE, so none of them leak into a caller. Every init() this
+ *     reaches does nothing but register hooks, which is what makes a
+ *     whole-array restore complete.
+ *  2. The table contains ONLY what the plugin registered. Filters are emptied
+ *     before the build, so an ambient `rest_api_init` listener a test happens
+ *     to have registered cannot smuggle a route into the sweep.
+ *
+ * Separate from sa_registered_routes() precisely so both are testable: the
+ * memoisation belongs to the wrapper, and it is memoisation — not the guards —
+ * that would otherwise make a second build unobservable.
+ *
+ * @return array<string,array<int,array>> Route pattern => endpoints.
+ */
+function sa_build_route_table(): array {
+	$filters_before          = $GLOBALS['_filters'];
+	$routes_before           = $GLOBALS['_rest_routes'] ?? array();
+	$GLOBALS['_filters']     = array();
+	$GLOBALS['_rest_routes'] = array();
+	try {
+		( new Aura_Worker() )->init();
+		do_action( 'rest_api_init' );
+		$table = $GLOBALS['_rest_routes'];
+	} finally {
+		$GLOBALS['_rest_routes'] = $routes_before;
+		$GLOBALS['_filters']     = $filters_before;
+	}
+	return $table;
+}
+
+/**
+ * The plugin's LIVE REST route table, memoised for the process: every route
+ * Aura_Worker registers, as `'/aura/v1/update/core' => [ endpoint, ... ]`,
+ * where each endpoint is the array the plugin handed register_rest_route()
+ * (`methods`, `callback`, `permission_callback`, `args`).
+ *
+ * The table is a fact about the CODE, not about a test's state — the handlers
+ * read $GLOBALS live, and Aura_Worker_Security's only per-request state is a
+ * static that sa_reset_state() clears — so rebuilding it per test would buy
+ * nothing. For the same reason it is NOT cleared in sa_reset_state(). A test
+ * that needs a build under different conditions calls sa_build_route_table()
+ * directly.
  *
  * @return array<string,array<int,array>> Route pattern => endpoints.
  */
 function sa_registered_routes(): array {
 	static $table = null;
-	if ( null !== $table ) {
-		return $table;
+	if ( null === $table ) {
+		$table = sa_build_route_table();
 	}
-	$filters_before          = $GLOBALS['_filters'];
-	$routes_before           = $GLOBALS['_rest_routes'] ?? array();
-	$GLOBALS['_filters']     = array();
-	$GLOBALS['_rest_routes'] = array();
-	( new Aura_Worker() )->init();
-	do_action( 'rest_api_init' );
-	$table                   = $GLOBALS['_rest_routes'];
-	$GLOBALS['_rest_routes'] = $routes_before;
-	$GLOBALS['_filters']     = $filters_before;
 	return $table;
 }
 

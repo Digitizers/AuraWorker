@@ -200,11 +200,15 @@ final class Aura_Worker_Unbind {
 	 * WP_Error instead of collapsing it into the boolean, for the callers that
 	 * must tell an unreadable marker from a present one.
 	 *
-	 * Its production caller is Aura_Worker_Rules::fast_path_or_refusal()
-	 * (class-aura-worker-rules.php:524), which answers a push differently in
-	 * the three cases. The write boundary does NOT use it (#434 Task 5): there
-	 * both an unreadable and a present marker end in the same refusal, so the
-	 * extra branch could not change an outcome — see is_set() above.
+	 * Its one production caller is Aura_Worker_Rules::accept_under_claim(),
+	 * at step 0 of a ruleset push: an unreadable marker there returns the
+	 * retryable store failure and writes nothing, a present one takes the
+	 * unbind fast path, and an absent one carries on as an ordinary push —
+	 * three different answers, which is what earns the third state.
+	 *
+	 * The write boundary does NOT use it (#434 Task 5): there an unreadable
+	 * and a present marker both end in the same refusal, so the extra branch
+	 * could not change an outcome — see is_set() above.
 	 *
 	 * @return bool|WP_Error True/false once the read genuinely succeeded, or
 	 *                       the WP_Error from a failed uncached read.

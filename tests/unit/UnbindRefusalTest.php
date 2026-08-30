@@ -263,21 +263,18 @@ final class UnbindRefusalTest extends TestCase {
 	}
 
 	/**
-	 * The enumeration's guarantee has to survive a change to the SET of route
-	 * registrars, not only to the routes inside the two we happened to know
-	 * about (round-1 IMPORTANT-1). sa_registered_routes() therefore runs the
-	 * plugin's own bootstrap and fires `rest_api_init`, so a registrar added
-	 * anywhere Aura_Worker::init() reaches is swept automatically.
+	 * Every `add_action( 'rest_api_init', … )` in the plugin, as
+	 * `filename => count`. Read from the source, tolerating either quote style
+	 * (round-1 NEW-1: the same registrar written with double quotes was a
+	 * green survivor of the single-quote-literal scan).
 	 *
-	 * The one thing still named by hand is that entry point, and this is what
-	 * keeps it honest: every `add_action( 'rest_api_init', … )` in the plugin
-	 * must live in the file the build's entry point lives in. A registrar
-	 * hooked up from a constructor, a second bootstrap function or another
-	 * file would never run during the build, and its routes would be invisible
-	 * to every assertion in this class.
+	 * A hook name held in a constant or a variable is still invisible here.
+	 * That is stated in the failure messages rather than papered over.
+	 *
+	 * @return array<string,int>
 	 */
-	public function test_the_route_table_is_built_from_the_only_entry_point_that_registers_routes(): void {
-		$files    = array();
+	private static function rest_api_init_registrations(): array {
+		$found    = array();
 		$scanned  = 0;
 		$iterator = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( SA_PLUGIN_DIR ) );
 		foreach ( $iterator as $file ) {
@@ -286,16 +283,134 @@ final class UnbindRefusalTest extends TestCase {
 			}
 			++$scanned;
 			$source = (string) file_get_contents( $file->getPathname() );
-			if ( preg_match( "#add_action\(\s*'rest_api_init'#", $source ) ) {
-				$files[ $file->getFilename() ] = true;
+			$hits   = preg_match_all( '#add_action\(\s*[\'"]rest_api_init[\'"]#', $source );
+			if ( $hits > 0 ) {
+				$found[ $file->getFilename() ] = $hits;
 			}
 		}
-		$this->assertGreaterThanOrEqual( 30, $scanned, 'the source scan found almost no files — is SA_PLUGIN_DIR right?' );
+		if ( $scanned < 30 ) {
+			throw new RuntimeException( "the source scan found only {$scanned} files — is SA_PLUGIN_DIR right?" );
+		}
+		return $found;
+	}
+
+	/**
+	 * The enumeration's guarantee has to survive a change to the SET of route
+	 * registrars, not only to the routes inside the two we happened to know
+	 * about (round-1 IMPORTANT-1). sa_build_route_table() therefore runs the
+	 * plugin's own bootstrap and fires `rest_api_init`, so a registrar added
+	 * anywhere Aura_Worker::init() reaches is swept automatically.
+	 *
+	 * The one thing still named by hand is that entry point, and this keeps it
+	 * honest in two ways. Every `add_action( 'rest_api_init', … )` must live in
+	 * the file that entry point lives in — one hooked up from a constructor, a
+	 * second bootstrap function or another file never runs during the build,
+	 * and its routes would be invisible to this whole class. And the NUMBER of
+	 * them in that file is pinned, because being in the right file is not the
+	 * same as being REACHED: `init()` has an `if ( is_admin() )` branch that is
+	 * false when the table is built, and a registrar inside it (or behind any
+	 * `defined()` / `class_exists()` guard) would pass a file-level scan while
+	 * never executing (round-1 NEW-2). A third registration therefore reddens
+	 * here whatever guards it, and the message says what to do about it.
+	 */
+	public function test_the_route_table_is_built_from_the_only_entry_point_that_registers_routes(): void {
+		$found = self::rest_api_init_registrations();
 		$this->assertSame(
-			array( 'class-aura-worker.php' ),
-			array_keys( $files ),
-			"a rest_api_init registrar lives outside the entry point sa_registered_routes() runs — its routes are invisible to this whole test class. Move it into Aura_Worker::init(), or make sa_registered_routes() reach it."
+			array( 'class-aura-worker.php' => 2 ),
+			$found,
+			"the plugin's rest_api_init registrations changed. They must all live in the file sa_build_route_table() runs, AND the build must actually reach them — a registrar behind is_admin(), defined() or class_exists() sits in the right file and still never executes, so its routes are invisible to every assertion in this class. Add it to Aura_Worker::init()'s unconditional body, or teach sa_build_route_table()/this test to build with that condition true. (A hook name held in a constant or variable is invisible to this scan entirely.)"
 		);
+	}
+
+	/**
+	 * The concrete conditional the plugin has today: `init()`'s
+	 * `if ( is_admin() )` branch. The table is built with is_admin() FALSE,
+	 * because that is what a REST request is — so a route registered only in
+	 * the admin branch would never appear in the sweep. Building it both ways
+	 * and comparing is what turns that from a silent blind spot into a failure
+	 * (round-1 NEW-2): if the two tables differ, some route's existence
+	 * depends on a condition the sweep does not hold.
+	 */
+	public function test_the_route_table_does_not_depend_on_being_a_front_end_request(): void {
+		$normalise = static function ( array $table ): array {
+			$out = array();
+			foreach ( $table as $route => $endpoints ) {
+				foreach ( $endpoints as $endpoint ) {
+					$out[ $route ][] = implode( ',', self::methods_of( $endpoint ) ) . ' => ' . self::callback_name( $endpoint );
+				}
+			}
+			ksort( $out );
+			return $out;
+		};
+
+		$as_front_end       = $normalise( sa_build_route_table() );
+		$GLOBALS['_is_admin'] = true;
+		try {
+			$as_admin = $normalise( sa_build_route_table() );
+		} finally {
+			$GLOBALS['_is_admin'] = false;
+		}
+
+		$this->assertNotEmpty( $as_front_end );
+		$this->assertSame(
+			$as_front_end,
+			$as_admin,
+			'a route is registered only under one value of is_admin(), so one of the two builds cannot see it — the refusal sweep runs against the front-end build'
+		);
+	}
+
+	/**
+	 * The build registers nothing that outlives it (round-1 NEW-3). It empties
+	 * $GLOBALS['_filters'] so an ambient listener cannot smuggle a route in,
+	 * and must put back exactly what it found — Aura_Worker::init() hooks up
+	 * the rules' core-REST filters, the app-password capture, the unbind sweep
+	 * and the abilities hooks, and a caller that loses its own listeners to
+	 * that is a caller whose next assertion silently means something else.
+	 *
+	 * This is testable only because sa_build_route_table() is separate from
+	 * the memoised wrapper; through sa_registered_routes() the second call
+	 * never builds, which is what made this look unpinnable in round 1.
+	 */
+	public function test_the_build_puts_back_every_filter_it_found(): void {
+		$sentinel = static function ( $value ) {
+			return $value;
+		};
+		add_filter( 'sa_sentinel_hook', $sentinel );
+		$before = $GLOBALS['_filters'];
+		$this->assertArrayHasKey( 'sa_sentinel_hook', $before );
+		// Not an empty window: sa_reset_state() leaves this one registered, and
+		// it is the hook Phase B's step trace is recorded on.
+		$this->assertArrayHasKey( 'aura_worker_unbind_step', $before );
+
+		sa_build_route_table();
+
+		$this->assertSame( $before, $GLOBALS['_filters'], 'the build did not restore the filters it found' );
+	}
+
+	/**
+	 * And the other direction: a listener already on `rest_api_init` when the
+	 * build runs must not contribute routes to the table. Without the reset,
+	 * whatever a test had hooked up would be swept as though the plugin had
+	 * registered it — and an exemption granted to a route the plugin does not
+	 * have is a hole nobody would ever find.
+	 */
+	public function test_the_build_ignores_ambient_rest_api_init_listeners(): void {
+		add_action(
+			'rest_api_init',
+			static function () {
+				register_rest_route(
+					'aura/v1',
+					'/ambient',
+					array(
+						'methods'             => 'POST',
+						'callback'            => '__return_true',
+						'permission_callback' => '__return_true',
+					)
+				);
+			}
+		);
+
+		$this->assertArrayNotHasKey( '/aura/v1/ambient', sa_build_route_table() );
 	}
 
 	/**
