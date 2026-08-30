@@ -87,12 +87,30 @@ class Aura_Worker_Grant {
 	/**
 	 * Verify a grant authorizes THIS tool + params on THIS site, right now, once.
 	 *
+	 * An UNBOUND site verifies nothing (#434 Task 5). The marker is checked
+	 * FIRST, before the signature, the window and the nonce: this is the other
+	 * way a call reaches a mutation — the WordPress Abilities path
+	 * (Aura_Worker_Call_Context) never touches the REST permission callbacks
+	 * and asks here instead — and a grant the gateway minted before the unbind
+	 * is still perfectly valid, so nothing further down would refuse it. The
+	 * nonce is deliberately NOT reserved on this path: refusing a grant is not
+	 * spending it, and a site that is rebound must still be able to run it.
+	 *
 	 * @param string $header X-Aura-Approval-Grant header value ("b64url.b64url").
 	 * @param string $tool   Tool name being executed.
 	 * @param array  $params Parameters the tool was called with.
-	 * @return true|string   True when valid; otherwise a short failure reason.
+	 * @return true|string|WP_Error True when valid; a short failure reason when
+	 *                              the grant does not verify; the shared unbind
+	 *                              refusal (403 aura_site_unbound) when this
+	 *                              site is no longer bound at all. Callers that
+	 *                              render the reason into a message must handle
+	 *                              the WP_Error — concatenating it is a fatal.
 	 */
 	public static function verify( $header, $tool, $params ) {
+		if ( Aura_Worker_Unbind::is_set() ) {
+			return Aura_Worker_Unbind::refusal();
+		}
+
 		if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
 			return 'server is missing libsodium';
 		}

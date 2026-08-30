@@ -439,6 +439,52 @@ class Aura_Worker_Security {
 	}
 
 	/**
+	 * Refuse a mutation at an UNBOUND site (#434 Phase A).
+	 *
+	 * From the moment the marker is written under the site claim, this site is
+	 * no longer Aura's to command: every mutation is refused with
+	 * 403 aura_site_unbound while reads keep working, and it stays refused
+	 * until the site is reconnected. That has to hold against a caller holding
+	 * a perfectly valid site token — a stale automation, a queued job, a
+	 * retried run — because the credentials outlive the binding by design:
+	 * Phase B deletes the token LAST, so there is a window in which the token
+	 * still authenticates and the site must still refuse.
+	 *
+	 * Called by every mutating permission callback AFTER validate_request()
+	 * has succeeded, never before it: a caller who cannot prove it holds the
+	 * token gets the token layer's answer and learns nothing about whether
+	 * this site is bound.
+	 *
+	 * Uses is_set(), not is_set_strict(), deliberately. is_set() answers TRUE
+	 * when the marker cannot be READ, and at a refusal boundary that is the
+	 * only defensible answer: an unreadable marker is not a clean site, and a
+	 * database blip must not re-open every write on a site that was
+	 * disconnected. is_set_strict() exists for callers that need to tell a
+	 * failed read from a clean one; here the two lead to the same refusal, so
+	 * the simpler contract is the honest one.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param WP_REST_Request $request The incoming request.
+	 * @return bool|WP_Error True when the site may still act, WP_Error when it may not.
+	 */
+	public function refuse_if_unbound( $request ) {
+		if ( ! Aura_Worker_Unbind::is_set() ) {
+			return true;
+		}
+
+		// The unbind envelope — and every retry of it — arrives on /aura/v2/rules,
+		// which Task 3 answers from the marker fast path. A site that refused this
+		// route could not be told anything, including that it is unbound.
+		$route = (string) $request->get_route();
+		if ( preg_match( '#/aura/v2/rules$#', $route ) ) {
+			return true;
+		}
+
+		return Aura_Worker_Unbind::refusal();
+	}
+
+	/**
 	 * Permission callback for REST routes requiring admin access.
 	 *
 	 * @param WP_REST_Request $request The incoming request.
@@ -449,6 +495,12 @@ class Aura_Worker_Security {
 		$valid = $this->validate_request( $request );
 		if ( is_wp_error( $valid ) ) {
 			return $valid;
+		}
+
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
 		}
 
 		// Then check WordPress capability.
@@ -475,6 +527,12 @@ class Aura_Worker_Security {
 			return $valid;
 		}
 
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
+		}
+
 		if ( ! current_user_can( 'update_plugins' ) ) {
 			return new WP_Error(
 				'aura_insufficient_permissions',
@@ -498,6 +556,12 @@ class Aura_Worker_Security {
 			return $valid;
 		}
 
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
+		}
+
 		if ( ! current_user_can( 'update_core' ) ) {
 			return new WP_Error(
 				'aura_insufficient_permissions',
@@ -519,6 +583,12 @@ class Aura_Worker_Security {
 		$valid = $this->validate_request( $request );
 		if ( is_wp_error( $valid ) ) {
 			return $valid;
+		}
+
+		// An unbound site refuses every mutation, however good the credentials.
+		$unbound = $this->refuse_if_unbound( $request );
+		if ( is_wp_error( $unbound ) ) {
+			return $unbound;
 		}
 
 		if ( ! current_user_can( 'update_themes' ) ) {

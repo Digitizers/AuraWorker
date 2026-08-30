@@ -27,6 +27,12 @@
 define( 'SA_TESTS_DIR', __DIR__ );
 define( 'SA_PLUGIN_DIR', dirname( __DIR__ ) . '/digitizer-site-worker' );
 
+// The raw site token sa_token_hash() installs the hash of. A request built by
+// sa_token_request() presents THIS value in X-Aura-Token, so the security
+// layer's hash_equals() against the stored digest succeeds — the two helpers
+// have to agree on one string, and this is it.
+define( 'SA_RAW_SITE_TOKEN', 'raw-site-token' );
+
 if ( ! defined( 'ABSPATH' ) ) {
 	// A fixture root, not the repo root: the only thing under it is
 	// wp-admin/includes/*.php — trivial placeholders so the unconditional
@@ -691,7 +697,7 @@ function sa_sign_ruleset( array $payload, ?string $secret = null ): string {
  */
 function sa_token_hash(): string {
 	if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
-		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', 'raw-site-token' );
+		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', SA_RAW_SITE_TOKEN );
 	}
 	return (string) $GLOBALS['_options']['aura_worker_site_token'];
 }
@@ -1389,6 +1395,38 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 		public function get_headers(): array {
 			return $this->headers;
 		}
+	}
+}
+
+// Core's own permission callback for a route that authenticates itself
+// (/aura/v1/connect proves a signed magic link inside its handler). Defined
+// here so the route table's callbacks are all actually callable.
+if ( ! function_exists( '__return_true' ) ) {
+	function __return_true(): bool {
+		return true;
+	}
+}
+
+// --- REST route table -------------------------------------------------------
+// Records what the plugin passes to register_rest_route(), so a test can
+// enumerate the LIVE route table instead of hard-coding a list that goes stale
+// the day a route is added (#434 Task 5: the unbind refusal is asserted for
+// EVERY registered non-safe-method route). Recording only — nothing here
+// dispatches a request; sa_dispatch_permission() below calls one endpoint's
+// permission_callback and nothing else.
+if ( ! function_exists( 'register_rest_route' ) ) {
+	function register_rest_route( string $namespace, string $route, array $args = array(), bool $override = false ): bool {
+		// Core normalises a single endpoint into a list of endpoints before
+		// storing it (rest-api.php, register_rest_route()); an enumeration that
+		// did not would miss every endpoint of a multi-endpoint route.
+		if ( isset( $args['callback'] ) ) {
+			$args = array( $args );
+		}
+		$full = '/' . trim( $namespace, '/' ) . '/' . ltrim( $route, '/' );
+		foreach ( $args as $endpoint ) {
+			$GLOBALS['_rest_routes'][ $full ][] = $endpoint;
+		}
+		return true;
 	}
 }
 
@@ -2462,6 +2500,116 @@ if ( ! function_exists( 'sa_register_ability' ) ) {
 			}
 		};
 	}
+}
+
+/**
+ * The plugin's LIVE REST route table: every route Aura_Worker_API and
+ * Aura_Worker_MCP register, as `'/aura/v1/update/core' => [ endpoint, ... ]`,
+ * where each endpoint is the array the plugin handed register_rest_route()
+ * (`methods`, `callback`, `permission_callback`, `args`).
+ *
+ * Built by CALLING register_routes(), never by scanning source and never by
+ * naming routes here: a hard-coded list would let a mutating route ship next
+ * year with an unguarded permission callback and a green suite (#434 Task 5).
+ *
+ * Memoised for the process. The table is a fact about the CODE, not about a
+ * test's state — the handlers read $GLOBALS live, and Aura_Worker_Security's
+ * only per-request state is a static that sa_reset_state() clears — so
+ * rebuilding it per test would buy nothing and would re-run
+ * Aura_Worker_Magic_Link's constructor (an add_action) on every call. For the
+ * same reason it is NOT cleared in sa_reset_state().
+ *
+ * @return array<string,array<int,array>> Route pattern => endpoints.
+ */
+function sa_registered_routes(): array {
+	static $table = null;
+	if ( null !== $table ) {
+		return $table;
+	}
+	$before                  = $GLOBALS['_rest_routes'] ?? array();
+	$GLOBALS['_rest_routes'] = array();
+	$security                = new Aura_Worker_Security();
+	( new Aura_Worker_API( $security ) )->register_routes();
+	( new Aura_Worker_MCP( $security ) )->register_routes();
+	$table                   = $GLOBALS['_rest_routes'];
+	$GLOBALS['_rest_routes'] = $before;
+	return $table;
+}
+
+/**
+ * A request the security layer will authenticate: the raw site token in the
+ * header whose hash sa_token_hash() stored, on the given route and method.
+ *
+ * Deliberately does NOT install the token option — a test that deleted it (the
+ * state Phase B's final step leaves behind) must be able to build a request
+ * without silently putting it back.
+ *
+ * @param string $method HTTP method.
+ * @param string $route  Full REST route, e.g. '/aura/v1/update/core'.
+ * @return WP_REST_Request
+ */
+function sa_token_request( string $method, string $route ): WP_REST_Request {
+	$request = new WP_REST_Request();
+	$request->set_method( $method );
+	$request->set_route( $route );
+	$request->set_header( 'X-Aura-Token', SA_RAW_SITE_TOKEN );
+	return $request;
+}
+
+/**
+ * Run the permission_callback the LIVE route table registered for this
+ * request's route and method — and nothing else. The route callback is never
+ * reached, so a refusal proved here is a refusal proved before any handler
+ * could act.
+ *
+ * A route the table does not carry is an exception, never a silent skip: an
+ * enumeration that quietly matched nothing is exactly the vacuous pass this
+ * seam exists to prevent.
+ *
+ * @param WP_REST_Request $request The request.
+ * @return mixed Whatever the permission callback answered.
+ * @throws RuntimeException When no registered route/method matches.
+ */
+function sa_dispatch_permission( WP_REST_Request $request ) {
+	$route  = $request->get_route();
+	$method = strtoupper( $request->get_method() );
+	foreach ( sa_registered_routes() as $registered => $endpoints ) {
+		// A registered route is a PATTERN ('/aura/v2/rollback/(?P<plugin>...)');
+		// core matches the request path against it, so this does too.
+		if ( $registered !== $route && 1 !== preg_match( '#^' . $registered . '$#', $route ) ) {
+			continue;
+		}
+		foreach ( $endpoints as $endpoint ) {
+			$methods = array();
+			foreach ( (array) $endpoint['methods'] as $declared ) {
+				foreach ( explode( ',', (string) $declared ) as $one ) {
+					$methods[] = strtoupper( trim( $one ) );
+				}
+			}
+			if ( ! in_array( $method, $methods, true ) ) {
+				continue;
+			}
+			return call_user_func( $endpoint['permission_callback'], $request );
+		}
+	}
+	throw new RuntimeException( "no registered route matches {$method} {$route}" );
+}
+
+/**
+ * Everything the stubs record when something actually HAPPENS: the mutating
+ * stubs' own log ($GLOBALS['_mutations'] — upgrades, activations, file
+ * deletes), every witnessed option write or delete, and every scheduled event.
+ * A permission callback that refuses must leave all three exactly as it found
+ * them.
+ *
+ * @return array
+ */
+function sa_snapshot_side_effects(): array {
+	return array(
+		'mutations'     => $GLOBALS['_mutations'],
+		'option_writes' => $GLOBALS['_option_writes'],
+		'scheduled'     => $GLOBALS['_scheduled'],
+	);
 }
 
 function sa_reset_state(): void {

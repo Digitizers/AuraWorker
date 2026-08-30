@@ -179,6 +179,21 @@ class Aura_Worker_MCP {
 				}
 				$grant  = (string) $request->get_header( 'X-Aura-Approval-Grant' );
 				$reason = Aura_Worker_Grant::verify( $grant, $tool_name, $params );
+				// A WP_Error is not a verdict about the GRANT — it is a refusal
+				// that has nothing to do with one (an unbound site, #434 Task 5).
+				// It carries its own code and status, and concatenating it into
+				// the message below would be a fatal, so it is answered first.
+				if ( is_wp_error( $reason ) ) {
+					$data = $reason->get_error_data();
+					return new WP_REST_Response(
+						array(
+							'success' => false,
+							'code'    => $reason->get_error_code(),
+							'error'   => $reason->get_error_message(),
+						),
+						( is_array( $data ) && isset( $data['status'] ) ) ? (int) $data['status'] : 403
+					);
+				}
 				if ( true !== $reason ) {
 					return new WP_REST_Response(
 						array(
