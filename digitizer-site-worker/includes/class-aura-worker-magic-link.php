@@ -1201,6 +1201,7 @@ class Aura_Worker_Magic_Link {
 		if ( '' === (string) $fence ) {
 			return false;
 		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- The bytes this swap names must be the ROW's, never the option cache's: a cached copy is exactly the stale value a seizure may already have replaced.
 		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::SITE_CLAIM ) );
 		if ( ! is_string( $held ) || 0 !== strpos( $held, $fence . '|' ) ) {
 			return false;
@@ -1209,6 +1210,7 @@ class Aura_Worker_Magic_Link {
 		if ( $held === $fresh ) {
 			return true; // same second: the lease is already as fresh as it gets
 		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- A compare-and-swap has no storage-function equivalent; the cache is evicted immediately below, as every other writer of this row does.
 		$rows = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s", $fresh, self::SITE_CLAIM, $held ) );
 		wp_cache_delete( self::SITE_CLAIM, 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
