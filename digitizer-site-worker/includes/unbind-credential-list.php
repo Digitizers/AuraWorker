@@ -25,6 +25,12 @@
  * @package Aura_Worker
  */
 
+// Loaded by the plugin bootstrap AND by uninstall.php, which runs with
+// WP_UNINSTALL_PLUGIN defined and ABSPATH available — never directly.
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
 if ( ! function_exists( 'aura_worker_credential_list' ) ) {
 	/**
 	 * The uuids a stored credential list proves, or null when it proves
