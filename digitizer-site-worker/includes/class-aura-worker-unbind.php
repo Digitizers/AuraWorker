@@ -22,6 +22,34 @@ final class Aura_Worker_Unbind {
 	/** Minimum seconds between Phase-B attempts (Task 4). */
 	const FINISH_THROTTLE = 300;
 
+	/**
+	 * The self-heal's NEGATIVE throttle: this site had no marker when it was
+	 * last asked (#434 Codex round-11 P2).
+	 *
+	 * maybe_finish() runs on `init`, and is_set() is a deliberately UNCACHED
+	 * raw read. FINISH_TRANSIENT throttles the MARKED site; a bound site — the
+	 * overwhelming majority, and every request on them — matched no throttle
+	 * at all and paid that query on every frontend, admin and REST hit,
+	 * forever, to be told again that there is nothing to finish.
+	 *
+	 * Deliberately a SECOND transient rather than reusing the first: arming
+	 * FINISH_TRANSIENT on the absent path would make a Phase A landing a moment
+	 * later wait out FINISH_THROTTLE before its first self-heal.
+	 *
+	 * write_under_claim() clears it, so a marker written now heals now. The
+	 * TTL is what makes a missed invalidation harmless rather than
+	 * load-bearing: the worst a stale negative can cost is that much delay
+	 * before the site sweeps ITSELF. Nothing that refuses a request reads this
+	 * — every boundary asks is_set() directly — so a stale negative can never
+	 * un-refuse a marked site.
+	 *
+	 * @since 2.13.0
+	 */
+	const ABSENT_TRANSIENT = 'aura_worker_unbind_absent';
+
+	/** @since 2.13.0 */
+	const ABSENT_THROTTLE = 300;
+
 	/** The error code read() answers with for a marker row that exists but cannot be trusted. */
 	const MALFORMED_CODE = 'aura_unbind_marker_malformed';
 
@@ -311,9 +339,15 @@ final class Aura_Worker_Unbind {
 		// Compare identity (site) + freshness (seq) only, deliberately not the
 		// whole marker: proof that THIS write landed is "the row now names my
 		// site at my seq", not a byte-for-byte match of every field.
-		return is_array( $back ) && isset( $back['site'], $back['seq'] )
+		$landed = is_array( $back ) && isset( $back['site'], $back['seq'] )
 			&& $back['site'] === $marker['site']
 			&& (int) $back['seq'] === (int) $marker['seq'];
+		if ( $landed ) {
+			// This site is no longer one with no marker, so the self-heal's
+			// negative throttle must not go on saying it is.
+			delete_transient( self::ABSENT_TRANSIENT );
+		}
+		return $landed;
 	}
 
 	/**
@@ -1060,10 +1094,18 @@ final class Aura_Worker_Unbind {
 		if ( false !== get_transient( self::FINISH_TRANSIENT ) ) {
 			return;
 		}
+		// The negative is throttled too, and separately (round-11 P2). A bound
+		// site matched neither throttle and paid is_set()'s uncached query on
+		// every request forever; arming the FINISH throttle instead would make
+		// a Phase A landing a moment later wait it out.
+		if ( false !== get_transient( self::ABSENT_TRANSIENT ) ) {
+			return;
+		}
 		if ( ! self::is_set() ) {
-			// Deliberately BEFORE set_transient(): a site with no marker must not
-			// arm the throttle, or a Phase A landing a moment later would wait
-			// out FINISH_THROTTLE before its first self-heal.
+			// Deliberately NOT FINISH_TRANSIENT: see above. write_under_claim()
+			// clears this one, so a marker written a moment from now heals on
+			// the request that follows it rather than waiting out the TTL.
+			set_transient( self::ABSENT_TRANSIENT, 1, self::ABSENT_THROTTLE );
 			return;
 		}
 		set_transient( self::FINISH_TRANSIENT, 1, self::FINISH_THROTTLE );

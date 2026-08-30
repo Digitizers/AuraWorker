@@ -444,7 +444,8 @@ final class UnbindCleanupTest extends TestCase {
 
 		Aura_Worker_Unbind::maybe_finish();
 
-		$this->assertFalse( get_transient( Aura_Worker_Unbind::FINISH_TRANSIENT ), 'a bound site must not throttle the sweep it has not needed yet' );
+		$this->assertFalse( get_transient( Aura_Worker_Unbind::FINISH_TRANSIENT ), 'a bound site must not arm the throttle a MARKED site uses' );
+		$this->assertNotFalse( get_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT ), 'and it must not pay the uncached read again on the very next request' );
 
 		sa_set_marker(
 			array(
@@ -458,6 +459,48 @@ final class UnbindCleanupTest extends TestCase {
 		Aura_Worker_Unbind::maybe_finish();
 
 		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ), 'the finish that became due ran at once' );
+	}
+
+	/**
+	 * THE NEGATIVE THROTTLE IS CLEARED BY THE WRITE THAT INVALIDATES IT
+	 * (Codex round-11 P2). A bound site stops paying is_set()'s uncached query
+	 * on every request — but a Phase A landing a moment later must still heal
+	 * on the request that follows it, not after the TTL.
+	 */
+	public function test_phase_a_clears_the_negative_throttle(): void {
+		sa_clear_marker();
+		Aura_Worker_Unbind::maybe_finish();
+		$this->assertNotFalse( get_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT ) );
+
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue(
+			Aura_Worker_Unbind::write_under_claim(
+				array(
+					'at'                 => '2026-08-29T10:00:00Z',
+					'site'               => sa_token_hash(),
+					'site_ref'           => 'res1',
+					'client'             => 'c1',
+					'seq'                => 9,
+					'connect_user_id'    => 3,
+					'app_password_uuids' => array(),
+					'app_password_users' => array(),
+				),
+				$fence
+			)
+		);
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertFalse( get_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT ), 'the site is no longer one with no marker' );
+	}
+
+	/** A write that did NOT land leaves the negative alone — nothing changed. */
+	public function test_a_failed_phase_a_leaves_the_negative_throttle_alone(): void {
+		sa_clear_marker();
+		Aura_Worker_Unbind::maybe_finish();
+
+		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( array( 'site' => 'x', 'seq' => 1 ), 'not-the-fence' ) );
+
+		$this->assertNotFalse( get_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT ) );
 	}
 
 	public function test_maybe_finish_releases_the_claim(): void {

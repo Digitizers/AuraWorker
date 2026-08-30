@@ -239,6 +239,7 @@ $aura_uninstall_site = static function () {
 	// their own within 30 minutes.
 	delete_transient( 'aura_worker_token_reveal' );  // the one-time token reveal (activation / regeneration)
 	delete_transient( 'aura_worker_unbind_finish' ); // the Phase B self-heal throttle (mirrors Aura_Worker_Unbind::FINISH_TRANSIENT)
+	delete_transient( 'aura_worker_unbind_absent' ); // and its negative half (mirrors Aura_Worker_Unbind::ABSENT_TRANSIENT)
 };
 
 if ( is_multisite() && function_exists( 'get_sites' ) && function_exists( 'switch_to_blog' ) ) {

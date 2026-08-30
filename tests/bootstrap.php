@@ -776,6 +776,14 @@ function sa_set_marker( array $over = array() ): array {
 	);
 	$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = $marker;
 	unset( $GLOBALS['_rows'][ Aura_Worker_Unbind::OPTION ], $GLOBALS['_notoptions'][ Aura_Worker_Unbind::OPTION ] );
+	// A marker now exists, so the self-heal's NEGATIVE throttle must not go on
+	// saying none does — write_under_claim() clears it, and a fixture that
+	// seeds the row straight into the database has to model that too
+	// (#434 Codex round-11).
+	if ( class_exists( 'Aura_Worker_Unbind' ) ) {
+		delete_transient( Aura_Worker_Unbind::ABSENT_TRANSIENT );
+	}
+
 	return $marker;
 }
 
