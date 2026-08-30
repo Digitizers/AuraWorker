@@ -264,9 +264,20 @@ final class UnbindRefusalTest extends TestCase {
 
 	/**
 	 * Every `add_action( 'rest_api_init', … )` in the plugin, as
-	 * `filename => count`. Read from the source, tolerating either quote style
-	 * (round-1 NEW-1: the same registrar written with double quotes was a
-	 * green survivor of the single-quote-literal scan).
+	 * `path => count` — the path RELATIVE to SA_PLUGIN_DIR. Read from the
+	 * source, tolerating either quote style (round-1 NEW-1: the same registrar
+	 * written with double quotes was a green survivor of the single-quote-literal
+	 * scan).
+	 *
+	 * THE KEY IS A PATH, NEVER A BASENAME (#434 Task 7 round-2). Keyed by
+	 * basename, this map SILENTLY LOST entries: `RecursiveDirectoryIterator`
+	 * walks `includes/aaa_legacy/` before `includes/`, so a second file sharing
+	 * a basename with a real one had its slot overwritten by the real file, and
+	 * a third `rest_api_init` registration in it left this whole class green
+	 * while its routes were invisible to every assertion here. An enumeration
+	 * whose guarantee is COMPLETENESS must not have a key space in which two
+	 * findings can collapse into one. Reproduced and pinned by
+	 * test_a_registrar_hidden_under_a_shared_basename_is_still_found.
 	 *
 	 * A hook name held in a constant or a variable is still invisible here.
 	 * That is stated in the failure messages rather than papered over.
@@ -282,10 +293,11 @@ final class UnbindRefusalTest extends TestCase {
 				continue;
 			}
 			++$scanned;
-			$source = (string) file_get_contents( $file->getPathname() );
+			$path   = (string) $file->getPathname();
+			$source = (string) file_get_contents( $path );
 			$hits   = preg_match_all( '#add_action\(\s*[\'"]rest_api_init[\'"]#', $source );
 			if ( $hits > 0 ) {
-				$found[ $file->getFilename() ] = $hits;
+				$found[ ltrim( str_replace( SA_PLUGIN_DIR, '', $path ), '/' ) ] = $hits;
 			}
 		}
 		if ( $scanned < 30 ) {
@@ -316,9 +328,41 @@ final class UnbindRefusalTest extends TestCase {
 	public function test_the_route_table_is_built_from_the_only_entry_point_that_registers_routes(): void {
 		$found = self::rest_api_init_registrations();
 		$this->assertSame(
-			array( 'class-aura-worker.php' => 2 ),
+			array( 'includes/class-aura-worker.php' => 2 ),
 			$found,
 			"the plugin's rest_api_init registrations changed. They must all live in the file sa_build_route_table() runs, AND the build must actually reach them — a registrar behind is_admin(), defined() or class_exists() sits in the right file and still never executes, so its routes are invisible to every assertion in this class. Add it to Aura_Worker::init()'s unconditional body, or teach sa_build_route_table()/this test to build with that condition true. (A hook name held in a constant or variable is invisible to this scan entirely.)"
+		);
+	}
+
+	/**
+	 * THE KEY SPACE ITSELF, pinned (#434 Task 7 round-2).
+	 *
+	 * The scan above is worth exactly as much as its inability to LOSE a
+	 * finding, and for a whole task it could lose one: keyed by basename, a
+	 * registrar in `includes/aaa_legacy/class-aura-worker.php` had its slot
+	 * overwritten by the real `includes/class-aura-worker.php` — the iterator
+	 * reaches the subdirectory first — and the assertion above stayed green
+	 * with a third `rest_api_init` registration sitting on disk.
+	 *
+	 * This puts that exact file back and requires BOTH to be reported. A scan
+	 * that silently merges two findings is not an enumeration, and no message
+	 * would ever have told anybody.
+	 */
+	public function test_a_registrar_hidden_under_a_shared_basename_is_still_found(): void {
+		$found = sa_with_plugin_file(
+			'includes/aaa_legacy/class-aura-worker.php',
+			"<?php\nadd_action( 'rest_api_init', 'legacy_registrar' );\n",
+			static function () {
+				return self::rest_api_init_registrations();
+			}
+		);
+		$this->assertSame(
+			array(
+				'includes/aaa_legacy/class-aura-worker.php' => 1,
+				'includes/class-aura-worker.php'            => 2,
+			),
+			$found,
+			'the scan lost a registrar to a shared basename — its completeness guarantee is void'
 		);
 	}
 

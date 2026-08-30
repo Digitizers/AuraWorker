@@ -327,6 +327,28 @@ final class UnbindCoreRestTest extends TestCase {
 	}
 
 	/**
+	 * The tripwire's key space, pinned the same way as Task 5's
+	 * (UnbindRefusalTest, round-2). This scan is already path-keyed, so a
+	 * caller hiding under a shared basename is reported rather than
+	 * overwritten — but "already correct" is not a guard, and the sibling scan
+	 * proved how quietly this breaks.
+	 */
+	public function test_a_caller_hidden_under_a_shared_basename_is_still_found(): void {
+		$callers = sa_with_plugin_file(
+			'includes/aaa_legacy/class-aura-worker-unbind.php',
+			"<?php\nclass Legacy_Unbind { public function go() { Aura_Worker_Unbind::delete_under_claim( 'x' ); } }\n",
+			static function () {
+				return self::files_calling( self::plugin_sources(), 'delete_under_claim' );
+			}
+		);
+		$this->assertSame(
+			array( 'class-aura-worker-unbind.php', 'class-aura-worker-unbind.php' ),
+			$callers,
+			'the scan lost a caller to a shared basename — the tripwire would never fire on it'
+		);
+	}
+
+	/**
 	 * Every plugin PHP file, COMMENTS STRIPPED with PHP's own tokeniser: a
 	 * docblock that DISCUSSES a method (this file's own reasoning does, and so
 	 * does the one in class-aura-worker-rules.php) is prose, not a call, and a

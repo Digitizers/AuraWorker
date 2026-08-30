@@ -2389,6 +2389,45 @@ foreach ( glob( SA_PLUGIN_DIR . '/includes/tools/class-tool-*.php' ) as $tool_fi
 }
 
 /**
+ * Run $body with ONE extra PHP file present inside the plugin tree, then remove
+ * it — and remove it whatever $body does, including throwing a failed
+ * assertion, so a red test never leaves the working tree dirty.
+ *
+ * It exists for the source-scanning guards (#434 Tasks 5-7), which enumerate
+ * the plugin's own files and whose whole value is COMPLETENESS. The only
+ * honest way to show such a scan cannot lose a finding is to put a second
+ * finding on disk where it would be lost — a same-named file in another
+ * directory — and watch the scan still report both. Nothing may be asserted
+ * about that from memory: keying a scan by basename silently collapsed two
+ * findings into one for a whole task before anyone looked (round-2).
+ *
+ * @param string   $relative Path under SA_PLUGIN_DIR, e.g. 'includes/x/y.php'.
+ * @param string   $contents The file's PHP source.
+ * @param callable $body     Run while the file exists.
+ * @return mixed Whatever $body returned.
+ */
+function sa_with_plugin_file( string $relative, string $contents, callable $body ) {
+	$path = SA_PLUGIN_DIR . '/' . ltrim( $relative, '/' );
+	$dir  = dirname( $path );
+	$made = ! is_dir( $dir );
+	if ( $made ) {
+		mkdir( $dir, 0777, true );
+	}
+	if ( file_exists( $path ) ) {
+		throw new RuntimeException( "sa_with_plugin_file(): {$relative} already exists — refusing to overwrite a real plugin file" );
+	}
+	file_put_contents( $path, $contents );
+	try {
+		return $body();
+	} finally {
+		@unlink( $path );
+		if ( $made ) {
+			@rmdir( $dir );
+		}
+	}
+}
+
+/**
  * Reset all mutable stub state. Call from each test's setUp().
  */
 // ---------------------------------------------------------------------------
