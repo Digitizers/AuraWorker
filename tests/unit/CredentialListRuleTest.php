@@ -54,14 +54,26 @@ final class CredentialListRuleTest extends TestCase {
 				continue; // the rule itself
 			}
 			foreach ( explode( "\n", (string) file_get_contents( $path ) ) as $n => $line ) {
-				if ( self::is_comment( $line ) || false === strpos( $line, 'app_password_uuids' ) ) {
+				if ( self::is_comment( $line ) || false === strpos( $line, 'app_password_' ) ) {
 					continue;
 				}
-				// The ARGUMENT must be the field itself. `is_array( $marker )`
-				// beside a read of a marker read() already proved is not a
-				// re-derivation — that check is about the marker, and the list
-				// inside it is proven by then.
-				if ( ! preg_match( '/\b(is_array|isset|array_map)\s*\([^)]*app_password_uuids/', $line ) ) {
+				// Two shapes, and only these two.
+				//
+				// (a) Deciding the shape of the uuid LIST, with the field
+				//     itself as the argument. `is_array( $marker )` beside a
+				//     read of a list read() already proved is not a
+				//     re-derivation — that check is about the marker.
+				//     Deciding the shape of the owners MAP is not flagged
+				//     either: an unreadable map means every owner is unknown,
+				//     which fails CLOSED, where an unreadable LIST read as
+				//     empty fails open. Only one of them is a security claim.
+				//
+				// (b) Casting an owner. `(int) "42junk"` is 42 in PHP, and a
+				//     confident wrong owner sends the revocation to the wrong
+				//     user's list, which answers "not there".
+				$shape = preg_match( '/\b(is_array|isset|array_map)\s*\([^)]*app_password_uuids/', $line );
+				$cast  = preg_match( '/\(int\)[^\n]*app_password_users/', $line );
+				if ( ! $shape && ! $cast ) {
 					continue;
 				}
 				if ( false !== strpos( $line, self::RULE ) ) {
@@ -91,6 +103,40 @@ final class CredentialListRuleTest extends TestCase {
 				"{$entry} does not load the credential-list rule, so it is free to invent its own"
 			);
 		}
+	}
+
+	/**
+	 * THE OWNER HALF (Codex round-7 P1). A line-level scan cannot see a read
+	 * through a local alias — uninstall.php copied the owners map into a
+	 * variable and then cast it — so this asks the question at file level,
+	 * where it holds: nothing may index that map without asking the rule what
+	 * the value names. A `(int)` cast reads "42junk" as user 42, and a
+	 * confident wrong owner is worse than an unknown one.
+	 */
+	public function test_no_file_reads_a_credential_owner_without_asking_the_rule(): void {
+		$offenders = array();
+		foreach ( self::sources() as $path ) {
+			if ( 'unbind-credential-list.php' === basename( $path ) ) {
+				continue;
+			}
+			$src = (string) file_get_contents( $path );
+			// A file that holds the owners map AND revokes a credential is
+			// acting on an attribution, whether it reads it directly or
+			// through a local alias. A file that only carries the map forward
+			// — copying it into a marker it is about to write — interprets
+			// nothing and is not asked to.
+			if ( false === strpos( $src, 'app_password_users' ) ) {
+				continue;
+			}
+			if ( false === strpos( $src, 'delete_application_password(' ) && false === strpos( $src, 'password_gone(' ) ) {
+				continue;
+			}
+			if ( false === strpos( $src, 'aura_worker_credential_owner(' ) ) {
+				$offenders[] = basename( $path );
+			}
+		}
+
+		$this->assertSame( array(), $offenders, 'these files read a credential owner without asking the rule what it names' );
 	}
 
 	// --- the rule's own behaviour ------------------------------------------
@@ -126,6 +172,40 @@ final class CredentialListRuleTest extends TestCase {
 			'a null entry'    => array( array( 'u-1', null ) ),
 			'a bool entry'    => array( array( 'u-1', true ) ),
 			'an empty entry'  => array( array( 'u-1', '' ) ),
+		);
+	}
+
+	// --- the owner rule ----------------------------------------------------
+
+	public function test_a_positive_int_owner_is_the_user(): void {
+		$this->assertSame( 42, aura_worker_credential_owner( 42 ) );
+		$this->assertSame( 42, aura_worker_credential_owner( '42' ) );
+	}
+
+	/**
+	 * @dataProvider unnamed_owners
+	 *
+	 * @param mixed $raw What the row holds.
+	 */
+	public function test_anything_that_names_nobody_is_null( $raw ): void {
+		$this->assertNull( aura_worker_credential_owner( $raw ) );
+	}
+
+	/** @return array<string,array{0:mixed}> */
+	public static function unnamed_owners(): array {
+		return array(
+			'null'              => array( null ),
+			'zero'              => array( 0 ),
+			'zero as a string'  => array( '0' ),
+			'negative'          => array( -3 ),
+			'an empty string'   => array( '' ),
+			'digits with junk'  => array( '42junk' ),
+			'junk with digits'  => array( 'junk42' ),
+			'a float'           => array( 42.5 ),
+			'a float string'    => array( '4.2' ),
+			'true'              => array( true ),
+			'an array'          => array( array( 42 ) ),
+			'an object'         => array( new stdClass() ),
 		);
 	}
 }

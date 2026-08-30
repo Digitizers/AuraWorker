@@ -131,17 +131,13 @@ final class Aura_Worker_Unbind {
 			return self::malformed();
 		}
 		$m['app_password_uuids'] = $uuids;
-		// Owners are normalised to a POSITIVE int or an explicit null meaning
-		// "this site does not know whose password this is" (round-3). Anything
-		// else — 0, '', a string, an object, a marker written by an earlier
-		// build — is that same unknown, never a user id: Phase B's single
-		// lookup is authoritative ONLY against an owner the site actually
-		// recorded, so a value that names nobody must not be passed off as one.
-		$users = isset( $m['app_password_users'] ) && is_array( $m['app_password_users'] ) ? $m['app_password_users'] : array();
+		// Owners, through the same rule file: a POSITIVE int, or an explicit
+		// null meaning "this site does not know whose password this is"
+		// (round-3). Anything else is that same unknown, never a user id.
+		$users                   = is_array( $m['app_password_users'] ?? null ) ? $m['app_password_users'] : array();
 		$m['app_password_users'] = array();
 		foreach ( $users as $uuid => $owner ) {
-			$owner                                       = is_int( $owner ) || ( is_string( $owner ) && ctype_digit( $owner ) ) ? (int) $owner : 0;
-			$m['app_password_users'][ (string) $uuid ] = $owner > 0 ? $owner : null;
+			$m['app_password_users'][ (string) $uuid ] = aura_worker_credential_owner( $owner );
 		}
 		return $m;
 	}
@@ -534,7 +530,7 @@ final class Aura_Worker_Unbind {
 	private static function password_owner( array $m, string $uuid ): ?int {
 		// read() has already normalised every entry to a positive int or null;
 		// a uuid with no entry at all is the same unknown.
-		return isset( $m['app_password_users'][ $uuid ] ) ? (int) $m['app_password_users'][ $uuid ] : null;
+		return aura_worker_credential_owner( $m['app_password_users'][ $uuid ] ?? null );
 	}
 
 	/**

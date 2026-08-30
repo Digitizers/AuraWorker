@@ -74,3 +74,40 @@ if ( ! function_exists( 'aura_worker_credential_list' ) ) {
 		return $out;
 	}
 }
+
+if ( ! function_exists( 'aura_worker_credential_owner' ) ) {
+	/**
+	 * The user a stored credential OWNER names, or null when it names nobody
+	 * this code may act on.
+	 *
+	 * The other half of the same record, and the same rule (#434 Codex
+	 * round-7 P1). `uninstall.php` cast the stored value with `(int)`, and PHP
+	 * reads `"42junk"` as 42: a damaged attribution became a confident one, the
+	 * revocation asked user 42's list, was told "not there", and reported a
+	 * credential belonging to somebody else as settled — after which the sweep
+	 * deleted the marker that was its only record. validated() had the correct
+	 * test all along, in its own copy, which is exactly the arrangement that
+	 * lets one copy be wrong.
+	 *
+	 * NULL is returned for every shape that is not a positive integer, and it
+	 * means the SAME thing on both sides: this site does not know whose
+	 * password this is. Phase B's single lookup is authoritative only against
+	 * an owner the site actually recorded, so a value that names nobody must
+	 * never be passed off as one — and 0 is not a user.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param mixed $raw Whatever the stored marker holds for the owner.
+	 * @return int|null The user id, or null when nothing was named.
+	 */
+	function aura_worker_credential_owner( $raw ) {
+		if ( is_int( $raw ) ) {
+			return $raw > 0 ? $raw : null;
+		}
+		if ( is_string( $raw ) && ctype_digit( $raw ) ) {
+			$id = (int) $raw;
+			return $id > 0 ? $id : null;
+		}
+		return null;
+	}
+}

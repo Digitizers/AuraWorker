@@ -720,6 +720,32 @@ final class UninstallCoverageTest extends TestCase {
 		);
 	}
 
+	/**
+	 * A DAMAGED OWNER IS AN UNKNOWN ONE, NEVER A CONFIDENT WRONG ONE (Codex
+	 * round-7 P1). `(int) "42junk"` is 42 in PHP, so the revocation asked user
+	 * 42's list, was told "not there", and reported a credential that belongs
+	 * to somebody else as settled — after which the sweep deleted the marker
+	 * that was its only record.
+	 */
+	public function test_a_marker_owner_that_names_nobody_outlives_the_uninstall(): void {
+		$GLOBALS['_app_passwords'][9] = array( array( 'uuid' => 'uuid-manual', 'name' => 'Somebody' ) );
+		update_option(
+			Aura_Worker_Unbind::OPTION,
+			array(
+				'unbound_at'         => gmdate( 'c' ),
+				'app_password_uuids' => array( 'uuid-manual' ),
+				'app_password_users' => array( 'uuid-manual' => '42junk' ),
+			)
+		);
+		update_option( 'aura_worker_site_token', 'hash' );
+
+		self::run_uninstall();
+
+		$this->assertNotFalse( get_option( Aura_Worker_Unbind::OPTION, false ), 'the debt was settled against a user the row never named' );
+		$this->assertTrue( sa_app_password_exists( 9, 'uuid-manual' ), 'and the real holder still has it' );
+		$this->assertFalse( get_option( 'aura_worker_site_token', false ), 'everything else still went' );
+	}
+
 	private static function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 			define( 'WP_UNINSTALL_PLUGIN', 'digitizer-site-worker/digitizer-site-worker.php' );

@@ -141,8 +141,13 @@ $aura_uninstall_site = static function () {
 	$aura_marker_settled = ! $aura_marker_present || null !== $aura_marker_uuids;
 	foreach ( (array) $aura_marker_uuids as $aura_marker_uuid ) {
 		$aura_marker_uuid  = (string) $aura_marker_uuid;
-		$aura_marker_owner = (int) ( $aura_marker_users[ $aura_marker_uuid ] ?? 0 );
-		if ( '' === $aura_marker_uuid || $aura_marker_owner <= 0 || ! class_exists( 'WP_Application_Passwords' ) ) {
+		// The owner through the same rule the plugin reads it by. A bare
+		// `(int)` cast accepted "42junk" as user 42, and a confident wrong
+		// owner is worse than an unknown one: the revocation asks that user's
+		// list, is told "not there", and reports somebody else's live
+		// credential settled (Codex round-7 P1).
+		$aura_marker_owner = aura_worker_credential_owner( $aura_marker_users[ $aura_marker_uuid ] ?? null );
+		if ( '' === $aura_marker_uuid || null === $aura_marker_owner || ! class_exists( 'WP_Application_Passwords' ) ) {
 			// An entry whose owner was never recovered — the marker repair
 			// stores those with a null owner on purpose rather than guessing
 			// one. Nothing HERE can address the credential, and the site-wide
