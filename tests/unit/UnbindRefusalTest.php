@@ -396,6 +396,42 @@ final class UnbindRefusalTest extends TestCase {
 	}
 
 	/**
+	 * The fixture writes a real PHP file into the SHIPPED plugin tree, so where it
+	 * may write is a property of the helper and not of its callers' good manners.
+	 * The tool auto-loader (class-aura-worker-tools.php) require_once's everything
+	 * matching includes/tools/class-tool-*.php, so a fixture landing there would be
+	 * LOADED by the plugin — in a later test, or on a site if a killed run stranded
+	 * it. Today's call sites write to includes/aaa_legacy/, which matches nothing;
+	 * these two pin that the helper refuses the dangerous shapes regardless.
+	 *
+	 * @dataProvider refused_fixture_paths
+	 */
+	public function test_the_fixture_refuses_a_path_it_must_never_write( string $relative, string $because ): void {
+		$ran = false;
+		try {
+			sa_with_plugin_file(
+				$relative,
+				"<?php\n",
+				static function () use ( &$ran ) {
+					$ran = true;
+					return null;
+				}
+			);
+			$this->fail( "sa_with_plugin_file() must refuse {$relative}: {$because}" );
+		} catch ( RuntimeException $e ) {
+			$this->assertStringContainsString( $because, $e->getMessage() );
+		}
+		$this->assertFalse( $ran, 'and it refuses BEFORE running the body or touching the disk' );
+	}
+
+	public static function refused_fixture_paths(): array {
+		return array(
+			'inside the tool auto-loader glob' => array( 'includes/tools/class-tool-fixture.php', "tool auto-loader's glob" ),
+			'escaping the plugin directory'    => array( '../outside-the-plugin.php', 'escapes the plugin directory' ),
+		);
+	}
+
+	/**
 	 * The concrete conditional the plugin has today: `init()`'s
 	 * `if ( is_admin() )` branch. The table is built with is_admin() FALSE,
 	 * because that is what a REST request is — so a route registered only in

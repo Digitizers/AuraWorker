@@ -2408,6 +2408,31 @@ foreach ( glob( SA_PLUGIN_DIR . '/includes/tools/class-tool-*.php' ) as $tool_fi
  */
 function sa_with_plugin_file( string $relative, string $contents, callable $body ) {
 	$path = SA_PLUGIN_DIR . '/' . ltrim( $relative, '/' );
+
+	// This helper writes a real PHP file INTO THE SHIPPED PLUGIN TREE so a source
+	// scan's key space can be pinned with a genuine collision. Two things must be
+	// true by CONSTRUCTION rather than by the good manners of its callers, because
+	// the next caller will not read this comment:
+	//
+	// (1) It must not escape the plugin directory. `ltrim` alone does not stop
+	//     `../../…`; the containment check does.
+	// (2) It must not write anywhere the PRODUCTION loader would pick up. The tool
+	//     auto-loader (class-aura-worker-tools.php) globs
+	//     `includes/tools/class-tool-*.php` and require_once's every match, so a
+	//     fixture landing there would be LOADED by the plugin — in a later test, or
+	//     on a site, if a killed run ever stranded it. Today's two call sites write
+	//     to includes/aaa_legacy/, which matches nothing; that is a property of the
+	//     call sites, not of this helper, and this is what makes it a property of
+	//     the helper.
+	$root = realpath( SA_PLUGIN_DIR );
+	$want = $root . '/' . ltrim( $relative, '/' );
+	if ( false === $root || 0 !== strpos( $want, $root . '/' ) || false !== strpos( $relative, '..' ) ) {
+		throw new RuntimeException( "sa_with_plugin_file(): {$relative} escapes the plugin directory" );
+	}
+	if ( 1 === preg_match( '#(^|/)includes/tools/class-tool-[^/]*\.php$#', ltrim( $relative, '/' ) ) ) {
+		throw new RuntimeException( "sa_with_plugin_file(): {$relative} is inside the tool auto-loader's glob — a fixture there would be require_once'd by the plugin" );
+	}
+
 	$dir  = dirname( $path );
 	$made = ! is_dir( $dir );
 	if ( $made ) {
