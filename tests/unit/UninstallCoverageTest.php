@@ -614,6 +614,78 @@ final class UninstallCoverageTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_worker_site_token', false ), 'the plugin\'s own row still went' );
 	}
 
+	/**
+	 * THE MARKER IS A CREDENTIAL RECORD TOO (Codex on PR #76, round 3). Phase B
+	 * could not prove this password revoked, so the marker's uuid list is the
+	 * only trace of a live administrator credential — the record settled first
+	 * names only the password this plugin minted, never one an operator
+	 * connected by hand. Sweeping the marker away would leave the credential
+	 * authenticating with nothing on the site that records it.
+	 */
+	public function test_a_marker_naming_an_unrevocable_password_outlives_the_uninstall(): void {
+		$GLOBALS['_app_passwords'][7]          = array( array( 'uuid' => 'uuid-manual', 'name' => 'Somebody' ) );
+		$GLOBALS['_app_passwords_delete_fail'] = true;
+		update_option(
+			Aura_Worker_Unbind::OPTION,
+			array(
+				'unbound_at'         => gmdate( 'c' ),
+				'app_password_uuids' => array( 'uuid-manual' ),
+				'app_password_users' => array( 'uuid-manual' => 7 ),
+			)
+		);
+		update_option( 'aura_worker_site_token', 'hash' );
+
+		self::run_uninstall();
+
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'the only trace of a live administrator credential was swept away' );
+		$this->assertSame( array( 'uuid-manual' ), get_option( Aura_Worker_Unbind::OPTION )['app_password_uuids'] );
+		$this->assertFalse( get_option( 'aura_worker_site_token', false ), 'everything else still went' );
+	}
+
+	/**
+	 * An entry the marker repair could not attribute carries a NULL owner
+	 * rather than a guessed one, so nothing in this file can address it — and
+	 * the site-wide search that could lives in plugin code uninstall does not
+	 * load. The debt stands; the marker stays.
+	 */
+	public function test_a_marker_entry_with_no_recovered_owner_outlives_the_uninstall(): void {
+		update_option(
+			Aura_Worker_Unbind::OPTION,
+			array(
+				'unbound_at'         => gmdate( 'c' ),
+				'app_password_uuids' => array( 'uuid-orphan' ),
+				'app_password_users' => array( 'uuid-orphan' => null ),
+			)
+		);
+
+		self::run_uninstall();
+
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'an unattributed credential is not an absent one' );
+	}
+
+	/**
+	 * And the debt really is settled when it can be: the credential is revoked
+	 * by its stored uuid and the marker goes with everything else, so a
+	 * reinstall does not meet a marker refusing every mutation for a password
+	 * that no longer exists.
+	 */
+	public function test_a_marker_whose_password_is_revoked_does_not_outlive_the_uninstall(): void {
+		$GLOBALS['_app_passwords'][7] = array( array( 'uuid' => 'uuid-manual', 'name' => 'Somebody' ) );
+		update_option(
+			Aura_Worker_Unbind::OPTION,
+			array(
+				'unbound_at'         => gmdate( 'c' ),
+				'app_password_uuids' => array( 'uuid-manual' ),
+				'app_password_users' => array( 'uuid-manual' => 7 ),
+			)
+		);
+
+		self::run_uninstall();
+
+		$this->assertFalse( sa_app_password_exists( 7, 'uuid-manual' ), 'the credential the marker named is revoked' );
+		$this->assertFalse( Aura_Worker_Unbind::is_set(), 'and nothing is owed, so the marker goes' );
+	}
+
 	private static function run_uninstall(): void {
 		if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 			define( 'WP_UNINSTALL_PLUGIN', 'digitizer-site-worker/digitizer-site-worker.php' );

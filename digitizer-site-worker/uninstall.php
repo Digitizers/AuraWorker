@@ -101,6 +101,50 @@ $aura_uninstall_site = static function () {
 		delete_option( 'aura_worker_app_password' );
 	}
 
+	// THE MARKER IS A CREDENTIAL RECORD TOO (Codex round-3 P1).
+	//
+	// Phase B revokes the Application Passwords the departed binding used, and
+	// when it CANNOT prove one gone the unbind marker keeps that debt:
+	// `app_password_uuids` and `app_password_users` are then the only trace on
+	// the site of which credential is still live and who owns it — the record
+	// settled above names just the one this plugin minted, never a password an
+	// operator connected by hand. Sweeping the marker away while that debt
+	// stands leaves an administrator credential authenticating to WordPress
+	// with nothing left that records its existence: the exact failure the
+	// block above exists to prevent, through the other door.
+	//
+	// So the marker is settled on the same terms and with the same proof:
+	// deleted by the STORED uuid, believed only on the owner's list rather
+	// than on the delete's return value, and KEPT whenever an entry cannot be
+	// proven gone. A kept marker refuses every authenticated mutation after a
+	// reinstall, which is what it is for — the settings screen names the debt
+	// and offers to finish it, and that is the honest state of a site whose
+	// credential really is still out there.
+	$aura_marker         = get_option( 'aura_worker_unbound', null ); // mirrors Aura_Worker_Unbind::OPTION
+	$aura_marker_uuids   = ( is_array( $aura_marker ) && isset( $aura_marker['app_password_uuids'] ) && is_array( $aura_marker['app_password_uuids'] ) ) ? $aura_marker['app_password_uuids'] : array();
+	$aura_marker_users   = ( is_array( $aura_marker ) && isset( $aura_marker['app_password_users'] ) && is_array( $aura_marker['app_password_users'] ) ) ? $aura_marker['app_password_users'] : array();
+	$aura_marker_settled = true;
+	foreach ( $aura_marker_uuids as $aura_marker_uuid ) {
+		$aura_marker_uuid  = (string) $aura_marker_uuid;
+		$aura_marker_owner = (int) ( $aura_marker_users[ $aura_marker_uuid ] ?? 0 );
+		if ( '' === $aura_marker_uuid || $aura_marker_owner <= 0 || ! class_exists( 'WP_Application_Passwords' ) ) {
+			// An entry whose owner was never recovered — the marker repair
+			// stores those with a null owner on purpose rather than guessing
+			// one. Nothing HERE can address the credential, and the site-wide
+			// search that could lives in plugin code this file deliberately
+			// does not load, so the debt stands.
+			$aura_marker_settled = false;
+			continue;
+		}
+		WP_Application_Passwords::delete_application_password( $aura_marker_owner, $aura_marker_uuid );
+		foreach ( WP_Application_Passwords::get_user_application_passwords( $aura_marker_owner ) as $aura_pw_item ) {
+			if ( $aura_marker_uuid === (string) ( $aura_pw_item['uuid'] ?? '' ) ) {
+				$aura_marker_settled = false;
+				break;
+			}
+		}
+	}
+
 	// THE KEY SET IS NOT WRITTEN DOWN HERE (#434 Task 10).
 	//
 	// This file used to name every option it removed, one delete_option() per
@@ -131,10 +175,13 @@ $aura_uninstall_site = static function () {
 	// maintains `notoptions`, the autoload cache and each transient's timeout
 	// row exactly as it would for a by-name removal.
 	$aura_prefixes = array( 'aura_worker_', 'aura_magic_', 'aura_grant_nonce_' );
-	// The one row that may outlive this uninstall: a tracking record whose
+	// The rows that may outlive this uninstall: either tracking record whose
 	// Application Password revocation could not be PROVEN is deliberately kept
 	// above, and the sweep must not undo that decision.
 	$aura_keep = $aura_pw_gone ? array() : array( 'aura_worker_app_password' );
+	if ( ! $aura_marker_settled ) {
+		$aura_keep[] = 'aura_worker_unbound';
+	}
 
 	global $wpdb;
 	// The WHOLE literal is escaped, never a prefix concatenated onto an
