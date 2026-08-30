@@ -1859,10 +1859,7 @@ class Aura_Worker_Magic_Link {
 		}
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
 		$rows = $wpdb->get_results( $sql );
-		if ( ! is_array( $rows ) || array() === $rows ) {
-			// The sentinel makes an empty answer impossible for a statement
-			// that ran, so this is the statement failing. Same breadcrumb the
-			// per-user probe leaves, with no owner to name.
+		if ( ! is_array( $rows ) ) {
 			do_action( 'aura_worker_app_password_probe_unproven', 0 );
 			return null;
 		}
@@ -1886,7 +1883,12 @@ class Aura_Worker_Magic_Link {
 		}
 		if ( ! $sentinel ) {
 			// The one row this statement cannot fail to return did not come
-			// back, so what did come back is not this statement's answer.
+			// back, so what did come back is not this statement's answer. It is
+			// also how a statement that FAILED is caught — it answers with no
+			// rows at all, and no rows is no sentinel. Kept as the single test
+			// rather than as a special case beside an is-empty check, so the
+			// guard that decides this is one the suite can actually redden.
+			// Same breadcrumb the per-user probe leaves, with no owner to name.
 			do_action( 'aura_worker_app_password_probe_unproven', 0 );
 			return null;
 		}

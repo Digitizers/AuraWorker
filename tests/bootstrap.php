@@ -1713,7 +1713,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					return array();
 				}
 				$needle = str_replace( array( '\\_', '\\%', '\\\\' ), array( '_', '%', '\\' ), stripslashes( $m[3] ) );
-				$rows   = array( (object) array( 'probe' => $m[1], 'user_id' => 0 ) ); // the sentinel
+				$rows = array( (object) array( 'probe' => $m[1], 'user_id' => 0 ) ); // the sentinel
 				// A result set whose OWNER rows came from somebody else's
 				// statement while the sentinel is this call's: the shape a
 				// check that read only the first row would wave through.

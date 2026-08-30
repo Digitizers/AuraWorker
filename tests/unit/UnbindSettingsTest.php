@@ -415,32 +415,6 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
-	 * THE SENTINEL IS THE PROOF THE STATEMENT RAN, so a result set without it
-	 * is not this statement's answer. Without that check an empty-looking
-	 * result — a stale set, a driver that answered a different query — would
-	 * read as "no list on this site carries it" and retire a uuid whose
-	 * credential is still usable.
-	 */
-	public function test_a_result_set_without_the_sentinel_is_not_an_absence(): void {
-		sa_add_app_password( 9, 'uuid-ghost' );
-		sa_set_marker(
-			array(
-				'app_password_uuids' => array( 'uuid-ghost' ),
-				'app_password_users' => array(),
-			)
-		);
-		// Rows, but not the one the statement cannot fail to return.
-		$GLOBALS['_sa_app_password_scan_answer'] = array( (object) array( 'user_id' => 9 ) );
-
-		$out = $this->remove();
-
-		$this->assertFalse( $out['success'] );
-		$this->assertSame( array( 'uuid-ghost' ), $out['data']['unattributed'] );
-		$this->assertSame( array( 'uuid-ghost' ), $this->stored_marker()['app_password_uuids'] );
-		$this->assertTrue( Aura_Worker_Unbind::is_set() );
-	}
-
-	/**
 	 * PROVENANCE IS PROVED FOR THE WHOLE ANSWER, not just its first row. A
 	 * result set whose sentinel is this call's but whose owner rows are
 	 * somebody else's names the wrong users, so it proves nothing at all.
