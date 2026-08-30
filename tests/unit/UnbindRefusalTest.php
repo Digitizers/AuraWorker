@@ -367,6 +367,35 @@ final class UnbindRefusalTest extends TestCase {
 	}
 
 	/**
+	 * The fixture the two collision pins stand on must not be able to leave a
+	 * file inside the plugin tree — including when the body FAILS, which is
+	 * the case that matters: a red assertion is an exception, and a scan
+	 * fixture that survived one would poison every later test in the process
+	 * and dirty the working tree.
+	 */
+	public function test_the_scan_fixture_removes_itself_even_when_the_body_throws(): void {
+		$relative = 'includes/aaa_legacy/class-aura-worker.php';
+		$path     = SA_PLUGIN_DIR . '/' . $relative;
+		$existed  = null;
+		try {
+			sa_with_plugin_file(
+				$relative,
+				"<?php\n",
+				static function () use ( $path, &$existed ) {
+					$existed = file_exists( $path );
+					throw new RuntimeException( 'the body failed, as a red assertion does' );
+				}
+			);
+			$this->fail( 'the body\'s failure must propagate, not be swallowed by the cleanup' );
+		} catch ( RuntimeException $e ) {
+			$this->assertSame( 'the body failed, as a red assertion does', $e->getMessage() );
+		}
+		$this->assertTrue( $existed, 'the file really was on disk while the body ran' );
+		$this->assertFileDoesNotExist( $path, 'and it is gone afterwards' );
+		$this->assertDirectoryDoesNotExist( dirname( $path ), 'including the directory it created' );
+	}
+
+	/**
 	 * The concrete conditional the plugin has today: `init()`'s
 	 * `if ( is_admin() )` branch. The table is built with is_admin() FALSE,
 	 * because that is what a REST request is — so a route registered only in
