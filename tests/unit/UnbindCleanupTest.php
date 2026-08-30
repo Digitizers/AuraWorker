@@ -406,6 +406,60 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertTrue( sa_app_password_exists( 3, 'uuid-managed' ) );
 	}
 
+	/**
+	 * Final round MINOR-2. is_set() is a DELIBERATELY UNCACHED raw read — one
+	 * guaranteed query — and it used to be asked BEFORE the throttle, so the
+	 * throttle did not throttle the expensive half: an unbound site paid that
+	 * query on every page load, front-end, admin and cron alike, forever. The
+	 * cheap question is asked first now, and this is what says so: a throttled
+	 * sweep must issue no statement against the marker row at all.
+	 */
+	public function test_a_throttled_sweep_does_not_pay_the_uncached_marker_read(): void {
+		set_transient( Aura_Worker_Unbind::FINISH_TRANSIENT, 1, Aura_Worker_Unbind::FINISH_THROTTLE );
+		$GLOBALS['_db_queries'] = array();
+
+		Aura_Worker_Unbind::maybe_finish();
+
+		$marker_statements = array_values(
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static function ( $q ) {
+					return false !== strpos( (string) $q, Aura_Worker_Unbind::OPTION );
+				}
+			)
+		);
+		$this->assertSame( array(), $marker_statements, 'the throttle is consulted before the raw read, not after' );
+		$this->assertTrue( sa_app_password_exists( 3, 'uuid-managed' ), 'and the throttled sweep still did nothing' );
+	}
+
+	/**
+	 * The other half of that reordering, and the property it must not break:
+	 * asking the throttle first cannot skip a finish that is DUE. The throttle
+	 * is armed only on the path where the marker is set, so a site that is not
+	 * unbound never arms it — and a Phase A landing a moment later is swept on
+	 * the very next request, not after FINISH_THROTTLE seconds.
+	 */
+	public function test_a_sweep_that_finds_no_marker_does_not_arm_the_throttle(): void {
+		sa_clear_marker();
+
+		Aura_Worker_Unbind::maybe_finish();
+
+		$this->assertFalse( get_transient( Aura_Worker_Unbind::FINISH_TRANSIENT ), 'a bound site must not throttle the sweep it has not needed yet' );
+
+		sa_set_marker(
+			array(
+				'site'               => sa_token_hash(),
+				'seq'                => 9,
+				'connect_user_id'    => 3,
+				'app_password_uuids' => array( 'uuid-managed' ),
+				'app_password_users' => array( 'uuid-managed' => 3 ),
+			)
+		);
+		Aura_Worker_Unbind::maybe_finish();
+
+		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ), 'the finish that became due ran at once' );
+	}
+
 	public function test_maybe_finish_releases_the_claim(): void {
 		Aura_Worker_Unbind::maybe_finish();
 		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM, '' ) );

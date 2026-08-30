@@ -331,4 +331,97 @@ final class UnbindMarkerTest extends TestCase {
 		$GLOBALS['_sa_wpdb_error'] = '';
 		$this->assertNull( $fragment );
 	}
+
+	// -----------------------------------------------------------------------
+	// Final round MINOR-1 (M20): write_under_claim()'s read-back is the SOLE
+	// proof that Phase A's marker reached the row, and nothing held it —
+	// replacing the whole return expression with `return true;` left the suite
+	// green. The seam that can tell the difference is the stub's
+	// _sa_option_write_divert: a claim-fenced write that ANSWERS 1 while the
+	// stored row diverges from what the caller asked for (a lost write, a
+	// filter, a trigger, replication lag). Nothing else in the harness can
+	// make a claim-conditional write report success without landing.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * The INSERT half — the very first marker a Phase A writes. The statement
+	 * reports success, the row lands empty, and the caller must not go on to
+	 * tell Aura the site is marked when the refusal boundary would read it as
+	 * a site that never was.
+	 */
+	public function test_a_first_claimed_write_that_does_not_land_is_not_reported_as_written(): void {
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$GLOBALS['_sa_option_write_divert'][ Aura_Worker_Unbind::OPTION ] = true;
+
+		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( $this->marker(), $fence ) );
+
+		$GLOBALS['_sa_option_write_divert'] = array();
+		$this->assertNull( Aura_Worker_Unbind::read(), 'and nothing claims the site is marked' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * The UPDATE half, both fields the read-back compares. Identity (`site`)
+	 * and freshness (`seq`) are the two halves of "the row now names MY site
+	 * at MY seq"; each is asserted on its own, so a mutant that drops either
+	 * comparison — or the whole expression — reddens.
+	 */
+	public function test_a_claimed_write_that_reports_success_over_an_unchanged_row_is_refused(): void {
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Unbind::write_under_claim( $this->marker(), $fence ) );
+
+		// Freshness: the statement answers 1; the row keeps the seq it had.
+		$GLOBALS['_sa_option_write_divert'][ Aura_Worker_Unbind::OPTION ] = true;
+		$next        = $this->marker();
+		$next['seq'] = 8;
+		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( $next, $fence ), 'a stale seq is not this write' );
+		$this->assertSame( 7, Aura_Worker_Unbind::read()['seq'], 'the write genuinely did not land' );
+
+		// Identity: the write lands, but naming another site's token.
+		$GLOBALS['_sa_option_write_divert'][ Aura_Worker_Unbind::OPTION ] = static function ( $value ) {
+			$m         = maybe_unserialize( $value );
+			$m['site'] = str_repeat( 'b', 64 );
+			return maybe_serialize( $m );
+		};
+		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( $this->marker(), $fence ), 'another site is not this site' );
+		$this->assertSame( str_repeat( 'b', 64 ), Aura_Worker_Unbind::read()['site'] );
+
+		// And a row that is not a marker at all.
+		$GLOBALS['_sa_option_write_divert'][ Aura_Worker_Unbind::OPTION ] = static function () {
+			return 'not-a-marker';
+		};
+		$this->assertFalse( Aura_Worker_Unbind::write_under_claim( $this->marker(), $fence ) );
+
+		$GLOBALS['_sa_option_write_divert'] = array();
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * Final round LOW-1. `app_password_uuids` is the one marker field
+	 * validated() does not type-check per entry, and it used to be
+	 * `array_map( 'strval', … )`: an OBJECT entry threw a PHP 8 Error straight
+	 * out of read() — which runs on nearly every request at a marked site and
+	 * at the core-REST seam — and an ARRAY entry degraded to the string
+	 * "Array". Only a hand-corrupted row can produce either, and both failed
+	 * hard rather than open, but a fatal at the refusal boundary is worse than
+	 * a refusal. A uuid is a string or an int; every other shape names no
+	 * credential and is dropped, exactly as merged_with_damaged_row() does.
+	 */
+	public function test_a_non_scalar_uuid_entry_is_dropped_rather_than_fataling(): void {
+		$GLOBALS['_options'][ Aura_Worker_Unbind::OPTION ] = array(
+			'at'                 => '2026-08-29T10:00:00Z',
+			'site'               => str_repeat( 'a', 64 ),
+			'site_ref'           => 'res1',
+			'client'             => 'c1',
+			'seq'                => 7,
+			'app_password_uuids' => array( 'u-1', new stdClass(), array( 'u-2' ), null, true, 7 ),
+			'app_password_users' => array( 'u-1' => 3 ),
+		);
+
+		$m = Aura_Worker_Unbind::read();
+
+		$this->assertIsArray( $m, 'the marker still reads — the row is corrupt, not the request' );
+		$this->assertSame( array( 'u-1', '7' ), $m['app_password_uuids'] );
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'and the site still refuses everything' );
+	}
 }

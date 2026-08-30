@@ -2235,6 +2235,7 @@ class Aura_Worker_Magic_Link {
 	 */
 	private static function seize_stale_claim( $claim_key, $fence, $new_value, $takeover_after ) {
 		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- The claim's AGE decides a takeover, so it must come from the row, never the option cache: a cached copy is exactly the stale value this seize exists to measure.
 		$existing = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $claim_key ) );
 		if ( ! is_string( $existing ) || '' === $existing ) {
 			return false; // Gone already, or unreadable — a plain retry is the safe next step, not a seize.
@@ -2256,6 +2257,7 @@ class Aura_Worker_Magic_Link {
 		if ( $age <= $takeover_after ) {
 			return false;
 		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- A compare-and-swap on the exact bytes just read; update_option() cannot express the condition, and the row is evicted from the cache below.
 		$rows = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",

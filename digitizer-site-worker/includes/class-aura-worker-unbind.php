@@ -112,9 +112,21 @@ final class Aura_Worker_Unbind {
 			|| ! self::field_is( $m, 'seq', 'int' ) ) {
 			return self::malformed();
 		}
-		$m['app_password_uuids'] = isset( $m['app_password_uuids'] ) && is_array( $m['app_password_uuids'] )
-			? array_values( array_map( 'strval', $m['app_password_uuids'] ) )
-			: array();
+		$uuids = isset( $m['app_password_uuids'] ) && is_array( $m['app_password_uuids'] ) ? $m['app_password_uuids'] : array();
+		// Non-scalar entries are DROPPED, not stringified (final round LOW-1).
+		// `strval()` on an object without __toString is a PHP 8 Error thrown
+		// straight out of read() — which runs on nearly every request at a
+		// marked site, and at the core-REST seam — so a hand-corrupted row would
+		// fatal the boundary instead of refusing at it. An array entry degraded
+		// to the string "Array". Neither shape can name a credential, so the
+		// same rule merged_with_damaged_row() already applies is applied here:
+		// a uuid is a string or an int, and anything else is not one.
+		$m['app_password_uuids'] = array();
+		foreach ( $uuids as $uuid ) {
+			if ( is_string( $uuid ) || is_int( $uuid ) ) {
+				$m['app_password_uuids'][] = (string) $uuid;
+			}
+		}
 		// Owners are normalised to a POSITIVE int or an explicit null meaning
 		// "this site does not know whose password this is" (round-3). Anything
 		// else — 0, '', a string, an object, a marker written by an earlier
@@ -1017,10 +1029,22 @@ final class Aura_Worker_Unbind {
 	 * @return void
 	 */
 	public static function maybe_finish(): void {
-		if ( ! self::is_set() ) {
+		// THE THROTTLE IS ASKED FIRST (final round MINOR-2). is_set() is a
+		// deliberately UNCACHED raw read — one guaranteed query — and asking it
+		// ahead of the throttle meant the throttle did not throttle the
+		// expensive half: an unbound site paid that query on every single page
+		// load, not once per FINISH_THROTTLE. The two orders decide identically,
+		// because the sweep runs only when the marker is set AND the transient is
+		// absent, and the transient is written only on the path where both hold;
+		// so no finish that is due can be skipped, and nothing is thrown away by
+		// asking the cheap question first.
+		if ( false !== get_transient( self::FINISH_TRANSIENT ) ) {
 			return;
 		}
-		if ( false !== get_transient( self::FINISH_TRANSIENT ) ) {
+		if ( ! self::is_set() ) {
+			// Deliberately BEFORE set_transient(): a site with no marker must not
+			// arm the throttle, or a Phase A landing a moment later would wait
+			// out FINISH_THROTTLE before its first self-heal.
 			return;
 		}
 		set_transient( self::FINISH_TRANSIENT, 1, self::FINISH_THROTTLE );
