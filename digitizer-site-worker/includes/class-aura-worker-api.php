@@ -1036,7 +1036,18 @@ class Aura_Worker_API {
 			// from the bool alone. Empty exactly when nothing is owed; a
 			// non-empty list means a credential or a store this site still
 			// holds, and the tombstone must stay.
-			$leftovers = ( isset( $res['leftovers'] ) && is_array( $res['leftovers'] ) ) ? $res['leftovers'] : array();
+			// The default is the FAIL-CLOSED list, not `array()` (#434 Task 8).
+			// An empty list is a claim — "this site is proven to owe nothing" —
+			// and Aura retires the tombstone on it; an answer that carries no
+			// list at all has made no such claim, and reading one into it is
+			// exactly how a tombstone naming a live administrator credential
+			// gets retired. Both producers below always send the list (their
+			// own tests pin that), so this is the answer for a THIRD one that
+			// forgets to — the same list Aura_Worker_Unbind::leftovers() itself
+			// answers when it cannot look.
+			$leftovers = ( isset( $res['leftovers'] ) && is_array( $res['leftovers'] ) )
+				? $res['leftovers']
+				: array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
 			return new WP_REST_Response(
 				array(
 					'success'          => true,

@@ -362,6 +362,24 @@ final class UnbindUnkeyedTest extends TestCase {
 	// -----------------------------------------------------------------------
 
 	/**
+	 * The INTERNAL answer, not the transported one: receive_rules() supplies a
+	 * `leftovers` list for an answer that carries none, so a producer that
+	 * dropped the field would still put a plausible list on the wire. This path
+	 * must carry its own — what is owed is a question only Phase B's own call
+	 * can answer.
+	 */
+	public function test_the_bare_answer_carries_its_own_leftovers(): void {
+		$res = Aura_Worker_Rules::accept_bare_unbind(
+			array( 'site_ref' => 'r1', 'client' => 'c1', 'seq' => 4, 'final' => true )
+		);
+
+		$this->assertIsArray( $res );
+		$this->assertSame( array( 'unbound', 'seq', 'cleanup_complete', 'leftovers' ), array_keys( $res ) );
+		$this->assertIsArray( $res['leftovers'] );
+		$this->assertSame( array(), $res['leftovers'] );
+	}
+
+	/**
 	 * Aura reads ONE contract off this route. The bare answer and the enveloped
 	 * one are built from the same state and must be identical — same keys, same
 	 * order, same types — because Aura branches on `leftovers` and would read a
