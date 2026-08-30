@@ -914,6 +914,15 @@ if ( ! function_exists( 'set_transient' ) ) {
 if ( ! function_exists( 'delete_transient' ) ) {
 	function delete_transient( string $key ): bool {
 		unset( $GLOBALS['_transients'][ $key ] );
+		// Core deletes the transient's two OPTION ROWS as well (option.php), and
+		// on a site with no persistent object cache those rows are where the
+		// transient actually lives. Modelled because uninstall.php's prefix
+		// sweep finds a transient as a `_transient_…` row and hands the name
+		// back to delete_transient() to remove — if that left the row behind,
+		// the sweep would look like it worked and the value would survive.
+		foreach ( array( '_transient_' . $key, '_transient_timeout_' . $key ) as $row ) {
+			unset( $GLOBALS['_options'][ $row ], $GLOBALS['_rows'][ $row ], $GLOBALS['_rows_autoload'][ $row ] );
+		}
 		return true;
 	}
 }
@@ -1858,6 +1867,22 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public function get_col( $query = null, $x = 0 ) {
 			$this->last_query         = (string) $query;
 			$GLOBALS['_db_queries'][] = (string) $query;
+			// The unbounded prefix listing uninstall.php issues (#434 Task 10).
+			// Read against $_rows — the "database" — so a row written by raw SQL
+			// (the rule counters) is as visible to the sweep here as it is on a
+			// real site, which is the whole point of asking the table rather
+			// than a list of names somebody maintained.
+			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%'$/", (string) $query, $m ) ) {
+				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
+				return array_values(
+					array_filter(
+						array_keys( $GLOBALS['_rows'] ),
+						static function ( $k ) use ( $prefix ) {
+							return 0 === strpos( $k, $prefix );
+						}
+					)
+				);
+			}
 			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", (string) $query, $m ) ) {
 				$prefix = str_replace( array( '\\_', '\\%' ), array( '_', '%' ), stripslashes( $m[1] ) );
 				$before = stripslashes( $m[2] );
@@ -2574,6 +2599,44 @@ function sa_with_plugin_file( string $relative, string $contents, callable $body
 			@rmdir( $dir );
 		}
 	}
+}
+
+/**
+ * Every PHP file the plugin ships, COMMENTS STRIPPED with PHP's own tokeniser,
+ * keyed by PATH RELATIVE to SA_PLUGIN_DIR.
+ *
+ * Comments go because a docblock that DISCUSSES a call is prose, not a call,
+ * and this tree's docblocks discuss `add_option()` and `update_option()` at
+ * length. The key is a path and never a basename, because two identically named
+ * files in different directories would collide and SILENTLY drop one from every
+ * scan built on this — the exact failure that hid a REST registrar for a whole
+ * task (#434 Task 7 round-2), pinned by a fixture in UnbindRefusalTest and again
+ * in UninstallCoverageTest.
+ *
+ * @return array<string,string> relative path => comment-free source.
+ */
+function sa_plugin_php_sources(): array {
+	$sources  = array();
+	$iterator = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( SA_PLUGIN_DIR ) );
+	foreach ( $iterator as $file ) {
+		if ( ! $file->isFile() || 'php' !== strtolower( $file->getExtension() ) ) {
+			continue;
+		}
+		$stripped = '';
+		foreach ( token_get_all( (string) file_get_contents( $file->getPathname() ) ) as $token ) {
+			if ( is_array( $token ) && in_array( $token[0], array( T_COMMENT, T_DOC_COMMENT ), true ) ) {
+				continue;
+			}
+			$stripped .= is_array( $token ) ? $token[1] : $token;
+		}
+		$relative             = ltrim( str_replace( (string) SA_PLUGIN_DIR, '', (string) $file->getPathname() ), '/' );
+		$sources[ $relative ] = $stripped;
+	}
+	// A scan that quietly matched almost nothing proves nothing at all.
+	if ( count( $sources ) <= 30 ) {
+		throw new RuntimeException( 'sa_plugin_php_sources(): only ' . count( $sources ) . ' files — is SA_PLUGIN_DIR right?' );
+	}
+	return $sources;
 }
 
 /**

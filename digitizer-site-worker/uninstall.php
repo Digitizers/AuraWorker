@@ -100,16 +100,72 @@ $aura_uninstall_site = static function () {
 	if ( $aura_pw_gone ) {
 		delete_option( 'aura_worker_app_password' );
 	}
-	
-	// Remove plugin options.
-	delete_option( 'aura_worker_activated' );
-	delete_option( 'aura_worker_version' );
-	delete_option( 'aura_worker_site_token' );
-	delete_option( 'aura_worker_allowed_ips' );
-	delete_option( 'aura_worker_allowed_domains' );
-	delete_option( 'aura_worker_dashboard_url' );
-	delete_option( 'aura_worker_connect_lock' ); // the site-wide connect claim (mirrors Aura_Worker_Magic_Link::SITE_CLAIM)
-	delete_option( 'aura_worker_app_password_probe_unproven' ); // the unprovable-probe breadcrumb (#434 Task 9)
+
+	// THE KEY SET IS NOT WRITTEN DOWN HERE (#434 Task 10).
+	//
+	// This file used to name every option it removed, one delete_option() per
+	// key, and the list was maintained by whoever happened to remember. It fell
+	// behind — twice over. `aura_worker_unbound` (the unbind marker) survived an
+	// uninstall, so a reinstall minted a fresh token onto a site whose stale
+	// marker refused every authenticated mutation, with nothing left on disk to
+	// explain why; and the ruleset, the gateway key, the connect user, the rule
+	// counters and both throttle transients were never removed at all. A
+	// hand-maintained enumeration in the one file whose entire job IS the
+	// enumeration is the bug, so the enumeration is gone: everything the plugin
+	// stores is removed BY NAMESPACE.
+	//
+	// Three prefixes, because that is the whole of the plugin's key space —
+	// including the four families no by-name list could ever have covered, whose
+	// names are computed at runtime: the hourly rule counters
+	// (aura_worker_rules_{blocked,warned}_h<hour>, written by raw SQL and so
+	// invisible to any scan of storage-function calls), the per-rule-per-day
+	// expiry notices (aura_worker_rule_expired_<day>_<hash>), the per-IP token
+	// throttles (aura_worker_tokfail_<md5>), the per-link connect transients and
+	// claims (aura_magic_<id>, aura_magic_claim_<id>) and the single-use grant
+	// nonces (aura_grant_nonce_<hash>). tests/unit/UninstallCoverageTest.php
+	// computes the plugin's storage keys from source and fails, by name, if one
+	// ever lands outside this list.
+	//
+	// The rows are read first and removed through delete_option()/
+	// delete_transient() rather than deleted by one bulk statement, so core
+	// maintains `notoptions`, the autoload cache and each transient's timeout
+	// row exactly as it would for a by-name removal.
+	$aura_prefixes = array( 'aura_worker_', 'aura_magic_', 'aura_grant_nonce_' );
+	// The one row that may outlive this uninstall: a tracking record whose
+	// Application Password revocation could not be PROVEN is deliberately kept
+	// above, and the sweep must not undo that decision.
+	$aura_keep = $aura_pw_gone ? array() : array( 'aura_worker_app_password' );
+
+	global $wpdb;
+	foreach ( $aura_prefixes as $aura_prefix ) {
+		$aura_like = $wpdb->esc_like( $aura_prefix ) . '%';
+		foreach ( array( $aura_like, '_transient_' . $aura_like, '_transient_timeout_' . $aura_like ) as $aura_pattern ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Enumerating the plugin's own rows by prefix is the point of this file; there is no core API that lists options by name, and nothing is left to cache after it.
+			$aura_names = $wpdb->get_col( $wpdb->prepare( "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s", $aura_pattern ) );
+			foreach ( (array) $aura_names as $aura_name ) {
+				$aura_name = (string) $aura_name;
+				if ( in_array( $aura_name, $aura_keep, true ) ) {
+					continue;
+				}
+				if ( 0 === strpos( $aura_name, '_transient_timeout_' ) ) {
+					continue; // delete_transient() removes the timeout with its value row
+				}
+				if ( 0 === strpos( $aura_name, '_transient_' ) ) {
+					delete_transient( substr( $aura_name, strlen( '_transient_' ) ) );
+					continue;
+				}
+				delete_option( $aura_name );
+			}
+		}
+	}
+
+	// A site with a PERSISTENT object cache keeps its transients out of the
+	// options table entirely, so the sweep above sees no row for them. The two
+	// whose names are fixed are therefore also deleted by name; the computed
+	// ones (aura_magic_<id>, aura_worker_tokfail_<md5>) cannot be, and expire on
+	// their own within 30 minutes.
+	delete_transient( 'aura_worker_token_reveal' );  // the one-time token reveal (activation / regeneration)
+	delete_transient( 'aura_worker_unbind_finish' ); // the Phase B self-heal throttle (mirrors Aura_Worker_Unbind::FINISH_TRANSIENT)
 };
 
 if ( is_multisite() && function_exists( 'get_sites' ) && function_exists( 'switch_to_blog' ) ) {
