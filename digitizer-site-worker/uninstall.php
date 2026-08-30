@@ -109,6 +109,7 @@ $aura_uninstall_site = static function () {
 	delete_option( 'aura_worker_allowed_domains' );
 	delete_option( 'aura_worker_dashboard_url' );
 	delete_option( 'aura_worker_connect_lock' ); // the site-wide connect claim (mirrors Aura_Worker_Magic_Link::SITE_CLAIM)
+	delete_option( 'aura_worker_app_password_probe_unproven' ); // the unprovable-probe breadcrumb (#434 Task 9)
 };
 
 if ( is_multisite() && function_exists( 'get_sites' ) && function_exists( 'switch_to_blog' ) ) {

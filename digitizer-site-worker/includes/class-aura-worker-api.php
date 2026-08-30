@@ -435,6 +435,17 @@ class Aura_Worker_API {
 			$status['unbound'] = (object) $unbound;
 		}
 
+		// Why a tombstone will not finish (#434 Task 9). An Application
+		// Password probe that cannot prove itself owes `app_passwords` forever
+		// — cleanup_complete stays false and Aura waits on a site that will
+		// never converge — and until now the reason was visible nowhere. The
+		// key's PRESENCE is the signal; an object, like `unbound` above, so its
+		// shape never changes with its contents.
+		$probe = Aura_Worker_Magic_Link::probe_unproven_report();
+		if ( null !== $probe ) {
+			$status['app_password_probe_unproven'] = (object) $probe;
+		}
+
 		return rest_ensure_response( $status );
 	}
 

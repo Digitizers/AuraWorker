@@ -534,6 +534,107 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
+	 * THE OPERATOR'S RESOLUTION OF AN OWNER PHASE A COULD NOT NAME (#434 Task 9).
+	 *
+	 * Phase A records a positive owner or an explicit null, and Phase B does one
+	 * authoritative lookup against a recorded owner and NO lookup at all against
+	 * a null one — it cannot delete from a user it cannot name, and it will not
+	 * guess. So a null owner owes `app_passwords` in leftovers() unconditionally
+	 * and forever: cleanup() can never reach step (5), the token is never
+	 * deleted, the marker is never cleared, and Aura's tombstone pends for good.
+	 * By design (Task 4's ruling) — with the operator as the way out, and this
+	 * is the operator's half.
+	 *
+	 * It does NOT re-introduce the search that ruling deleted. It records no
+	 * guessed owner in the marker; `app_password_users` keeps meaning "a user
+	 * this site was TOLD about". For each unattributed uuid it does the only
+	 * two things that are actually provable:
+	 *
+	 *   1. ask the whole usermeta table, in one statement, which lists carry
+	 *      that uuid (Aura_Worker_Magic_Link::password_holders()), and delete
+	 *      it from each — the credential is what matters, not who holds it;
+	 *   2. ask again. Only an answer that PROVED no list on this site carries
+	 *      the uuid retires it from the marker, and the marker is rewritten
+	 *      under the claim and re-read before any of that is believed.
+	 *
+	 * Retiring a proven-absent uuid is safe in the one direction that matters:
+	 * `Aura_Worker_Rules::departed_binding_request()` refuses a request that
+	 * authenticates with a uuid the marker names, and a uuid no list carries
+	 * cannot authenticate anything. Everything else — a statement that proved
+	 * nothing, a delete that did not land, a marker rewrite that did not verify
+	 * — leaves the marker exactly as it was and the uuid reported as owed.
+	 *
+	 * This is also the one place SiteAgent removes an Application Password it
+	 * cannot attribute, which is what closes the XML-RPC door Task 6 recorded:
+	 * `Aura_Worker_Rules::is_agent_rest_request()` requires `REST_REQUEST`, so
+	 * a departed Application Password still reaches `pre_delete_post` over
+	 * XML-RPC — live only on this unknown-owner path, because Phase B revokes
+	 * every attributed password first. Removing the credential closes it; no
+	 * guard outside REST is widened.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $fence The caller's site-claim fence.
+	 * @return string[] The uuids still unattributed after this call — empty
+	 *                  when there were none, or when every one was settled.
+	 */
+	public static function resolve_unknown_owners( string $fence ): array {
+		$m = self::read();
+		if ( ! is_array( $m ) || '' === $fence || ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			// No marker this call can read is no LIST of uuids either, so there
+			// is nothing here to report about. The caller decides separately
+			// what an unreadable marker means — see ajax_remove_aura_data(),
+			// which refuses before ever getting here.
+			return array();
+		}
+		$uuids   = $m['app_password_uuids'];
+		$users   = $m['app_password_users'];
+		$left    = array();
+		$retired = array();
+		foreach ( $uuids as $uuid ) {
+			$uuid = (string) $uuid;
+			if ( null !== self::password_owner( $m, $uuid ) ) {
+				continue; // attributed: Phase B's single lookup stands
+			}
+			$holders = Aura_Worker_Magic_Link::password_holders( $uuid );
+			if ( is_array( $holders ) && array() !== $holders && class_exists( 'WP_Application_Passwords' ) ) {
+				foreach ( $holders as $holder ) {
+					WP_Application_Passwords::delete_application_password( (int) $holder, $uuid );
+				}
+				// The SECOND statement is the proof; the delete's return value
+				// is not (it is false for a failed meta write as well as for
+				// "not there"), exactly as Phase B's step (1) reasons.
+				$holders = Aura_Worker_Magic_Link::password_holders( $uuid );
+			}
+			if ( array() === $holders ) {
+				$retired[] = $uuid;
+				continue;
+			}
+			$left[] = $uuid;
+		}
+		if ( array() === $retired ) {
+			return $left;
+		}
+		$updated                       = $m;
+		$updated['app_password_uuids'] = array_values( array_diff( $uuids, $retired ) );
+		$updated['app_password_users'] = array_diff_key( $users, array_flip( $retired ) );
+		self::write_under_claim( $updated, $fence );
+		// write_under_claim() proves "the row names my site at my seq", which a
+		// retirement does not change — so it would pass whether or not this
+		// edit landed. Read the list back instead, and treat anything that is
+		// still there (including a marker that has become unreadable under us)
+		// as still owed.
+		$back  = self::read();
+		$still = is_array( $back ) ? $back['app_password_uuids'] : $uuids;
+		foreach ( $retired as $uuid ) {
+			if ( in_array( $uuid, $still, true ) ) {
+				$left[] = $uuid;
+			}
+		}
+		return $left;
+	}
+
+	/**
 	 * Which of steps (1)-(4) are still owed — the same evidence cleanup() uses
 	 * to decide whether it may reach step (5), exposed so a caller (and Task
 	 * 9's teardown) can see what a site still holds.

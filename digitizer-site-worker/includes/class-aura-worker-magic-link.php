@@ -45,7 +45,12 @@ class Aura_Worker_Magic_Link {
 		// rather than from a marker some path forgot to set.
 		$state     = self::credential_state();
 		$connected = ( $dashboard_url && $site_token );
-		if ( $connected ) {
+		if ( 'unbound' === $state ) {
+			// Aura has disconnected this site: both write boundaries refuse
+			// every mutation, so the connected block below would describe a
+			// connection that no longer does anything (#434 Task 9).
+			self::render_unbound_panel();
+		} elseif ( $connected ) {
 			$healthy = ( 'delivered' === $state || 'unavailable' === $state );
 			echo '<p style="color:' . ( $healthy ? '#2e7d32' : '#b26a00' ) . ';">';
 			echo '<span class="dashicons dashicons-' . ( $healthy ? 'yes-alt' : 'warning' ) . '"></span> ';
@@ -102,6 +107,106 @@ class Aura_Worker_Magic_Link {
 					status.style.color = '#c62828';
 					status.textContent = <?php echo wp_json_encode( __( 'Network error. Please try again.', 'digitizer-site-worker' ) ); ?>;
 				});
+			});
+		})();
+		</script>
+		<?php
+	}
+
+	/**
+	 * The "Disconnected by Aura" panel and its teardown control (#434 Task 9).
+	 *
+	 * The one screen a site whose dashboard is gone still has. Everything on it
+	 * is read from the site's own state, uncached, and reported at exactly the
+	 * confidence that state supports:
+	 *
+	 *  - The TIME comes from the marker read as a tri-state, never from
+	 *    is_set(): a marker that could not be read still refuses every mutation
+	 *    (which is why credential_state() sent us here), but it names no
+	 *    moment, and printing an empty timestamp — or worse, inventing one —
+	 *    would be a claim this site cannot make. It says so instead.
+	 *  - The LEFTOVERS are named only for a marker that was actually read.
+	 *    leftovers() fails closed and answers all four steps for an unreadable
+	 *    one, which is right for a GATE and wrong for a screen: rendered as a
+	 *    list it would report four specific debts nobody has established
+	 *    (#434 Task 4 review, Task 9's half).
+	 *  - The BUTTON is offered while anything remains, and "anything" includes
+	 *    the site token, which leftovers() tracks steps (1)-(4) only and can
+	 *    never name. An unreadable token row counts as present: absence has to
+	 *    be proven.
+	 *
+	 * @return void
+	 */
+	private static function render_unbound_panel(): void {
+		$marker = Aura_Worker_Unbind::read();
+		$at     = is_array( $marker ) ? (string) $marker['at'] : '';
+		echo '<div class="notice notice-warning aura-unbound"><p>';
+		if ( '' !== $at ) {
+			printf(
+				/* translators: %s: the moment Aura disconnected this site, ISO-8601. */
+				esc_html__( 'Disconnected by Aura at %s', 'digitizer-site-worker' ),
+				'<time datetime="' . esc_attr( $at ) . '">' . esc_html( $at ) . '</time>' // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- attribute and text are escaped inline, immediately above.
+			);
+		} else {
+			echo esc_html__( 'Disconnected by Aura. This site cannot read its own disconnect record, so it cannot say when, or exactly what is left to remove.', 'digitizer-site-worker' );
+		}
+		echo '</p></div>';
+
+		$leftovers = Aura_Worker_Unbind::leftovers();
+		$token     = Aura_Worker_Rules::read_option_uncached( 'aura_worker_site_token' );
+		// Unreadable is not absent — the same rule Phase B's own step proofs
+		// follow. A token row nobody could read leaves the control on offer.
+		$has_token = is_wp_error( $token ) || null !== $token;
+		if ( array() === $leftovers && ! $has_token ) {
+			echo '<p>' . esc_html__( 'Nothing of the previous connection remains on this site.', 'digitizer-site-worker' ) . '</p>';
+			return;
+		}
+
+		if ( is_array( $marker ) ) {
+			echo '<p>' . esc_html__( 'Some of the previous connection is still on this site:', 'digitizer-site-worker' ) . ' ';
+			echo '<code>' . esc_html( implode( ', ', array_merge( $leftovers, $has_token ? array( 'token' ) : array() ) ) ) . '</code></p>';
+		} else {
+			echo '<p>' . esc_html__( 'This site cannot determine what the previous connection left behind.', 'digitizer-site-worker' ) . '</p>';
+		}
+
+		$nonce = wp_create_nonce( 'aura_worker_remove_aura_data' );
+		?>
+		<button type="button" id="aura-remove-data-btn" class="button"
+				data-nonce="<?php echo esc_attr( $nonce ); ?>">
+			<?php esc_html_e( 'Remove remaining Aura data', 'digitizer-site-worker' ); ?>
+		</button>
+		<span id="aura-remove-data-status" style="margin-left:10px;"></span>
+		<p class="description">
+			<?php esc_html_e( 'Removes the Application Passwords, options, ruleset and site token this connection installed. Anything that cannot be removed is named instead, and nothing is forgotten until all of it is gone.', 'digitizer-site-worker' ); ?>
+		</p>
+		<script>
+		(function() {
+			var btn = document.getElementById('aura-remove-data-btn');
+			if ( ! btn ) { return; }
+			btn.addEventListener('click', function() {
+				if ( ! window.confirm(<?php echo wp_json_encode( __( 'Remove the remaining Aura data from this site? This cannot be undone.', 'digitizer-site-worker' ) ); ?>) ) { return; }
+				var status = document.getElementById('aura-remove-data-status');
+				btn.disabled = true;
+				status.textContent = <?php echo wp_json_encode( __( 'Removing…', 'digitizer-site-worker' ) ); ?>;
+				var data = new FormData();
+				data.append('action', 'aura_worker_remove_aura_data');
+				data.append('nonce', btn.getAttribute('data-nonce'));
+				fetch(<?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>, { method: 'POST', body: data })
+					.then(function(r) { return r.json(); })
+					.then(function(res) {
+						if ( res.success ) {
+							window.location.reload();
+						} else {
+							btn.disabled = false;
+							status.style.color = '#c62828';
+							status.textContent = (res.data && res.data.message) ? res.data.message : 'Error';
+						}
+					})
+					.catch(function() {
+						btn.disabled = false;
+						status.style.color = '#c62828';
+						status.textContent = <?php echo wp_json_encode( __( 'Network error. Please try again.', 'digitizer-site-worker' ) ); ?>;
+					});
 			});
 		})();
 		</script>
@@ -785,6 +890,20 @@ class Aura_Worker_Magic_Link {
 	/** password_state(): the list could not be read — never evidence of absence. */
 	const STATE_UNKNOWN = 'unknown';
 
+	/**
+	 * The bounded breadcrumb an unprovable probe leaves (#434 Task 9). Not
+	 * autoloaded: written only on a failure path, read only by `/status` and
+	 * by an operator looking at a tombstone that will not finish.
+	 */
+	const PROBE_UNPROVEN_OPTION = 'aura_worker_app_password_probe_unproven';
+
+	/**
+	 * Where that count stops. "Bounded" is the requirement, and a counter that
+	 * saturates says everything the operator needs — this is happening, a lot —
+	 * without the option growing by one digit per event forever.
+	 */
+	const PROBE_UNPROVEN_MAX = 9999;
+
 
 
 	/**
@@ -1057,6 +1176,7 @@ class Aura_Worker_Magic_Link {
 	 * one question the settings screen has to answer, read from the one option
 	 * that records it (round-26).
 	 *
+	 * 'unbound'     Aura disconnected this site; every mutation is refused
 	 * 'delivered'   a password exists and the connect that minted it returned it
 	 * 'undelivered' a password exists but no connect ever handed it over
 	 * 'unavailable' this site cannot issue one; the connection is token-only
@@ -1065,6 +1185,22 @@ class Aura_Worker_Magic_Link {
 	 * @return string
 	 */
 	private static function credential_state(): string {
+		// The marker outranks every credential question below it (#434 Task 9).
+		// A disconnected site refuses every mutation at BOTH write boundaries,
+		// so whatever credential it still holds buys nothing, and painting the
+		// screen "Connected to Aura dashboard" over it — green check included —
+		// describes a connection that no longer does anything.
+		//
+		// is_set(), deliberately, not the tri-state: an unreadable marker
+		// refuses exactly as a present one does (it is the same boolean
+		// Aura_Worker_Security::refuse_if_unbound() gates on), so the screen
+		// must say the same thing about both. What must NOT be derived from
+		// this boolean is the disconnect TIME — render_unbound_panel() reads
+		// the tri-state itself for that, because a moment is a value and this
+		// answer carries none.
+		if ( Aura_Worker_Unbind::is_set() ) {
+			return 'unbound';
+		}
 		$rec = get_option( self::APP_PASSWORD_RECORD_OPTION, null );
 		if ( is_array( $rec ) && ! empty( $rec['unavailable'] ) ) {
 			return 'unavailable';
@@ -1574,6 +1710,145 @@ class Aura_Worker_Magic_Link {
 			}
 		}
 		return self::STATE_GONE;
+	}
+
+	/**
+	 * Which users' Application Password lists carry that UUID — asked of the
+	 * WHOLE usermeta table, in ONE statement, and answered only when the
+	 * statement can prove it ran (#434 Task 9).
+	 *
+	 * THIS IS NOT THE OWNER SEARCH TASK 4 DELETED, and the difference is the
+	 * whole reason it may exist. That one walked a bounded CANDIDATE LIST — the
+	 * connecting user, then up to 200 administrators — and read "in none of
+	 * them" as absence, which stops being evidence the moment a 201st user, or
+	 * a non-administrator holder, exists. This asks the TABLE: every row that
+	 * holds an Application Password list is examined by the same statement, so
+	 * an empty answer is a fact about the site rather than about a list
+	 * somebody guessed.
+	 *
+	 * It is also on no automatic path. Phase B still does exactly one lookup,
+	 * against the owner Phase A recorded, on every sweep forever; this runs
+	 * only from the operator's explicit "Remove remaining Aura data", which is
+	 * the one place a full scan's cost is bought deliberately — and `meta_key`
+	 * is indexed, so the scan covers the users who have Application Passwords
+	 * at all, not every row of usermeta.
+	 *
+	 * The `probe` nonce is the in-band proof app_password_row_state() uses, for
+	 * the identical reason: wpdb::get_row() extracts from the PREVIOUS
+	 * statement's result set when this one never ran, so only a value this call
+	 * invented can tell "nobody holds it" from "nothing was asked".
+	 *
+	 * The LIKE over the serialized list is deliberately loose. It can name a
+	 * user who does not really hold the uuid — some other Application Password
+	 * list containing the same characters — and it cannot MISS one, because
+	 * core serialises the uuid literally. A false positive costs one delete
+	 * that removes nothing plus the confirming statement; a false negative is
+	 * the thing that must never happen here.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $uuid The password's uuid.
+	 * @return int[]|null The users whose list may hold it, EMPTY when the
+	 *                    statement proved that no list on this site does, and
+	 *                    null when nothing was proved at all.
+	 */
+	public static function password_holders( string $uuid ) {
+		global $wpdb;
+		if ( '' === $uuid || ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
+			return null; // no way to ask: never a proof of absence
+		}
+		static $seq = 0;
+		++$seq;
+		$nonce = $seq . '-' . wp_generate_uuid4();
+		$sql   = $wpdb->prepare(
+			"SELECT %s AS probe, (SELECT GROUP_CONCAT(user_id) FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s) AS v",
+			$nonce,
+			self::APP_PASSWORD_USERMETA_KEY,
+			'%' . $wpdb->esc_like( $uuid ) . '%'
+		);
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			return null; // nothing was issued, so nothing was proved
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
+		$row = $wpdb->get_row( $sql );
+		if ( ! isset( $row->probe ) || $nonce !== (string) $row->probe ) {
+			// No row, or somebody else's: this call proved nothing. Same
+			// breadcrumb the per-user probe leaves, with no owner to name.
+			do_action( 'aura_worker_app_password_probe_unproven', 0 );
+			return null;
+		}
+		$raw = isset( $row->v ) ? (string) $row->v : '';
+		if ( '' === $raw ) {
+			return array(); // proven: no Application Password list on this site carries it
+		}
+		$users = array();
+		foreach ( explode( ',', $raw ) as $id ) {
+			$id = (int) trim( $id );
+			if ( $id > 0 ) {
+				$users[] = $id;
+			}
+		}
+		// Rows matched but named nobody this code can use (a truncated
+		// GROUP_CONCAT, a user_id of 0). That is not the empty answer above —
+		// it is an answer that could not be read, and reporting it as "nobody
+		// holds it" would be absence inferred from evidence that says the
+		// opposite.
+		return array() === $users ? null : $users;
+	}
+
+	/**
+	 * Record that a probe could not prove itself (#434 Task 9).
+	 *
+	 * Task 6 left `aura_worker_app_password_probe_unproven` firing into
+	 * nothing: an unprovable probe owes `app_passwords` forever, so a tombstone
+	 * that never completes had no explanation anywhere — not in the site, not
+	 * on the wire. This is the listener, and get_status() carries it to Aura.
+	 *
+	 * BOUNDED, because the alternative writes an ever-growing option on a
+	 * failure path: three scalars, one row, a count that stops climbing at
+	 * PROBE_UNPROVEN_MAX. No list of occurrences, no per-user history — the
+	 * question this answers is "is this happening, and when did it last
+	 * happen", and a saturating counter answers it at fixed size.
+	 *
+	 * @param int $owner The user whose list could not be read, or 0 when the
+	 *                   probe was site-wide and names nobody.
+	 * @return void
+	 */
+	public static function record_probe_unproven( $owner = 0 ): void {
+		$stored = get_option( self::PROBE_UNPROVEN_OPTION, null );
+		$count  = ( is_array( $stored ) && isset( $stored['count'] ) && is_int( $stored['count'] ) && $stored['count'] > 0 )
+			? (int) $stored['count']
+			: 0;
+		if ( $count < self::PROBE_UNPROVEN_MAX ) {
+			++$count;
+		}
+		update_option(
+			self::PROBE_UNPROVEN_OPTION,
+			array(
+				'count' => $count,
+				'at'    => gmdate( 'c' ),
+				'owner' => (int) $owner > 0 ? (int) $owner : 0,
+			),
+			false
+		);
+	}
+
+	/**
+	 * What `/status` reports about unprovable probes, or null when none has
+	 * ever been recorded (#434 Task 9).
+	 *
+	 * @return array{count:int,at:string,owner:int}|null
+	 */
+	public static function probe_unproven_report(): ?array {
+		$stored = get_option( self::PROBE_UNPROVEN_OPTION, null );
+		if ( ! is_array( $stored ) || ! isset( $stored['count'] ) || (int) $stored['count'] <= 0 ) {
+			return null;
+		}
+		return array(
+			'count' => (int) $stored['count'],
+			'at'    => isset( $stored['at'] ) ? (string) $stored['at'] : '',
+			'owner' => isset( $stored['owner'] ) ? (int) $stored['owner'] : 0,
+		);
 	}
 
 	/**

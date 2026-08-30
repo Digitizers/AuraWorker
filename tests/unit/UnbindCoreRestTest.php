@@ -297,15 +297,35 @@ final class UnbindCoreRestTest extends TestCase {
 	 * that clears without finishing, breaks the reasoning in
 	 * departed_binding_request() and in Aura_Worker_Unbind::maybe_finish(), and
 	 * this file is where that has to be noticed.
+	 *
+	 * TASK 9 IS THE THIRD CALLER, AND THIS TEST IS WHERE THAT DECISION WAS
+	 * MADE DELIBERATELY. `ajax_remove_aura_data()` — the operator's "Remove
+	 * remaining Aura data" — deletes the marker without any rebind at all, so
+	 * "only a proven rebind clears the marker" is no longer the whole truth.
+	 * What replaces it is not weaker, because the two routes prove the SAME
+	 * thing by different evidence:
+	 *
+	 *   - a rebind proves the departed binding is settled and a replacement is
+	 *     installed end to end (finish_before_rebind() … the token …
+	 *     release_marker_after_rebind());
+	 *   - the teardown proves there is nothing left to be bound to:
+	 *     `cleanup( true, $fence )` returns exactly true only after an uncached
+	 *     read has shown the site token row itself gone (Task 4), which is
+	 *     strictly more than a rebind proves.
+	 *
+	 * So the marker still outlives everything it names, on both routes. The
+	 * caller list below is the pin: a FOURTH caller, or a teardown that stops
+	 * gating on `cleanup()`'s exact `true`, breaks the same reasoning and has
+	 * to be noticed here.
 	 */
-	public function test_only_a_proven_rebind_clears_the_marker(): void {
+	public function test_only_a_proven_rebind_or_a_proven_teardown_clears_the_marker(): void {
 		$sources = self::plugin_sources();
 
 		$gateways = self::files_calling( $sources, 'delete_under_claim' );
 		$this->assertSame(
-			array( 'class-aura-worker-unbind.php' ),
+			array( 'class-aura-worker-unbind.php', 'class-aura-worker.php' ),
 			$gateways,
-			'the marker is deleted through ONE gateway. A second caller means the refusal can now be lifted somewhere departed_binding_request() has not reasoned about.'
+			'the marker is deleted by the rebind gateway and by the operator teardown, and by nothing else. Another caller means the refusal can now be lifted somewhere departed_binding_request() has not reasoned about.'
 		);
 
 		$rebinds = self::files_calling( $sources, 'release_marker_after_rebind' );
@@ -324,6 +344,39 @@ final class UnbindCoreRestTest extends TestCase {
 				"{$flow} releases the marker but never settles the departed binding's outstanding Phase-B work first."
 			);
 		}
+
+		// The teardown's own gate, read out of the source: its delete is
+		// reached only under `true !== $done` having been passed. A truthiness
+		// test, or a `false !==`, would let a `cleanup()` that answered
+		// something other than proof delete the marker.
+		$this->assertMatchesRegularExpression(
+			'/\$done\s*=\s*Aura_Worker_Unbind::cleanup\(\s*true,\s*\$fence\s*\);\s*if\s*\(\s*true\s*!==\s*\$done\s*\)/',
+			$sources[ SA_PLUGIN_DIR . '/includes/class-aura-worker.php' ],
+			'the teardown must gate its delete on cleanup() returning exactly true'
+		);
+	}
+
+	/**
+	 * The site-wide holder statement is the OPERATOR'S, and only the
+	 * operator's (#434 Task 9). Task 4 deleted the owner search from Phase B
+	 * and left one lookup against a recorded owner; if a sweep, the fast path
+	 * or leftovers() ever adopted this scan, the cost Task 4 refused to pay on
+	 * every request would be back — and so would a proof made on a path nobody
+	 * asked for.
+	 */
+	public function test_the_site_wide_password_scan_is_reached_only_from_the_operator_teardown(): void {
+		$sources = self::plugin_sources();
+
+		$this->assertSame(
+			array( 'class-aura-worker-unbind.php' ),
+			self::files_calling( $sources, 'password_holders' ),
+			'the scan has ONE caller — resolve_unknown_owners(). (files_calling() does not count the declaration.)'
+		);
+		$this->assertSame(
+			array( 'class-aura-worker.php' ),
+			self::files_calling( $sources, 'resolve_unknown_owners' ),
+			'…and that resolution runs only from the operator teardown'
+		);
 	}
 
 	/**
@@ -342,7 +395,7 @@ final class UnbindCoreRestTest extends TestCase {
 			}
 		);
 		$this->assertSame(
-			array( 'class-aura-worker-unbind.php', 'class-aura-worker-unbind.php' ),
+			array( 'class-aura-worker-unbind.php', 'class-aura-worker-unbind.php', 'class-aura-worker.php' ),
 			$callers,
 			'the scan lost a caller to a shared basename — the tripwire would never fire on it'
 		);

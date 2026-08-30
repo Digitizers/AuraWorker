@@ -807,6 +807,68 @@ function sa_app_password_exists( int $user_id, string $uuid ): bool {
 }
 
 /**
+ * Capture what a renderer echoes (#434 Task 9's settings panel).
+ *
+ * The buffer is closed on EVERY exit, a throwing body included — a fixture
+ * that leaks an output buffer takes the rest of the run's output with it, and
+ * PHPUnit's own report along with it.
+ *
+ * @param callable $body The renderer.
+ * @return string Everything it echoed.
+ */
+function sa_capture( callable $body ): string {
+	ob_start();
+	try {
+		$body();
+	} catch ( Throwable $e ) {
+		ob_end_clean();
+		throw $e;
+	}
+	return (string) ob_get_clean();
+}
+
+/**
+ * Dispatch an admin-ajax action the way admin-ajax.php does (#434 Task 9):
+ * through the hook the PLUGIN registered, as the given user.
+ *
+ * Going through `wp_ajax_{$action}` rather than calling the handler is the
+ * point — a handler nobody registered, or registered under another name, is a
+ * handler no button can reach, and this helper fails loudly on it.
+ *
+ * The capability follows the site's own idea of who administers it
+ * ($GLOBALS['_admins'], which is what user_can() reads), so a test names its
+ * administrators once and every check in the request agrees with it.
+ *
+ * @param string $action  The action, without the `wp_ajax_` prefix.
+ * @param int    $user_id The user making the request.
+ * @return array{success:bool,data:mixed,status:?int}
+ */
+function sa_admin_ajax_call( string $action, int $user_id ): array {
+	if ( empty( $GLOBALS['_filters'][ 'wp_ajax_' . $action ] ) ) {
+		// admin-ajax.php is an admin request, which is the branch the plugin
+		// registers these handlers in. Registered once per test: init() adds
+		// listeners, and a second registration would count one probe twice.
+		$GLOBALS['_is_admin'] = true;
+		( new Aura_Worker() )->init();
+	}
+	$GLOBALS['_current_user_id'] = $user_id;
+	$GLOBALS['_current_user']    = $user_id;
+	$GLOBALS['_caps']            = in_array( $user_id, array_map( 'intval', $GLOBALS['_admins'] ), true )
+		? array( 'manage_options', 'read' )
+		: array( 'read' );
+	try {
+		do_action( 'wp_ajax_' . $action );
+	} catch ( SA_Json_Response $res ) {
+		return array(
+			'success' => $res->success,
+			'data'    => $res->data,
+			'status'  => $res->status,
+		);
+	}
+	throw new RuntimeException( 'nothing answered wp_ajax_' . $action . ' — is the handler registered?' );
+}
+
+/**
  * The seam that runs between a caller's read and its compare-and-swap — the
  * window in which a concurrent connect writes its binding. A test sets
  * $GLOBALS['_sa_before_swap'] to a callable (which clears itself, so it fires
@@ -894,6 +956,8 @@ $GLOBALS['_app_passwords_available'] = true;
 $GLOBALS['_app_passwords_delete_fail'] = false;
 $GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails (#434 Task 4).
 $GLOBALS['_sa_app_password_read_fail'] = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
+$GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
+$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's answer outright (#434 Task 9).
 $GLOBALS['_unbind_trace']              = array(); // Phase B's step trace; sa_reset_state() re-arms the recorder.
 if ( ! function_exists( 'wp_is_application_passwords_available_for_user' ) ) {
 	function wp_is_application_passwords_available_for_user( $user ): bool {
@@ -1706,6 +1770,41 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					'v'     => isset( $GLOBALS['_app_passwords'][ $user ] )
 						? serialize( $GLOBALS['_app_passwords'][ $user ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
 						: null, // no row at all
+				);
+			}
+			// The site-wide holder statement (#434 Task 9): the same nonce
+			// proof, asked of every Application Password list at once. Modelled
+			// over $GLOBALS['_app_passwords'] the way MySQL would run the LIKE
+			// — the uuid appears literally in the serialized list — so a
+			// password nobody recorded an owner for is still found.
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, \(SELECT GROUP_CONCAT\(user_id\) FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%'\) AS v$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				// A statement that failed at the driver: no result set, no row,
+				// nothing proved. Separate from _sa_app_password_read_fail,
+				// which scopes a failure to ONE user's row.
+				if ( ! empty( $GLOBALS['_sa_app_password_scan_fail'] ) ) {
+					$this->last_error = 'scan failed';
+					return null;
+				}
+				$needle = str_replace( array( '\\_', '\\%', '\\\\' ), array( '_', '%', '\\' ), stripslashes( $m[2] ) );
+				$found  = array();
+				foreach ( $GLOBALS['_app_passwords'] as $user => $list ) {
+					// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+					if ( false !== strpos( serialize( $list ), $needle ) ) {
+						$found[] = (int) $user;
+					}
+				}
+				return (object) array(
+					'probe' => $m[1],
+					// GROUP_CONCAT over no rows is NULL, never an empty string.
+					// _sa_app_password_scan_answer replaces the answer outright:
+					// GROUP_CONCAT truncates at group_concat_max_len and MySQL
+					// says so only in a warning, so "rows matched but the list
+					// came back unusable" is a real answer this stub could not
+					// otherwise produce.
+					'v'     => array_key_exists( '_sa_app_password_scan_answer', $GLOBALS ) && null !== $GLOBALS['_sa_app_password_scan_answer']
+						? $GLOBALS['_sa_app_password_scan_answer']
+						: ( array() === $found ? null : implode( ',', $found ) ),
 				);
 			}
 			// Reformatting the production probe would otherwise unhook every
@@ -2983,6 +3082,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails; see the stub above.
 	$GLOBALS['_sa_app_password_read_fail']  = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
+	$GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
+	$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's answer outright (#434 Task 9).
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
 	$GLOBALS['_sa_app_password_create_fails']    = false;
 	$GLOBALS['_abilities']    = array();
