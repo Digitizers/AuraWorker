@@ -222,6 +222,9 @@ final class UnbindRebindTest extends TestCase {
 	 * fail-CLOSED direction: cleanup() does nothing at all for a marker it
 	 * cannot name, so nothing can be proven settled. Reconnecting anyway would
 	 * clear a refusal over a binding whose credentials were never enumerated.
+	 *
+	 * But it refuses with its own CODE, not `aura_unbind_incomplete` (round-1
+	 * MINOR-1): nothing was found to be owed here, nobody could look.
 	 */
 	public function test_finish_before_rebind_refuses_an_unreadable_marker(): void {
 		$fence = Aura_Worker_Magic_Link::claim_site();
@@ -229,13 +232,44 @@ final class UnbindRebindTest extends TestCase {
 		$out = Aura_Worker_Unbind::finish_before_rebind( $fence );
 		$GLOBALS['_sa_option_read_fail'] = array();
 		$this->assertInstanceOf( WP_Error::class, $out );
-		$this->assertSame( 'aura_unbind_incomplete', $out->get_error_code() );
-		$this->assertSame(
-			array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ),
-			$out->get_error_data()['leftover'],
-			'nothing can be proven settled, so everything is owed'
-		);
+		$this->assertSame( 'aura_unbind_unreadable', $out->get_error_code() );
+		$this->assertSame( 409, $out->get_error_data()['status'] );
+		$this->assertArrayNotHasKey( 'leftover', $out->get_error_data(), '"everything is owed" here means "nothing could be checked"' );
 		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::OLD_UUID ), 'and nothing was deleted for a binding the site cannot name' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * A MALFORMED marker is a record that exists and cannot be trusted, which
+	 * is the same unknown and gets the same account of itself.
+	 */
+	public function test_finish_before_rebind_refuses_a_malformed_marker(): void {
+		sa_set_marker( array( 'site_ref' => null ) ); // present, and not the shape read() accepts
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$out   = Aura_Worker_Unbind::finish_before_rebind( $fence );
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_unbind_unreadable', $out->get_error_code() );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * THE POINT OF THE SEPARATE CODE (round-1 MINOR-1). At a site that was
+	 * NEVER unbound, a blip in the marker read still refuses — fail-closed, and
+	 * nothing is lost because nothing has been written yet — but it must not
+	 * tell the operator of a fresh site about a disconnect that never happened.
+	 * The message asserted here is about the record being unreadable, and says
+	 * nothing about a previous binding.
+	 */
+	public function test_a_read_blip_at_a_site_that_was_never_unbound_does_not_invent_a_disconnect(): void {
+		sa_clear_marker();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
+		$out = Aura_Worker_Unbind::finish_before_rebind( $fence );
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $out, 'still refuses: unreadable is not a clean site' );
+		$this->assertSame( 'aura_unbind_unreadable', $out->get_error_code() );
+		$this->assertStringNotContainsString( 'previous Aura binding', $out->get_error_message() );
+		$this->assertStringContainsString( 'could not be read', $out->get_error_message() );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
@@ -347,6 +381,54 @@ final class UnbindRebindTest extends TestCase {
 		$this->assertSame( Aura_Worker_Security::hash_token( 'the-newer-token' ), $this->tokenRow() );
 	}
 
+	/**
+	 * MINOR-2's pin, and the twin of
+	 * test_regenerate_keeps_the_marker_when_the_connect_user_write_fails.
+	 * `aura_worker_connect_user_id` is the half of the binding a token-only
+	 * request runs on, and Phase B deleted it — so a connect whose own write of
+	 * it did not land has not re-established the binding, whatever else
+	 * succeeded. Unproven, the marker stays. Both flows, one meaning of
+	 * "proven rebind"; this test and its twin are what stop the asymmetry
+	 * coming back.
+	 */
+	public function test_the_connect_callback_keeps_the_marker_when_the_connect_user_write_fails(): void {
+		$GLOBALS['_sa_option_write_fail']['aura_worker_connect_user_id'] = true;
+		$res = $this->ml->handle_connect( $this->connectRequest() );
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'aura_unbind_store_failed', $res->get_data()['code'] );
+		$this->assertNotNull( $this->markerRow() );
+		$this->assertNull( sa_read_option_uncached( 'aura_worker_connect_user_id' ) );
+		$this->assertNotFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'retryable' );
+		$this->assertUnbound( $this->mutateAsToken( 'the-new-token' ), 'the half-installed replacement token' );
+	}
+
+	/**
+	 * NIT-1's pin: NOTHING fallible sits after the marker release. The last
+	 * write of a token-only install is the "this site cannot have an
+	 * Application Password" record, and it lands BEFORE the refusal is lifted.
+	 */
+	public function test_the_last_install_write_lands_before_the_marker_is_cleared(): void {
+		$GLOBALS['_app_passwords_available'] = false; // a healthy token-only site
+		$GLOBALS['_option_writes']           = array();
+		$res = $this->ml->handle_connect( $this->connectRequest() );
+		$this->assertSame( 200, $res->get_status(), var_export( $res->get_data(), true ) );
+		$this->assertSame( 'app_passwords_unavailable', $res->get_data()['app_password_unavailable'] );
+		$record  = null;
+		$cleared = null;
+		foreach ( $GLOBALS['_option_writes'] as $i => $write ) {
+			if ( 'set' === $write[0] && Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION === $write[1] ) {
+				$record = $i;
+			}
+			if ( 'delete' === $write[0] && Aura_Worker_Unbind::OPTION === $write[1] ) {
+				$cleared = $i;
+			}
+		}
+		$this->assertNotNull( $record, 'the token-only record was written' );
+		$this->assertNotNull( $cleared, 'and the marker was cleared' );
+		$this->assertLessThan( $cleared, $record, 'the install\'s last fallible write precedes the release' );
+	}
+
 	/** A site that was never unbound connects exactly as it did before. */
 	public function test_a_connect_at_a_bound_site_is_unchanged(): void {
 		sa_clear_marker();
@@ -447,7 +529,7 @@ final class UnbindRebindTest extends TestCase {
 		$GLOBALS['_sa_option_read_fail'] = array();
 		$this->assertFalse( $res->success );
 		$this->assertSame( 409, $res->status );
-		$this->assertSame( 'aura_unbind_incomplete', $res->data['code'] );
+		$this->assertSame( 'aura_unbind_unreadable', $res->data['code'] );
 		$this->assertSame( sa_token_hash(), $this->tokenRow(), 'the token that was there is still there' );
 		$this->assertFalse( get_transient( 'aura_worker_token_reveal' ) );
 		$this->assertSame( '', (string) get_option( Aura_Worker_Magic_Link::SITE_CLAIM, '' ), 'the claim is released' );

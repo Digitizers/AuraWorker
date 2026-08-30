@@ -343,12 +343,20 @@ final class Aura_Worker_Unbind {
 	 * and the flow's own write-and-verify (or the rotation's compare-and-swap)
 	 * needs to find it there.
 	 *
-	 * An unreadable or malformed marker takes the 409 branch too, and that is
-	 * deliberate: cleanup() does nothing at all for a marker it cannot name and
-	 * leftovers() then reports every step owed, so this site refuses to be
-	 * reconnected until an operator clears it (Task 9's removal panel). Refusing
-	 * the rebind is the fail-CLOSED direction — the alternative reconnects a
-	 * site whose previous dashboard may still hold a live credential.
+	 * An unreadable or malformed marker refuses too, and fail-CLOSED is right —
+	 * the alternative reconnects a site whose previous dashboard may still hold
+	 * a live credential — but it refuses with its OWN code and its own story
+	 * (round-1 MINOR-1). `aura_unbind_incomplete` says "the previous binding
+	 * could not be fully removed", and at a site that was never unbound at all
+	 * that is a claim about an event that never happened: any blip in the marker
+	 * read would send the operator of a fresh site hunting a disconnect. What is
+	 * true in every one of these cases — a database read that would not
+	 * complete, a marker row this build cannot parse, a site that may or may not
+	 * be unbound because nobody could look — is exactly one thing: the record
+	 * could not be READ. So that is what `aura_unbind_unreadable` says, and it
+	 * carries no `leftover` list, because "everything is owed" there means
+	 * "nothing could be checked" and naming four steps would repeat the same
+	 * wrong story in detail.
 	 *
 	 * @since 2.13.0
 	 *
@@ -356,10 +364,25 @@ final class Aura_Worker_Unbind {
 	 *                      hold the claim, and this consumes it rather than
 	 *                      taking a second one.
 	 * @return true|WP_Error True when nothing is owed (including "this site was
-	 *                       never unbound"), else the 409 naming what is left.
+	 *                       never unbound"); a 409 `aura_unbind_incomplete`
+	 *                       naming what is left; or a 409
+	 *                       `aura_unbind_unreadable` when the marker row could
+	 *                       not be read at all.
 	 */
 	public static function finish_before_rebind( string $fence ) {
-		if ( ! self::is_set() ) {
+		// is_set_strict(), not is_set(): this caller genuinely acts DIFFERENTLY
+		// on an unreadable marker than on a present one — same refusal, but a
+		// different account of why — which is the only thing that earns the
+		// third state (see is_set()'s docblock).
+		$marked = self::is_set_strict();
+		if ( is_wp_error( $marked ) ) {
+			return new WP_Error(
+				'aura_unbind_unreadable',
+				__( 'This site\'s Aura disconnect record could not be read, so it cannot be reconnected until it can.', 'digitizer-site-worker' ),
+				array( 'status' => 409 )
+			);
+		}
+		if ( ! $marked ) {
 			return true; // not an unbound site: a rebind here has nothing to settle
 		}
 		// The return value is deliberately ignored: cleanup( false, … ) answers

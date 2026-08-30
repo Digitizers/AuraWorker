@@ -332,7 +332,11 @@ final class UnbindCoreRestTest extends TestCase {
 	 * does the one in class-aura-worker-rules.php) is prose, not a call, and a
 	 * text grep cannot tell the two apart.
 	 *
-	 * @return array<string,string> filename => comment-free source.
+	 * Keyed by PATH, never by basename (round-1 NIT): two identically named
+	 * files in different directories would collide, and the collision would
+	 * SILENTLY drop one of them from every scan below.
+	 *
+	 * @return array<string,string> path => comment-free source.
 	 */
 	private static function plugin_sources(): array {
 		$sources = array();
@@ -348,7 +352,7 @@ final class UnbindCoreRestTest extends TestCase {
 				}
 				$source .= is_array( $token ) ? $token[1] : $token;
 			}
-			$sources[ $file->getFilename() ] = $source;
+			$sources[ $file->getPathname() ] = $source;
 		}
 		// A scan that quietly matched almost nothing proves nothing at all.
 		if ( count( $sources ) <= 30 ) {
@@ -361,15 +365,19 @@ final class UnbindCoreRestTest extends TestCase {
 	 * Which files CALL that method — the name followed by an open paren, never
 	 * a `function` declaration of it.
 	 *
-	 * @param array<string,string> $sources Comment-free sources by filename.
+	 * The answer is reported as basenames — that is what a reader of a failure
+	 * message needs — but built from the path-keyed map, so a collision cannot
+	 * hide a caller.
+	 *
+	 * @param array<string,string> $sources Comment-free sources by path.
 	 * @param string               $method  The method name.
-	 * @return string[] Filenames, sorted.
+	 * @return string[] Basenames, sorted.
 	 */
 	private static function files_calling( array $sources, string $method ): array {
 		$callers = array();
-		foreach ( $sources as $name => $source ) {
+		foreach ( $sources as $path => $source ) {
 			if ( preg_match( '#(?<!function )\b' . preg_quote( $method, '#' ) . '\s*\(#', $source ) ) {
-				$callers[] = $name;
+				$callers[] = basename( $path );
 			}
 		}
 		sort( $callers );

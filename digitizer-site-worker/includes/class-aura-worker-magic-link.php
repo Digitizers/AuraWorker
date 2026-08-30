@@ -603,30 +603,10 @@ class Aura_Worker_Magic_Link {
 				500
 			);
 		}
-		// THE WAY BACK, second half (#434 Task 7): the LAST fallible step of a
-		// rebind that got all the way through. The token is installed and read
-		// back, the previous credential revoked, the binding written, the
-		// dashboard URL and gateway key stored and verified, and the
-		// Application Password settled (minted, or this site proven unable to
-		// have one) — only now may the refusal be lifted. EVERY error exit
-		// above returns without reaching this line, which is the point: a
-		// half-established replacement binding leaves the marker in place, so
-		// the old token AND the half-installed new one go on being refused
-		// everywhere.
-		//
-		// Placed BEFORE the magic transient is consumed, deliberately (a
-		// deviation from the brief, which put it after): a failure here is a
-		// store failure, and the connect must stay RETRYABLE — the retry's own
-		// finish_before_rebind() finds nothing owed, revokes the password this
-		// attempt minted and installs a fresh binding. Consuming the link first
-		// would leave a live recorded administrator credential that no further
-		// attempt could reach.
-		if ( ! Aura_Worker_Unbind::release_marker_after_rebind( $site_fence ) ) {
-			$release(); // keep the transient — this connect is retryable
-			return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous disconnect record could not be cleared; retry.', 'code' => 'aura_unbind_store_failed' ), 500 );
-		}
-		// Consumed only now (the round-23 orphan rule still holds: the claim is released with it below).
-		delete_transient( 'aura_magic_' . $magic_id );
+		// The mint's own bookkeeping — the LAST fallible write of the install,
+		// and therefore ahead of the marker release below (round-1 NIT): the
+		// bracket's discipline is that nothing that can fail sits after the
+		// refusal is lifted.
 		if ( is_wp_error( $minted ) ) {
 			$body['app_password_unavailable'] = $minted->get_error_code();
 			// Recorded, not merely reported (round-26): a site that CANNOT issue
@@ -654,6 +634,55 @@ class Aura_Worker_Magic_Link {
 			// The uuid is the site's own bookkeeping — never part of the response.
 			$body['app_password'] = array( 'user_login' => $minted['user_login'], 'password' => $minted['password'] );
 		}
+		// THE WAY BACK, second half (#434 Task 7): the LAST fallible step of a
+		// rebind that got all the way through. The token is installed and read
+		// back, the previous credential revoked, the binding written, the
+		// dashboard URL and gateway key stored and verified, and the
+		// Application Password settled (minted, or this site proven unable to
+		// have one) — only now may the refusal be lifted. EVERY error exit
+		// above returns without reaching this line, which is the point: a
+		// half-established replacement binding leaves the marker in place, so
+		// the old token AND the half-installed new one go on being refused
+		// everywhere.
+		//
+		// Placed BEFORE the magic transient is consumed, deliberately (a
+		// deviation from the brief, which put it after): a failure here is a
+		// store failure, and the connect must stay RETRYABLE — the retry's own
+		// finish_before_rebind() finds nothing owed, revokes the password this
+		// attempt minted and installs a fresh binding. Consuming the link first
+		// would leave a live recorded administrator credential that no further
+		// attempt could reach.
+		//
+		// Scoped to a MARKED site, and symmetric with ajax_regenerate_token()
+		// (round-1 MINOR-2): "a proven rebind" has to mean the same thing in
+		// both flows. `aura_worker_connect_user_id` is the half of the binding
+		// a token-only request runs on, and Phase B DELETED it a few hundred
+		// lines above — so this install's own write of it is not the refresh it
+		// is on an ordinary connect but the only thing naming this install's
+		// administrator, and it is proven by an uncached read before the
+		// refusal is lifted. A positive id, because resolve_connect_user()
+		// ignores 0 and falls back to the first administrator, which is not the
+		// binding this connect established. On an unmarked site nothing here
+		// runs and the connect behaves exactly as it always has.
+		if ( Aura_Worker_Unbind::is_set() ) {
+			$creator_id = (int) ( $stored['connect_user_id'] ?? 0 );
+			$recorded   = Aura_Worker_Rules::read_option_uncached( 'aura_worker_connect_user_id' );
+			$recorded   = is_wp_error( $recorded ) ? 0 : (int) maybe_unserialize( $recorded );
+			if ( $creator_id <= 0 || $recorded !== $creator_id ) {
+				$release(); // keep the transient — this connect is retryable
+				return new WP_REST_Response( array( 'error' => 'Connect not completed: the site could not record which administrator this connection runs as; retry.', 'code' => 'aura_unbind_store_failed' ), 500 );
+			}
+		}
+		if ( ! Aura_Worker_Unbind::release_marker_after_rebind( $site_fence ) ) {
+			$release(); // keep the transient — this connect is retryable
+			return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous disconnect record could not be cleared; retry.', 'code' => 'aura_unbind_store_failed' ), 500 );
+		}
+		// Consumed only now (the round-23 orphan rule still holds: the claim is
+		// released with it below). Nothing fallible remains: the transient
+		// delete is not part of the binding — a delete that did not land leaves
+		// the link alive for a retry that would simply reconnect an already
+		// bound, already unmarked site.
+		delete_transient( 'aura_magic_' . $magic_id );
 		// Released only NOW (round-3): the site-wide claim exists to make token
 		// and password one handler's; released before the mint, a paused
 		// handler could resume and rotate away the password the winner just
