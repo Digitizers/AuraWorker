@@ -270,6 +270,122 @@ final class UnbindCoreRestTest extends TestCase {
 		$this->assertRefused( self::core_any( 'POST', '/wp/v2/posts' ), 'fallback admin, departed token' );
 	}
 
+	/* ---------------------------------------------------------------- */
+	/* A REBIND does not clear the marker — round-1 MAJOR-1               */
+	/* ---------------------------------------------------------------- */
+
+	/**
+	 * The premise, asserted rather than believed: nothing in this plugin
+	 * clears the marker when a site is re-connected.
+	 * Aura_Worker_Unbind::delete_under_claim() has no production caller and
+	 * handle_connect() never touches the option — so "a rebind clears the
+	 * marker" was a claim of safety resting on a fact the code does not
+	 * provide, and the seam must not depend on it. If Task 7 makes it true,
+	 * this test says so and the run-as branch can be revisited deliberately.
+	 */
+	public function test_nothing_in_the_plugin_clears_the_marker_on_a_rebind(): void {
+		$callers = array();
+		$dir     = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( SA_PLUGIN_DIR ) );
+		$scanned = 0;
+		foreach ( $dir as $file ) {
+			if ( ! $file->isFile() || 'php' !== strtolower( $file->getExtension() ) ) {
+				continue;
+			}
+			++$scanned;
+			// Comments STRIPPED before the scan, with PHP's own tokeniser: a
+			// docblock that DISCUSSES the method (this file's own reasoning
+			// does, and so does the one in class-aura-worker-rules.php) is
+			// prose, not a call, and a text grep cannot tell the two apart.
+			$source = '';
+			foreach ( token_get_all( (string) file_get_contents( $file->getPathname() ) ) as $token ) {
+				if ( is_array( $token ) && in_array( $token[0], array( T_COMMENT, T_DOC_COMMENT ), true ) ) {
+					continue;
+				}
+				$source .= is_array( $token ) ? $token[1] : $token;
+			}
+			// The declaration lives in class-aura-worker-unbind.php; a CALL is
+			// the name followed by an open paren, not "function ".
+			if ( preg_match( '#(?<!function )\bdelete_under_claim\s*\(#', $source ) ) {
+				$callers[] = $file->getFilename();
+			}
+		}
+		$this->assertGreaterThan( 30, $scanned, 'the source scan found almost nothing — is SA_PLUGIN_DIR right?' );
+		$this->assertSame(
+			array(),
+			array_diff( $callers, array( 'class-aura-worker-unbind.php' ) ),
+			'something now clears the marker under claim. If a rebind does it, the token-hash clause in departed_binding_request() can be revisited — deliberately, not by accident.'
+		);
+	}
+
+	/**
+	 * THE ROUND-1 MAJOR-1 CASE, in the direction that was broken.
+	 *
+	 * The site has been re-connected and holds a NEW token, but the marker is
+	 * still there naming the DEPARTED one (nothing clears it). Its token-only
+	 * requests are the new binding's, and core REST must carry them.
+	 */
+	public function test_a_new_binding_token_at_a_still_marked_site_passes(): void {
+		sa_set_marker(
+			array(
+				'site'               => hash( 'sha256', 'the-departed-token' ),
+				'app_password_uuids' => array( self::MANAGED_UUID ),
+			)
+		);
+		$this->assertNotSame( sa_token_hash(), Aura_Worker_Unbind::read()['site'], 'the site now holds another token' );
+		sa_token_run_as( self::MARKER_USER );
+		$this->assertNull( self::core_any( 'POST', '/wp/v2/posts' ), 'the new binding may write' );
+		$this->assertNull( apply_filters( 'pre_delete_post', null, (object) array( 'ID' => 5, 'post_type' => 'post' ), false ) );
+	}
+
+	/**
+	 * ...and the same site, same marker, still refuses the DEPARTED token.
+	 * This is the half that must not move: the token hash narrows the seam, it
+	 * does not weaken it.
+	 */
+	public function test_the_departed_token_at_the_same_site_is_still_refused(): void {
+		// The marker names the token the site actually holds — the state Phase
+		// A leaves, and the state a rebind has not yet changed.
+		$this->assertSame( sa_token_hash(), Aura_Worker_Unbind::read()['site'] );
+		sa_token_run_as( self::MARKER_USER );
+		$this->assertRefused( self::core_any( 'POST', '/wp/v2/posts' ), 'the departed token' );
+	}
+
+	/**
+	 * The token swap moves the RUN-AS branch only. A credential the marker
+	 * names by uuid is the departed binding's whatever token the site now
+	 * holds — Phase B revokes that password, and until it does, it writes.
+	 */
+	public function test_the_managed_password_is_refused_even_after_the_token_was_replaced(): void {
+		sa_set_marker(
+			array(
+				'site'               => hash( 'sha256', 'the-departed-token' ),
+				'app_password_uuids' => array( self::MANAGED_UUID ),
+			)
+		);
+		sa_authenticate_app_password( self::MARKER_USER, self::MANAGED_UUID );
+		$this->assertRefused( self::core_any( 'POST', '/wp/v2/posts' ), 'the departed password' );
+	}
+
+	/**
+	 * A token the site cannot READ is not evidence of a different binding, so
+	 * the run-as branch fails closed the same way the marker read does.
+	 */
+	public function test_an_unreadable_site_token_refuses_the_run_as(): void {
+		sa_token_run_as( self::MARKER_USER );
+		$GLOBALS['_sa_option_read_fail']['aura_worker_site_token'] = true;
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Rules::site_token_uncached(), 'the token read really did fail' );
+		$this->assertRefused( self::core_any( 'POST', '/wp/v2/posts' ), 'unreadable token' );
+	}
+
+	/**
+	 * Neither is a marker that names no token at all.
+	 */
+	public function test_a_marker_naming_no_token_refuses_the_run_as(): void {
+		sa_set_marker( array( 'site' => '' ) );
+		sa_token_run_as( self::MARKER_USER );
+		$this->assertRefused( self::core_any( 'POST', '/wp/v2/posts' ), 'marker names no token' );
+	}
+
 	/**
 	 * The one route a marked site must still answer: the ruleset envelope and
 	 * every retry of it (Task 3's fast path). A site that refused this could

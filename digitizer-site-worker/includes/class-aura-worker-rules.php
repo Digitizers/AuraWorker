@@ -2437,17 +2437,38 @@ class Aura_Worker_Rules {
 	 *      identifies exactly one password, while `app_password_users` holds
 	 *      null for an owner the site could not determine, and requiring a
 	 *      match against an unknown would read that unknown as innocence.
-	 *    - the token run-as path (Aura_Worker_Security::ran_as_token()). Its
-	 *      mere PRESENCE is the proof, not the user id it resolved to. Layer
-	 *      2.5 only runs for a request that already presented a valid site
-	 *      token, and at a marked site the only token that can still do that is
-	 *      the departed binding's — Phase B deletes it last, and a rebind
-	 *      clears the marker before issuing another. Comparing the run-as id
-	 *      against the marker's `connect_user_id` would be strictly WEAKER and
-	 *      wrong: once Phase B has deleted `aura_worker_connect_user_id`,
-	 *      resolve_connect_user() falls back to the FIRST administrator, so the
-	 *      ids routinely differ on exactly the requests this predicate exists
-	 *      to catch.
+	 *    - the token run-as path (Aura_Worker_Security::ran_as_token()) taken
+	 *      with THE TOKEN THE MARKER NAMES. Two clauses, and each is load-
+	 *      bearing.
+	 *
+	 *      The run-as path, not the user id it resolved to: comparing against
+	 *      the marker's `connect_user_id` would be strictly WEAKER and wrong,
+	 *      because once Phase B has deleted `aura_worker_connect_user_id`,
+	 *      resolve_connect_user() falls back to the FIRST administrator — so
+	 *      the ids routinely differ on exactly the requests this predicate
+	 *      exists to catch.
+	 *
+	 *      And the token hash, compared the same way fast_path_or_refusal()
+	 *      compares it, because the run-as path ALONE over-fires. Round-1
+	 *      MAJOR-1: an earlier version of this comment claimed a rebind clears
+	 *      the marker before issuing another token, and NOTHING IN THIS PLUGIN
+	 *      DOES THAT — Aura_Worker_Unbind::delete_under_claim() has no
+	 *      production caller, and handle_connect() never touches the marker
+	 *      option. So a site that was re-connected while still marked would
+	 *      have had its NEW binding's token-only requests refused at every core
+	 *      REST route. Fail-closed, therefore not a hole; an availability
+	 *      defect, and a claim of safety resting on a fact the code did not
+	 *      provide. The token hash is the discriminator the marker already
+	 *      carries, and it costs nothing for the case this seam exists for:
+	 *      Layer 2.5 runs only for a request whose token Layer 2 has already
+	 *      accepted, and Phase B deletes that token last, so whenever `ran_as`
+	 *      is non-null there IS a stored token to compare. (Clearing the marker
+	 *      on a proven rebind is still Task 7's; this seam no longer depends on
+	 *      it.)
+	 *
+	 *      A token that cannot be read, or either side of the comparison being
+	 *      empty, answers TRUE for the reason (1) gives: it is not evidence of
+	 *      a DIFFERENT binding.
 	 *
 	 * @since 2.13.0
 	 *
@@ -2465,7 +2486,19 @@ class Aura_Worker_Rules {
 		if ( null !== $uuid && '' !== $uuid && in_array( $uuid, $marker['app_password_uuids'], true ) ) {
 			return true;
 		}
-		return null !== Aura_Worker_Security::ran_as_token();
+		if ( null === Aura_Worker_Security::ran_as_token() ) {
+			return false;
+		}
+		$ours = self::site_token_uncached();
+		if ( is_wp_error( $ours ) ) {
+			return true; // Cannot read the token: cannot show this is another binding.
+		}
+		$ours   = (string) $ours;
+		$theirs = (string) $marker['site'];
+		if ( '' === $ours || '' === $theirs ) {
+			return true; // Nothing to compare is not evidence of innocence either.
+		}
+		return hash_equals( $theirs, $ours );
 	}
 
 	/**
