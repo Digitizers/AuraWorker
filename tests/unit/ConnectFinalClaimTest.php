@@ -39,6 +39,26 @@ final class ConnectFinalClaimTest extends TestCase {
 		return $req;
 	}
 
+	/**
+	 * THE LEASE IS REFRESHED BY THE CONNECT ITSELF. The refresh changes
+	 * nothing observable in a fast request — which is exactly why its absence
+	 * has to be asserted directly, rather than inferred from a timestamp two
+	 * statements apart in the same second.
+	 */
+	public function test_the_connect_refreshes_its_lease_once_the_mint_is_behind_it(): void {
+		$refreshed = array();
+		add_action(
+			'aura_worker_connect_lease_refreshed',
+			static function ( $ok ) use ( &$refreshed ) {
+				$refreshed[] = $ok;
+			}
+		);
+
+		$this->assertSame( 200, $this->ml->handle_connect( $this->request() )->get_status() );
+
+		$this->assertSame( array( true ), $refreshed, 'the tail ran on the lease the claim was taken with' );
+	}
+
 	public function test_an_undisturbed_connect_still_succeeds(): void {
 		$this->assertSame( 200, $this->ml->handle_connect( $this->request() )->get_status() );
 		$this->assertFalse( get_transient( 'aura_magic_' . $this->magic_id ), 'the link was consumed' );

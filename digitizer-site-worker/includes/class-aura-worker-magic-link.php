@@ -726,7 +726,10 @@ class Aura_Worker_Magic_Link {
 		// seconds, and a connect that overran SITE_CLAIM_TAKEOVER_AFTER while
 		// legitimately working became seizable — so the tail below runs on a
 		// lease measured from HERE rather than from the claim.
-		self::touch_site_claim( $site_fence );
+		// The refresh is announced, not merely done: it is the one step whose
+		// absence changes nothing observable in a fast request, so without this
+		// a mutant that deletes it leaves every test green.
+		do_action( 'aura_worker_connect_lease_refreshed', self::touch_site_claim( $site_fence ) );
 		// The mint's own bookkeeping — the LAST fallible write of the install,
 		// and therefore ahead of the marker release below (round-1 NIT): the
 		// bracket's discipline is that nothing that can fail sits after the
