@@ -67,6 +67,26 @@ class Aura_Worker_Security {
 	private static $authenticating_user = null;
 
 	/**
+	 * The user this request was made to run as by Layer 2.5 — the token-only
+	 * path — or null when no such thing happened.
+	 *
+	 * This is the ONE statement that a request was authorised by the SITE
+	 * TOKEN ALONE. It cannot be recovered afterwards: `wp_set_current_user()`
+	 * leaves a request indistinguishable from one an Application Password
+	 * authenticated, and `aura_worker_connect_user_id` — the option Layer 2.5
+	 * resolved through — is deleted by Phase B of an unbind while the token
+	 * still works. So the fact is recorded where it happens.
+	 *
+	 * Null, never 0: a run-as that resolved nobody never happened (Layer 2.5
+	 * returns aura_not_configured instead), and 0 is not a user (#434 C1-C4).
+	 *
+	 * @since 2.13.0
+	 *
+	 * @var int|null
+	 */
+	private static $ran_as = null;
+
+	/**
 	 * Register the hook that captures the authenticating Application Password.
 	 * Called from Aura_Worker::init(); WordPress fires the hook during REST
 	 * authentication, which is earlier than any route callback.
@@ -126,6 +146,40 @@ class Aura_Worker_Security {
 	 */
 	public static function authenticating_app_password_user() {
 		return self::$authenticating_user;
+	}
+
+	/**
+	 * The user Layer 2.5 ran this request as, or null when this request was
+	 * not authorised by the site token alone.
+	 *
+	 * A non-null answer is proof of the token path, and — while the unbind
+	 * marker is set — proof of the DEPARTED binding: Phase B deletes the site
+	 * token last, so the only token that can still reach Layer 2.5 at a marked
+	 * site is the one the departed binding was issued (a rebind clears the
+	 * marker before it issues another). The user id it resolved to proves
+	 * nothing on its own — see Aura_Worker_Rules::departed_binding_request().
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return int|null
+	 */
+	public static function ran_as_token() {
+		return self::$ran_as;
+	}
+
+	/**
+	 * Set the run-as user directly.
+	 *
+	 * @internal Tests only — production sets this from Layer 2.5 below.
+	 *
+	 * @param int|null $user The user id, or null for "this request took no
+	 *                       run-as path". Anything that is not a positive int
+	 *                       is that same null: a run-as that named nobody
+	 *                       never happened.
+	 * @return void
+	 */
+	public static function _set_ran_as_for_tests( $user ) {
+		self::$ran_as = ( null === $user || (int) $user <= 0 ) ? null : (int) $user;
 	}
 
 	/**
@@ -210,6 +264,12 @@ class Aura_Worker_Security {
 				);
 			}
 			wp_set_current_user( $run_as );
+			// Recorded here because here is the only place it is a FACT rather
+			// than a guess. After this line the request looks exactly like an
+			// application-password one, and the option that produced $run_as is
+			// deleted by Phase B of an unbind while this same token still
+			// authenticates (#434 Task 6).
+			self::$ran_as = (int) $run_as;
 
 			/**
 			 * Fires when a request is authorized by its Aura site token alone
@@ -473,17 +533,14 @@ class Aura_Worker_Security {
 			return true;
 		}
 
-		// The unbind envelope — and every retry of it — arrives on /aura/v2/rules,
-		// which Task 3 answers from the marker fast path. A site that refused this
-		// route could not be told anything, including that it is unbound.
-		//
-		// Anchored at BOTH ends (round-1 MINOR-3). Right-anchored alone, the
-		// exemption also matched '/aura/v1/anything/aura/v2/rules' — unreachable
-		// today, because the only registered capture excludes slashes, but an
-		// exemption that widens the day someone writes (?P<path>.+) is not an
-		// exemption anybody chose.
-		$route = (string) $request->get_route();
-		if ( preg_match( '#^/aura/v2/rules$#', $route ) ) {
+		// The unbind envelope — and every retry of it — arrives on
+		// /aura/v2/rules, which Task 3 answers from the marker fast path. A
+		// site that refused this route could not be told anything, including
+		// that it is unbound. The pattern (anchored at BOTH ends, round-1
+		// MINOR-3) lives on Aura_Worker_Unbind, because the core-REST boundary
+		// added in Task 6 must exempt exactly the same route and a second copy
+		// could drift.
+		if ( Aura_Worker_Unbind::is_rules_route( (string) $request->get_route() ) ) {
 			return true;
 		}
 

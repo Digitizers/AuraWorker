@@ -2392,6 +2392,83 @@ class Aura_Worker_Rules {
 	const PLUGIN_ROUTE = '#^/wp/v2/plugins(?:/(?P<plugin>[^.\/]+(?:/[^.\/]+)?))?/?$#';
 
 	/**
+	 * Is this request being made AS the binding Aura unbound (#434 Task 6)?
+	 *
+	 * This is the other door. Task 5 closed SiteAgent's own REST routes and
+	 * Aura_Worker_Grant::verify(), so an unbound site refuses every `aura/*`
+	 * mutation. WordPress core's REST API — /wp/v2/*, /wc/v3/*, anything a
+	 * plugin registers — is reached with the SAME credentials and never passes
+	 * through any of those seams, so without this a site that refuses
+	 * `aura/v2/snapshot` still accepts `POST /wp/v2/posts` from the
+	 * Application Password Aura just unbound.
+	 *
+	 * IDENTITY COMES FROM THE MARKER, NEVER FROM A LIVE OPTION. By the time
+	 * this matters, Phase B has already deleted `aura_worker_connect_user_id`
+	 * and the managed Application Password record; the credentials outlive
+	 * them, because the site token is deleted LAST. The marker is the only
+	 * record of which credentials the departed binding held, which is exactly
+	 * why Phase A copies them into it before Phase B removes anything (Task 3).
+	 * Any version of this predicate that consults a live option answers
+	 * "not the departed binding" for every request that arrives after the
+	 * cleanup it exists to survive.
+	 *
+	 * Three answers, and the reasoning for each:
+	 *
+	 * 1. The marker cannot be READ — a database failure, or a marker that
+	 *    exists and is malformed (Aura_Worker_Unbind::read() answers WP_Error
+	 *    for both). TRUE. This is a refusal boundary and an unreadable marker
+	 *    is not a clean site; more precisely, it is not evidence that THIS
+	 *    request is innocent, and absence of proof of guilt is not proof of
+	 *    innocence — the mistake this project has made six times. The cost is
+	 *    stated rather than hidden: while a marker is unreadable, EVERY agent
+	 *    write through core REST is refused, including credentials that have
+	 *    nothing to do with Aura. That site is already refusing every SiteAgent
+	 *    mutation for the same reason (refuse_if_unbound() uses is_set(), which
+	 *    reads an unreadable marker as set), it is already disconnected, and
+	 *    Task 9's removal panel is the operator's way out. A human at the
+	 *    keyboard is unaffected either way: every caller of this predicate sits
+	 *    behind is_agent_rest_request(), which stands aside for a cookie
+	 *    session.
+	 * 2. No marker at all. FALSE — the site is bound; nothing here applies.
+	 * 3. A marker. TRUE when this request presents one of the credentials the
+	 *    marker names:
+	 *    - the Application Password whose UUID the marker recorded. The UUID
+	 *      alone, never paired with the owner the marker also stored: a UUID
+	 *      identifies exactly one password, while `app_password_users` holds
+	 *      null for an owner the site could not determine, and requiring a
+	 *      match against an unknown would read that unknown as innocence.
+	 *    - the token run-as path (Aura_Worker_Security::ran_as_token()). Its
+	 *      mere PRESENCE is the proof, not the user id it resolved to. Layer
+	 *      2.5 only runs for a request that already presented a valid site
+	 *      token, and at a marked site the only token that can still do that is
+	 *      the departed binding's — Phase B deletes it last, and a rebind
+	 *      clears the marker before issuing another. Comparing the run-as id
+	 *      against the marker's `connect_user_id` would be strictly WEAKER and
+	 *      wrong: once Phase B has deleted `aura_worker_connect_user_id`,
+	 *      resolve_connect_user() falls back to the FIRST administrator, so the
+	 *      ids routinely differ on exactly the requests this predicate exists
+	 *      to catch.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @return bool
+	 */
+	public static function departed_binding_request(): bool {
+		$marker = Aura_Worker_Unbind::read();
+		if ( is_wp_error( $marker ) ) {
+			return true; // Unreadable is not innocent.
+		}
+		if ( null === $marker ) {
+			return false;
+		}
+		$uuid = Aura_Worker_Security::authenticating_app_password_uuid();
+		if ( null !== $uuid && '' !== $uuid && in_array( $uuid, $marker['app_password_uuids'], true ) ) {
+			return true;
+		}
+		return null !== Aura_Worker_Security::ran_as_token();
+	}
+
+	/**
 	 * `rest_request_before_callbacks` — every REST route, before its handler.
 	 *
 	 * Applies SITE rules on any route SiteAgent does not own — under a
@@ -2418,6 +2495,15 @@ class Aura_Worker_Rules {
 			return $response;
 		}
 		$route = is_object( $request ) && method_exists( $request, 'get_route' ) ? (string) $request->get_route() : '';
+		// An unbound site refuses every mutation made as the departed binding,
+		// whatever the route and whether or not any rule matches (#434 Task 6).
+		// BEFORE the branches below, all three of which return early for
+		// routes they judge no further — the refusal is categorical, not a
+		// verdict about a rule. The ruleset route is the one exemption, for the
+		// reason Aura_Worker_Unbind::is_rules_route() states.
+		if ( ! Aura_Worker_Unbind::is_rules_route( $route ) && self::departed_binding_request() ) {
+			return Aura_Worker_Unbind::refusal();
+		}
 		if ( preg_match( self::ID_AWARE_ROUTES, $route, $shape ) ) {
 			// `rest_pre_insert_{post,page}` owns creates and updates on these
 			// routes and carries the rule there, so enforcing here as well
@@ -2506,6 +2592,13 @@ class Aura_Worker_Rules {
 		if ( is_wp_error( $prepared ) || ! self::is_agent_rest_request( $request, false ) ) {
 			return $prepared;
 		}
+		// #434 Task 6 — an unbound site refuses the departed binding's writes
+		// at core's own insert filter too. A WP_Error here is what core's post
+		// controller already expects from this filter, so the write stops and
+		// the caller is told why.
+		if ( self::departed_binding_request() ) {
+			return Aura_Worker_Unbind::refusal();
+		}
 		$id = 0;
 		if ( is_object( $request ) && method_exists( $request, 'get_param' ) ) {
 			$id = (int) $request->get_param( 'id' );
@@ -2554,6 +2647,18 @@ class Aura_Worker_Rules {
 		// from any public endpoint, and an anonymous caller is not an agent.
 		if ( null !== $check || ! self::is_agent_rest_request() ) {
 			return $check;
+		}
+		// #434 Task 6 — the departed binding may not delete anything, of any
+		// post type. BEFORE the CORE_TYPES filter below: that list is the RULE
+		// vocabulary's ('post', 'page'), and an unbind is not a rule — a
+		// product, an order or any custom type is just as much a mutation.
+		//
+		// `false`, never a WP_Error, for the reason spelled out at the block
+		// below: this value becomes wp_delete_post()'s / wp_trash_post()'s
+		// return, whose contract is a post object or false, and a WP_Error is
+		// truthy — every caller would read the refusal as a success.
+		if ( self::departed_binding_request() ) {
+			return false;
 		}
 		if ( ! is_object( $post ) || ! isset( $post->ID, $post->post_type ) || ! in_array( (string) $post->post_type, self::CORE_TYPES, true ) ) {
 			return $check;

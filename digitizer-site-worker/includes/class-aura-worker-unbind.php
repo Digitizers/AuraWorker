@@ -316,6 +316,34 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
+	 * The ONE route an unbound site must still answer: the ruleset envelope.
+	 *
+	 * The unbind envelope — and every retry of it — arrives on /aura/v2/rules,
+	 * which Task 3 answers from the marker fast path. A site that refused this
+	 * route could not be told anything, including that it is unbound.
+	 *
+	 * Anchored at BOTH ends (round-1 MINOR-3). Right-anchored alone, the
+	 * exemption also matched '/aura/v1/anything/aura/v2/rules' — unreachable
+	 * today, because the only registered capture excludes slashes, but an
+	 * exemption that widens the day someone writes (?P<path>.+) is not an
+	 * exemption anybody chose.
+	 *
+	 * Lives here, as ONE definition, because there are now two boundaries that
+	 * must agree about it — Aura_Worker_Security::refuse_if_unbound() at
+	 * SiteAgent's own routes, and Aura_Worker_Rules::guard_core_any() at
+	 * core's (#434 Task 6). Two copies of a security exemption are two things
+	 * that can drift apart, and only one of them would be noticed.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $route The REST route, as $request->get_route() gives it.
+	 * @return bool
+	 */
+	public static function is_rules_route( string $route ): bool {
+		return 1 === preg_match( '#^/aura/v2/rules$#', $route );
+	}
+
+	/**
 	 * The refusal every mutation boundary answers with while the marker is set
 	 * (wired to those boundaries in a later task).
 	 *

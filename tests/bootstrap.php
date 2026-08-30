@@ -1335,6 +1335,27 @@ if ( ! class_exists( 'WP_REST_Request' ) ) {
 		private string $route  = '/aura/v1/status';
 		private string $method = 'GET';
 
+		/**
+		 * Core's own signature is __construct( $method = '', $route = '', … ),
+		 * and a test that wrote `new WP_REST_Request( 'POST', '/wp/v2/posts' )`
+		 * against a stub with no constructor got neither: PHP discards the
+		 * arguments silently and the request stays a GET on this class's
+		 * default route — a test that reads as a write and is not one. The
+		 * defaults above are kept for the many tests that rely on them: an
+		 * argument overrides, an omitted one does not.
+		 *
+		 * @param string $method HTTP method.
+		 * @param string $route  Route path.
+		 */
+		public function __construct( string $method = '', string $route = '' ) {
+			if ( '' !== $method ) {
+				$this->set_method( $method );
+			}
+			if ( '' !== $route ) {
+				$this->route = $route;
+			}
+		}
+
 		public function set_method( string $m ): void {
 			$this->method = strtoupper( $m );
 		}
@@ -2628,6 +2649,87 @@ function sa_token_request( string $method, string $route ): WP_REST_Request {
 }
 
 /**
+ * Authenticate this request the way core's Application Password path does:
+ * the user is logged in, rest_get_authenticated_app_password() names the
+ * password, and `application_password_did_authenticate` fires with the
+ * (user, item) pair WordPress hands it.
+ *
+ * Through do_action(), never by writing the capture directly: whether
+ * Aura_Worker_Security is LISTENING is part of what the unbind seam depends
+ * on, and a helper that set the static itself would keep every test green
+ * with the listener unregistered. A tag with no listener is an exception
+ * rather than a silent no-op, for the same reason.
+ *
+ * @param int    $user_id The authenticating user.
+ * @param string $uuid    The Application Password's uuid.
+ * @return void
+ * @throws RuntimeException When nothing is listening for the capture hook.
+ */
+function sa_authenticate_app_password( int $user_id, string $uuid ): void {
+	if ( empty( $GLOBALS['_filters']['application_password_did_authenticate'] ) ) {
+		throw new RuntimeException( 'nothing is listening for application_password_did_authenticate — call Aura_Worker_Security::init() first, or this proves nothing' );
+	}
+	$GLOBALS['_logged_in']         = true;
+	$GLOBALS['_current_user']      = $user_id;
+	$GLOBALS['_current_user_id']   = $user_id;
+	$GLOBALS['_rest_app_password'] = $uuid; // rest_get_authenticated_app_password()
+	do_action( 'application_password_did_authenticate', new WP_User( $user_id ), array( 'uuid' => $uuid ) );
+}
+
+/**
+ * Drive the REAL token-only path — Layer 2.5 of
+ * Aura_Worker_Security::validate_request(): a request presenting the site
+ * token with no application-password user, which resolves an administrator
+ * and runs as them.
+ *
+ * Nothing here fakes the run-as record. The helper only supplies the request
+ * state (a valid token, an administrator to resolve, no logged-in user) and
+ * lets production code decide, so a test built on it goes red if Layer 2.5
+ * stops recording what it did.
+ *
+ * $GLOBALS['_admins'] is set to $admin ALONE, which is what makes the fallback
+ * observable: with `aura_worker_connect_user_id` deleted (the state Phase B
+ * leaves), resolve_connect_user() returns the first administrator, whoever
+ * that is — not necessarily the user the unbind marker recorded.
+ *
+ * @param int $admin The administrator the site can resolve.
+ * @return int The user the request actually ran as.
+ * @throws RuntimeException When the security layer refused the request.
+ */
+function sa_token_run_as( int $admin ): int {
+	sa_token_hash();                  // installs the digest of SA_RAW_SITE_TOKEN
+	$GLOBALS['_admins']    = array( $admin );
+	$GLOBALS['_logged_in'] = false;   // no app-password user: Layer 2.5's precondition
+	$security = new Aura_Worker_Security();
+	$result   = $security->validate_request( sa_token_request( 'POST', '/aura/v2/snapshot' ) );
+	if ( true !== $result ) {
+		$code = is_wp_error( $result ) ? $result->get_error_code() : var_export( $result, true );
+		throw new RuntimeException( "the security layer refused the token-only request ({$code}) — no run-as happened, so the test would prove nothing" );
+	}
+	// What wp_set_current_user() does in WordPress and this file's stub does
+	// not: a request that has been set to a user IS logged in as them.
+	$GLOBALS['_logged_in']       = true;
+	$GLOBALS['_current_user_id'] = (int) $GLOBALS['_current_user'];
+	return (int) $GLOBALS['_current_user'];
+}
+
+/**
+ * A human at the keyboard: core authenticated this REST request from a cookie
+ * session with a verified nonce (rest_cookie_collect_status() sets the global
+ * this reads), and no Application Password is involved.
+ *
+ * @param int $user_id The signed-in user.
+ * @return void
+ */
+function sa_cookie_session( int $user_id ): void {
+	$GLOBALS['_logged_in']            = true;
+	$GLOBALS['_current_user']         = $user_id;
+	$GLOBALS['_current_user_id']      = $user_id;
+	$GLOBALS['_rest_app_password']    = null;
+	$GLOBALS['wp_rest_auth_cookie']   = true;
+}
+
+/**
  * Run the permission_callback the LIVE route table registered for this
  * request's route and method — and nothing else. The route callback is never
  * reached, so a refusal proved here is a refusal proved before any handler
@@ -2690,6 +2792,13 @@ function sa_reset_state(): void {
 	// here like every $GLOBALS store below.
 	if ( class_exists( 'Aura_Worker_Security' ) ) {
 		Aura_Worker_Security::_set_authenticating_uuid_for_tests( null ); // clears the captured user too
+		// The other piece of per-request identity: the user Layer 2.5 ran a
+		// token-only request as (#434 Task 6). A static, so one test's run-as
+		// would otherwise still be "the departed binding" in the next.
+		Aura_Worker_Security::_set_ran_as_for_tests( null );
+	}
+	if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
+		Aura_Worker_Call_Context::reset(); // the dispatching route is a static too
 	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
