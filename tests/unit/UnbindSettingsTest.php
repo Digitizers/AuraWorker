@@ -391,6 +391,30 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
+	 * The resolution deletes credentials, so it is claim-conditional like every
+	 * other lifecycle operation here. Without the claim — or holding somebody
+	 * else's — it must do nothing at all: a connect installing a replacement
+	 * binding beside it would otherwise have its fresh credential deleted by a
+	 * teardown that no longer owns the site.
+	 */
+	public function test_the_resolution_does_nothing_without_the_site_claim(): void {
+		sa_add_app_password( 9, 'uuid-ghost' );
+		sa_set_marker(
+			array(
+				'app_password_uuids' => array( 'uuid-ghost' ),
+				'app_password_users' => array(),
+			)
+		);
+
+		$this->assertSame( array(), Aura_Worker_Unbind::resolve_unknown_owners( '' ) );
+		$this->assertTrue( sa_app_password_exists( 9, 'uuid-ghost' ), 'no claim, no deletion' );
+
+		Aura_Worker_Magic_Link::claim_site(); // somebody else holds it
+		$this->assertSame( array(), Aura_Worker_Unbind::resolve_unknown_owners( 'not-my-fence' ) );
+		$this->assertTrue( sa_app_password_exists( 9, 'uuid-ghost' ), 'and not on another request\'s claim either' );
+	}
+
+	/**
 	 * ROWS MATCHED, AND THE ANSWER NAMED NOBODY. GROUP_CONCAT truncates at
 	 * `group_concat_max_len` and MySQL reports it in a warning nothing here
 	 * reads, so a scan CAN come back with a list this code cannot use. That is
