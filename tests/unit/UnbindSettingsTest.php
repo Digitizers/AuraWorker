@@ -555,6 +555,71 @@ final class UnbindSettingsTest extends TestCase {
 	}
 
 	/**
+	 * ONE READ THAT SAYS "MALFORMED" IS ONE READ. Another request — a connect
+	 * callback, an unbind retry — can land a well-formed marker in the window
+	 * between them, and a repair that rewrote the row on the strength of the
+	 * first read would throw away a real Phase A: its uuids, its owners, its
+	 * seq.
+	 */
+	public function test_the_repair_reads_twice_and_yields_to_a_marker_written_between_them(): void {
+		$this->damage_the_marker();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$GLOBALS['_sa_after_option_read'] = static function ( $name ) {
+			if ( Aura_Worker_Unbind::OPTION !== $name ) {
+				return;
+			}
+			$GLOBALS['_sa_after_option_read'] = null; // once
+			sa_set_marker( array( 'seq' => 42 ) );    // somebody else's Phase A
+		};
+
+		$this->assertFalse( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+
+		Aura_Worker_Magic_Link::release_site( $fence );
+		$this->assertSame( 42, $this->stored_marker()['seq'], "the other request's marker survives" );
+	}
+
+	/**
+	 * The repair is believed only once the row PARSES. write_under_claim()
+	 * proves the row names this site at this seq — which a repair supplies by
+	 * construction — so it cannot tell a marker the teardown can read from one
+	 * it cannot. Here the write lands with `at` destroyed, `site` and `seq`
+	 * intact: everything write_under_claim() checks still passes.
+	 */
+	public function test_a_repair_that_lands_unparseable_is_not_reported_as_repaired(): void {
+		$this->damage_the_marker();
+		$GLOBALS['_sa_option_write_divert'][ Aura_Worker_Unbind::OPTION ] = static function ( $value ) {
+			$marker       = maybe_unserialize( $value );
+			$marker['at'] = null; // present, wrong type: malformed again
+			return maybe_serialize( $marker );
+		};
+
+		$out = $this->remove();
+
+		$this->assertFalse( $out['success'] );
+		$this->assertSame( 'aura_unbind_unrepairable', $out['data']['code'] );
+		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'and the site still refuses everything' );
+		$this->assertTrue( sa_app_password_exists( self::ADMIN, self::MANAGED ), 'nothing was torn down' );
+	}
+
+	/**
+	 * The name sweep is a superset of what Aura MINTED, not of what it
+	 * RECORDED: an operator who renames the managed password takes it out of
+	 * the sweep, and the plugin's own record is the only thing that still names
+	 * it.
+	 */
+	public function test_the_repair_names_the_recorded_credential_even_when_its_name_changed(): void {
+		$GLOBALS['_app_passwords'][ self::ADMIN ][0]['name'] = 'Renamed by hand';
+		$this->damage_the_marker();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::repair_malformed_marker( $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+
+		$this->assertSame( array( self::MANAGED => self::ADMIN ), $this->stored_marker()['app_password_users'] );
+	}
+
+	/**
 	 * A repaired marker must still be the SITE's: maybe_finish() bails on a
 	 * hash mismatch, so a repair that named anything but the live token would
 	 * disarm the sweep it just re-enabled. A token read that did not complete

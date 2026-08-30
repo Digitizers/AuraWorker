@@ -869,6 +869,22 @@ function sa_admin_ajax_call( string $action, int $user_id ): array {
 }
 
 /**
+ * The seam that runs immediately after ONE uncached option read has been
+ * answered — the window in which a concurrent request rewrites the same row.
+ * A test sets $GLOBALS['_sa_after_option_read'] to a callable taking the
+ * option name; clearing it is the callable's own business, because "fires
+ * once" and "fires on the second read" are both cases worth modelling.
+ * Inert when unset.
+ *
+ * @param string $name The option just read.
+ */
+function sa_after_option_read( string $name ): void {
+	if ( isset( $GLOBALS['_sa_after_option_read'] ) && is_callable( $GLOBALS['_sa_after_option_read'] ) ) {
+		call_user_func( $GLOBALS['_sa_after_option_read'], $name );
+	}
+}
+
+/**
  * The seam that runs between a caller's read and its compare-and-swap — the
  * window in which a concurrent connect writes its binding. A test sets
  * $GLOBALS['_sa_before_swap'] to a callable (which clears itself, so it fires
@@ -1691,7 +1707,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					return null;
 				}
 				// The row, not the cache (see sa_read_option_uncached()).
-				return sa_read_option_uncached( $name );
+				$answer = sa_read_option_uncached( $name );
+				// …and then the window AFTER this read, in which another
+				// request writes the same row. A caller that reads one option
+				// TWICE to decide (#434 Task 9's repair, which will not rewrite
+				// a row on the strength of a single "malformed") can only be
+				// pinned if the two reads can disagree. Inert when unset;
+				// one-shot is the listener's own business.
+				sa_after_option_read( $name );
+				return $answer;
 			}
 			// app_password_row_state()'s confirming read is a get_row() now
 			// (#434 N1), so NO get_var() shape may touch this meta key except
@@ -2166,6 +2190,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
+	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
 }
 
@@ -3128,6 +3153,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
+	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
 	$GLOBALS['_posts']        = array();
 	$GLOBALS['_post_meta']    = array();
 	$GLOBALS['_cleaned_post_cache'] = array();
