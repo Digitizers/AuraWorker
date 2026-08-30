@@ -476,8 +476,14 @@ class Aura_Worker_Security {
 		// The unbind envelope — and every retry of it — arrives on /aura/v2/rules,
 		// which Task 3 answers from the marker fast path. A site that refused this
 		// route could not be told anything, including that it is unbound.
+		//
+		// Anchored at BOTH ends (round-1 MINOR-3). Right-anchored alone, the
+		// exemption also matched '/aura/v1/anything/aura/v2/rules' — unreachable
+		// today, because the only registered capture excludes slashes, but an
+		// exemption that widens the day someone writes (?P<path>.+) is not an
+		// exemption anybody chose.
 		$route = (string) $request->get_route();
-		if ( preg_match( '#/aura/v2/rules$#', $route ) ) {
+		if ( preg_match( '#^/aura/v2/rules$#', $route ) ) {
 			return true;
 		}
 

@@ -1398,6 +1398,35 @@ if ( ! class_exists( 'WP_REST_Response' ) ) {
 	}
 }
 
+// --- Media library ----------------------------------------------------------
+// Only the cleanup_orphaned_assets tool reaches these, and only through the
+// PREVIEW sweep in UnbindRefusalTest (#434 Task 5, round-1 MINOR-4): that
+// exemption says a preview mutates nothing, and without a delete that records
+// itself the claim could only ever be proved by a fatal.
+if ( ! function_exists( 'get_attached_file' ) ) {
+	function get_attached_file( $attachment_id, $unfiltered = false ) {
+		return $GLOBALS['_attached_files'][ (int) $attachment_id ] ?? false;
+	}
+}
+
+if ( ! function_exists( 'get_the_title' ) ) {
+	function get_the_title( $post = 0 ) {
+		$id  = (int) ( is_object( $post ) ? ( $post->ID ?? 0 ) : $post );
+		$obj = $GLOBALS['_posts'][ $id ] ?? null;
+		return is_object( $obj ) ? (string) ( $obj->post_title ?? '' ) : '';
+	}
+}
+
+if ( ! function_exists( 'wp_delete_attachment' ) ) {
+	function wp_delete_attachment( $post_id, $force_delete = false ) {
+		$id                      = (int) $post_id;
+		$GLOBALS['_mutations'][] = 'wp_delete_attachment:' . $id;
+		unset( $GLOBALS['_posts'][ $id ] );
+		$GLOBALS['_wp_query_posts'] = array_values( array_diff( $GLOBALS['_wp_query_posts'], array( $id ) ) );
+		return true;
+	}
+}
+
 // Core's own permission callback for a route that authenticates itself
 // (/aura/v1/connect proves a signed magic link inside its handler). Defined
 // here so the route table's callbacks are all actually callable.
@@ -1466,6 +1495,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public string $prefix     = 'wp_';
 		public string $options    = 'wp_options';
 		public string $usermeta   = 'wp_usermeta';
+		// Core's wpdb sets a property per core table; the tools that read the
+		// media library name these two.
+		public string $posts      = 'wp_posts';
+		public string $postmeta   = 'wp_postmeta';
 		public string $last_error = '';
 		public string $last_query = '';
 		/**
@@ -2285,6 +2318,7 @@ if ( ! function_exists( 'url_to_postid' ) ) {
 
 $GLOBALS['_bloginfo']   = array();
 $GLOBALS['_thumbnails'] = array();
+$GLOBALS['_attached_files'] = array(); // get_attached_file() — see the media stubs above.
 
 if ( ! function_exists( 'get_bloginfo' ) ) {
 	function get_bloginfo( $show = '', $filter = 'raw' ) {
@@ -2508,15 +2542,30 @@ if ( ! function_exists( 'sa_register_ability' ) ) {
  * where each endpoint is the array the plugin handed register_rest_route()
  * (`methods`, `callback`, `permission_callback`, `args`).
  *
- * Built by CALLING register_routes(), never by scanning source and never by
- * naming routes here: a hard-coded list would let a mutating route ship next
- * year with an unguarded permission callback and a green suite (#434 Task 5).
+ * Built by running the plugin's own bootstrap and firing the hook WordPress
+ * fires — `( new Aura_Worker() )->init(); do_action( 'rest_api_init' )` — so
+ * the table is whatever the plugin actually registers at runtime. Never by
+ * scanning source, never by naming routes, and (round-1 IMPORTANT-1) never by
+ * naming REGISTRARS either: calling Aura_Worker_API::register_routes() and
+ * Aura_Worker_MCP::register_routes() by hand made the SET OF REGISTRARS a
+ * maintained list — the forbidden artefact moved up one level — and a third
+ * `rest_api_init` registrar exposing an unauthenticated mutating route left
+ * the whole suite green. Asking "what enumerates THAT?" has one acceptable
+ * answer, and it is the system itself. The one remaining named thing is the
+ * plugin's single entry point, which
+ * UnbindRefusalTest::test_the_route_table_is_built_from_the_only_entry_point_that_registers_routes
+ * pins against the source.
+ *
+ * Every hook the bootstrap registers is contained: $GLOBALS['_filters'] is
+ * saved whole and restored whole around the build, so none of Aura_Worker's
+ * other registrations (rules' core-REST filters, the app-password capture,
+ * the unbind sweep, the abilities hooks) can leak into whichever test happened
+ * to trigger the build. Those init() methods do nothing BUT register hooks, so
+ * that restore is complete.
  *
  * Memoised for the process. The table is a fact about the CODE, not about a
  * test's state — the handlers read $GLOBALS live, and Aura_Worker_Security's
- * only per-request state is a static that sa_reset_state() clears — so
- * rebuilding it per test would buy nothing and would re-run
- * Aura_Worker_Magic_Link's constructor (an add_action) on every call. For the
+ * only per-request state is a static that sa_reset_state() clears. For the
  * same reason it is NOT cleared in sa_reset_state().
  *
  * @return array<string,array<int,array>> Route pattern => endpoints.
@@ -2526,13 +2575,15 @@ function sa_registered_routes(): array {
 	if ( null !== $table ) {
 		return $table;
 	}
-	$before                  = $GLOBALS['_rest_routes'] ?? array();
+	$filters_before          = $GLOBALS['_filters'];
+	$routes_before           = $GLOBALS['_rest_routes'] ?? array();
+	$GLOBALS['_filters']     = array();
 	$GLOBALS['_rest_routes'] = array();
-	$security                = new Aura_Worker_Security();
-	( new Aura_Worker_API( $security ) )->register_routes();
-	( new Aura_Worker_MCP( $security ) )->register_routes();
+	( new Aura_Worker() )->init();
+	do_action( 'rest_api_init' );
 	$table                   = $GLOBALS['_rest_routes'];
-	$GLOBALS['_rest_routes'] = $before;
+	$GLOBALS['_rest_routes'] = $routes_before;
+	$GLOBALS['_filters']     = $filters_before;
 	return $table;
 }
 
@@ -2686,6 +2737,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_url_to_postid']  = array();
 	$GLOBALS['_bloginfo']       = array();
 	$GLOBALS['_thumbnails']     = array();
+	$GLOBALS['_attached_files'] = array();
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_ability_categories'] = array();
 	$GLOBALS['_scheduled']    = array();

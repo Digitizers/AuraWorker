@@ -262,6 +262,137 @@ final class UnbindRefusalTest extends TestCase {
 		$this->assertGreaterThanOrEqual( 8, $checked, 'no reads were exercised — is the route table being built?' );
 	}
 
+	/**
+	 * The enumeration's guarantee has to survive a change to the SET of route
+	 * registrars, not only to the routes inside the two we happened to know
+	 * about (round-1 IMPORTANT-1). sa_registered_routes() therefore runs the
+	 * plugin's own bootstrap and fires `rest_api_init`, so a registrar added
+	 * anywhere Aura_Worker::init() reaches is swept automatically.
+	 *
+	 * The one thing still named by hand is that entry point, and this is what
+	 * keeps it honest: every `add_action( 'rest_api_init', … )` in the plugin
+	 * must live in the file the build's entry point lives in. A registrar
+	 * hooked up from a constructor, a second bootstrap function or another
+	 * file would never run during the build, and its routes would be invisible
+	 * to every assertion in this class.
+	 */
+	public function test_the_route_table_is_built_from_the_only_entry_point_that_registers_routes(): void {
+		$files    = array();
+		$scanned  = 0;
+		$iterator = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( SA_PLUGIN_DIR ) );
+		foreach ( $iterator as $file ) {
+			if ( ! $file->isFile() || 'php' !== strtolower( $file->getExtension() ) ) {
+				continue;
+			}
+			++$scanned;
+			$source = (string) file_get_contents( $file->getPathname() );
+			if ( preg_match( "#add_action\(\s*'rest_api_init'#", $source ) ) {
+				$files[ $file->getFilename() ] = true;
+			}
+		}
+		$this->assertGreaterThanOrEqual( 30, $scanned, 'the source scan found almost no files — is SA_PLUGIN_DIR right?' );
+		$this->assertSame(
+			array( 'class-aura-worker.php' ),
+			array_keys( $files ),
+			"a rest_api_init registrar lives outside the entry point sa_registered_routes() runs — its routes are invisible to this whole test class. Move it into Aura_Worker::init(), or make sa_registered_routes() reach it."
+		);
+	}
+
+	/**
+	 * The exemption is anchored at BOTH ends (round-1 MINOR-3). Right-anchored
+	 * alone it also exempted any route ENDING in /aura/v2/rules — unreachable
+	 * today, but an exemption that widens the day a route takes a permissive
+	 * capture is not an exemption anybody chose.
+	 */
+	public function test_only_the_rules_route_itself_is_exempt(): void {
+		$security = new Aura_Worker_Security();
+		foreach ( array( '/aura/v1/anything/aura/v2/rules', '/aura/v2/rules/extra', 'aura/v2/rules' ) as $lookalike ) {
+			$result = $security->refuse_if_unbound( sa_token_request( 'POST', $lookalike ) );
+			$this->assertInstanceOf( WP_Error::class, $result, $lookalike );
+			$this->assertSame( 'aura_site_unbound', $result->get_error_code(), $lookalike );
+		}
+		$this->assertTrue( $security->refuse_if_unbound( sa_token_request( 'POST', '/aura/v2/rules' ) ) );
+	}
+
+	/**
+	 * Params that reach a successful preview, per tool. Not the set being
+	 * swept — that comes from the registry below — but the fixtures needed to
+	 * DRIVE it. A preview-capable tool with no entry here fails the sweep
+	 * rather than being skipped, which is the point.
+	 *
+	 * @return array<string,array>
+	 */
+	private static function preview_fixtures(): array {
+		return array(
+			// dry_run=false is the adversarial input: the tool must override it.
+			'cleanup_orphaned_assets' => array( 'dry_run' => false ),
+			'update_page_block'       => array( 'post_id' => 4242, 'block_index' => 0, 'inner_html' => 'changed' ),
+			'test_power_double'       => array( 'target' => 'homepage' ),
+		);
+	}
+
+	/**
+	 * `/aura/mcp/tools/preview` is excluded from the refusal sweep because a
+	 * preview executes nothing. That is a property of every preview-capable
+	 * tool, and until now nothing asserted it (round-1 MINOR-4) — it rested on
+	 * one line in class-tool-cleanup-assets.php. If a preview ever mutates,
+	 * the exemption becomes a hole an unbound site is waved through.
+	 */
+	public function test_no_preview_capable_tool_mutates_anything(): void {
+		$GLOBALS['_caps'] = null;
+		$GLOBALS['_posts'][4242] = (object) array(
+			'ID'           => 4242,
+			'post_title'   => 'Fixture',
+			'post_status'  => 'publish',
+			'post_type'    => 'page',
+			'post_content' => wp_json_encode(
+				array(
+					array( 'blockName' => 'core/paragraph', 'attrs' => array(), 'innerHTML' => 'before', 'innerContent' => array( 'before' ), 'innerBlocks' => array() ),
+				)
+			),
+		);
+		$GLOBALS['_wp_query_posts'] = array( 101, 102 );
+
+		$registry  = new Aura_Worker_Tools();
+		$fixtures  = self::preview_fixtures();
+		$swept     = 0;
+		foreach ( $registry->list_tools() as $meta ) {
+			$name = (string) $meta['name'];
+			$tool = $registry->get_tool( $name );
+			$annotations = $tool->get_annotations();
+			if ( empty( $annotations['supports_preview'] ) ) {
+				continue;
+			}
+			$this->assertArrayHasKey( $name, $fixtures, "{$name} supports preview but this sweep has no params to drive it — add a fixture, do not skip it" );
+
+			$before = sa_snapshot_side_effects();
+			$result = $registry->preview_tool( $name, $fixtures[ $name ] );
+			$this->assertTrue( $result['success'], $name );
+			$this->assertTrue( $result['supported'], $name );
+			$this->assertSame( $before, sa_snapshot_side_effects(), "{$name}: a PREVIEW mutated the site" );
+			++$swept;
+		}
+		$this->assertSame( count( $fixtures ), $swept, 'the preview sweep did not see every fixtured tool' );
+
+		// The post the block preview was pointed at is byte-identical.
+		$this->assertStringContainsString( 'before', $GLOBALS['_posts'][4242]->post_content );
+		$this->assertStringNotContainsString( 'changed', $GLOBALS['_posts'][4242]->post_content );
+	}
+
+	/**
+	 * And the single line the whole classification rests on: cleanup_assets'
+	 * dry_run() delegates to execute(), so it must override the caller's
+	 * dry_run rather than pass it through.
+	 */
+	public function test_a_preview_overrides_a_caller_supplied_live_run(): void {
+		$GLOBALS['_wp_query_posts'] = array( 101, 102 );
+		$result = ( new Aura_Worker_Tools() )->preview_tool( 'cleanup_orphaned_assets', array( 'dry_run' => false ) );
+		$this->assertTrue( $result['success'] );
+		$this->assertSame( 2, $result['preview']['orphaned_count'], 'the fixture found no orphans, so the delete branch was never in play' );
+		$this->assertTrue( $result['preview']['dry_run'], 'the caller asked for a live run and the preview honoured it' );
+		$this->assertSame( 0, $result['preview']['removed_count'] );
+	}
+
 	public function test_rules_route_is_exempt_so_the_fast_path_is_reachable(): void {
 		$this->assertTrue( sa_dispatch_permission( sa_token_request( 'POST', '/aura/v2/rules' ) ) );
 	}

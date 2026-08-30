@@ -45,9 +45,9 @@ final class Aura_Worker_Unbind {
 	 * marker" — `$wpdb->get_var()` answers null for BOTH, and collapsing the
 	 * two would let a transient DB blip read as "site is bound" instead of
 	 * the retryable failure it is. Callers that need a plain boolean use
-	 * is_set() (fails OPEN, i.e. treats the error as "unbound" — documented
-	 * there) or is_set_strict() (surfaces the error so a caller can fail
-	 * CLOSED).
+	 * is_set(), which answers TRUE for an unreadable marker, or
+	 * is_set_strict(), which surfaces the error so a caller can tell the two
+	 * apart.
 	 *
 	 * Round-2 I3: an array in this row is an ATTEMPTED marker, and one that
 	 * does not satisfy the shape is MALFORMED, not absent. `isset()` is false
@@ -171,11 +171,22 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
-	 * Is this site currently unbound? FAILS OPEN on a database read error —
-	 * "unknown" is treated as "unbound" — because this is the plain-boolean
-	 * convenience for callers that only want a display/witness answer (e.g.
-	 * admin UI), not a security gate. A mutation boundary MUST NOT use this
-	 * method; use is_set_strict() and fail CLOSED on its WP_Error instead.
+	 * Is this site currently unbound? Answers TRUE when the marker cannot be
+	 * READ: an unreadable marker is not a clean site.
+	 *
+	 * Which way that "fails" depends entirely on what the caller does next,
+	 * and both readings are in this codebase, so neither word is used here.
+	 * At a refusal boundary it is fail-CLOSED and is the right choice — a
+	 * transient DB error refuses the mutation instead of re-opening every
+	 * write on a disconnected site — which is why
+	 * Aura_Worker_Security::refuse_if_unbound() (#434 Task 5) uses exactly
+	 * this method. For a WITNESS — a screen, or /status — the same answer
+	 * would claim a certainty the read did not have, which is why
+	 * status_fragment() reads the tri-state read() directly instead.
+	 *
+	 * Use is_set_strict() only when the caller genuinely acts DIFFERENTLY on
+	 * an unreadable marker than on a present one. If both branches end in the
+	 * same behaviour, this method is the honest one.
 	 *
 	 * @return bool
 	 */
@@ -185,10 +196,15 @@ final class Aura_Worker_Unbind {
 	}
 
 	/**
-	 * The strict form of is_set() for enforcement boundaries (Tasks 5/6):
-	 * surfaces a database read failure as a WP_Error instead of collapsing it
-	 * to a boolean, so the caller can refuse the mutation (self::refusal())
-	 * rather than silently letting it through while the marker is unreadable.
+	 * The strict form of is_set(): surfaces a database read failure as a
+	 * WP_Error instead of collapsing it into the boolean, for the callers that
+	 * must tell an unreadable marker from a present one.
+	 *
+	 * Its production caller is Aura_Worker_Rules::fast_path_or_refusal()
+	 * (class-aura-worker-rules.php:524), which answers a push differently in
+	 * the three cases. The write boundary does NOT use it (#434 Task 5): there
+	 * both an unreadable and a present marker end in the same refusal, so the
+	 * extra branch could not change an outcome — see is_set() above.
 	 *
 	 * @return bool|WP_Error True/false once the read genuinely succeeded, or
 	 *                       the WP_Error from a failed uncached read.
@@ -573,10 +589,11 @@ final class Aura_Worker_Unbind {
 			return; // a connect (or another sweep) holds the site; next time
 		}
 		try {
-			// is_set() above fails OPEN on a database error — it is the
-			// display-side convenience. Re-read here and stop on anything that
-			// is not a marker: an unreadable one must not send this sweep into
-			// a cleanup for a binding it cannot identify.
+			// is_set() above answers TRUE for an unreadable marker, which is
+			// the right answer for a REFUSAL and the wrong one for a sweep.
+			// Re-read here and stop on anything that is not a marker: an
+			// unreadable one must not send this cleanup after a binding it
+			// cannot identify.
 			$m = self::read();
 			if ( ! is_array( $m ) ) {
 				return;
