@@ -2808,6 +2808,23 @@ function sa_cookie_session( int $user_id ): void {
  * @throws RuntimeException When no registered route/method matches.
  */
 function sa_dispatch_permission( WP_REST_Request $request ) {
+	$endpoint = sa_route_endpoint( $request );
+	return call_user_func( $endpoint['permission_callback'], $request );
+}
+
+/**
+ * The ONE endpoint the LIVE route table registered for this request's route
+ * and method — the array the plugin handed register_rest_route().
+ *
+ * A route the table does not carry is an exception, never a silent skip: an
+ * enumeration that quietly matched nothing is exactly the vacuous pass these
+ * seams exist to prevent.
+ *
+ * @param WP_REST_Request $request The request.
+ * @return array The registered endpoint.
+ * @throws RuntimeException When no registered route/method matches.
+ */
+function sa_route_endpoint( WP_REST_Request $request ): array {
 	$route  = $request->get_route();
 	$method = strtoupper( $request->get_method() );
 	foreach ( sa_registered_routes() as $registered => $endpoints ) {
@@ -2826,10 +2843,107 @@ function sa_dispatch_permission( WP_REST_Request $request ) {
 			if ( ! in_array( $method, $methods, true ) ) {
 				continue;
 			}
-			return call_user_func( $endpoint['permission_callback'], $request );
+			return $endpoint;
 		}
 	}
 	throw new RuntimeException( "no registered route matches {$method} {$route}" );
+}
+
+/**
+ * Dispatch a request the way WP_REST_Server does: the registered ARGUMENTS
+ * first, then the permission callback, then the route callback. The point of
+ * going through here rather than calling a handler directly is the first step
+ * — core refuses a request whose `required` argument is missing before any
+ * handler runs, so a route arg declared `required` is a real refusal a
+ * handler-level test can never see (#434 Task 8).
+ *
+ * What it implements, in core's order (WP_REST_Request::has_valid_params(),
+ * ::sanitize_params(), WP_REST_Server::respond_to_request()):
+ *   - each arg's `required` => `rest_missing_callback_param`, 400;
+ *   - each present arg's `validate_callback` (false or WP_Error => 400);
+ *   - the endpoint-level `validate_callback`, called with the request;
+ *   - each present arg's `sanitize_callback`, written back onto the request;
+ *   - the permission callback (a WP_Error is answered at its own status);
+ *   - the route callback.
+ *
+ * What it deliberately does NOT implement is core's TYPE validation
+ * (`rest_parse_request_arg` on `type`/`enum`/`format`), which would make this
+ * helper the authority on values the handler must judge for itself: every
+ * caller reaching a handler directly — most of this suite, and Aura's own
+ * retries — arrives without it. Omitting it therefore makes this seam MORE
+ * permissive than WordPress, never less, so a refusal proved here is one the
+ * plugin makes on its own and a pass proved here cannot be resting on core.
+ *
+ * @param WP_REST_Request $request The request.
+ * @return WP_REST_Response|WP_Error Whatever the route answered, or the 400 /
+ *                                   permission refusal that pre-empted it.
+ * @throws RuntimeException When no registered route/method matches.
+ */
+function sa_dispatch_route( WP_REST_Request $request ) {
+	$endpoint = sa_route_endpoint( $request );
+	$args     = isset( $endpoint['args'] ) && is_array( $endpoint['args'] ) ? $endpoint['args'] : array();
+
+	foreach ( $args as $key => $arg ) {
+		$value   = $request->get_param( $key );
+		$present = null !== $value;
+		if ( ! empty( $arg['required'] ) && ! $present ) {
+			return new WP_REST_Response(
+				array(
+					'code'    => 'rest_missing_callback_param',
+					'message' => sprintf( 'Missing parameter(s): %s', $key ),
+					'data'    => array( 'status' => 400 ),
+				),
+				400
+			);
+		}
+		if ( $present && isset( $arg['validate_callback'] ) ) {
+			$valid = call_user_func( $arg['validate_callback'], $value, $request, $key );
+			if ( false === $valid || is_wp_error( $valid ) ) {
+				return sa_rest_error_response( is_wp_error( $valid ) ? $valid : new WP_Error( 'rest_invalid_param', "Invalid parameter(s): {$key}", array( 'status' => 400 ) ) );
+			}
+		}
+	}
+	if ( isset( $endpoint['validate_callback'] ) ) {
+		$valid = call_user_func( $endpoint['validate_callback'], $request );
+		if ( false === $valid || is_wp_error( $valid ) ) {
+			return sa_rest_error_response( is_wp_error( $valid ) ? $valid : new WP_Error( 'rest_invalid_param', 'Invalid parameter(s).', array( 'status' => 400 ) ) );
+		}
+	}
+	foreach ( $args as $key => $arg ) {
+		if ( isset( $arg['sanitize_callback'] ) && null !== $request->get_param( $key ) ) {
+			$request->set_param( $key, call_user_func( $arg['sanitize_callback'], $request->get_param( $key ), $request, $key ) );
+		}
+	}
+
+	$permission = call_user_func( $endpoint['permission_callback'], $request );
+	if ( is_wp_error( $permission ) ) {
+		return sa_rest_error_response( $permission );
+	}
+	if ( true !== $permission ) {
+		return sa_rest_error_response( new WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', array( 'status' => 401 ) ) );
+	}
+
+	$response = call_user_func( $endpoint['callback'], $request );
+	return is_wp_error( $response ) ? sa_rest_error_response( $response ) : $response;
+}
+
+/**
+ * A WP_Error rendered the way the REST server renders one: the error's own
+ * status, and the code on the body so a test can name what refused.
+ *
+ * @param WP_Error $error The refusal.
+ * @return WP_REST_Response
+ */
+function sa_rest_error_response( WP_Error $error ): WP_REST_Response {
+	$data = $error->get_error_data();
+	return new WP_REST_Response(
+		array(
+			'code'    => $error->get_error_code(),
+			'message' => $error->get_error_message(),
+			'data'    => is_array( $data ) ? $data : array(),
+		),
+		isset( $data['status'] ) ? (int) $data['status'] : 500
+	);
 }
 
 /**

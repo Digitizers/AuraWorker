@@ -661,40 +661,11 @@ class Aura_Worker_Rules {
 		// marker get written, and the ruleset store is left exactly as it was
 		// (Phase B clears it, under the same claim).
 		if ( isset( $doc['unbind'] ) && true === $doc['unbind'] ) {
-			$marker = array(
-				'at'                 => gmdate( 'c' ),
-				// The token hash the document was bound to — the AUTHORITATIVE
-				// one read above and proved equal to the document's own `site`,
-				// never a fresh read. A retry is matched against this after the
-				// stored record is gone.
-				'site'               => $ours,
-				'site_ref'           => $site_ref,
-				'client'             => $client,
-				'seq'                => (int) $doc['seq'],
-				'connect_user_id'    => (int) get_option( 'aura_worker_connect_user_id', 0 ),
-				'app_password_uuids' => array(),
-				'app_password_users' => array(),
-			);
-			// Every credential that can authenticate as this binding, copied in
-			// BEFORE Phase B deletes the options that name them: the managed
-			// Application Password SiteAgent minted, and the one that
-			// authenticated THIS request (a manually connected site's, or one
-			// Aura's PATCH installed, was never minted here). The core-REST
-			// seam matches on the marker's identity, never on the live options.
-			$managed = get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null );
-			if ( is_array( $managed ) && ! empty( $managed['uuid'] ) ) {
-				$uuid                                  = (string) $managed['uuid'];
-				$marker['app_password_uuids'][]        = $uuid;
-				$marker['app_password_users'][ $uuid ] = self::marker_password_owner( $uuid, (int) ( $managed['user_id'] ?? 0 ), (int) $marker['connect_user_id'] );
-			}
-			$auth = Aura_Worker_Security::authenticating_app_password_uuid();
-			if ( is_string( $auth ) && '' !== $auth && ! in_array( $auth, $marker['app_password_uuids'], true ) ) {
-				$marker['app_password_uuids'][]        = $auth;
-				// The user the SAME hook named beside this uuid — never
-				// get_current_user_id(), which is a fact about the request and
-				// not about the password (#434 Task 4, C4).
-				$marker['app_password_users'][ $auth ] = self::marker_password_owner( $auth, (int) Aura_Worker_Security::authenticating_app_password_user(), (int) $marker['connect_user_id'] );
-			}
+			// The token hash the document was bound to — the AUTHORITATIVE one
+			// read above and proved equal to the document's own `site`, never a
+			// fresh read. A retry is matched against this after the stored
+			// record is gone.
+			$marker = self::new_marker( $ours, $site_ref, $client, (int) $doc['seq'] );
 			// Claim-fenced and verified by read-back; a failed write is a
 			// retryable 500 with nothing else touched — never a silent unbind
 			// that no boundary can see.
@@ -870,6 +841,292 @@ class Aura_Worker_Rules {
 			'cleanup_complete' => (bool) $done,
 			// See the build path above: the names of what is still owed, so a
 			// false `cleanup_complete` can be told from a `! final` one (M9).
+			'leftovers'        => Aura_Worker_Unbind::leftovers(),
+		);
+	}
+
+	/**
+	 * The Phase-A marker for a binding that is departing: who the site is, who
+	 * it was bound to, and EVERY credential that can still authenticate as
+	 * that binding — copied in BEFORE Phase B deletes the options that name
+	 * them (the managed Application Password SiteAgent minted, and the one
+	 * that authenticated THIS request: a manually connected site's, or one
+	 * Aura's PATCH installed, was never minted here). The core-REST seam
+	 * matches on the marker's identity, never on the live options.
+	 *
+	 * ONE builder for both Phase-A writers — the enveloped document and the
+	 * unkeyed bare body (Task 8). The credential copy is the half that must
+	 * never drift: a marker missing a uuid is an administrator-level REST
+	 * credential the boundaries do not recognise and Phase B never revokes.
+	 *
+	 * Every field is written at the type Aura_Worker_Unbind::read() requires —
+	 * strings for `at`/`site`/`site_ref`/`client`, an int for `seq` — because a
+	 * field that is present and of the wrong type reads as MALFORMED, which
+	 * refuses every mutation on the site with no way back (#434 Task 4). The
+	 * signature enforces that for the two the bare body supplies.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param string $site     The site's own token hash, authoritative.
+	 * @param string $site_ref This site's id in Aura's vocabulary, '' when unknown.
+	 * @param string $client   The departing client.
+	 * @param int    $seq      The unbind's seq.
+	 * @return array The marker.
+	 */
+	private static function new_marker( string $site, string $site_ref, string $client, int $seq ) {
+		$marker = array(
+			'at'                 => gmdate( 'c' ),
+			'site'               => $site,
+			'site_ref'           => $site_ref,
+			'client'             => $client,
+			'seq'                => $seq,
+			'connect_user_id'    => (int) get_option( 'aura_worker_connect_user_id', 0 ),
+			'app_password_uuids' => array(),
+			'app_password_users' => array(),
+		);
+		$managed = get_option( Aura_Worker_Magic_Link::APP_PASSWORD_RECORD_OPTION, null );
+		if ( is_array( $managed ) && ! empty( $managed['uuid'] ) ) {
+			$uuid                                  = (string) $managed['uuid'];
+			$marker['app_password_uuids'][]        = $uuid;
+			$marker['app_password_users'][ $uuid ] = self::marker_password_owner( $uuid, (int) ( $managed['user_id'] ?? 0 ), (int) $marker['connect_user_id'] );
+		}
+		$auth = Aura_Worker_Security::authenticating_app_password_uuid();
+		if ( is_string( $auth ) && '' !== $auth && ! in_array( $auth, $marker['app_password_uuids'], true ) ) {
+			$marker['app_password_uuids'][]        = $auth;
+			// The user the SAME hook named beside this uuid — never
+			// get_current_user_id(), which is a fact about the request and
+			// not about the password (#434 Task 4, C4).
+			$marker['app_password_users'][ $auth ] = self::marker_password_owner( $auth, (int) Aura_Worker_Security::authenticating_app_password_user(), (int) $marker['connect_user_id'] );
+		}
+		return $marker;
+	}
+
+	/** The longest `client` / `site_ref` a bare unbind body may store in the marker. */
+	const MAX_BODY_FIELD = 191;
+
+	/**
+	 * Phase A for a site that holds NO gateway public key (#434 Task 8).
+	 *
+	 * A manually connected site was never given one, so no signed envelope can
+	 * verify there and every push answers 412 `no_gateway_key` — which would
+	 * strand its tombstone forever. Such a site's only binding IS its token,
+	 * and the route's permission callback has already proved the caller holds
+	 * it (`Aura_Worker_Security::check_aura_token()` refuses every request to
+	 * /aura/v2/rules without it), so the token is sufficient authority for the
+	 * one operation that ENDS that binding.
+	 *
+	 * Deliberately narrow:
+	 *  - a site that CAN verify signatures refuses this form (400) — there the
+	 *    envelope is the authority and a token-only unbind would be a downgrade;
+	 *  - every field comes from an unsigned request body, so each is validated
+	 *    and normalised before anything is written. A marker whose `client` or
+	 *    `site_ref` is not a string reads back MALFORMED, and a malformed
+	 *    marker refuses every mutation on the site with no way back short of
+	 *    the operator's teardown panel (#434 Task 4). A caller must never be
+	 *    able to write one.
+	 *
+	 * Runs under the same site-wide claim as accept(), for the same reason: an
+	 * unbind and a ruleset push must never interleave.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param array $body The request's own values, RAW: `client`, `seq`,
+	 *                    optional `site_ref` and `final`. Nothing here is
+	 *                    trusted to be a string, an int, or present at all.
+	 * @return array|WP_Error The same `{ unbound, seq, cleanup_complete,
+	 *                        leftovers }` answer the enveloped form returns, or
+	 *                        a refusal.
+	 */
+	public static function accept_bare_unbind( array $body ) {
+		// Validated BEFORE the claim is taken: nothing about a malformed body
+		// needs the site, and a request that could take the claim on its way to
+		// a 400 could 503 a good one behind it.
+		$fields = self::validated_unbind_body( $body );
+		if ( is_wp_error( $fields ) ) {
+			return $fields;
+		}
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		if ( '' === $fence ) {
+			return new WP_Error(
+				'aura_site_busy',
+				__( 'Another Aura operation holds this site; retry shortly.', 'digitizer-site-worker' ),
+				array( 'status' => 503 )
+			);
+		}
+		try {
+			return self::bare_unbind_under_claim( $fields, $fence );
+		} finally {
+			Aura_Worker_Magic_Link::release_site( $fence );
+		}
+	}
+
+	/**
+	 * The bare unbind's body, validated and normalised into exactly the values
+	 * the marker stores — or a refusal.
+	 *
+	 * Presence is asked with array_key_exists()/isset() and the TYPE is checked
+	 * rather than cast: `(string) $body['client']` fatals on an object and
+	 * answers 'Array' for an array, and either would write a marker nobody
+	 * meant. A field that is PRESENT but of the wrong type is a refusal, never
+	 * a silent default — the same rule Aura_Worker_Unbind::read() applies to a
+	 * stored marker, applied one step earlier, at the only place a caller can
+	 * still be told.
+	 *
+	 * @param array $body Raw request values.
+	 * @return array|WP_Error `client`, `site_ref`, `seq`, `final`.
+	 */
+	private static function validated_unbind_body( array $body ) {
+		$client = array_key_exists( 'client', $body ) ? $body['client'] : null;
+		if ( ! is_string( $client ) ) {
+			return self::bare_unbind_rejected( 'client is required and must be a string' );
+		}
+		$client = trim( $client );
+		if ( '' === $client || strlen( $client ) > self::MAX_BODY_FIELD ) {
+			return self::bare_unbind_rejected( sprintf( 'client must be 1-%d characters', self::MAX_BODY_FIELD ) );
+		}
+		// Absent or null is '' — an Aura that sends no `site_ref`, exactly as
+		// the enveloped form reads a document without the field. PRESENT but
+		// not a string is a refusal, NOT a silent '': the caller asked for
+		// something this site cannot store, and answering it with a marker
+		// that names a different site than the one requested would be worse
+		// than saying no.
+		$site_ref = ( array_key_exists( 'site_ref', $body ) && null !== $body['site_ref'] ) ? $body['site_ref'] : '';
+		if ( ! is_string( $site_ref ) ) {
+			return self::bare_unbind_rejected( 'site_ref must be a string' );
+		}
+		$site_ref = trim( $site_ref );
+		if ( strlen( $site_ref ) > self::MAX_BODY_FIELD ) {
+			return self::bare_unbind_rejected( sprintf( 'site_ref must be at most %d characters', self::MAX_BODY_FIELD ) );
+		}
+		$seq = self::body_seq( array_key_exists( 'seq', $body ) ? $body['seq'] : null );
+		if ( null === $seq ) {
+			return self::bare_unbind_rejected( 'seq must be a non-negative integer' );
+		}
+		return array(
+			'client'   => $client,
+			'site_ref' => $site_ref,
+			'seq'      => $seq,
+			// Read the way final_flag_of() reads a document: `final` only ever
+			// WIDENS Phase B (it permits deleting the site token), so anything
+			// that is not unambiguously true is false. A form-encoded body
+			// carries it as a string.
+			'final'    => array_key_exists( 'final', $body ) && in_array( $body['final'], array( true, 1, '1', 'true' ), true ),
+		);
+	}
+
+	/**
+	 * The seq a bare body carries, as a non-negative int — or null when it
+	 * carries none this site is willing to store.
+	 *
+	 * A form-encoded body carries every value as a string, so a digit string is
+	 * accepted, but only one that survives the round trip: a value past
+	 * PHP_INT_MAX saturates on cast, and the seq is ECHOED back for Aura to
+	 * match against the tombstone it pushed, so a seq that changed on the way
+	 * in is no answer at all. `0` is a seq like any other and must never be
+	 * read as absent.
+	 *
+	 * @param mixed $value The raw value.
+	 * @return int|null
+	 */
+	private static function body_seq( $value ) {
+		if ( is_int( $value ) ) {
+			return $value >= 0 ? $value : null;
+		}
+		if ( is_string( $value ) && '' !== $value && ctype_digit( $value ) ) {
+			$seq = (int) $value;
+			return (string) $seq === $value ? $seq : null;
+		}
+		return null;
+	}
+
+	/**
+	 * A bare unbind body this site will not act on. 400 and permanent: the same
+	 * body will be refused for the same reason on every retry, so Aura must fix
+	 * it rather than wait.
+	 *
+	 * @param string $why What was wrong.
+	 * @return WP_Error
+	 */
+	private static function bare_unbind_rejected( $why ) {
+		return new WP_Error( 'aura_ruleset_rejected', 'Unbind refused: ' . $why, array( 'status' => 400 ) );
+	}
+
+	/**
+	 * The bare unbind's body, run under a site claim the caller already holds.
+	 *
+	 * @param array  $fields Validated body — client, site_ref, seq, final.
+	 * @param string $fence  This request's site-claim fence.
+	 * @return array|WP_Error
+	 */
+	private static function bare_unbind_under_claim( array $fields, $fence ) {
+		// STEP 0 — the SAME fast path the enveloped form takes, and BEFORE the
+		// keyed refusal below. Phase B deletes the gateway key at step (4) and
+		// the site token at step (5), so an unbind interrupted after step (4)
+		// leaves a site indistinguishable from a never-keyed one, and one
+		// interrupted before it leaves a marked site that still holds its key
+		// (#434 Task 4 review). Judging a RETRY by the key would strand the
+		// first and refuse the second; the marker plus the token is the whole
+		// authority here, exactly as it is for an envelope this site can no
+		// longer verify.
+		//
+		// The CURRENT request's seq, never the marker's: two legacy tombstones
+		// sharing one token carry different clearSeqs, and echoing the marker's
+		// would fail Aura's seq check after the token is already deleted —
+		// stranding the very tombstone this path exists to rescue.
+		$fast = self::fast_path_or_refusal( $fence, $fields['final'], $fields['seq'] );
+		if ( null !== $fast ) {
+			return $fast;
+		}
+
+		// A site that can verify a signature has no business accepting an
+		// unverified unbind: there the envelope IS the authority, and a
+		// token-only form would be a downgrade — a stolen token could evict
+		// Aura from a keyed site. The RAW option, not has_usable_key(): a key
+		// that is present but corrupt still means "this site was keyed", and
+		// the answer to a key it cannot use is to reconnect (the 412), never to
+		// widen this path.
+		$key = self::read_option_uncached( 'aura_worker_grant_pubkey' );
+		if ( is_wp_error( $key ) ) {
+			return $key; // fails CLOSED: a key that could not be read is not an absent one
+		}
+		if ( null !== $key && '' !== trim( (string) maybe_unserialize( $key ) ) ) {
+			return self::bare_unbind_rejected( 'this site verifies signed documents; send the signed unbind envelope' );
+		}
+
+		$ours = self::site_token_uncached();
+		if ( is_wp_error( $ours ) ) {
+			return $ours;
+		}
+		$ours = (string) $ours;
+		if ( '' === $ours ) {
+			// Nothing to unbind, and — decisively — a marker whose `site` is ''
+			// could never be matched by a retry: fast_path_or_refusal() answers
+			// refusal() on an empty token, so the site would refuse every
+			// mutation forever with no way back. The route's own permission
+			// callback already refuses a tokenless request; this is the same
+			// answer for a token deleted between that check and this one.
+			return self::bare_unbind_rejected( 'this site holds no site token' );
+		}
+
+		$marker = self::new_marker( $ours, $fields['site_ref'], $fields['client'], $fields['seq'] );
+		// write_under_claim()'s read-back proves only "the row now names my
+		// site at my seq", which is sufficient here for the same reason it is
+		// in the enveloped path and nowhere else: the fast path above returned
+		// null, which it does ONLY for a marker read as genuinely ABSENT. There
+		// is no prior row whose site+seq could match while this write's other
+		// fields were lost.
+		if ( ! Aura_Worker_Unbind::write_under_claim( $marker, $fence ) ) {
+			return self::unbind_store_failed();
+		}
+		$done = Aura_Worker_Unbind::cleanup( $fields['final'], $fence );
+		return array(
+			'unbound'          => true,
+			'seq'              => $fields['seq'],
+			'cleanup_complete' => (bool) $done,
+			// Identical in shape to the enveloped answer, `leftovers` included:
+			// Aura branches on empty (only the shared token is outstanding) vs
+			// non-empty (a credential this site could not prove revoked), and
+			// an ABSENT field would read as "something may be owed" (Task 4 M9).
 			'leftovers'        => Aura_Worker_Unbind::leftovers(),
 		);
 	}
