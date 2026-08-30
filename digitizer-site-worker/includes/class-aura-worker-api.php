@@ -1023,41 +1023,7 @@ class Aura_Worker_API {
 			)
 			: Aura_Worker_Rules::accept( (string) $ruleset );
 		if ( is_array( $res ) && ! empty( $res['unbound'] ) ) {
-			// The unbind answer (#434). `seq` is the one THIS request carried,
-			// so Aura can retire the tombstone it actually sent;
-			// `cleanup_complete` says whether Phase B finished — false leaves
-			// the tombstone pending and the site finishes the job itself.
-			// Authenticated by the token before Phase B deleted it.
-			//
-			// `leftovers` names what is still owed (#434 Task 4, M9). A false
-			// `cleanup_complete` has two opposite causes — something could not
-			// be proven removed, or the token was deliberately kept because
-			// the document was not `final` — and Aura cannot separate them
-			// from the bool alone. Empty exactly when nothing is owed; a
-			// non-empty list means a credential or a store this site still
-			// holds, and the tombstone must stay.
-			// The default is the FAIL-CLOSED list, not `array()` (#434 Task 8).
-			// An empty list is a claim — "this site is proven to owe nothing" —
-			// and Aura retires the tombstone on it; an answer that carries no
-			// list at all has made no such claim, and reading one into it is
-			// exactly how a tombstone naming a live administrator credential
-			// gets retired. Both producers below always send the list (their
-			// own tests pin that), so this is the answer for a THIRD one that
-			// forgets to — the same list Aura_Worker_Unbind::leftovers() itself
-			// answers when it cannot look.
-			$leftovers = ( isset( $res['leftovers'] ) && is_array( $res['leftovers'] ) )
-				? $res['leftovers']
-				: array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
-			return new WP_REST_Response(
-				array(
-					'success'          => true,
-					'seq'              => (int) $res['seq'],
-					'unbound'          => true,
-					'cleanup_complete' => (bool) $res['cleanup_complete'],
-					'leftovers'        => array_values( array_map( 'strval', $leftovers ) ),
-				),
-				200
-			);
+			return self::unbind_response( $res );
 		}
 		if ( is_wp_error( $res ) ) {
 			$data = $res->get_error_data();
@@ -1085,6 +1051,55 @@ class Aura_Worker_API {
 			array(
 				'success' => true,
 				'seq'     => $seq,
+			),
+			200
+		);
+	}
+
+	/**
+	 * The unbind answer, on the wire (#434). `seq` is the one THIS request
+	 * carried, so Aura can retire the tombstone it actually sent;
+	 * `cleanup_complete` says whether Phase B finished — false leaves the
+	 * tombstone pending and the site finishes the job itself. Authenticated by
+	 * the token before Phase B deleted it.
+	 *
+	 * `leftovers` names what is still owed (#434 Task 4, M9). A false
+	 * `cleanup_complete` has two opposite causes — something could not be
+	 * proven removed, or the token was deliberately kept because the document
+	 * was not `final` — and Aura cannot separate them from the bool alone.
+	 * Empty exactly when nothing is owed; a non-empty list means a credential
+	 * or a store this site still holds, and the tombstone must stay.
+	 *
+	 * Its default is the FAIL-CLOSED list, not `array()` (#434 Task 8). An
+	 * empty list is a CLAIM — "this site is proven to owe nothing" — and Aura
+	 * retires the tombstone on it; an answer that carries no list at all has
+	 * made no such claim, and reading one into it is exactly how a tombstone
+	 * naming a live administrator credential gets retired. Both of today's
+	 * producers always send the list, and their own tests pin that, so the
+	 * default answers a THIRD one that forgets — which is why this mapping is
+	 * a separately callable function: a defence no caller can currently reach
+	 * is a defence no test can pin, and an unpinned one is indistinguishable
+	 * from a wrong one (round-1 LOW-2).
+	 *
+	 * @internal Transport only — a pure function of the answer it is handed.
+	 *           Public solely so its own contract can be tested directly.
+	 *
+	 * @since 2.13.0
+	 *
+	 * @param array $res The unbind answer from Aura_Worker_Rules.
+	 * @return WP_REST_Response
+	 */
+	public static function unbind_response( array $res ) {
+		$leftovers = ( isset( $res['leftovers'] ) && is_array( $res['leftovers'] ) )
+			? $res['leftovers']
+			: array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
+		return new WP_REST_Response(
+			array(
+				'success'          => true,
+				'seq'              => (int) $res['seq'],
+				'unbound'          => true,
+				'cleanup_complete' => (bool) $res['cleanup_complete'],
+				'leftovers'        => array_values( array_map( 'strval', $leftovers ) ),
 			),
 			200
 		);

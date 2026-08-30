@@ -106,16 +106,35 @@ final class UnbindUnkeyedTest extends TestCase {
 	/**
 	 * A key that is PRESENT but unusable is still a keyed site: the answer to
 	 * a key this site cannot verify with is "reconnect" (the 412 on the
-	 * enveloped path), never a token-only unbind. has_usable_key() would say
-	 * "no key" here and open the path.
+	 * enforced path), never a token-only unbind. has_usable_key() would say
+	 * "no key" for every row below and open the path.
+	 *
+	 * The whitespace rows are round-1 LOW-1: Aura_Worker_Grant::is_enforced()
+	 * calls such a site keyed, so trimming the value here would have two parts
+	 * of the plugin disagree about the same site — and this is the side that
+	 * would admit a token-only eviction.
+	 *
+	 * @dataProvider present_but_unusable_keys
+	 * @param string $key The stored `aura_worker_grant_pubkey`.
 	 */
-	public function test_a_corrupt_gateway_key_still_refuses_the_bare_form(): void {
-		$GLOBALS['_options']['aura_worker_grant_pubkey'] = 'not-a-key';
+	public function test_a_key_this_site_cannot_use_is_still_a_key( string $key ): void {
+		$GLOBALS['_options']['aura_worker_grant_pubkey'] = $key;
 
 		$resp = $this->api()->receive_rules( $this->bare() );
 
 		$this->assertSame( 400, $resp->get_status() );
+		$this->assertSame( 'aura_ruleset_rejected', $resp->get_data()['code'] );
 		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	public static function present_but_unusable_keys(): array {
+		return array(
+			'garbage'      => array( 'not-a-key' ),
+			'truncated'    => array( base64_encode( 'too-short' ) ),
+			'one space'    => array( ' ' ),
+			'whitespace'   => array( "  \t\n " ),
+		);
 	}
 
 	/**
@@ -406,6 +425,105 @@ final class UnbindUnkeyedTest extends TestCase {
 		$this->assertSame( 'aura_invalid_token', $refusal->get_error_code() );
 		$this->assertSame( 401, $refusal->get_error_data()['status'] );
 		$this->assertFalse( Aura_Worker_Unbind::is_set() );
+	}
+
+	// -----------------------------------------------------------------------
+	// The client cross-check (round-1 LOW-3) — defence in depth, not
+	// authorisation: the token is what proves the caller may unbind.
+	// -----------------------------------------------------------------------
+
+	public function test_a_bare_body_naming_another_client_is_refused(): void {
+		Aura_Worker_Rules::bind( 'c1', $this->hash );
+
+		$resp = $this->api()->receive_rules( $this->bare( array( 'client' => 'someone-else' ) ) );
+
+		$this->assertSame( 409, $resp->get_status() );
+		$this->assertSame( 'aura_ruleset_client_mismatch', $resp->get_data()['code'] );
+		$this->assertFalse( Aura_Worker_Unbind::is_set(), 'nothing was written' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	public function test_a_bare_body_naming_the_bound_client_is_accepted(): void {
+		Aura_Worker_Rules::bind( 'c1', $this->hash );
+
+		$resp = $this->api()->receive_rules( $this->bare() );
+
+		$this->assertSame( 200, $resp->get_status() );
+		$this->assertTrue( $resp->get_data()['unbound'] );
+		$this->assertSame( array(), $resp->get_data()['leftovers'] );
+	}
+
+	/**
+	 * The check is conditional on the record, exactly as the enveloped path's
+	 * is. A site with nothing stored — the manually connected case this whole
+	 * path exists for — is not cross-checked against a binding it never had,
+	 * and an unbind must never become impossible because the store the site no
+	 * longer needs is missing.
+	 */
+	public function test_a_site_with_no_stored_record_is_not_cross_checked(): void {
+		$resp = $this->api()->receive_rules( $this->bare( array( 'client' => 'anything-at-all' ) ) );
+
+		$this->assertSame( 200, $resp->get_status() );
+		$this->assertSame( 'anything-at-all', $this->stored_marker()['client'] );
+	}
+
+	/**
+	 * A record bound to a token that is no longer this site's binds nobody —
+	 * bound_client() answers '' for it — so it cannot refuse an unbind either.
+	 */
+	public function test_a_stale_record_does_not_cross_check(): void {
+		Aura_Worker_Rules::bind( 'c1', str_repeat( 'a', 64 ) );
+
+		$resp = $this->api()->receive_rules( $this->bare( array( 'client' => 'c2' ) ) );
+
+		$this->assertSame( 200, $resp->get_status() );
+	}
+
+	// -----------------------------------------------------------------------
+	// The transport itself (round-1 LOW-2). Both producers always send
+	// `leftovers`, so its default is unreachable from receive_rules() — and a
+	// defence no test can reach is indistinguishable from a wrong one. The
+	// mapping is called directly here, with the answer no producer makes.
+	// -----------------------------------------------------------------------
+
+	public function test_an_answer_carrying_no_leftovers_is_transported_as_everything_owed(): void {
+		$body = Aura_Worker_API::unbind_response(
+			array( 'unbound' => true, 'seq' => 4, 'cleanup_complete' => false )
+		)->get_data();
+
+		$this->assertSame(
+			array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ),
+			$body['leftovers'],
+			'an answer that made no claim must never be read as "owes nothing"'
+		);
+		$this->assertNotSame( array(), $body['leftovers'] );
+	}
+
+	/**
+	 * The same for a `leftovers` that is present but not a list: it is not a
+	 * claim either.
+	 */
+	public function test_a_leftovers_that_is_not_a_list_is_transported_as_everything_owed(): void {
+		$body = Aura_Worker_API::unbind_response(
+			array( 'unbound' => true, 'seq' => 4, 'cleanup_complete' => false, 'leftovers' => 'app_passwords' )
+		)->get_data();
+
+		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ), $body['leftovers'] );
+	}
+
+	/** And a list that IS there travels verbatim — the default never overrides one. */
+	public function test_a_leftovers_list_travels_verbatim(): void {
+		$body = Aura_Worker_API::unbind_response(
+			array( 'unbound' => true, 'seq' => 4, 'cleanup_complete' => false, 'leftovers' => array( 'app_passwords' ) )
+		)->get_data();
+
+		$this->assertSame( array( 'app_passwords' ), $body['leftovers'] );
+
+		$empty = Aura_Worker_API::unbind_response(
+			array( 'unbound' => true, 'seq' => 4, 'cleanup_complete' => true, 'leftovers' => array() )
+		)->get_data();
+
+		$this->assertSame( array(), $empty['leftovers'], 'a proven-empty list is a claim and must survive' );
 	}
 
 	// -----------------------------------------------------------------------

@@ -1089,7 +1089,12 @@ class Aura_Worker_Rules {
 		if ( is_wp_error( $key ) ) {
 			return $key; // fails CLOSED: a key that could not be read is not an absent one
 		}
-		if ( null !== $key && '' !== trim( (string) maybe_unserialize( $key ) ) ) {
+		// NOT trim()'d (round-1 LOW-1): a whitespace-only row is a value, and
+		// Aura_Worker_Grant::is_enforced() calls such a site keyed. Trimming it
+		// away here would have TWO parts of the plugin disagree about whether
+		// the same site is keyed — and this side is the one that would admit a
+		// token-only eviction.
+		if ( null !== $key && '' !== (string) maybe_unserialize( $key ) ) {
 			return self::bare_unbind_rejected( 'this site verifies signed documents; send the signed unbind envelope' );
 		}
 
@@ -1106,6 +1111,29 @@ class Aura_Worker_Rules {
 			// callback already refuses a tokenless request; this is the same
 			// answer for a token deleted between that check and this one.
 			return self::bare_unbind_rejected( 'this site holds no site token' );
+		}
+
+		// The bare form's counterpart to the enveloped path's client_mismatch
+		// (round-1 LOW-3). Defence in depth, not authorisation: the token is
+		// what proves this caller may unbind, and nothing downstream reads the
+		// marker's `client` — so this exists to make an Aura bug that
+		// mis-addresses a tombstone VISIBLE instead of silent.
+		//
+		// Conditional on the record, exactly as the enveloped check is
+		// (`! $stale && null !== $current && isset( $current['client'] )`).
+		// bound_client() is a report-only accessor: it already answers '' for a
+		// record that is missing, unreadable or bound to some other token, and
+		// each of those skips the check rather than refusing. That is the right
+		// direction HERE and only here — an unbind must not become impossible
+		// because the store this site no longer needs cannot be read, which is
+		// the whole reason the marker path never depends on it.
+		$bound = self::bound_client();
+		if ( '' !== $bound && ! hash_equals( $bound, $fields['client'] ) ) {
+			return new WP_Error(
+				'aura_ruleset_client_mismatch',
+				sprintf( 'Unbind refused: issued for client %s, this site is bound to %s', $fields['client'], $bound ),
+				array( 'status' => 409 )
+			);
 		}
 
 		$marker = self::new_marker( $ours, $fields['site_ref'], $fields['client'], $fields['seq'] );
