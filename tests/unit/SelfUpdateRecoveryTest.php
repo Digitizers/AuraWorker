@@ -793,4 +793,31 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertTrue( $res['success'], $res['error'] ?? '' );
 		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the outlived request removed its successor\'s claim' );
 	}
+
+	public function test_the_claim_is_renewed_between_phases_so_a_live_update_is_never_seizable(): void {
+		// A fixed ten-minute age let a still-live update be seized as stale, and
+		// the fenced release (round 21) only stopped the loser from deleting the
+		// winner's claim — not the two from running side by side (Codex round-22
+		// P1). The lease is renewed before backup, before install and after it;
+		// here the row is aged during the install and must read fresh again by
+		// the time the loopback runs.
+		$seen_at_loopback = null;
+		$GLOBALS['_install_effect'] = function () use ( &$seen_at_loopback ) {
+			$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+			$fence = substr( $held, 0, (int) strpos( $held, '|' ) );
+			update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+			$GLOBALS['_http_effect'] = function () use ( &$seen_at_loopback ) {
+				$seen_at_loopback = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+			};
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertNotNull( $seen_at_loopback );
+		$stamp = (int) substr( $seen_at_loopback, (int) strpos( $seen_at_loopback, '|' ) + 1 );
+		$this->assertGreaterThan( time() - 60, $stamp, 'the lease was not renewed after the install: ' . $seen_at_loopback );
+	}
 }

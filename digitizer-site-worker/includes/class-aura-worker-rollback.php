@@ -247,17 +247,32 @@ class Aura_Worker_Rollback {
 	 * walked cannot be represented and would never end; it makes the backup
 	 * incomplete, which `backup_plugin()` reports and refuses to keep.
 	 *
-	 * @param ZipArchive $zip         Open zip archive instance.
-	 * @param string     $dir         Absolute path to the source directory.
-	 * @param string     $relative_to Prefix for zip entry paths.
-	 * @param array      $chain       Real paths of the directories on the current
-	 *                                descent, keyed by path — the loop guard.
+	 * And a link is followed ONLY while its target stays inside the plugin
+	 * root (#78, Codex round-22 P1). A link to anywhere else — a home
+	 * directory, a config tree — would copy whatever is readable there into a
+	 * predictably named zip under wp-content, behind an .htaccess that nginx
+	 * never reads; that is a disclosure, not a backup. Such a link is not
+	 * archived and the backup is incomplete: `backed_up: false`, the update
+	 * proceeds (the #472 rule), and the operator learns that this layout has
+	 * no automatic way back. This applies to file links as much as directory
+	 * links — `addFile()` on a link copies the target's bytes.
+	 *
+	 * @param ZipArchive  $zip         Open zip archive instance.
+	 * @param string      $dir         Absolute path to the source directory.
+	 * @param string      $relative_to Prefix for zip entry paths.
+	 * @param array       $chain       Real paths of the directories on the current
+	 *                                 descent, keyed by path — the loop guard.
+	 * @param string|null $root        Real path of the plugin root; null at the
+	 *                                 top-level call, where it becomes $dir's.
 	 * @return bool Whether EVERY entry went in.
 	 */
-	private function add_directory_to_zip( $zip, $dir, $relative_to, array $chain = array() ) {
+	private function add_directory_to_zip( $zip, $dir, $relative_to, array $chain = array(), $root = null ) {
 		$real = realpath( $dir );
 		if ( false === $real || '' === $real || isset( $chain[ $real ] ) || ! is_readable( $dir ) ) {
 			return false;
+		}
+		if ( null === $root ) {
+			$root = $real;
 		}
 		$chain[ $real ] = true;
 		$entries        = scandir( $dir );
@@ -271,13 +286,17 @@ class Aura_Worker_Rollback {
 			}
 			$path  = $dir . '/' . $name;
 			$entry = $relative_to . '/' . $name;
+			if ( is_link( $path ) && ! $this->resolves_inside( $path, $root ) ) {
+				$complete = false;
+				continue;
+			}
 			if ( is_dir( $path ) ) {
 				// `is_dir()` follows a link, so a symlinked directory arrives here
 				// and is walked like any other; the chain stops it from looping.
 				if ( ! $zip->addEmptyDir( $entry ) ) {
 					$complete = false;
 				}
-				if ( ! $this->add_directory_to_zip( $zip, $path, $entry, $chain ) ) {
+				if ( ! $this->add_directory_to_zip( $zip, $path, $entry, $chain, $root ) ) {
 					$complete = false;
 				}
 				continue;
@@ -298,6 +317,22 @@ class Aura_Worker_Rollback {
 			}
 		}
 		return $complete;
+	}
+
+	/**
+	 * Whether a path's real location is the root itself or somewhere under it.
+	 *
+	 * @param string $path Path, typically a symlink.
+	 * @param string $root Real path of the plugin root.
+	 * @return bool
+	 */
+	private function resolves_inside( $path, $root ) {
+		$target = realpath( $path );
+		if ( false === $target || '' === $target ) {
+			return false;
+		}
+		$root = rtrim( $root, '/' );
+		return $target === $root || 0 === strpos( $target, $root . '/' );
 	}
 
 	/**

@@ -196,7 +196,7 @@ class Aura_Worker_Updater {
 			);
 		}
 		try {
-			return $this->self_update_locked( $zip_url, $expected_sha256 );
+			return $this->self_update_locked( $zip_url, $expected_sha256, $fence );
 		} finally {
 			Aura_Worker_Magic_Link::release_claim( self::SELF_UPDATE_LOCK, $fence );
 		}
@@ -208,9 +208,12 @@ class Aura_Worker_Updater {
 	 *
 	 * @param string $zip_url         See self_update().
 	 * @param string $expected_sha256 See self_update().
+	 * @param string $fence           The claim self_update() holds, renewed between
+	 *                                phases so a live update is never seized as
+	 *                                stale (Codex round-22 P1).
 	 * @return array
 	 */
-	private function self_update_locked( $zip_url, $expected_sha256 = '' ) {
+	private function self_update_locked( $zip_url, $expected_sha256, $fence ) {
 		// Load the recovery classes BEFORE the install, so their code is in
 		// memory from the OLD build. After `install()` this plugin's directory
 		// has been replaced; a class first required afterwards would be read
@@ -265,6 +268,14 @@ class Aura_Worker_Updater {
 			$install_source = $tmp;
 		}
 
+		// The lease is renewed before each phase that could take a while, so a
+		// slow download, backup or install is never mistaken for a dead holder
+		// and seized from under a request that is still working. Losing it here
+		// means another self-update took over: stop before touching the files.
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			return $this->self_update_claim_lost();
+		}
+
 		// Back up this plugin's own directory so a bad build can be undone.
 		// Taken HERE, not at the top: everything above can still refuse the
 		// update (a bad digest, a failed download), and a backup made for an
@@ -280,6 +291,10 @@ class Aura_Worker_Updater {
 		$backup      = $rollback ? $rollback->backup_plugin( $plugin_slug ) : array( 'success' => false );
 		$backup_path = ! empty( $backup['success'] ) ? $backup['backup_path'] : null;
 
+
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			return $this->self_update_claim_lost();
+		}
 
 		// Install from the verified local file (or the URL when no digest given).
 		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
@@ -386,6 +401,10 @@ class Aura_Worker_Updater {
 		// satisfy this verdict either.
 		$boot_nonce = bin2hex( random_bytes( 16 ) );
 		update_option( 'aura_worker_boot_nonce', $boot_nonce, false );
+
+		// Files are replaced; whatever happens to the lease now, the verdict and
+		// any rollback below are still owed. Renew it and carry on.
+		$this->keep_self_update_claim( $fence );
 
 		// Did THIS build come up? See `verify_self_update()`.
 		$health_result = $this->verify_self_update( $new_version, $boot_nonce );
@@ -687,6 +706,30 @@ class Aura_Worker_Updater {
 			);
 		}
 		return array( 'restored' => true, 'error' => null );
+	}
+
+	/**
+	 * Renew the self-update claim's lease. True while this request still holds it.
+	 *
+	 * @param string $fence The claim self_update() took.
+	 * @return bool
+	 */
+	private function keep_self_update_claim( $fence ) {
+		return Aura_Worker_Magic_Link::refresh_claim( self::SELF_UPDATE_LOCK, $fence );
+	}
+
+	/**
+	 * The result for a self-update whose claim was seized before it changed
+	 * anything: another self-update is the one running now.
+	 *
+	 * @return array
+	 */
+	private function self_update_claim_lost() {
+		return array(
+			'success'     => false,
+			'error'       => __( 'SiteAgent lost its self-update claim before installing; another self-update took over on this site.', 'digitizer-site-worker' ),
+			'in_progress' => true,
+		);
 	}
 
 	/**

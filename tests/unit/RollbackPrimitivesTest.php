@@ -44,6 +44,26 @@ final class RollbackPrimitivesTest extends TestCase {
 		}
 	}
 
+	/** Remove a link as a link, or a real directory with everything under it. */
+	private function removeTree( string $path ): void {
+		if ( is_link( $path ) ) {
+			unlink( $path );
+			return;
+		}
+		if ( ! is_dir( $path ) ) {
+			if ( is_file( $path ) ) {
+				unlink( $path );
+			}
+			return;
+		}
+		foreach ( scandir( $path ) as $f ) {
+			if ( '.' !== $f && '..' !== $f ) {
+				$this->removeTree( $path . '/' . $f );
+			}
+		}
+		rmdir( $path );
+	}
+
 	public function test_a_real_backup_and_restore_round_trip_returns_the_original(): void {
 		$rollback = new Aura_Worker_Rollback();
 		$backup   = $rollback->backup_plugin( $this->slug );
@@ -297,14 +317,16 @@ final class RollbackPrimitivesTest extends TestCase {
 		$this->assertDirectoryDoesNotExist( $this->dir . '/sub' );
 	}
 
-	public function test_a_symlinked_directory_is_archived_by_its_contents_and_restored_whole(): void {
+	public function test_a_symlinked_directory_inside_the_plugin_is_archived_by_its_contents_and_restored_whole(): void {
 		// The iterator yielded a symlinked directory as a directory and did not
 		// descend into it, so the archive held an empty dir and called itself
 		// complete; a restore then put an EMPTY directory where plugin code had
 		// been, and the main-file check — which never looks there — still said
 		// `rolled_back: true` (Codex round-15 P1). A restore extracts real
-		// directories, so the target's contents are what the backup must hold.
-		$target = sys_get_temp_dir() . '/sa-linked-target-' . getmypid();
+		// directories, so the target's contents are what the backup must hold —
+		// for a link whose target is INSIDE the plugin (round 22: outside, see
+		// the next test).
+		$target = $this->dir . '/vendor-real';
 		mkdir( $target . '/deeper', 0777, true );
 		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
 		file_put_contents( $target . '/deeper/leaf.php', 'LEAF' );
@@ -326,21 +348,38 @@ final class RollbackPrimitivesTest extends TestCase {
 			$this->assertSame( 'LINKED CODE', @file_get_contents( $this->dir . '/linked/inner.php' ), 'the linked directory came back empty' );
 			$this->assertSame( 'LEAF', @file_get_contents( $this->dir . '/linked/deeper/leaf.php' ) );
 		} finally {
-			foreach ( array( $this->dir . '/linked', $target ) as $d ) {
-				if ( is_link( $d ) ) {
-					unlink( $d );
-				} elseif ( is_dir( $d ) ) {
-					foreach ( array( '/deeper/leaf.php', '/inner.php' ) as $f ) {
-						if ( is_file( $d . $f ) ) {
-							unlink( $d . $f );
-						}
-					}
-					if ( is_dir( $d . '/deeper' ) ) {
-						rmdir( $d . '/deeper' );
-					}
-					rmdir( $d );
+			$this->removeTree( $this->dir . '/linked' );
+			$this->removeTree( $target );
+		}
+	}
+
+	public function test_a_symlink_pointing_outside_the_plugin_is_not_archived_and_the_backup_says_so(): void {
+		// Following links (round 15) copied whatever a link pointed at into a
+		// predictably named zip under wp-content — a link to a home directory
+		// would archive credentials, behind an .htaccess nginx never reads (Codex
+		// round-22 P1). A link that leaves the plugin root is not followed, for
+		// directories and files alike; the backup is incomplete and not kept.
+		$outside = sys_get_temp_dir() . '/sa-outside-' . getmypid();
+		mkdir( $outside, 0777, true );
+		file_put_contents( $outside . '/secret.txt', 'NOT YOURS' );
+		symlink( $outside, $this->dir . '/linked-dir' );
+		try {
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array(), 'no archive may hold the outside contents' );
+
+			unlink( $this->dir . '/linked-dir' );
+			symlink( $outside . '/secret.txt', $this->dir . '/linked-file.php' );
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'], 'a FILE link out of the tree copies the target bytes just the same' );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array() );
+		} finally {
+			foreach ( array( $this->dir . '/linked-dir', $this->dir . '/linked-file.php' ) as $l ) {
+				if ( is_link( $l ) ) {
+					unlink( $l );
 				}
 			}
+			$this->removeTree( $outside );
 		}
 	}
 
@@ -468,7 +507,7 @@ final class RollbackPrimitivesTest extends TestCase {
 		// is stripped before any deleter runs; the archive (round 15) already
 		// holds the target's contents, so the restore brings the code back as a
 		// real directory and the target is untouched.
-		$target = sys_get_temp_dir() . '/sa-linked-sub-' . getmypid();
+		$target = $this->dir . '/real-sub';
 		mkdir( $target, 0777, true );
 		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
 		symlink( $target, $this->dir . '/linked' );
@@ -510,7 +549,7 @@ final class RollbackPrimitivesTest extends TestCase {
 		// then walks through it and empties the target before the root deletion
 		// fails (Codex round-18 P1). A link that is still there is a reason to
 		// stop, not a detail to proceed past.
-		$target = sys_get_temp_dir() . '/sa-ro-target-' . getmypid();
+		$target = $this->dir . '/real-sub';
 		mkdir( $target, 0777, true );
 		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
 		symlink( $target, $this->dir . '/linked' );
