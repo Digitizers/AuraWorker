@@ -19,6 +19,7 @@
  *   $GLOBALS['_install_result'] — Plugin_Upgrader::install() return (default true)
  *   $GLOBALS['_install_effect'] — callable run inside install(), to mutate files
  *   $GLOBALS['_http_responses_by_url'] — substring => response, for multi-probe code
+ *   $GLOBALS['_wp_filesystem_unavailable'] — WP_Filesystem() fails, $wp_filesystem null
  *
  * @package Aura_Worker\Tests
  */
@@ -1291,6 +1292,14 @@ if ( ! function_exists( 'wp_delete_file' ) ) {
 if ( ! function_exists( 'WP_Filesystem' ) ) {
 	function WP_Filesystem() {
 		global $wp_filesystem;
+		// `_wp_filesystem_unavailable` models a site where no transport
+		// initialises (FTP/SSH credentials not in wp-config): core returns
+		// false and leaves $wp_filesystem null. Code that dereferences it
+		// without checking fatals there — which is what a test needs to see.
+		if ( ! empty( $GLOBALS['_wp_filesystem_unavailable'] ) ) {
+			$wp_filesystem = null;
+			return false;
+		}
 		if ( ! $wp_filesystem ) {
 			$wp_filesystem = new SA_Test_Filesystem();
 		}

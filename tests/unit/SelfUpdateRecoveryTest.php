@@ -94,8 +94,9 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	}
 
 	/** A plugin file with a real Version header, the way WordPress reads it. */
-	private function build( string $marker, string $version ): string {
-		return "<?php\n/**\n * Plugin Name: SiteAgent\n * Version: {$version}\n */\n// {$marker}\n";
+	private function build( string $marker, string $version, ?string $constant = null ): string {
+		$constant = $constant ?? $version;
+		return "<?php\n/**\n * Plugin Name: SiteAgent\n * Version: {$version}\n */\ndefine( 'AURA_WORKER_VERSION', '{$constant}' );\n// {$marker}\n";
 	}
 
 	/** The marker inside the plugin file on disk — OLD BUILD or NEW BUILD. */
@@ -172,6 +173,34 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['healthy'] );
 		// The only claim that matters: the previous build is back on disk.
 		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_build_whose_header_and_constant_disagree_is_a_failed_install(): void {
+		// Codex round-13: the beacon writers name the build by AURA_WORKER_VERSION;
+		// the verdict looks records up by the header. If they differ, the records
+		// are written under one name and read under another — nothing found,
+		// inconclusive, broken build left standing. Malformed build: restored.
+		$GLOBALS['_install_effect'] = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9', '9.9.8' ) );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertStringContainsString( 'disagree', $res['error'] );
+	}
+
+	public function test_a_build_with_no_constant_at_all_is_a_failed_install(): void {
+		$GLOBALS['_install_effect'] = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', "<?php\\n/**\\n * Plugin Name: SiteAgent\\n * Version: 9.9.9\\n */\\n// NEW BUILD\\n" );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
 	}
 
 	public function test_a_fatal_recorded_BY_this_update_rolls_it_back(): void {

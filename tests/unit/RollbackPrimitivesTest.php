@@ -230,6 +230,29 @@ final class RollbackPrimitivesTest extends TestCase {
 		}
 	}
 
+	public function test_construction_survives_a_filesystem_transport_that_will_not_initialise(): void {
+		// Codex round-13: with no aura-backups dir yet and WP_Filesystem() failing
+		// (FTP/SSH site, no credentials), the constructor dereferenced a null
+		// $wp_filesystem and fatalled — before backup_plugin() could even report
+		// itself unsuccessful. Directory protection is best-effort; construction
+		// and the backup itself must still work.
+		$dir = WP_CONTENT_DIR . '/aura-backups';
+		foreach ( glob( $dir . '/*' ) ?: array() as $f ) { @unlink( $f ); }
+		foreach ( glob( $dir . '/.*' ) ?: array() as $f ) { if ( is_file( $f ) ) { @unlink( $f ); } }
+		@rmdir( $dir );
+		$GLOBALS['_wp_filesystem_unavailable'] = true;
+		$GLOBALS['wp_filesystem'] = null;
+
+		try {
+			$rollback = new Aura_Worker_Rollback();
+			$backup   = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], 'the backup itself needs ZipArchive, not a WP_Filesystem transport' );
+		} finally {
+			unset( $GLOBALS['_wp_filesystem_unavailable'] );
+			$GLOBALS['wp_filesystem'] = null;
+		}
+	}
+
 	public function test_backing_up_a_directory_that_is_not_there_fails_cleanly(): void {
 		$rollback = new Aura_Worker_Rollback();
 		$res      = $rollback->backup_plugin( 'sa-no-such-plugin' );

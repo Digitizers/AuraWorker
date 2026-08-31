@@ -26,13 +26,25 @@ class Aura_Worker_Rollback {
 		if ( ! file_exists( $this->backup_dir ) ) {
 			wp_mkdir_p( $this->backup_dir );
 
+			// Protecting the directory is best-effort and must never end the
+			// request (#78, Codex round-13). `WP_Filesystem()` returns false — and
+			// leaves `$wp_filesystem` null — when no transport initialises, which
+			// is exactly the FTP/SSH-managed site a caller written to continue
+			// with `backed_up: false` was written for. Dereferencing null here
+			// fatalled the self-update before its backup could even fail.
 			global $wp_filesystem;
 			if ( ! function_exists( 'WP_Filesystem' ) ) {
 				require_once ABSPATH . 'wp-admin/includes/file.php';
 			}
-			WP_Filesystem();
-			$wp_filesystem->put_contents( $this->backup_dir . '.htaccess', 'Deny from all', FS_CHMOD_FILE );
-			$wp_filesystem->put_contents( $this->backup_dir . 'index.php', '<?php // Silence is golden.', FS_CHMOD_FILE );
+			$ready = WP_Filesystem() && is_object( $wp_filesystem ) && method_exists( $wp_filesystem, 'put_contents' );
+			$chmod = defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644;
+			foreach ( array( '.htaccess' => 'Deny from all', 'index.php' => '<?php // Silence is golden.' ) as $name => $body ) {
+				if ( $ready ) {
+					$wp_filesystem->put_contents( $this->backup_dir . $name, $body, $chmod );
+				} else {
+					@file_put_contents( $this->backup_dir . $name, $body ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
+				}
+			}
 		}
 	}
 

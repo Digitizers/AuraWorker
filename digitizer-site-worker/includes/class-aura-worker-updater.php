@@ -176,7 +176,14 @@ class Aura_Worker_Updater {
 		$plugin_file = 'digitizer-site-worker/digitizer-site-worker.php';
 		$plugin_slug = 'digitizer-site-worker';
 
-		$rollback = new Aura_Worker_Rollback();
+		// Under the same contract as the backup itself: anything the recovery
+		// setup does that could end the request instead of reporting failure
+		// leaves a site unable to self-update at all (Codex round-13).
+		try {
+			$rollback = new Aura_Worker_Rollback();
+		} catch ( Throwable $e ) {
+			$rollback = null;
+		}
 
 		$skin     = new Automatic_Upgrader_Skin();
 		$upgrader = new Plugin_Upgrader( $skin );
@@ -223,7 +230,7 @@ class Aura_Worker_Updater {
 		// #472 spent months not noticing. The result reports `backed_up`, so the
 		// caller records which updates had no way back instead of the plugin
 		// quietly deciding that for it.
-		$backup      = $rollback->backup_plugin( $plugin_slug );
+		$backup      = $rollback ? $rollback->backup_plugin( $plugin_slug ) : array( 'success' => false );
 		$backup_path = ! empty( $backup['success'] ) ? $backup['backup_path'] : null;
 
 
@@ -293,6 +300,31 @@ class Aura_Worker_Updater {
 				$backup_path,
 				$old_version,
 				__( 'Self-update installed an archive without a readable main plugin file.', 'digitizer-site-worker' )
+			);
+		}
+
+		// ONE identifier for the build (Codex round-13). The beacon writers name
+		// the running build by its AURA_WORKER_VERSION constant; this verdict
+		// looks the records up by the version it read from the file header. An
+		// archive where those two disagree would write its records under one
+		// name and be looked up under another — neither found, inconclusive, a
+		// broken build left standing. So the two must agree before the verdict
+		// is asked, and a build where they do not is malformed: a failed
+		// install, restored like any other.
+		$constant_version = $this->installed_constant_version( $plugin_file );
+		if ( $constant_version !== $new_version ) {
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				sprintf(
+					/* translators: 1: header version, 2: constant version or "(missing)" */
+					__( 'Self-update installed a build whose header (%1$s) and AURA_WORKER_VERSION constant (%2$s) disagree.', 'digitizer-site-worker' ),
+					$new_version,
+					null === $constant_version ? '(missing)' : $constant_version
+				)
 			);
 		}
 
@@ -389,6 +421,27 @@ class Aura_Worker_Updater {
 			'health'       => $health_result,
 			'rolled_back'  => false,
 		);
+	}
+
+	/**
+	 * The AURA_WORKER_VERSION the installed entry file DEFINES — read from the
+	 * file's text, since this process is still running the old constant. This
+	 * is the identifier the new build's beacon writers will use; the header is
+	 * what the verdict looks records up by; the two must be the same string.
+	 *
+	 * @param string $plugin_file Plugin file relative to WP_PLUGIN_DIR.
+	 * @return string|null Null when the define cannot be found.
+	 */
+	private function installed_constant_version( $plugin_file ) {
+		$path = WP_PLUGIN_DIR . '/' . $plugin_file;
+		if ( ! file_exists( $path ) ) {
+			return null;
+		}
+		$src = (string) file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+		if ( preg_match( "/define\\(\\s*'AURA_WORKER_VERSION'\\s*,\\s*'([^']*)'\\s*\\)/", $src, $m ) ) {
+			return $m[1];
+		}
+		return null;
 	}
 
 	/**
@@ -567,7 +620,7 @@ class Aura_Worker_Updater {
 	 * @return array { restored: bool, error: string|null }
 	 */
 	private function attempt_rollback( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version ) {
-		if ( null === $backup_path ) {
+		if ( null === $backup_path || null === $rollback ) {
 			return array( 'restored' => false, 'error' => null );
 		}
 		$restore = $rollback->restore_plugin( $plugin_slug, $backup_path );
