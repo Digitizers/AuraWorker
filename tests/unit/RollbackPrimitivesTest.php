@@ -358,4 +358,60 @@ final class RollbackPrimitivesTest extends TestCase {
 			unlink( $this->dir . '/loop' );
 		}
 	}
+
+	public function test_a_restore_without_a_transport_does_not_delete_through_a_symlinked_plugin_root(): void {
+		// The direct-deletion fallback checked `isLink()` on every CHILD and never
+		// on the root, so a plugin directory that is itself a symlink — a common
+		// deployment layout — was walked into and its TARGET emptied: a shared
+		// checkout outside WP_PLUGIN_DIR destroyed by a rollback, and the link
+		// itself left standing (Codex round-16 P1). The link goes as a link; the
+		// target is not ours to touch.
+		$target = sys_get_temp_dir() . '/sa-checkout-' . getmypid();
+		mkdir( $target . '/inc', 0777, true );
+		file_put_contents( $target . '/main.php', 'ORIGINAL' );
+		file_put_contents( $target . '/inc/lib.php', 'SHARED' );
+		unlink( $this->dir . '/main.php' );
+		rmdir( $this->dir );
+		symlink( $target, $this->dir );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+			$GLOBALS['_wp_filesystem_unavailable'] = true;
+			$GLOBALS['wp_filesystem'] = null;
+			try {
+				$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+			} finally {
+				unset( $GLOBALS['_wp_filesystem_unavailable'] );
+				$GLOBALS['wp_filesystem'] = null;
+			}
+
+			$this->assertSame( 'SHARED', @file_get_contents( $target . '/inc/lib.php' ), 'the symlink target was deleted through' );
+			$this->assertSame( 'ORIGINAL', @file_get_contents( $target . '/main.php' ) );
+			$this->assertFalse( is_link( $this->dir ), 'the link itself was left standing' );
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertSame( 'ORIGINAL', @file_get_contents( $this->dir . '/main.php' ) );
+		} finally {
+			if ( is_link( $this->dir ) ) {
+				unlink( $this->dir );
+			}
+			foreach ( array( $this->dir, $target ) as $d ) {
+				if ( is_dir( $d ) && ! is_link( $d ) ) {
+					foreach ( array( '/inc/lib.php', '/main.php' ) as $f ) {
+						if ( is_file( $d . $f ) ) {
+							unlink( $d . $f );
+						}
+					}
+					if ( is_dir( $d . '/inc' ) ) {
+						rmdir( $d . '/inc' );
+					}
+				}
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
 }

@@ -382,14 +382,22 @@ class Aura_Worker_Rollback {
 
 	/**
 	 * Recursive deletion with PHP's own primitives, for a site with no
-	 * `WP_Filesystem` transport. Children first; a symlink is removed as a
-	 * link, never followed. Reports nothing — `delete_directory()` judges the
+	 * `WP_Filesystem` transport. Children first; a symlink — the root
+	 * included — is removed as a link, never followed. Reports nothing — `delete_directory()` judges the
 	 * outcome by the one fact that matters, whether the directory is gone.
 	 *
 	 * @param string $dir Absolute path to the directory to remove.
 	 * @return void
 	 */
 	private function delete_directory_directly( $dir ) {
+		// A plugin directory that is ITSELF a symlink — a common deployment
+		// layout — must go as a link. The iterator below would walk into the
+		// target and delete a checkout that lives outside WP_PLUGIN_DIR, then
+		// fail to remove the link it never looked at (#78, Codex round-16 P1).
+		if ( is_link( $dir ) ) {
+			@unlink( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
+			return;
+		}
 		if ( ! is_dir( $dir ) ) {
 			return;
 		}
