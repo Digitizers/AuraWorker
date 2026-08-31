@@ -23,7 +23,6 @@ This file provides context and conventions for AI assistants working in this rep
 ```
 digitizer-site-worker/                                      # Repo root (development)
 ├── CLAUDE.md                                # AI assistant instructions (dev only)
-├── CHECKLIST.md                             # Development checklist (dev only)
 ├── README.md                                # GitHub readme (dev only)
 ├── LICENSE                                  # GPLv2 license text (dev only)
 ├── assets/                                  # WordPress.org plugin page assets (NOT shipped)
@@ -256,6 +255,23 @@ There are currently no automated tests. When adding tests:
 - Test REST endpoint registration and response shapes
 
 ---
+
+## Releasing
+
+A version bump touches **four places, always together** — 2.14.0 shipped with the
+first three and not the fourth, and the GitHub readme's changelog silently stopped
+at 2.13.0 (found by a human, not a check):
+
+1. `digitizer-site-worker/digitizer-site-worker.php` — the `Version:` header
+2. `AURA_WORKER_VERSION` constant (same file)
+3. `digitizer-site-worker/readme.txt` — `Stable tag:` **and** a `== Changelog ==` entry
+4. `README.md` — a matching entry under `## Changelog` **and** the `Stable-x.y.z`
+   shields badge at the top. GitHub is a release surface too, and nothing
+   automates any of it: no workflow edits `README.md` — the 2.14.0 badge bump
+   was a human commit (`434fdd4`).
+
+Publishing a **stable GitHub release** IS the WordPress.org deploy: `release.yml`
+builds and attaches the zip, `deploy.yml` pushes to wp.org SVN.
 
 ## Relationship to Aura
 
