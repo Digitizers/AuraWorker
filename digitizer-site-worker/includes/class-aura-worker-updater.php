@@ -288,22 +288,30 @@ class Aura_Worker_Updater {
 			// Restoring works even though the on-disk plugin is broken: this
 			// method, Aura_Worker_Rollback and ZipArchive are all already in
 			// memory from the pre-install require above.
-			$restore = $rollback->restore_plugin( $plugin_slug, $backup_path );
-			return array(
-				'success'       => false,
-				'error'         => sprintf(
+			$restore    = $rollback->restore_plugin( $plugin_slug, $backup_path );
+			$restored   = ! empty( $restore['success'] );
+			// The message has to agree with the fields (Codex round-2 P2). A
+			// dashboard that shows only `error` was told the site had recovered
+			// while `rolled_back` said otherwise — and the site may still be
+			// carrying the broken build.
+			$message = $restored
+				? sprintf(
 					/* translators: %s: version that was rolled back to */
 					__( 'SiteAgent update failed its health check and was rolled back to %s.', 'digitizer-site-worker' ),
 					$old_version
-				),
+				)
+				: __( 'SiteAgent update failed its health check AND could not be rolled back — the site may still be running the broken build.', 'digitizer-site-worker' );
+			return array(
+				'success'       => false,
+				'error'         => $message,
 				'old_version'   => $old_version,
 				'new_version'   => $new_version,
 				'backed_up'     => true,
 				'health_checked'=> true,
 				'healthy'       => false,
 				'health'        => $health_result,
-				'rolled_back'   => ! empty( $restore['success'] ),
-				'restore_error' => empty( $restore['success'] ) ? ( $restore['error'] ?? null ) : null,
+				'rolled_back'   => $restored,
+				'restore_error' => $restored ? null : ( $restore['error'] ?? null ),
 			);
 		}
 
@@ -376,21 +384,37 @@ class Aura_Worker_Updater {
 	 */
 	private function new_fatals_since( $offset ) {
 		$log = $this->error_log_path();
-		if ( null === $log || null === $offset ) {
+		if ( null === $log ) {
 			return 0;
 		}
+
+		// `null` offset means there was NO log before the install, so everything
+		// in one that exists now was written after it — read from byte zero
+		// (#77, Codex round-2 P1). Discarding it lost the most important case
+		// there is: a build that fatals during bootstrap and CREATES the log by
+		// doing so. Both REST probes then fail from that same bootstrap, which
+		// reads as inconclusive, and the broken build was called healthy and its
+		// backup pruned.
+		$from = ( null === $offset ) ? 0 : (int) $offset;
+
+		clearstatcache( true, $log );
 		$size = (int) filesize( $log );
 		// A log that SHRANK was rotated under us; there is no longer a window
 		// this update owns, so claim nothing rather than read someone else's.
-		if ( $size <= $offset ) {
+		// Only meaningful for a log that existed before — a new one starts at 0
+		// and cannot have rotated.
+		if ( null !== $offset && $size <= $from ) {
+			return 0;
+		}
+		if ( $size <= $from ) {
 			return 0;
 		}
 		$fp = fopen( $log, 'r' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
 		if ( false === $fp ) {
 			return 0;
 		}
-		fseek( $fp, $offset );
-		$tail = (string) fread( $fp, min( $size - $offset, 65536 ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+		fseek( $fp, $from );
+		$tail = (string) fread( $fp, min( $size - $from, 65536 ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
 		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 
 		return preg_match_all( '/(PHP Fatal error|PHP Parse error)/i', $tail, $m ) ? count( $m[0] ) : 0;
@@ -432,26 +456,40 @@ class Aura_Worker_Updater {
 			'redirection' => 0,
 		);
 
-		$plugin_probe = wp_remote_get( add_query_arg( $bust, rest_url( 'aura/v1/status' ) ), $args );
-		$plugin_code  = is_wp_error( $plugin_probe ) ? 0 : (int) wp_remote_retrieve_response_code( $plugin_probe );
-		// 200 should not happen unauthenticated, but it equally proves the route
-		// is there. Everything else — 404, 5xx, transport failure — does not.
-		$plugin_up = in_array( $plugin_code, array( 200, 401, 403 ), true );
+		$code_of = function ( $url ) use ( $args ) {
+			$res = wp_remote_get( $url, $args );
+			return is_wp_error( $res ) ? 0 : (int) wp_remote_retrieve_response_code( $res );
+		};
+
+		$plugin_code  = $code_of( add_query_arg( $bust, rest_url( 'aura/v1/status' ) ) );
+		// The CONTROL: a path inside this plugin's namespace that is never
+		// registered. On a normal site an unregistered path answers 404 while a
+		// registered-but-refused one answers 401/403, so the two differ and the
+		// difference IS the proof of registration.
+		//
+		// Comparing against a control rather than against a fixed list of "good"
+		// statuses is what makes this survive a site that denies anonymous REST
+		// globally (Codex round-2 P1): there an authentication filter answers
+		// 401 for EVERY path, registered or not, so a bare `in_array( 401 )`
+		// would have accepted a build that never registered anything. When the
+		// two answers are identical this probe has learned nothing.
+		$missing_code = $code_of( add_query_arg( $bust, rest_url( 'aura/v1/__aura_probe_absent__' ) ) );
+		$plugin_up    = ( 0 !== $plugin_code ) && ( $plugin_code !== $missing_code );
 
 		$checks = array(
 			'plugin_route' => array(
 				'status' => $plugin_up ? 'pass' : 'fail',
-				'detail' => is_wp_error( $plugin_probe )
-					? $plugin_probe->get_error_message()
-					: 'HTTP ' . $plugin_code,
+				'detail' => 'HTTP ' . $plugin_code . ' vs HTTP ' . $missing_code . ' for an unregistered path',
 			),
 		);
 
 		$core_reachable = null;
 		if ( ! $plugin_up ) {
-			$core_probe     = wp_remote_get( add_query_arg( $bust, rest_url( 'wp/v2/types' ) ), $args );
-			$core_code      = is_wp_error( $core_probe ) ? 0 : (int) wp_remote_retrieve_response_code( $core_probe );
-			$core_reachable = in_array( $core_code, array( 200, 401, 403 ), true );
+			// Does anonymous REST work here AT ALL? Only if it does can "the
+			// aura route is indistinguishable from an absent one" mean the
+			// plugin is down rather than the door being shut to everyone.
+			$core_code      = $code_of( add_query_arg( $bust, rest_url( 'wp/v2/types' ) ) );
+			$core_reachable = ( 200 === $core_code );
 			$checks['core_route'] = array(
 				'status' => $core_reachable ? 'pass' : 'fail',
 				'detail' => 'HTTP ' . $core_code,

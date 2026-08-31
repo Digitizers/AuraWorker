@@ -95,8 +95,19 @@ class Aura_Worker_Rollback {
 		// Open the archive BEFORE deleting anything. The old order deleted the
 		// directory first and then discovered it could not read the backup —
 		// turning a recoverable state into an empty one.
-		if ( is_dir( $plugin_dir ) ) {
-			$this->delete_directory( $plugin_dir );
+		//
+		// The deletion must SUCCEED before extracting (#77, Codex round-2 P1).
+		// If the directory survives but its files stay writable, `extractTo()`
+		// happily overwrites the ones the backup contains and reports success —
+		// while every file the broken release ADDED is still sitting there. That
+		// is a half-restored plugin reported as a clean rollback. Better to
+		// refuse and say so than to claim a recovery that did not happen.
+		if ( is_dir( $plugin_dir ) && ! $this->delete_directory( $plugin_dir ) ) {
+			$zip->close();
+			return array(
+				'success' => false,
+				'error'   => 'Could not remove the installed plugin directory before restoring',
+			);
 		}
 
 		// `extractTo()` returns false when it cannot write — the ordinary case
@@ -202,5 +213,10 @@ class Aura_Worker_Rollback {
 		}
 		WP_Filesystem();
 		$wp_filesystem->delete( $dir, true, 'd' );
+
+		// Report on the DIRECTORY, not on the call. `delete()`'s own return is
+		// not uniformly trustworthy across filesystem transports, and what the
+		// caller needs to know is one fact it can verify: is it gone?
+		return ! is_dir( $dir );
 	}
 }

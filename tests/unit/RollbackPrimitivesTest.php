@@ -107,6 +107,37 @@ final class RollbackPrimitivesTest extends TestCase {
 		}
 	}
 
+	public function test_a_directory_that_cannot_be_removed_is_not_reported_as_restored(): void {
+		// Codex round-2: if the installed directory survives but its files stay
+		// writable, `extractTo()` overwrites the ones the backup contains and
+		// reports success — while every file the broken release ADDED is still
+		// on disk. That is a half-restored plugin described as a clean rollback.
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'] );
+
+		// A file the backup does not contain: what a broken release left behind.
+		file_put_contents( $this->dir . '/stray-from-broken-build.php', 'STRAY' );
+
+		// Read-only PARENT: the directory entry cannot be removed, while the
+		// files inside it remain writable.
+		$perms = fileperms( WP_PLUGIN_DIR ) & 0777;
+		chmod( WP_PLUGIN_DIR, 0555 );
+		if ( false !== @file_put_contents( WP_PLUGIN_DIR . '/.sa-probe', 'x' ) ) {
+			@unlink( WP_PLUGIN_DIR . '/.sa-probe' );
+			chmod( WP_PLUGIN_DIR, $perms );
+			$this->markTestSkipped( 'filesystem does not enforce the read-only mode (running as root?)' );
+		}
+
+		try {
+			$restore = @$rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+			$this->assertFalse( $restore['success'], 'a directory that could not be removed is not a rollback' );
+		} finally {
+			chmod( WP_PLUGIN_DIR, $perms );
+			@unlink( $this->dir . '/stray-from-broken-build.php' );
+		}
+	}
+
 	public function test_a_missing_backup_file_is_refused(): void {
 		$rollback = new Aura_Worker_Rollback();
 		$restore  = $rollback->restore_plugin( $this->slug, WP_CONTENT_DIR . '/aura-backups/nope.zip' );

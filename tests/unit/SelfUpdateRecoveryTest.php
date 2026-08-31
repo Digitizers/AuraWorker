@@ -56,8 +56,11 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$GLOBALS['_mutations']      = array();
 		$GLOBALS['_wp_http_calls']  = array();
 		$GLOBALS['_http_error']     = false;
-		$GLOBALS['_http_response']  = array( 'response' => array( 'code' => 401 ), 'body' => '{"code":"rest_forbidden"}' );
-		$GLOBALS['_http_responses_by_url'] = array();
+		// A healthy site: the registered route refuses an anonymous caller (401)
+		// while an unregistered path under the same namespace 404s. The two
+		// differing is what proves the plugin registered.
+		$GLOBALS['_http_response']         = array( 'response' => array( 'code' => 404 ), 'body' => '{}' );
+		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteUp();
 		$GLOBALS['_install_result'] = true;
 		$GLOBALS['_install_effect'] = function () {
 			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
@@ -96,11 +99,21 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		return is_file( $f ) ? (string) file_get_contents( $f ) : '';
 	}
 
-	/** The site answers core REST but has no aura route: the build did not come up. */
+	/** Registered route refuses anonymously; an unregistered path 404s. */
+	private function pluginRouteUp(): array {
+		return array(
+			'__aura_probe_absent__' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
+			'aura/v1/status'        => array( 'response' => array( 'code' => 401 ), 'body' => '{"code":"rest_forbidden"}' ),
+			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
+		);
+	}
+
+	/** The aura route is indistinguishable from an absent one, and core REST works. */
 	private function pluginRouteGone(): array {
 		return array(
-			'aura/v1/status' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
-			'wp/v2/types'    => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
+			'__aura_probe_absent__' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
+			'aura/v1/status'        => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
+			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
 		);
 	}
 
@@ -132,26 +145,86 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertStringContainsString( 'aura_probe=', $urls[0] );
 	}
 
-	public function test_a_403_from_the_route_is_a_pass_because_the_refusal_proves_it_registered(): void {
-		$GLOBALS['_http_response'] = array( 'response' => array( 'code' => 403 ), 'body' => '{}' );
+	public function test_a_403_refusal_that_differs_from_an_absent_path_proves_registration(): void {
+		$GLOBALS['_http_responses_by_url'] = array(
+			'__aura_probe_absent__' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
+			'aura/v1/status'        => array( 'response' => array( 'code' => 403 ), 'body' => '{}' ),
+			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
+		);
 
 		$this->assertTrue( $this->selfUpdate()['success'] );
 	}
 
-	public function test_a_site_that_blocks_anonymous_REST_is_not_rolled_back_on_that_alone(): void {
-		// 404 from the aura route AND core REST unreachable: the evidence cannot
-		// tell "this plugin is dead" from "REST is closed to strangers here", so
-		// it must not destroy a working install on the guess.
+	public function test_a_site_that_denies_anonymous_REST_globally_is_never_rolled_back_on_a_401(): void {
+		// The case a fixed "401/403 means registered" list gets wrong (Codex
+		// round-2 P1). An authentication filter answers 401 for EVERY path, so
+		// the aura route and a path that does not exist are indistinguishable —
+		// this probe has learned nothing and must not claim the plugin is up OR
+		// that it is down.
 		$GLOBALS['_http_responses_by_url'] = array(
-			'aura/v1/status' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
-			'wp/v2/types'    => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
+			'__aura_probe_absent__' => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
+			'aura/v1/status'        => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
+			'wp/v2/types'           => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
 		);
 
 		$res = $this->selfUpdate();
 
-		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['success'], 'inconclusive evidence must not destroy a working install' );
 		$this->assertFalse( $res['rolled_back'] );
 		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
+
+	public function test_a_401_that_an_ABSENT_path_also_returns_is_not_treated_as_registration(): void {
+		// The case that separates the control-comparison from a fixed
+		// "401/403 means registered" list. Anonymous REST demonstrably works
+		// here (core answers 200), yet a path that cannot exist answers 401 just
+		// like the real one — so nothing in the aura namespace is being routed
+		// by this plugin, and a status list would have called that healthy.
+		$GLOBALS['_http_responses_by_url'] = array(
+			'__aura_probe_absent__' => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
+			'aura/v1/status'        => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
+			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
+		);
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_build_that_never_registered_is_rolled_back_even_when_REST_denies_anonymously(): void {
+		// Same 401-everywhere site, but core REST proves anonymous REST works.
+		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
+
+		$this->assertTrue( $this->selfUpdate()['rolled_back'] );
+	}
+
+	public function test_a_log_created_BY_the_new_build_is_read_from_byte_zero(): void {
+		// No log before the install; the new build fatals during bootstrap and
+		// creates one by doing so. Discarding a null offset lost exactly this
+		// case, and both REST probes fail from the same bootstrap, so the REST
+		// evidence reads as inconclusive (Codex round-2 P1).
+		$log = WP_CONTENT_DIR . '/sa-test-error.log';
+		@unlink( $log );
+		$this->prev_error_log = ini_get( 'error_log' );
+		ini_set( 'error_log', $log );
+
+		$GLOBALS['_http_responses_by_url'] = array(
+			'__aura_probe_absent__' => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
+			'aura/v1/status'        => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
+			'wp/v2/types'           => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
+		);
+		$GLOBALS['_install_effect'] = function () use ( $log ) {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $log, "[today] PHP Fatal error: cannot redeclare aura_worker_init()\n" );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
 	}
 
 	public function test_a_build_that_breaks_the_site_is_rolled_back(): void {
@@ -308,6 +381,26 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['success'] );
 		$this->assertFalse( $res['rolled_back'] );
 		$this->assertNotNull( $res['restore_error'] );
+	}
+
+	public function test_a_failed_restore_does_not_claim_in_its_MESSAGE_that_it_rolled_back(): void {
+		// The fields said `rolled_back: false` while the human-facing `error`
+		// still said the site "was rolled back" (Codex round-2 P2). A dashboard
+		// showing only the message told an operator the site had recovered while
+		// it was still carrying the broken build.
+		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
+		$GLOBALS['_install_effect']        = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				file_put_contents( $f, 'not a zip' );
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertStringNotContainsString( 'was rolled back', $res['error'] );
+		$this->assertStringContainsString( 'could not be rolled back', $res['error'] );
 	}
 
 	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {
