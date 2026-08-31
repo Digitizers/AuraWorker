@@ -226,6 +226,12 @@ class Aura_Worker_Updater {
 		$backup      = $rollback->backup_plugin( $plugin_slug );
 		$backup_path = ! empty( $backup['success'] ) ? $backup['backup_path'] : null;
 
+		// Where the error log ends BEFORE the install. The verdict below reads
+		// only past this point, so a fatal that was already in the log — from
+		// last month, from another plugin — cannot be attributed to this update
+		// and roll back a build that is fine (#77, Codex round-1 P2).
+		$log_offset = $this->error_log_size();
+
 		// Install from the verified local file (or the URL when no digest given).
 		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
 
@@ -273,17 +279,9 @@ class Aura_Worker_Updater {
 		$new_data    = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin_file, false, false );
 		$new_version = $new_data['Version'] ?? 'unknown';
 
-		// Verify the site still boots, from a SEPARATE PHP process.
-		//
-		// This is the whole reason the check is meaningful here. An in-process
-		// assertion after overwriting the running plugin proves almost nothing:
-		// the old code is already loaded and would keep answering. The health
-		// check's first probe is `wp_remote_get( home_url() )` — a real request,
-		// served by a fresh process that loads the NEW files. If the new build
-		// fatals on load, that request fails and we learn it here rather than
-		// from a customer.
-		$health        = new Aura_Worker_Health();
-		$health_result = $health->run_health_check();
+		// Did THIS build come up? See `verify_self_update()` — the aggregate
+		// site health check cannot answer that question (Codex round-1).
+		$health_result = $this->verify_self_update( $log_offset );
 		$healthy       = ! empty( $health_result['healthy'] );
 
 		if ( ! $healthy && null !== $backup_path ) {
@@ -346,6 +344,135 @@ class Aura_Worker_Updater {
 			'health_checked'=> true,
 			'healthy'      => true,
 			'rolled_back'  => false,
+		);
+	}
+
+	/**
+	 * Current size of the PHP error log, or null when there is none to read.
+	 * Paired with `new_fatals_since()` so a verdict can consider only what this
+	 * update wrote.
+	 *
+	 * @return int|null
+	 */
+	private function error_log_size() {
+		$log = $this->error_log_path();
+		return ( null !== $log && file_exists( $log ) ) ? (int) filesize( $log ) : null;
+	}
+
+	/** The log both halves read. Mirrors Aura_Worker_Health's resolution order. */
+	private function error_log_path() {
+		$log = ini_get( 'error_log' );
+		if ( empty( $log ) || ! file_exists( $log ) ) {
+			$log = WP_CONTENT_DIR . '/debug.log';
+		}
+		return file_exists( $log ) ? $log : null;
+	}
+
+	/**
+	 * Fatal/parse errors written to the log AFTER $offset bytes.
+	 *
+	 * @param int|null $offset Size of the log before the install.
+	 * @return int Count of new fatals; 0 when there is nothing to read.
+	 */
+	private function new_fatals_since( $offset ) {
+		$log = $this->error_log_path();
+		if ( null === $log || null === $offset ) {
+			return 0;
+		}
+		$size = (int) filesize( $log );
+		// A log that SHRANK was rotated under us; there is no longer a window
+		// this update owns, so claim nothing rather than read someone else's.
+		if ( $size <= $offset ) {
+			return 0;
+		}
+		$fp = fopen( $log, 'r' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
+		if ( false === $fp ) {
+			return 0;
+		}
+		fseek( $fp, $offset );
+		$tail = (string) fread( $fp, min( $size - $offset, 65536 ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+
+		return preg_match_all( '/(PHP Fatal error|PHP Parse error)/i', $tail, $m ) ? count( $m[0] ) : 0;
+	}
+
+	/**
+	 * Did the build that was just installed actually come up?
+	 *
+	 * `Aura_Worker_Health::run_health_check()` cannot answer this, which is the
+	 * whole reason for a separate probe (Codex round-1 P1). It fetches the
+	 * anonymous home page with no cache-buster, so on any site behind a
+	 * full-page cache or CDN both of its HTTP probes are served from cache
+	 * WITHOUT starting PHP — nothing loads the new files — while its remaining
+	 * checks run inside this already-running old process. A build that fatals on
+	 * bootstrap was marked healthy and its backup pruned.
+	 *
+	 * So ask something only this plugin can answer, and make it uncacheable:
+	 * an unauthenticated GET to an `aura/v1` route with a unique query argument.
+	 * If the new build loaded and registered its routes the permission callback
+	 * refuses it — 401/403 — which is a PASS: the refusal itself proves the
+	 * route exists. A 404 means no such route, i.e. the plugin did not come up.
+	 *
+	 * A 404 alone is not proof, though: some sites block the REST API for
+	 * anonymous callers entirely. So a failing Aura probe is only believed when
+	 * a CORE REST route answers normally from the same request — that separates
+	 * "this plugin is dead" from "REST is closed to strangers here". When core
+	 * REST is unreachable too, the evidence cannot support a rollback and this
+	 * reports healthy rather than destroying a working install on a guess.
+	 *
+	 * @param int|null $log_offset Log size captured before the install.
+	 * @return array
+	 */
+	private function verify_self_update( $log_offset ) {
+		$bust = array( 'aura_probe' => (string) wp_rand( 100000, 999999 ) );
+		$args = array(
+			'timeout'     => 15,
+			'sslverify'   => false,
+			'headers'     => array( 'Cache-Control' => 'no-cache', 'Pragma' => 'no-cache' ),
+			'redirection' => 0,
+		);
+
+		$plugin_probe = wp_remote_get( add_query_arg( $bust, rest_url( 'aura/v1/status' ) ), $args );
+		$plugin_code  = is_wp_error( $plugin_probe ) ? 0 : (int) wp_remote_retrieve_response_code( $plugin_probe );
+		// 200 should not happen unauthenticated, but it equally proves the route
+		// is there. Everything else — 404, 5xx, transport failure — does not.
+		$plugin_up = in_array( $plugin_code, array( 200, 401, 403 ), true );
+
+		$checks = array(
+			'plugin_route' => array(
+				'status' => $plugin_up ? 'pass' : 'fail',
+				'detail' => is_wp_error( $plugin_probe )
+					? $plugin_probe->get_error_message()
+					: 'HTTP ' . $plugin_code,
+			),
+		);
+
+		$core_reachable = null;
+		if ( ! $plugin_up ) {
+			$core_probe     = wp_remote_get( add_query_arg( $bust, rest_url( 'wp/v2/types' ) ), $args );
+			$core_code      = is_wp_error( $core_probe ) ? 0 : (int) wp_remote_retrieve_response_code( $core_probe );
+			$core_reachable = in_array( $core_code, array( 200, 401, 403 ), true );
+			$checks['core_route'] = array(
+				'status' => $core_reachable ? 'pass' : 'fail',
+				'detail' => 'HTTP ' . $core_code,
+			);
+		}
+
+		$new_fatals       = $this->new_fatals_since( $log_offset );
+		$checks['php_errors'] = array(
+			'status' => $new_fatals ? 'fail' : 'pass',
+			'detail' => $new_fatals ? $new_fatals . ' new fatal error(s) since the install' : 'No new fatal errors',
+		);
+
+		// Roll back only on evidence that supports it: the plugin's own route is
+		// gone while core REST still answers, or this update wrote fatals.
+		$plugin_really_down = ! $plugin_up && true === $core_reachable;
+		$healthy            = ! $plugin_really_down && 0 === $new_fatals;
+
+		return array(
+			'healthy'       => $healthy,
+			'checks'        => $checks,
+			'inconclusive'  => ! $plugin_up && false === $core_reachable,
 		);
 	}
 

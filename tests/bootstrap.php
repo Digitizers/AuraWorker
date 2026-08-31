@@ -18,6 +18,7 @@
  *   $GLOBALS['_did_actions']   — do_action() call log
  *   $GLOBALS['_install_result'] — Plugin_Upgrader::install() return (default true)
  *   $GLOBALS['_install_effect'] — callable run inside install(), to mutate files
+ *   $GLOBALS['_http_responses_by_url'] — substring => response, for multi-probe code
  *
  * @package Aura_Worker\Tests
  */
@@ -2877,6 +2878,18 @@ if ( ! function_exists( 'rawurlencode_deep' ) ) {
 	// no-op helper space reserved
 }
 
+if ( ! function_exists( 'rest_url' ) ) {
+	function rest_url( $path = '' ) {
+		return 'https://example.test/wp-json/' . ltrim( (string) $path, '/' );
+	}
+}
+
+if ( ! function_exists( 'wp_rand' ) ) {
+	function wp_rand( $min = 0, $max = 0 ) {
+		return random_int( (int) $min, (int) $max > 0 ? (int) $max : PHP_INT_MAX );
+	}
+}
+
 if ( ! function_exists( 'wp_remote_get' ) ) {
 	/**
 	 * Recording HTTP stub: returns $GLOBALS['_http_response'] (or a WP_Error
@@ -2889,6 +2902,15 @@ if ( ! function_exists( 'wp_remote_get' ) ) {
 		);
 		if ( ! empty( $GLOBALS['_http_error'] ) ) {
 			return new WP_Error( 'http_request_failed', 'stubbed failure' );
+		}
+		// Per-URL responses, matched by substring, for code that probes more
+		// than one endpoint in a single operation (the self-update verdict asks
+		// an Aura REST route, a core REST route and the home page, and has to
+		// tell their answers apart). Falls back to the single `_http_response`.
+		foreach ( (array) ( $GLOBALS['_http_responses_by_url'] ?? array() ) as $needle => $resp ) {
+			if ( false !== strpos( $url, (string) $needle ) ) {
+				return $resp;
+			}
 		}
 		return $GLOBALS['_http_response'] ?? array(
 			'response' => array( 'code' => 200 ),
