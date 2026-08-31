@@ -252,8 +252,10 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 
 = 2.14.0 =
 * Feature: **a self-update can now undo itself.** Before installing, SiteAgent
-  archives its current build; after installing, it asks the new build to prove
-  it came up. The proof is written by the build itself: a boot beacon recorded
+  archives its current build — best-effort: a site without ZipArchive or with
+  an unwritable backup directory still updates, and the result says
+  `backed_up: false` so the caller knows this one had no way back. After
+  installing, SiteAgent asks the new build to prove it came up. The proof is written by the build itself: a boot beacon recorded
   the first time the new code serves a request, and a fatal beacon recorded by
   a shutdown guard when the new code dies while loading. A build whose own
   records say it broke is rolled back to the archived one — compiled copies
