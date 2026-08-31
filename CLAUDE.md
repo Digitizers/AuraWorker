@@ -265,11 +265,13 @@ at 2.13.0 (found by a human, not a check):
 1. `digitizer-site-worker/digitizer-site-worker.php` — the `Version:` header
 2. `AURA_WORKER_VERSION` constant (same file)
 3. `digitizer-site-worker/readme.txt` — `Stable tag:` **and** a `== Changelog ==` entry
-4. `README.md` — a matching entry under `## Changelog` (GitHub is a release surface too)
+4. `README.md` — a matching entry under `## Changelog` **and** the `Stable-x.y.z`
+   shields badge at the top. GitHub is a release surface too, and nothing
+   automates any of it: no workflow edits `README.md` — the 2.14.0 badge bump
+   was a human commit (`434fdd4`).
 
 Publishing a **stable GitHub release** IS the WordPress.org deploy: `release.yml`
-builds and attaches the zip, `deploy.yml` pushes to wp.org SVN. The `.wordpress-org`
-badge bump on `main` is automated — do not hand-edit it.
+builds and attaches the zip, `deploy.yml` pushes to wp.org SVN.
 
 ## Relationship to Aura
 
