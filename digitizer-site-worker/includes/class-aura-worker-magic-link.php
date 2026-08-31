@@ -1200,12 +1200,26 @@ class Aura_Worker_Magic_Link {
 	 * @return bool True while this fence still holds the site.
 	 */
 	public static function touch_site_claim( $fence ) {
+		return self::refresh_claim( self::SITE_CLAIM, $fence );
+	}
+
+	/**
+	 * Renew a claim's lease while its holder is still working: the row's
+	 * timestamp moves to now, by compare-and-swap on the exact bytes held, so a
+	 * long operation is never seized as stale while it is alive (#434 round 8
+	 * for the connect; #78 Codex round-22 for the self-update).
+	 *
+	 * @param string $claim_key Option name.
+	 * @param string $fence     The value take_claim() / claim_site() returned.
+	 * @return bool True while this fence still holds the claim.
+	 */
+	public static function refresh_claim( $claim_key, $fence ) {
 		global $wpdb;
 		if ( '' === (string) $fence ) {
 			return false;
 		}
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- The bytes this swap names must be the ROW's, never the option cache's: a cached copy is exactly the stale value a seizure may already have replaced.
-		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::SITE_CLAIM ) );
+		$held = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $claim_key ) );
 		if ( ! is_string( $held ) || 0 !== strpos( $held, $fence . '|' ) ) {
 			return false;
 		}
@@ -1214,8 +1228,8 @@ class Aura_Worker_Magic_Link {
 			return true; // same second: the lease is already as fresh as it gets
 		}
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- A compare-and-swap has no storage-function equivalent; the cache is evicted immediately below, as every other writer of this row does.
-		$rows = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s", $fresh, self::SITE_CLAIM, $held ) );
-		wp_cache_delete( self::SITE_CLAIM, 'options' );
+		$rows = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s", $fresh, $claim_key, $held ) );
+		wp_cache_delete( $claim_key, 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
 		return 1 === (int) $rows && '' === (string) $wpdb->last_error;
 	}
@@ -2301,5 +2315,38 @@ class Aura_Worker_Magic_Link {
 		global $wpdb;
 		$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value LIKE %s", $claim_key, $wpdb->esc_like( $fence . '|' ) . '%' ) );
 		wp_cache_delete( $claim_key, 'options' );
+	}
+
+	/**
+	 * A per-site mutex for OTHER long-running work — today the plugin's own
+	 * self-update (#78, Codex rounds 20-21) — on the same claim row the connect
+	 * uses: taken by a conditional INSERT, seized only when older than
+	 * $takeover_after (a request that fatals never releases), and released only
+	 * by its holder — a DELETE fenced on the value — so a holder that outlived
+	 * the takeover cannot remove its successor's claim. Core's own
+	 * WP_Upgrader::release_lock() is an unconditional delete and has exactly
+	 * that hole.
+	 *
+	 * @param string $claim_key      Option name, under a prefix uninstall sweeps.
+	 * @param int    $takeover_after Seconds a holder must EXCEED to be seized.
+	 * @return string The fence to release with, or '' when not taken.
+	 */
+	public static function take_claim( $claim_key, $takeover_after ) {
+		return self::claim_magic_link( (string) $claim_key, (int) $takeover_after );
+	}
+
+	/**
+	 * Release a claim taken with take_claim(): removes the row only while it
+	 * still carries this fence. A holder whose claim was seized removes nothing.
+	 *
+	 * @param string $claim_key Option name.
+	 * @param string $fence     The fence take_claim() returned.
+	 * @return void
+	 */
+	public static function release_claim( $claim_key, $fence ) {
+		if ( '' === (string) $fence ) {
+			return;
+		}
+		self::release_magic_link( (string) $claim_key, (string) $fence );
 	}
 }

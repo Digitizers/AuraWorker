@@ -15,6 +15,19 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Aura_Worker_Updater {
 
 	/**
+	 * Option holding the per-site self-update claim (`<fence>|<unix time>`);
+	 * under the prefix uninstall.php sweeps.
+	 */
+	const SELF_UPDATE_LOCK = 'aura_worker_self_update_lock';
+
+	/**
+	 * This plugin's own file, as WordPress names it. Every path that can replace
+	 * these files — self-update, the generic single update, the batch — takes
+	 * the SELF_UPDATE_LOCK claim first (Codex round-23 P1).
+	 */
+	const SELF_PLUGIN_FILE = 'digitizer-site-worker/digitizer-site-worker.php';
+
+	/**
 	 * Load required WordPress upgrade files.
 	 */
 	private function load_upgrade_dependencies() {
@@ -164,8 +177,66 @@ class Aura_Worker_Updater {
 	public function self_update( $zip_url, $expected_sha256 = '' ) {
 		$this->load_upgrade_dependencies();
 
+		// ONE self-update at a time per site (Codex round-20 P1). The verdict
+		// rests on a single nonce option: a second request overlapping the first
+		// overwrote it before the first loopback wrote its beacon, so the first
+		// verifier read a record carrying a nonce it did not arm — "unrelated",
+		// inconclusive, healthy — and a broken release stood with no rollback;
+		// concurrent installs also back up and replace each other's files.
+		//
+		// The claim is the connect's own (#434): a conditional INSERT to take it,
+		// seized only when its holder is older than the takeover window (a request
+		// that fatals mid-update never reaches `finally`), and released ONLY by
+		// its holder — the DELETE is fenced on the value — so a request that ran
+		// past the window and was taken over cannot remove its successor's claim
+		// on its way out (Codex round-21 P1; core's WP_Upgrader::release_lock()
+		// is an unconditional delete with exactly that hole).
+		if ( ! class_exists( 'Aura_Worker_Magic_Link' ) ) {
+			require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-magic-link.php';
+		}
+		$fence = Aura_Worker_Magic_Link::take_claim( self::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		if ( '' === $fence ) {
+			return $this->self_update_busy();
+		}
+		try {
+			return $this->self_update_locked( $zip_url, $expected_sha256, $fence );
+		} finally {
+			Aura_Worker_Magic_Link::release_claim( self::SELF_UPDATE_LOCK, $fence );
+		}
+	}
+
+	/**
+	 * The self-update proper. Runs only under the lock `self_update()` holds, so
+	 * the nonce it arms is the only one armed on this site.
+	 *
+	 * @param string $zip_url         See self_update().
+	 * @param string $expected_sha256 See self_update().
+	 * @param string $fence           The claim self_update() holds, renewed between
+	 *                                phases so a live update is never seized as
+	 *                                stale (Codex round-22 P1).
+	 * @return array
+	 */
+	private function self_update_locked( $zip_url, $expected_sha256, $fence ) {
+		// Load the recovery classes BEFORE the install, so their code is in
+		// memory from the OLD build. After `install()` this plugin's directory
+		// has been replaced; a class first required afterwards would be read
+		// from the new files — which are exactly what we may be about to decide
+		// are broken. `batch_update_plugins()` takes the same precaution.
+		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-health.php';
+		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-rollback.php';
+
 		$old_version = AURA_WORKER_VERSION;
-		$plugin_file = 'digitizer-site-worker/digitizer-site-worker.php';
+		$plugin_file = self::SELF_PLUGIN_FILE;
+		$plugin_slug = 'digitizer-site-worker';
+
+		// Under the same contract as the backup itself: anything the recovery
+		// setup does that could end the request instead of reporting failure
+		// leaves a site unable to self-update at all (Codex round-13).
+		try {
+			$rollback = new Aura_Worker_Rollback();
+		} catch ( Throwable $e ) {
+			$rollback = null;
+		}
 
 		$skin     = new Automatic_Upgrader_Skin();
 		$upgrader = new Plugin_Upgrader( $skin );
@@ -200,6 +271,34 @@ class Aura_Worker_Updater {
 			$install_source = $tmp;
 		}
 
+		// The lease is renewed before each phase that could take a while, so a
+		// slow download, backup or install is never mistaken for a dead holder
+		// and seized from under a request that is still working. Losing it here
+		// means another self-update took over: stop before touching the files.
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			return $this->self_update_claim_lost();
+		}
+
+		// Back up this plugin's own directory so a bad build can be undone.
+		// Taken HERE, not at the top: everything above can still refuse the
+		// update (a bad digest, a failed download), and a backup made for an
+		// install that never runs is just a zip nobody asked for.
+		//
+		// A backup that CANNOT be made does not refuse the update. Refusing
+		// would be safer for this one site and would silently make every site
+		// without ZipArchive — or with an unwritable backup dir — permanently
+		// un-updatable: a gate that can never pass, which is the defect Aura
+		// #472 spent months not noticing. The result reports `backed_up`, so the
+		// caller records which updates had no way back instead of the plugin
+		// quietly deciding that for it.
+		$backup      = $rollback ? $rollback->backup_plugin( $plugin_slug ) : array( 'success' => false );
+		$backup_path = ! empty( $backup['success'] ) ? $backup['backup_path'] : null;
+
+
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			return $this->self_update_claim_lost();
+		}
+
 		// Install from the verified local file (or the URL when no digest given).
 		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
 
@@ -207,20 +306,32 @@ class Aura_Worker_Updater {
 			wp_delete_file( $tmp );
 		}
 
+		// A FAILED install is the case that most needs the backup: `install()`
+		// with `overwrite_package` deletes before it writes, so a failure
+		// partway can leave this plugin's directory incomplete. Restoring here
+		// is what makes a failed self-update survivable rather than terminal.
 		if ( is_wp_error( $result ) ) {
-			return array(
-				'success' => false,
-				'error'   => $result->get_error_message(),
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				$result->get_error_message()
 			);
 		}
 
 		if ( false === $result ) {
 			$messages = $skin->get_upgrade_messages();
 			$last_msg = ! empty( $messages ) ? end( $messages ) : '';
-			return array(
-				'success' => false,
-				'error'   => __( 'Self-update failed — filesystem error.', 'digitizer-site-worker' ),
-				'detail'  => $last_msg,
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				__( 'Self-update failed — filesystem error.', 'digitizer-site-worker' ),
+				$last_msg
 			);
 		}
 
@@ -235,9 +346,157 @@ class Aura_Worker_Updater {
 			wp_cache_flush();
 		}
 
-		// Read new version from the updated file header.
-		$new_data    = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin_file, false, false );
-		$new_version = $new_data['Version'] ?? 'unknown';
+		// The install is only complete if the file WordPress will load is there
+		// and carries a version header (Codex round-7 P1). `Plugin_Upgrader` can
+		// return success for an archive that renamed or omitted the main file —
+		// another PHP file with a valid header satisfies it — while the active
+		// plugin entry still points at the missing one. The loopback then loads
+		// nothing of ours: no beacon, no attributed fatal, and the verdict below
+		// would read that as inconclusive and let a headless install stand. The
+		// header on disk is a fact of the same kind the restore is held to, so it
+		// is checked FIRST and a missing one is a failed install, restored like
+		// any other.
+		$new_version = $this->installed_version( $plugin_file );
+		if ( null === $new_version || '' === $new_version ) {
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				__( 'Self-update installed an archive without a readable main plugin file.', 'digitizer-site-worker' )
+			);
+		}
+
+		// ONE identifier for the build (Codex round-13). The beacon writers name
+		// the running build by its AURA_WORKER_VERSION constant; this verdict
+		// looks the records up by the version it read from the file header. An
+		// archive where those two disagree would write its records under one
+		// name and be looked up under another — neither found, inconclusive, a
+		// broken build left standing. So the two must agree before the verdict
+		// is asked, and a build where they do not is malformed: a failed
+		// install, restored like any other.
+		$constant_version = $this->installed_constant_version( $plugin_file );
+		if ( $constant_version !== $new_version ) {
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				sprintf(
+					/* translators: 1: header version, 2: constant version or "(missing)" */
+					__( 'Self-update installed a build whose header (%1$s) and AURA_WORKER_VERSION constant (%2$s) disagree.', 'digitizer-site-worker' ),
+					$new_version,
+					null === $constant_version ? '(missing)' : $constant_version
+				)
+			);
+		}
+
+		// The verdict tells builds apart by VERSION — a record counts only when its
+		// version is the new one — so a package carrying the version already
+		// running is indistinguishable from the old build: a request that loaded
+		// the pre-update files and fatals after the nonce is armed writes a record
+		// this build would own, and a healthy replacement is rolled back on it
+		// (Codex round-23 P1). Aura never sends a same-version package — the
+		// rollout compares versions first — so refusing costs nothing real, and
+		// it is refused like any other malformed install: restored, and said so.
+		if ( $new_version === $old_version ) {
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				sprintf(
+					/* translators: %s: the version already installed */
+					__( 'Self-update refused a package carrying the version already running (%s): a same-version build cannot be told apart from the old one by its boot records.', 'digitizer-site-worker' ),
+					$new_version
+				)
+			);
+		}
+
+		// Ask the next boot of this plugin to announce itself. Armed HERE — after
+		// the install and the main-file check, immediately before the probe —
+		// and not before the install (Codex round-8 P1): while `install()` runs,
+		// any other front-end request is still served by the OLD build, which
+		// would consume the nonce, write a beacon carrying the old version, and
+		// leave the verdict a stale beacon instead of a missing one. Only a
+		// request that starts after this line can answer, and by then only the
+		// new build is on disk. Random, so a beacon from any earlier boot cannot
+		// satisfy this verdict either.
+		$boot_nonce = bin2hex( random_bytes( 16 ) );
+		update_option( 'aura_worker_boot_nonce', $boot_nonce, false );
+
+		// Files are replaced; whatever happens to the lease now, the verdict and
+		// any rollback below are still owed. Renew it and carry on.
+		$this->keep_self_update_claim( $fence );
+
+		// Did THIS build come up? See `verify_self_update()`.
+		$health_result = $this->verify_self_update( $new_version, $boot_nonce );
+		// Whatever happened, the request for a beacon is spent.
+		delete_option( 'aura_worker_boot_nonce' );
+		$healthy       = ! empty( $health_result['healthy'] );
+
+		if ( ! $healthy && null !== $backup_path ) {
+			// Restoring works even though the on-disk plugin is broken: this
+			// method, Aura_Worker_Rollback and ZipArchive are all already in
+			// memory from the pre-install require above.
+			$rb       = $this->attempt_rollback( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version );
+			$restored = $rb['restored'];
+			// The message has to agree with the fields (Codex round-2 P2). A
+			// dashboard that shows only `error` was told the site had recovered
+			// while `rolled_back` said otherwise — and the site may still be
+			// carrying the broken build.
+			$message = $restored
+				? sprintf(
+					/* translators: %s: version that was rolled back to */
+					__( 'SiteAgent update failed its health check and was rolled back to %s.', 'digitizer-site-worker' ),
+					$old_version
+				)
+				: __( 'SiteAgent update failed its health check AND could not be rolled back — the site may still be running the broken build.', 'digitizer-site-worker' );
+			return array(
+				'success'       => false,
+				'error'         => $message,
+				'old_version'   => $old_version,
+				'new_version'   => $new_version,
+				'backed_up'     => true,
+				'health_checked'=> true,
+				'healthy'       => false,
+				'health'        => $health_result,
+				'rolled_back'   => $restored,
+				'restore_error' => $rb['error'],
+			);
+		}
+
+		if ( ! $healthy ) {
+			// Unhealthy with nothing to restore. Say so plainly instead of
+			// reporting a success the site cannot support — the operator needs
+			// to know this one needs hands.
+			return array(
+				'success'       => false,
+				'error'         => __( 'SiteAgent update failed its health check and no backup was available to roll back.', 'digitizer-site-worker' ),
+				'old_version'   => $old_version,
+				'new_version'   => $new_version,
+				'backed_up'     => false,
+				'health_checked'=> true,
+				'healthy'       => false,
+				'health'        => $health_result,
+				'rolled_back'   => false,
+			);
+		}
+
+		// The update stuck, so older copies of this plugin are no longer the
+		// thing anyone would restore. Bounded, not emptied: the most recent few
+		// stay, because "the update succeeded" and "the new build is good" are
+		// not the same claim on a site nobody has looked at yet.
+		//
+		// And only when there is a rollback object to ask: construction may have
+		// failed above and been deliberately continued past (Codex round-14 P1) —
+		// a successful update must not fatal on tidying up backups it never took.
+		if ( $rollback ) {
+			$rollback->cleanup_old_backups( 3 );
+		}
 
 		return array(
 			'success'      => true,
@@ -249,7 +508,294 @@ class Aura_Worker_Updater {
 			),
 			'old_version'  => $old_version,
 			'new_version'  => $new_version,
+			'backed_up'    => null !== $backup_path,
+			'health_checked'=> true,
+			'healthy'      => true,
+			// `verified` is the beacon, specifically: a success with `verified:
+			// false` is an update that stood because the evidence was
+			// INCONCLUSIVE, not because the build was seen to boot. Aura's
+			// update log should be able to tell those apart.
+			'verified'     => ! empty( $health_result['verified'] ),
+			'health'       => $health_result,
+			'rolled_back'  => false,
 		);
+	}
+
+	/**
+	 * The AURA_WORKER_VERSION the installed entry file DEFINES — read from the
+	 * file's text, since this process is still running the old constant. This
+	 * is the identifier the new build's beacon writers will use; the header is
+	 * what the verdict looks records up by; the two must be the same string.
+	 *
+	 * @param string $plugin_file Plugin file relative to WP_PLUGIN_DIR.
+	 * @return string|null Null when the define cannot be found.
+	 */
+	private function installed_constant_version( $plugin_file ) {
+		$path = WP_PLUGIN_DIR . '/' . $plugin_file;
+		if ( ! file_exists( $path ) ) {
+			return null;
+		}
+		$src = (string) file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+		if ( preg_match( "/define\\(\\s*'AURA_WORKER_VERSION'\\s*,\\s*'([^']*)'\\s*\\)/", $src, $m ) ) {
+			return $m[1];
+		}
+		return null;
+	}
+
+	/**
+	 * The version WordPress reads from a plugin's own file header, right now.
+	 * The one post-condition a rollback can be held to: the old build is back
+	 * only if the file on disk says so.
+	 *
+	 * @param string $plugin_file Plugin file relative to WP_PLUGIN_DIR.
+	 * @return string|null
+	 */
+	private function installed_version( $plugin_file ) {
+		$path = WP_PLUGIN_DIR . '/' . $plugin_file;
+		if ( ! file_exists( $path ) ) {
+			return null;
+		}
+		if ( function_exists( 'wp_clean_plugins_cache' ) ) {
+			wp_clean_plugins_cache( false );
+		}
+		$data = get_plugin_data( $path, false, false );
+		return isset( $data['Version'] ) ? (string) $data['Version'] : null;
+	}
+
+	/**
+	 * `rest_api_init` callback: emit the boot beacon for the running build.
+	 * Hooked LAST from `Aura_Worker::init()`. The write itself lives in
+	 * includes/boot-beacon.php, the one owner of `aura_worker_boot`.
+	 */
+	public static function emit_boot_beacon() {
+		self::write_boot_beacon( AURA_WORKER_VERSION );
+	}
+
+	/** Thin wrapper kept for callers and tests; see aura_worker_write_boot_beacon(). */
+	public static function write_boot_beacon( $version ) {
+		return aura_worker_write_boot_beacon( $version );
+	}
+
+	/**
+	 * Did the build that was just installed actually come up?
+	 *
+	 * Answered from a FACT the new build writes, not inferred from the outside.
+	 * Four review rounds found a case where every inferential signal lies: the
+	 * home page served from a full-page cache without starting PHP; 401/403
+	 * meaning "registered" on one site and "REST closed to everyone" on
+	 * another; a 500 differing from a 404 control; a log tail that was too
+	 * short, or the wrong file. Each patch converged on nothing because the
+	 * question — "did this code boot?" — has no answer in status codes.
+	 *
+	 * So: leave a nonce, make ONE uncacheable request so a fresh PHP process
+	 * loads the new files, then read `aura_worker_boot`. The new build's own
+	 * `aura_worker_boot_beacon()` writes it as the LAST line of init, echoing
+	 * the nonce. Beacon carrying our nonce and the new version ⇒ it booted.
+	 *
+	 * What can still be wrong, stated rather than hidden:
+	 *  - The request never reached PHP at all (transport failure: the site
+	 *    cannot connect to itself). No beacon then proves nothing, and rolling
+	 *    back on it would make every update fail on such a site for ever — the
+	 *    unsatisfiable-gate shape Aura #472 spent months in. Reported as
+	 *    `inconclusive`, no rollback, `verified: false`.
+	 *  - A cache answering a REST URL that carries a random query argument and
+	 *    no-cache headers. Accepted as the residual; REST is not page-cached in
+	 *    any mainstream setup.
+	 *
+	 * Breakage is a fact too: the dying process records a fatal in one of our
+	 * files against the same nonce (includes/boot-beacon.php). Nothing is read
+	 * from anyone's log.
+	 *
+	 * @param string     $new_version  Version read from the installed header.
+	 * @param string     $nonce        The nonce left in `aura_worker_boot_nonce`.
+	 * @return array { healthy: bool, inconclusive: bool, checks: array }
+	 */
+	private function verify_self_update( $new_version, $nonce ) {
+		$probe = wp_remote_get(
+			add_query_arg( array( 'aura_probe' => $nonce ), rest_url( 'aura/v1/status' ) ),
+			array(
+				'timeout'     => 15,
+				'sslverify'   => false,
+				'redirection' => 0,
+				'headers'     => array( 'Cache-Control' => 'no-cache', 'Pragma' => 'no-cache' ),
+			)
+		);
+		$reached = ! is_wp_error( $probe );
+
+		// Read the fact UNCACHED: the option cache in this process may still hold
+		// the pre-install state.
+		$fatal_key = aura_worker_fatal_record_key( $new_version );
+		wp_cache_delete( 'aura_worker_boot', 'options' );
+		wp_cache_delete( $fatal_key, 'options' );
+		$boot  = get_option( 'aura_worker_boot' );
+		// The NEW version's own fatal record. Per-version records (round-12) mean
+		// an old build's straggler death cannot have overwritten this one.
+		$fatal = get_option( $fatal_key );
+
+		// A record counts only if it is for THIS verdict (the nonce) and names
+		// THIS build (the version). The version test is what keeps a request
+		// still running the OLD build — one that loaded before the install and
+		// dies, or boots, after the nonce was armed — from overriding the new
+		// build's record in either direction (Codex round-11).
+		$for_this = function ( $record ) use ( $nonce, $new_version ) {
+			return is_array( $record )
+				&& isset( $record['nonce'], $record['version'] )
+				&& hash_equals( $nonce, (string) $record['nonce'] )
+				&& (string) $record['version'] === (string) $new_version;
+		};
+		// Precedence at READ time: a recorded death outranks a recorded boot.
+		// Two records, two owners, no write races between them (round-11).
+		$broken = $for_this( $fatal );
+		$booted = ! $broken && $for_this( $boot );
+		// For the detail strings only: does SOME record carry this nonce?
+		$ours = ( is_array( $boot ) && isset( $boot['nonce'] ) && hash_equals( $nonce, (string) $boot['nonce'] ) )
+			|| ( is_array( $fatal ) && isset( $fatal['nonce'] ) && hash_equals( $nonce, (string) $fatal['nonce'] ) );
+		$beacon = $boot;
+
+		$checks = array(
+			'loopback'   => array(
+				'status' => $reached ? 'pass' : 'fail',
+				'detail' => $reached
+					? 'HTTP ' . (int) wp_remote_retrieve_response_code( $probe )
+					: $probe->get_error_message(),
+			),
+			'boot_beacon' => array(
+				'status' => $booted ? 'pass' : 'fail',
+				'detail' => $booted
+					? 'build ' . $new_version . ' reported boot'
+					: ( $ours ? ( $broken ? 'died before booting' : 'a different build answered' ) : ( is_array( $beacon ) ? 'stale beacon' : 'no beacon written' ) ),
+			),
+			'fatal_beacon' => array(
+				'status' => $broken ? 'fail' : 'pass',
+				'detail' => $broken
+					? 'the build died in ' . (string) ( $fatal['file'] ?? '?' ) . ': ' . (string) ( $fatal['message'] ?? '' )
+					: 'no fatal recorded by this plugin',
+			),
+		);
+
+		// The decision rests on POSITIVE facts only, in both directions.
+		//
+		// Health: the boot beacon. Breakage: the fatal beacon — written by the
+		// dying process itself when a fatal in one of OUR files ended a request
+		// while this verdict was pending. Attribution is the file PHP names,
+		// checked against our directory; another plugin's death cannot count.
+		//
+		// What is deliberately NOT a fact: "we got an HTTP response". A CDN, WAF
+		// or reverse proxy can answer a 301 or a 403 challenge before WordPress
+		// ever runs, and no beacon can be written then; treating that response
+		// as proof PHP was reached rolled back healthy builds on every site
+		// fronted that way — for ever (Codex round-5 P1). So `$reached` is
+		// reported and decides nothing.
+		//
+		// No beacon of either kind is therefore INCONCLUSIVE: the update stands,
+		// `verified: false`. The one case that produces that is a parse error in
+		// the ENTRY FILE itself — nothing in it runs, so neither handler is ever
+		// armed. Stated here rather than hidden: it is visible in Aura's update
+		// log as unverified and bounded by the 5-per-night cap, and the
+		// alternative — rolling back on absence of evidence — makes every
+		// edge-fronted site permanently un-updatable, the worse failure and the
+		// one that hides.
+		$inconclusive = ! $booted && ! $broken;
+		$healthy      = ! $broken && ( $booted || $inconclusive );
+
+		return array(
+			'healthy'      => $healthy,
+			'inconclusive' => $inconclusive,
+			'verified'     => $booted,
+			'checks'       => $checks,
+		);
+	}
+
+	/**
+	 * Put the previous build back and PROVE it is back.
+	 *
+	 * The single place a rollback is decided (Codex round-4 P1: the two exits
+	 * had drifted — one checked the header, one trusted the step result). Fifteen
+	 * findings on this branch were one class, a success value resting on
+	 * evidence that could not support it, so this returns success only on the
+	 * post-condition: the plugin's own header reads the version we came from.
+	 *
+	 * @return array { restored: bool, error: string|null }
+	 */
+	private function attempt_rollback( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version ) {
+		if ( null === $backup_path || null === $rollback ) {
+			return array( 'restored' => false, 'error' => null );
+		}
+		$restore = $rollback->restore_plugin( $plugin_slug, $backup_path );
+		if ( empty( $restore['success'] ) ) {
+			return array( 'restored' => false, 'error' => (string) ( $restore['error'] ?? 'restore failed' ) );
+		}
+		if ( $old_version !== $this->installed_version( $plugin_file ) ) {
+			return array(
+				'restored' => false,
+				'error'    => 'restore completed but the plugin header does not read ' . $old_version,
+			);
+		}
+		return array( 'restored' => true, 'error' => null );
+	}
+
+	/**
+	 * Renew the self-update claim's lease. True while this request still holds it.
+	 *
+	 * @param string $fence The claim self_update() took.
+	 * @return bool
+	 */
+	private function keep_self_update_claim( $fence ) {
+		return Aura_Worker_Magic_Link::refresh_claim( self::SELF_UPDATE_LOCK, $fence );
+	}
+
+	/**
+	 * The result for a self-update whose claim was seized before it changed
+	 * anything: another self-update is the one running now.
+	 *
+	 * @return array
+	 */
+	private function self_update_claim_lost() {
+		return array(
+			'success'     => false,
+			'error'       => __( 'SiteAgent lost its self-update claim before installing; another self-update took over on this site.', 'digitizer-site-worker' ),
+			'in_progress' => true,
+		);
+	}
+
+	/**
+	 * Shared exit for a self-update whose install did not complete: put the
+	 * previous build back when there is one, and report what happened either
+	 * way. Deliberately one function — the two failure shapes above differ only
+	 * in their message, and duplicating the restore would let the two drift
+	 * until one of them silently stopped restoring.
+	 *
+	 * @param Aura_Worker_Rollback $rollback    Loaded before the install.
+	 * @param string               $plugin_slug This plugin's directory name.
+	 * @param string|null          $backup_path Backup zip, or null if none was made.
+	 * @param string               $error       Message describing the failure.
+	 * @param string               $detail      Optional upgrader detail.
+	 * @return array
+	 */
+	private function self_update_install_failed( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version, $error, $detail = '' ) {
+		$rb            = $this->attempt_rollback( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version );
+		$restored      = $rb['restored'];
+		$restore_error = $rb['error'];
+
+		// The message must carry the recovery outcome too (Codex round-4 P2): a
+		// consumer showing only `error` was told about the upgrader failure and
+		// not that the plugin may now be missing.
+		if ( null !== $backup_path && ! $restored ) {
+			$error .= ' ' . __( 'The previous build could NOT be restored — the plugin may be missing or incomplete.', 'digitizer-site-worker' );
+		}
+
+		$out = array(
+			'success'       => false,
+			'error'         => $error,
+			'backed_up'     => null !== $backup_path,
+			'health_checked'=> false,
+			'rolled_back'   => $restored,
+			'restore_error' => $restore_error,
+		);
+		if ( '' !== $detail ) {
+			$out['detail'] = $detail;
+		}
+		return $out;
 	}
 
 	/**
@@ -278,6 +824,129 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * One plugin of a batch: backup, update, health check, rollback on failure.
+	 *
+	 * @param string               $plugin_file   Plugin file path.
+	 * @param Aura_Worker_Rollback $rollback      Shared rollback helper.
+	 * @param Aura_Worker_Health   $health        Shared health checker.
+	 * @param bool                 $create_backup Whether to back up first.
+	 * @return array { plugin, status, detail }
+	 */
+	private function batch_update_one( $plugin_file, $rollback, $health, $create_backup ) {
+		$slug        = dirname( $plugin_file );
+		$backup_path = null;
+		$entry       = array(
+			'plugin'  => $plugin_file,
+			'status'  => 'skipped',
+			'detail'  => '',
+		);
+
+		// 1. Backup.
+		if ( $create_backup ) {
+			$backup_result = $rollback->backup_plugin( $slug );
+			if ( $backup_result['success'] ) {
+				$backup_path = $backup_result['backup_path'];
+			} else {
+				$entry['status'] = 'failed';
+				$entry['detail'] = 'Backup failed: ' . $backup_result['error'];
+				return $entry;
+			}
+		}
+
+		// 2. Update.
+		$update_result = $this->update_single_plugin( $plugin_file );
+		if ( ! $update_result['success'] ) {
+			$entry['status'] = 'failed';
+			$entry['detail'] = $update_result['error'];
+			return $entry;
+		}
+
+		// 3. Health check.
+		$health_result = $health->run_health_check();
+		if ( ! $health_result['healthy'] ) {
+			// 4. Auto-rollback.
+			if ( $backup_path ) {
+				$restore_result  = $rollback->restore_plugin( $slug, $backup_path );
+				$entry['status'] = 'rolled_back';
+				$entry['detail'] = 'Health check failed; rollback ' . ( $restore_result['success'] ? 'succeeded' : 'failed: ' . $restore_result['error'] );
+			} else {
+				$entry['status'] = 'failed';
+				$entry['detail'] = 'Health check failed; no backup available for rollback';
+			}
+			return $entry;
+		}
+
+		// 5. Success.
+		$entry['status'] = 'updated';
+		$entry['detail'] = 'Update and health check passed';
+		return $entry;
+	}
+
+	/**
+	 * Restore a plugin from a backup, under the self-update claim when the
+	 * plugin is SiteAgent itself. The generic rollback route restored these
+	 * files with no claim taken (Codex round-24 P1), so it could delete and
+	 * re-extract the directory while a locked self-update was backing up,
+	 * installing or probing it.
+	 *
+	 * @param Aura_Worker_Rollback $rollback    Rollback helper (owns the backups).
+	 * @param string               $plugin_slug Plugin folder name.
+	 * @param string               $backup_path Backup zip to restore.
+	 * @return array restore_plugin()'s result, or the shared busy result.
+	 */
+	public function restore_plugin_guarded( $rollback, $plugin_slug, $backup_path ) {
+		$plugin_file = 'digitizer-site-worker' === $plugin_slug ? self::SELF_PLUGIN_FILE : $plugin_slug . '/-';
+		$result      = $this->guarding_self( $plugin_file, function () use ( $rollback, $plugin_slug, $backup_path ) {
+			return $rollback->restore_plugin( $plugin_slug, $backup_path );
+		}, $busy );
+		return $busy ? $this->self_update_busy() : $result;
+	}
+
+	/**
+	 * Run $work under the self-update claim when $plugin_file is this plugin;
+	 * run it plainly for any other plugin. $busy is set when the claim is held
+	 * by a self-update, in which case $work is not run and null is returned.
+	 *
+	 * @param string   $plugin_file Plugin being mutated.
+	 * @param callable $work        The mutation.
+	 * @param bool     $busy        Out: true when refused for a held claim.
+	 * @return mixed $work's return, or null when busy.
+	 */
+	private function guarding_self( $plugin_file, $work, &$busy ) {
+		$busy = false;
+		if ( self::SELF_PLUGIN_FILE !== $plugin_file ) {
+			return $work();
+		}
+		if ( ! class_exists( 'Aura_Worker_Magic_Link' ) ) {
+			require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-magic-link.php';
+		}
+		$fence = Aura_Worker_Magic_Link::take_claim( self::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		if ( '' === $fence ) {
+			$busy = true;
+			return null;
+		}
+		try {
+			return $work();
+		} finally {
+			Aura_Worker_Magic_Link::release_claim( self::SELF_UPDATE_LOCK, $fence );
+		}
+	}
+
+	/**
+	 * The result every SiteAgent-mutating path answers while a self-update
+	 * holds the claim.
+	 *
+	 * @return array
+	 */
+	private function self_update_busy() {
+		return array(
+			'success'     => false,
+			'error'       => __( 'A SiteAgent self-update is already in progress on this site.', 'digitizer-site-worker' ),
+			'in_progress' => true,
+		);
+	}
+
+	/**
 	 * Update a specific plugin.
 	 *
 	 * @param string $plugin_file Plugin file path (e.g., "akismet/akismet.php").
@@ -286,9 +955,18 @@ class Aura_Worker_Updater {
 	public function update_plugin( $plugin_file ) {
 		$this->load_upgrade_dependencies();
 
-		$skin     = new Automatic_Upgrader_Skin();
-		$upgrader = new Plugin_Upgrader( $skin );
-		$result   = $upgrader->upgrade( $plugin_file );
+		// This plugin's own update goes under the self-update claim, like every
+		// other path that can replace these files (Codex round-23 P1): a generic
+		// update landing between a self-update's backup, install and probe would
+		// have the beacon describing one build and the rollback restoring another.
+		$result = $this->guarding_self( $plugin_file, function () use ( $plugin_file ) {
+			$skin     = new Automatic_Upgrader_Skin();
+			$upgrader = new Plugin_Upgrader( $skin );
+			return $upgrader->upgrade( $plugin_file );
+		}, $busy );
+		if ( $busy ) {
+			return $this->self_update_busy();
+		}
 
 		if ( is_wp_error( $result ) ) {
 			return array(
@@ -487,56 +1165,20 @@ class Aura_Worker_Updater {
 
 		foreach ( $chunks as $chunk ) {
 			foreach ( $chunk as $plugin_file ) {
-				$slug        = dirname( $plugin_file );
-				$backup_path = null;
-				$entry       = array(
-					'plugin'  => $plugin_file,
-					'status'  => 'skipped',
-					'detail'  => '',
-				);
-
-				// 1. Backup.
-				if ( $create_backup ) {
-					$backup_result = $rollback->backup_plugin( $slug );
-					if ( $backup_result['success'] ) {
-						$backup_path = $backup_result['backup_path'];
-					} else {
-						$entry['status'] = 'failed';
-						$entry['detail'] = 'Backup failed: ' . $backup_result['error'];
-						$results[]       = $entry;
-						continue;
-					}
+				// SiteAgent's own entry runs under the self-update claim (Codex
+				// round-23 P1); while a self-update holds it, the entry is skipped
+				// and says why, and the rest of the batch is unaffected.
+				$entry = $this->guarding_self( $plugin_file, function () use ( $plugin_file, $rollback, $health, $create_backup ) {
+					return $this->batch_update_one( $plugin_file, $rollback, $health, $create_backup );
+				}, $busy );
+				if ( $busy ) {
+					$entry = array(
+						'plugin' => $plugin_file,
+						'status' => 'skipped',
+						'detail' => 'A SiteAgent self-update is in progress on this site',
+					);
 				}
-
-				// 2. Update.
-				$update_result = $this->update_single_plugin( $plugin_file );
-				if ( ! $update_result['success'] ) {
-					$entry['status'] = 'failed';
-					$entry['detail'] = $update_result['error'];
-					$results[]       = $entry;
-					continue;
-				}
-
-				// 3. Health check.
-				$health_result = $health->run_health_check();
-				if ( ! $health_result['healthy'] ) {
-					// 4. Auto-rollback.
-					if ( $backup_path ) {
-						$restore_result  = $rollback->restore_plugin( $slug, $backup_path );
-						$entry['status'] = 'rolled_back';
-						$entry['detail'] = 'Health check failed; rollback ' . ( $restore_result['success'] ? 'succeeded' : 'failed: ' . $restore_result['error'] );
-					} else {
-						$entry['status'] = 'failed';
-						$entry['detail'] = 'Health check failed; no backup available for rollback';
-					}
-					$results[] = $entry;
-					continue;
-				}
-
-				// 5. Success.
-				$entry['status'] = 'updated';
-				$entry['detail'] = 'Update and health check passed';
-				$results[]       = $entry;
+				$results[] = $entry;
 			}
 
 			// Between chunks: flush caches and run garbage collection.

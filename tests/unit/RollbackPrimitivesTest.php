@@ -1,0 +1,700 @@
+<?php
+/**
+ * Aura_Worker_Rollback's two primitives must report what actually happened
+ * (SiteAgent #77, Codex round-1). Both used to answer in ways a caller could
+ * not act on:
+ *
+ *  - `backup_plugin()` constructed a ZipArchive unconditionally, so on a site
+ *    without ext-zip it raised an uncaught Error and killed the request —
+ *    a caller written to continue with `backed_up: false` never got the chance.
+ *  - `restore_plugin()` deleted the plugin directory, ignored `extractTo()`'s
+ *    return value, and reported success regardless — so "rolled back" could
+ *    mean "the plugin is gone".
+ *
+ * @package Aura_Worker\Tests
+ */
+
+use PHPUnit\Framework\TestCase;
+
+final class RollbackPrimitivesTest extends TestCase {
+
+	private string $slug = 'sa-rollback-fixture';
+	private string $dir;
+
+	protected function setUp(): void {
+		$this->dir = WP_PLUGIN_DIR . '/' . $this->slug;
+		if ( ! is_dir( $this->dir ) ) {
+			mkdir( $this->dir, 0777, true );
+		}
+		file_put_contents( $this->dir . '/main.php', 'ORIGINAL' );
+	}
+
+	protected function tearDown(): void {
+		foreach ( glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array() as $f ) {
+			unlink( $f );
+		}
+		@chmod( WP_PLUGIN_DIR, 0777 );
+		if ( is_dir( $this->dir ) ) {
+			foreach ( scandir( $this->dir ) as $f ) {
+				if ( '.' !== $f && '..' !== $f ) {
+					unlink( $this->dir . '/' . $f );
+				}
+			}
+			rmdir( $this->dir );
+		}
+	}
+
+	/** Remove a link as a link, or a real directory with everything under it. */
+	private function removeTree( string $path ): void {
+		if ( is_link( $path ) ) {
+			unlink( $path );
+			return;
+		}
+		if ( ! is_dir( $path ) ) {
+			if ( is_file( $path ) ) {
+				unlink( $path );
+			}
+			return;
+		}
+		foreach ( scandir( $path ) as $f ) {
+			if ( '.' !== $f && '..' !== $f ) {
+				$this->removeTree( $path . '/' . $f );
+			}
+		}
+		rmdir( $path );
+	}
+
+	public function test_a_real_backup_and_restore_round_trip_returns_the_original(): void {
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'] );
+
+		file_put_contents( $this->dir . '/main.php', 'REPLACED' );
+		$restore = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+		$this->assertTrue( $restore['success'] );
+		$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+	}
+
+	public function test_an_unreadable_archive_fails_without_destroying_what_is_there(): void {
+		// The order matters: opening the archive BEFORE deleting means a backup
+		// that turns out to be unreadable leaves the site as it was, instead of
+		// converting a recoverable state into an empty one.
+		$rollback = new Aura_Worker_Rollback();
+		$bad      = WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_broken.zip';
+		file_put_contents( $bad, 'not a zip at all' );
+
+		$restore = $rollback->restore_plugin( $this->slug, $bad );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertTrue( is_dir( $this->dir ), 'the plugin directory must survive a failed restore' );
+		$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+	}
+
+	public function test_a_valid_archive_that_cannot_be_written_is_not_reported_as_restored(): void {
+		// The case the `extractTo()` return value exists for, and the one a
+		// corrupt-archive test does NOT reach — there `open()` fails first. The
+		// real-world trigger is a site whose PHP process cannot write to
+		// WP_PLUGIN_DIR because WordPress updates over FTP/SSH.
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'] );
+
+		// Remove the target first: with the directory still present and
+		// writable, extraction just overwrites the files inside it and a
+		// read-only PARENT changes nothing. The failure being modelled is
+		// "cannot create the plugin directory at all".
+		unlink( $this->dir . '/main.php' );
+		rmdir( $this->dir );
+
+		$perms = fileperms( WP_PLUGIN_DIR ) & 0777;
+		chmod( WP_PLUGIN_DIR, 0555 );
+		// Root ignores the mode bits, so prove the environment actually refuses
+		// a write before asserting on a failure that would not happen.
+		$probe = @file_put_contents( WP_PLUGIN_DIR . '/.sa-write-probe', 'x' );
+		if ( false !== $probe ) {
+			@unlink( WP_PLUGIN_DIR . '/.sa-write-probe' );
+			chmod( WP_PLUGIN_DIR, $perms );
+			$this->markTestSkipped( 'filesystem does not enforce the read-only mode (running as root?)' );
+		}
+
+		try {
+			$restore = @$rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+			$this->assertFalse( $restore['success'], 'a restore that could not write must not report success' );
+			$this->assertNotEmpty( $restore['error'] );
+		} finally {
+			chmod( WP_PLUGIN_DIR, $perms );
+		}
+	}
+
+	public function test_a_directory_that_cannot_be_removed_is_not_reported_as_restored(): void {
+		// Codex round-2: if the installed directory survives but its files stay
+		// writable, `extractTo()` overwrites the ones the backup contains and
+		// reports success — while every file the broken release ADDED is still
+		// on disk. That is a half-restored plugin described as a clean rollback.
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'] );
+
+		// A file the backup does not contain: what a broken release left behind.
+		file_put_contents( $this->dir . '/stray-from-broken-build.php', 'STRAY' );
+
+		// Read-only PARENT: the directory entry cannot be removed, while the
+		// files inside it remain writable.
+		$perms = fileperms( WP_PLUGIN_DIR ) & 0777;
+		chmod( WP_PLUGIN_DIR, 0555 );
+		if ( false !== @file_put_contents( WP_PLUGIN_DIR . '/.sa-probe', 'x' ) ) {
+			@unlink( WP_PLUGIN_DIR . '/.sa-probe' );
+			chmod( WP_PLUGIN_DIR, $perms );
+			$this->markTestSkipped( 'filesystem does not enforce the read-only mode (running as root?)' );
+		}
+
+		try {
+			$restore = @$rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+			$this->assertFalse( $restore['success'], 'a directory that could not be removed is not a rollback' );
+		} finally {
+			chmod( WP_PLUGIN_DIR, $perms );
+			@unlink( $this->dir . '/stray-from-broken-build.php' );
+		}
+	}
+
+	public function test_the_files_a_restore_must_drop_from_the_cache_are_every_php_file_it_wrote(): void {
+		// Files on disk are not what PHP runs: the failed release was already
+		// compiled by the loopback probe, and where `opcache.validate_timestamps`
+		// is off the workers keep executing that cached code however correct the
+		// bytes are (Codex round-3).
+		//
+		// This pins WHICH files a restore has to drop — the part with judgement
+		// in it. The `opcache_invalidate()` call itself is deliberately NOT
+		// covered: PHP defines that function even where OPcache is disabled, so
+		// a recording stub can never stand in for it, and a test that asserted
+		// around that would be passing for a reason unrelated to its claim.
+		mkdir( $this->dir . '/sub', 0777, true );
+		file_put_contents( $this->dir . '/sub/inner.php', '<?php' );
+		file_put_contents( $this->dir . '/readme.txt', 'not php' );
+
+		$m = new ReflectionMethod( Aura_Worker_Rollback::class, 'php_files_under' );
+		$m->setAccessible( true );
+		$found = $m->invoke( new Aura_Worker_Rollback(), $this->dir );
+
+		sort( $found );
+		$this->assertSame(
+			array( realpath( $this->dir . '/main.php' ), realpath( $this->dir . '/sub/inner.php' ) ),
+			$found,
+			'every PHP file it restored, and nothing else'
+		);
+
+		unlink( $this->dir . '/sub/inner.php' );
+		rmdir( $this->dir . '/sub' );
+		unlink( $this->dir . '/readme.txt' );
+	}
+
+	public function test_a_missing_backup_file_is_refused(): void {
+		$rollback = new Aura_Worker_Rollback();
+		$restore  = $rollback->restore_plugin( $this->slug, WP_CONTENT_DIR . '/aura-backups/nope.zip' );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertTrue( is_dir( $this->dir ) );
+	}
+
+	public function test_an_archive_that_could_not_take_every_file_is_not_offered_as_a_backup(): void {
+		// A partially populated but perfectly readable zip used to come back as
+		// `success: true`, and a later restore would delete the installed
+		// directory, extract the few entries that made it, and call that a
+		// rollback (Codex round-3). An incomplete archive is not a backup, and
+		// it must not be left on disk for something else to trust.
+		$rollback = new Aura_Worker_Rollback();
+
+		// A dangling symlink is the honest version of "a file disappeared during
+		// traversal": the iterator yields it, `getRealPath()` answers false, and
+		// `addFile()` cannot take it.
+		$dangling = $this->dir . '/vanished.php';
+		symlink( $this->dir . '/definitely-not-here.php', $dangling );
+
+		try {
+			$res = $rollback->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame(
+				array(),
+				glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array(),
+				'an incomplete archive must not be left behind'
+			);
+		} finally {
+			unlink( $dangling );
+		}
+	}
+
+	public function test_a_traversal_that_throws_comes_out_as_an_unsuccessful_backup_not_an_exception(): void {
+		// An unreadable subtree makes RecursiveDirectoryIterator throw on
+		// descent. That exception used to escape the "unsuccessful backup"
+		// contract and kill the request before the upgrader ran (Codex round-6).
+		$sub = $this->dir . '/locked';
+		mkdir( $sub, 0777, true );
+		file_put_contents( $sub . '/inner.php', '<?php' );
+		chmod( $sub, 0000 );
+		if ( @scandir( $sub ) !== false ) {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/inner.php' );
+			rmdir( $sub );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array() );
+		} finally {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/inner.php' );
+			rmdir( $sub );
+		}
+	}
+
+	public function test_construction_survives_a_filesystem_transport_that_will_not_initialise(): void {
+		// Codex round-13: with no aura-backups dir yet and WP_Filesystem() failing
+		// (FTP/SSH site, no credentials), the constructor dereferenced a null
+		// $wp_filesystem and fatalled — before backup_plugin() could even report
+		// itself unsuccessful. Directory protection is best-effort; construction
+		// and the backup itself must still work.
+		$dir = WP_CONTENT_DIR . '/aura-backups';
+		foreach ( glob( $dir . '/*' ) ?: array() as $f ) { @unlink( $f ); }
+		foreach ( glob( $dir . '/.*' ) ?: array() as $f ) { if ( is_file( $f ) ) { @unlink( $f ); } }
+		@rmdir( $dir );
+		$GLOBALS['_wp_filesystem_unavailable'] = true;
+		$GLOBALS['wp_filesystem'] = null;
+
+		try {
+			$rollback = new Aura_Worker_Rollback();
+			$backup   = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], 'the backup itself needs ZipArchive, not a WP_Filesystem transport' );
+		} finally {
+			unset( $GLOBALS['_wp_filesystem_unavailable'] );
+			$GLOBALS['wp_filesystem'] = null;
+		}
+	}
+
+	public function test_backing_up_a_directory_that_is_not_there_fails_cleanly(): void {
+		$rollback = new Aura_Worker_Rollback();
+		$res      = $rollback->backup_plugin( 'sa-no-such-plugin' );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertNotEmpty( $res['error'] );
+	}
+
+	public function test_a_restore_works_when_no_filesystem_transport_initialises(): void {
+		// Round 13 let construction and the backup survive a site whose
+		// WP_Filesystem() returns false. The restore then reached
+		// delete_directory(), which dereferenced the null $wp_filesystem and
+		// fatalled — after the backup was made, at the moment it was needed
+		// (Codex round-14 P1). The archive is written and read directly; the
+		// deletion between them has to be direct too.
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'] );
+		file_put_contents( $this->dir . '/main.php', 'BROKEN' );
+		file_put_contents( $this->dir . '/added-by-broken-build.php', 'x' );
+		mkdir( $this->dir . '/sub' );
+		file_put_contents( $this->dir . '/sub/deep.php', 'y' );
+
+		$GLOBALS['_wp_filesystem_unavailable'] = true;
+		$GLOBALS['wp_filesystem'] = null;
+		try {
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+		} finally {
+			unset( $GLOBALS['_wp_filesystem_unavailable'] );
+			$GLOBALS['wp_filesystem'] = null;
+			if ( is_file( $this->dir . '/sub/deep.php' ) ) {
+				unlink( $this->dir . '/sub/deep.php' );
+			}
+			if ( is_dir( $this->dir . '/sub' ) ) {
+				rmdir( $this->dir . '/sub' );
+			}
+		}
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+		$this->assertFileDoesNotExist( $this->dir . '/added-by-broken-build.php', 'a file the broken build added must not survive the restore' );
+		$this->assertDirectoryDoesNotExist( $this->dir . '/sub' );
+	}
+
+	public function test_a_symlinked_directory_inside_the_plugin_is_archived_by_its_contents_and_restored_whole(): void {
+		// The iterator yielded a symlinked directory as a directory and did not
+		// descend into it, so the archive held an empty dir and called itself
+		// complete; a restore then put an EMPTY directory where plugin code had
+		// been, and the main-file check — which never looks there — still said
+		// `rolled_back: true` (Codex round-15 P1). A restore extracts real
+		// directories, so the target's contents are what the backup must hold —
+		// for a link whose target is INSIDE the plugin (round 22: outside, see
+		// the next test).
+		$target = $this->dir . '/vendor-real';
+		mkdir( $target . '/deeper', 0777, true );
+		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
+		file_put_contents( $target . '/deeper/leaf.php', 'LEAF' );
+		symlink( $target, $this->dir . '/linked' );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+			// The broken build removed the link; the restore has to bring the
+			// code back, not an empty directory named after it.
+			unlink( $this->dir . '/linked' );
+			file_put_contents( $this->dir . '/main.php', 'BROKEN' );
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $this->dir . '/linked/inner.php' ), 'the linked directory came back empty' );
+			$this->assertSame( 'LEAF', @file_get_contents( $this->dir . '/linked/deeper/leaf.php' ) );
+		} finally {
+			$this->removeTree( $this->dir . '/linked' );
+			$this->removeTree( $target );
+		}
+	}
+
+	public function test_a_symlink_pointing_outside_the_plugin_is_not_archived_and_the_backup_says_so(): void {
+		// Following links (round 15) copied whatever a link pointed at into a
+		// predictably named zip under wp-content — a link to a home directory
+		// would archive credentials, behind an .htaccess nginx never reads (Codex
+		// round-22 P1). A link that leaves the plugin root is not followed, for
+		// directories and files alike; the backup is incomplete and not kept.
+		$outside = sys_get_temp_dir() . '/sa-outside-' . getmypid();
+		mkdir( $outside, 0777, true );
+		file_put_contents( $outside . '/secret.txt', 'NOT YOURS' );
+		symlink( $outside, $this->dir . '/linked-dir' );
+		try {
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array(), 'no archive may hold the outside contents' );
+
+			unlink( $this->dir . '/linked-dir' );
+			symlink( $outside . '/secret.txt', $this->dir . '/linked-file.php' );
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'], 'a FILE link out of the tree copies the target bytes just the same' );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array() );
+		} finally {
+			foreach ( array( $this->dir . '/linked-dir', $this->dir . '/linked-file.php' ) as $l ) {
+				if ( is_link( $l ) ) {
+					unlink( $l );
+				}
+			}
+			$this->removeTree( $outside );
+		}
+	}
+
+	public function test_a_symlink_looping_back_into_the_plugin_makes_the_backup_incomplete_not_endless(): void {
+		// Following links is what the fix above does; a link to an ancestor of
+		// the directory being walked would then never end. It cannot be put in
+		// an archive faithfully, so the backup reports itself incomplete and is
+		// not kept — the same door every other gap comes out of.
+		symlink( $this->dir, $this->dir . '/loop' );
+		try {
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array() );
+		} finally {
+			unlink( $this->dir . '/loop' );
+		}
+	}
+
+	public function test_a_restore_without_a_transport_does_not_delete_through_a_symlinked_plugin_root(): void {
+		// The direct-deletion fallback checked `isLink()` on every CHILD and never
+		// on the root, so a plugin directory that is itself a symlink — a common
+		// deployment layout — was walked into and its TARGET emptied: a shared
+		// checkout outside WP_PLUGIN_DIR destroyed by a rollback, and the link
+		// itself left standing (Codex round-16 P1). The link goes as a link; the
+		// target is not ours to touch.
+		$target = sys_get_temp_dir() . '/sa-checkout-' . getmypid();
+		mkdir( $target . '/inc', 0777, true );
+		file_put_contents( $target . '/main.php', 'ORIGINAL' );
+		file_put_contents( $target . '/inc/lib.php', 'SHARED' );
+		unlink( $this->dir . '/main.php' );
+		rmdir( $this->dir );
+		symlink( $target, $this->dir );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+			$GLOBALS['_wp_filesystem_unavailable'] = true;
+			$GLOBALS['wp_filesystem'] = null;
+			try {
+				$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+			} finally {
+				unset( $GLOBALS['_wp_filesystem_unavailable'] );
+				$GLOBALS['wp_filesystem'] = null;
+			}
+
+			$this->assertSame( 'SHARED', @file_get_contents( $target . '/inc/lib.php' ), 'the symlink target was deleted through' );
+			$this->assertSame( 'ORIGINAL', @file_get_contents( $target . '/main.php' ) );
+			$this->assertFalse( is_link( $this->dir ), 'the link itself was left standing' );
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertSame( 'ORIGINAL', @file_get_contents( $this->dir . '/main.php' ) );
+		} finally {
+			if ( is_link( $this->dir ) ) {
+				unlink( $this->dir );
+			}
+			foreach ( array( $this->dir, $target ) as $d ) {
+				if ( is_dir( $d ) && ! is_link( $d ) ) {
+					foreach ( array( '/inc/lib.php', '/main.php' ) as $f ) {
+						if ( is_file( $d . $f ) ) {
+							unlink( $d . $f );
+						}
+					}
+					if ( is_dir( $d . '/inc' ) ) {
+						rmdir( $d . '/inc' );
+					}
+				}
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
+
+	public function test_a_restore_with_a_transport_does_not_delete_through_a_symlinked_plugin_root(): void {
+		// Round 16 put the root-link guard inside the DIRECT fallback only. With
+		// the ordinary transport available, WP_Filesystem_Direct::delete() still
+		// treated a link to a directory as a directory and emptied the target
+		// (Codex round-17 P1). Links are now handled at the one entry both
+		// deleters are reached through, so this is the round-16 case with the
+		// transport left ON — and the stub mirrors core's walk-through.
+		$target = sys_get_temp_dir() . '/sa-checkout-t-' . getmypid();
+		mkdir( $target . '/inc', 0777, true );
+		file_put_contents( $target . '/main.php', 'ORIGINAL' );
+		file_put_contents( $target . '/inc/lib.php', 'SHARED' );
+		unlink( $this->dir . '/main.php' );
+		rmdir( $this->dir );
+		symlink( $target, $this->dir );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertSame( 'SHARED', @file_get_contents( $target . '/inc/lib.php' ), 'the symlink target was deleted through' );
+			$this->assertFalse( is_link( $this->dir ), 'the link itself was left standing' );
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertSame( 'ORIGINAL', @file_get_contents( $this->dir . '/main.php' ) );
+		} finally {
+			if ( is_link( $this->dir ) ) {
+				unlink( $this->dir );
+			}
+			foreach ( array( $this->dir, $target ) as $d ) {
+				if ( is_dir( $d ) && ! is_link( $d ) ) {
+					foreach ( array( '/inc/lib.php', '/main.php' ) as $f ) {
+						if ( is_file( $d . $f ) ) {
+							unlink( $d . $f );
+						}
+					}
+					if ( is_dir( $d . '/inc' ) ) {
+						rmdir( $d . '/inc' );
+					}
+				}
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
+
+	public function test_a_restore_with_a_transport_does_not_delete_through_a_symlinked_subdirectory(): void {
+		// The same walk-through, one level down: a linked SUBDIRECTORY left in
+		// place at restore time is deleted through by core's transport. The link
+		// is stripped before any deleter runs; the archive (round 15) already
+		// holds the target's contents, so the restore brings the code back as a
+		// real directory and the target is untouched.
+		$target = $this->dir . '/real-sub';
+		mkdir( $target, 0777, true );
+		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
+		symlink( $target, $this->dir . '/linked' );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+			file_put_contents( $this->dir . '/main.php', 'BROKEN' );
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $target . '/inner.php' ), 'the linked subdirectory was deleted through' );
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertFalse( is_link( $this->dir . '/linked' ) );
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $this->dir . '/linked/inner.php' ) );
+			$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+		} finally {
+			if ( is_link( $this->dir . '/linked' ) ) {
+				unlink( $this->dir . '/linked' );
+			} elseif ( is_dir( $this->dir . '/linked' ) ) {
+				if ( is_file( $this->dir . '/linked/inner.php' ) ) {
+					unlink( $this->dir . '/linked/inner.php' );
+				}
+				rmdir( $this->dir . '/linked' );
+			}
+			if ( is_file( $target . '/inner.php' ) ) {
+				unlink( $target . '/inner.php' );
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
+
+	public function test_a_link_that_cannot_be_removed_stops_the_restore_before_any_deleter_runs(): void {
+		// Stripping links at the entry (round 17) assumed the unlink worked. With
+		// the plugin directory read-only to PHP and the link's target writable,
+		// the unlink fails quietly, the link stays, and the transport deleter
+		// then walks through it and empties the target before the root deletion
+		// fails (Codex round-18 P1). A link that is still there is a reason to
+		// stop, not a detail to proceed past.
+		$target = $this->dir . '/real-sub';
+		mkdir( $target, 0777, true );
+		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
+		symlink( $target, $this->dir . '/linked' );
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+		chmod( $this->dir, 0555 );
+		if ( @file_put_contents( $this->dir . '/probe', 'x' ) !== false ) {
+			chmod( $this->dir, 0777 );
+			unlink( $this->dir . '/probe' );
+			unlink( $this->dir . '/linked' );
+			unlink( $target . '/inner.php' );
+			rmdir( $target );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $target . '/inner.php' ), 'the target was deleted through a link that could not be removed' );
+			$this->assertFalse( $res['success'] );
+			$this->assertStringContainsString( 'Could not remove', $res['error'] );
+			$this->assertTrue( is_link( $this->dir . '/linked' ) );
+		} finally {
+			chmod( $this->dir, 0777 );
+			if ( is_link( $this->dir . '/linked' ) ) {
+				unlink( $this->dir . '/linked' );
+			} elseif ( is_dir( $this->dir . '/linked' ) ) {
+				if ( is_file( $this->dir . '/linked/inner.php' ) ) {
+					unlink( $this->dir . '/linked/inner.php' );
+				}
+				rmdir( $this->dir . '/linked' );
+			}
+			if ( is_file( $target . '/inner.php' ) ) {
+				unlink( $target . '/inner.php' );
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
+
+	public function test_a_restore_whose_traversal_throws_comes_out_as_a_failed_restore_not_an_exception(): void {
+		// The link strip at the deletion entry walks the tree with
+		// RecursiveDirectoryIterator, which throws on a subdirectory PHP cannot
+		// read. Nothing above it caught that, so the self-update request died
+		// during recovery instead of returning `rolled_back: false` with a
+		// `restore_error` (Codex round-19 P1) — the backup side's round-6 lesson,
+		// unlearnt on the restore side.
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+		$sub = $this->dir . '/locked';
+		mkdir( $sub, 0777, true );
+		file_put_contents( $sub . '/inner.php', '<?php' );
+		chmod( $sub, 0000 );
+		if ( @scandir( $sub ) !== false ) {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/inner.php' );
+			rmdir( $sub );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+			$this->assertFalse( $res['success'] );
+			$this->assertStringContainsString( 'Could not remove', $res['error'] );
+			$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ), 'nothing was deleted' );
+		} finally {
+			chmod( $sub, 0777 );
+			if ( is_file( $sub . '/inner.php' ) ) {
+				unlink( $sub . '/inner.php' );
+			}
+			if ( is_dir( $sub ) ) {
+				rmdir( $sub );
+			}
+		}
+	}
+
+	public function test_the_opcache_sweep_survives_a_subtree_it_cannot_read(): void {
+		// The same iterator, after a restore that already SUCCEEDED: a throw here
+		// would turn a completed rollback into a dead request. The sweep is
+		// best-effort by contract, so it returns — whatever it managed to see
+		// before the throw, which depends on listing order and is not asserted.
+		$sub = $this->dir . '/locked';
+		mkdir( $sub, 0777, true );
+		file_put_contents( $sub . '/hidden.php', '<?php' );
+		file_put_contents( $this->dir . '/visible.php', '<?php' );
+		chmod( $sub, 0000 );
+		if ( @scandir( $sub ) !== false ) {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/hidden.php' );
+			rmdir( $sub );
+			unlink( $this->dir . '/visible.php' );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$m = new ReflectionMethod( Aura_Worker_Rollback::class, 'php_files_under' );
+			$m->setAccessible( true );
+			$found = $m->invoke( new Aura_Worker_Rollback(), $this->dir );
+			$this->assertIsArray( $found, 'the sweep must return, not throw' );
+		} finally {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/hidden.php' );
+			rmdir( $sub );
+			unlink( $this->dir . '/visible.php' );
+		}
+	}
+
+	public function test_path_containment_is_blind_to_the_separator(): void {
+		// realpath() answers with backslashes on Windows; a containment check
+		// appending '/' to the root classified every INTERNAL link as external,
+		// so such installs always got `backed_up: false` (Codex round-24 P2).
+		$m = new ReflectionMethod( Aura_Worker_Rollback::class, 'path_is_inside' );
+		$m->setAccessible( true );
+
+		$this->assertTrue( $m->invoke( null, 'C:\\plugins\\siteagent\\shared', 'C:\\plugins\\siteagent' ) );
+		$this->assertTrue( $m->invoke( null, 'C:\\plugins\\siteagent\\shared', 'C:/plugins/siteagent' ), 'mixed separators, same tree' );
+		$this->assertTrue( $m->invoke( null, '/p/siteagent', '/p/siteagent' ), 'the root itself is inside' );
+		$this->assertFalse( $m->invoke( null, 'C:\\plugins\\siteagent-evil\\x', 'C:\\plugins\\siteagent' ), 'a sibling with the root as prefix is NOT inside' );
+		$this->assertFalse( $m->invoke( null, '/home/user/secrets', '/p/siteagent' ) );
+	}
+
+	public function test_two_backups_in_the_same_second_never_share_a_file(): void {
+		// The filename was the slug plus a one-second timestamp, and the archive
+		// opens with OVERWRITE — so the approved backup tool starting beside a
+		// self-update's automatic backup in the same second wrote the same path,
+		// and the later close replaced the recovery archive after installation
+		// had begun (Codex round-25 P2). Each backup owns a per-operation suffix.
+		$rollback = new Aura_Worker_Rollback();
+		$a = $rollback->backup_plugin( $this->slug );
+		$b = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $a['success'] && $b['success'] );
+
+		$pattern = '/_' . preg_quote( gmdate( 'Y-m-d_' ), '/' ) . '\\d{2}-\\d{2}-\\d{2}-[0-9a-f]{8}\\.zip$/';
+		$this->assertMatchesRegularExpression( $pattern, $a['backup_path'], 'the name must carry a per-operation suffix, not the second alone' );
+		$this->assertNotSame( $a['backup_path'], $b['backup_path'] );
+		$this->assertFileExists( $a['backup_path'] );
+		$this->assertFileExists( $b['backup_path'] );
+
+		$listed = $rollback->list_backups( $this->slug );
+		$this->assertCount( 2, $listed, 'list_backups must still recognise the suffixed names' );
+		$this->assertSame( $this->slug, $listed[0]['plugin_slug'] );
+	}
+}

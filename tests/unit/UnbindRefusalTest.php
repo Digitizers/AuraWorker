@@ -327,8 +327,14 @@ final class UnbindRefusalTest extends TestCase {
 	 */
 	public function test_the_route_table_is_built_from_the_only_entry_point_that_registers_routes(): void {
 		$found = self::rest_api_init_registrations();
+		// Three, not two, since #78: the API and MCP route registrars, plus the
+		// boot beacon (`Aura_Worker_Updater::emit_boot_beacon`, PHP_INT_MAX) —
+		// not a registrar, but a `rest_api_init` hook all the same, and this
+		// count exists so that adding one is a conscious act. It was first
+		// hooked from the entry file, which this scan cannot see; the failure
+		// here is what moved it into init(), where it is also testable.
 		$this->assertSame(
-			array( 'includes/class-aura-worker.php' => 2 ),
+			array( 'includes/class-aura-worker.php' => 3 ),
 			$found,
 			"the plugin's rest_api_init registrations changed. They must all live in the file sa_build_route_table() runs, AND the build must actually reach them — a registrar behind is_admin(), defined() or class_exists() sits in the right file and still never executes, so its routes are invisible to every assertion in this class. Add it to Aura_Worker::init()'s unconditional body, or teach sa_build_route_table()/this test to build with that condition true. (A hook name held in a constant or variable is invisible to this scan entirely.)"
 		);
@@ -359,7 +365,7 @@ final class UnbindRefusalTest extends TestCase {
 		$this->assertSame(
 			array(
 				'includes/aaa_legacy/class-aura-worker.php' => 1,
-				'includes/class-aura-worker.php'            => 2,
+				'includes/class-aura-worker.php'            => 3,
 			),
 			$found,
 			'the scan lost a registrar to a shared basename — its completeness guarantee is void'

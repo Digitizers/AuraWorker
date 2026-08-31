@@ -16,6 +16,11 @@
  *   $GLOBALS['_admins']        — get_users() administrator IDs
  *   $GLOBALS['_current_user']  — last wp_set_current_user() id
  *   $GLOBALS['_did_actions']   — do_action() call log
+ *   $GLOBALS['_install_result'] — Plugin_Upgrader::install() return (default true)
+ *   $GLOBALS['_install_effect'] — callable run inside install(), to mutate files
+ *   $GLOBALS['_http_responses_by_url'] — substring => response, for multi-probe code
+ *   $GLOBALS['_wp_filesystem_unavailable'] — WP_Filesystem() fails, $wp_filesystem null
+ *   $GLOBALS['_wp_mkdir_p_throws'] — wp_mkdir_p() throws instead of returning
  *
  * @package Aura_Worker\Tests
  */
@@ -1270,6 +1275,11 @@ if ( ! function_exists( 'apply_filters' ) ) {
 
 if ( ! function_exists( 'wp_mkdir_p' ) ) {
 	function wp_mkdir_p( string $dir ): bool {
+		// `_wp_mkdir_p_throws` models recovery setup that ENDS the request rather
+		// than reporting failure — the case a caller's try/catch continues past.
+		if ( ! empty( $GLOBALS['_wp_mkdir_p_throws'] ) ) {
+			throw new RuntimeException( 'wp_mkdir_p refused: ' . $dir );
+		}
 		return is_dir( $dir ) || mkdir( $dir, 0777, true );
 	}
 }
@@ -1288,6 +1298,14 @@ if ( ! function_exists( 'wp_delete_file' ) ) {
 if ( ! function_exists( 'WP_Filesystem' ) ) {
 	function WP_Filesystem() {
 		global $wp_filesystem;
+		// `_wp_filesystem_unavailable` models a site where no transport
+		// initialises (FTP/SSH credentials not in wp-config): core returns
+		// false and leaves $wp_filesystem null. Code that dereferences it
+		// without checking fatals there — which is what a test needs to see.
+		if ( ! empty( $GLOBALS['_wp_filesystem_unavailable'] ) ) {
+			$wp_filesystem = null;
+			return false;
+		}
 		if ( ! $wp_filesystem ) {
 			$wp_filesystem = new SA_Test_Filesystem();
 		}
@@ -1402,6 +1420,15 @@ if ( ! function_exists( 'wp_clean_plugins_cache' ) ) {
 
 if ( ! function_exists( 'get_plugin_data' ) ) {
 	function get_plugin_data( $plugin_file, $markup = true, $translate = true ) {
+		// Read the header out of the FILE, the way WordPress does. A constant
+		// 'unknown' cannot express "the old build is back on disk", which is the
+		// post-condition a rollback is now held to.
+		if ( is_string( $plugin_file ) && file_exists( $plugin_file ) ) {
+			$head = (string) file_get_contents( $plugin_file );
+			if ( preg_match( '/^[ \t\/*#@]*Version:\s*(.+)$/mi', $head, $m ) ) {
+				return array( 'Version' => trim( $m[1] ) );
+			}
+		}
 		return array( 'Version' => 'unknown' );
 	}
 }
@@ -1437,7 +1464,13 @@ if ( ! class_exists( 'Plugin_Upgrader' ) ) {
 
 		public function install( $package, $args = array() ) {
 			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::install';
-			return true;
+			// `_install_effect` lets a test act on the filesystem the way a real
+			// install does (replace the plugin directory), so a rollback can be
+			// asserted on CONTENT rather than on a return value.
+			if ( isset( $GLOBALS['_install_effect'] ) && is_callable( $GLOBALS['_install_effect'] ) ) {
+				call_user_func( $GLOBALS['_install_effect'] );
+			}
+			return $GLOBALS['_install_result'] ?? true;
 		}
 	}
 }
@@ -1861,6 +1894,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( '' !== $this->last_error ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
+			}
+			// The liveness probe Aura_Worker_Health::check_db_connection() issues.
+			// A reachable database answers '1' — a string, which is what the
+			// production comparison (`=== '1'`) is written against. Honouring
+			// `_sa_wpdb_error` above means a test can still make the database
+			// look broken; this branch only says what a WORKING one returns.
+			if ( 'SELECT 1' === trim( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return '1';
 			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
@@ -2407,11 +2449,16 @@ if ( ! class_exists( 'SA_Test_Filesystem' ) ) {
 			if ( false !== $type && ( is_file( $path ) || is_dir( $path ) || is_link( $path ) ) ) {
 				$GLOBALS['_mutations'][] = 'SA_Test_Filesystem::delete';
 			}
-			if ( is_file( $path ) || is_link( $path ) ) {
+			// Mirrors core's symlink behaviour, which is the point of routing the
+			// rollback through here: WP_Filesystem_Direct::delete() asks is_file()
+			// then is_dir() — both FOLLOW a link — so a link to a directory is walked
+			// into and its TARGET emptied, and the rmdir on the link itself then
+			// fails. Only a dangling link (neither file nor dir) is unlinked as such.
+			if ( is_file( $path ) ) {
 				return @unlink( $path );
 			}
 			if ( ! is_dir( $path ) ) {
-				return false;
+				return is_link( $path ) ? @unlink( $path ) : false;
 			}
 			$items = array_diff( scandir( $path ), array( '.', '..' ) );
 			foreach ( $items as $item ) {
@@ -2638,6 +2685,7 @@ if ( ! function_exists( 'has_post_thumbnail' ) ) {
 // Load the classes under test
 // ---------------------------------------------------------------------------
 
+require_once SA_PLUGIN_DIR . '/includes/boot-beacon.php';
 require_once SA_PLUGIN_DIR . '/includes/tools/class-tool-base.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-tools.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-security.php';
@@ -2860,6 +2908,18 @@ if ( ! function_exists( 'rawurlencode_deep' ) ) {
 	// no-op helper space reserved
 }
 
+if ( ! function_exists( 'rest_url' ) ) {
+	function rest_url( $path = '' ) {
+		return 'https://example.test/wp-json/' . ltrim( (string) $path, '/' );
+	}
+}
+
+if ( ! function_exists( 'wp_rand' ) ) {
+	function wp_rand( $min = 0, $max = 0 ) {
+		return random_int( (int) $min, (int) $max > 0 ? (int) $max : PHP_INT_MAX );
+	}
+}
+
 if ( ! function_exists( 'wp_remote_get' ) ) {
 	/**
 	 * Recording HTTP stub: returns $GLOBALS['_http_response'] (or a WP_Error
@@ -2872,6 +2932,22 @@ if ( ! function_exists( 'wp_remote_get' ) ) {
 		);
 		if ( ! empty( $GLOBALS['_http_error'] ) ) {
 			return new WP_Error( 'http_request_failed', 'stubbed failure' );
+		}
+		// `_http_effect` models the FRESH PROCESS a loopback request starts:
+		// whatever the new build would do on boot (write its beacon, or not)
+		// happens here, at request time — not at install time, which is the
+		// wrong moment and was the round-8 finding.
+		if ( isset( $GLOBALS['_http_effect'] ) && is_callable( $GLOBALS['_http_effect'] ) ) {
+			call_user_func( $GLOBALS['_http_effect'], $url );
+		}
+		// Per-URL responses, matched by substring, for code that probes more
+		// than one endpoint in a single operation (the self-update verdict asks
+		// an Aura REST route, a core REST route and the home page, and has to
+		// tell their answers apart). Falls back to the single `_http_response`.
+		foreach ( (array) ( $GLOBALS['_http_responses_by_url'] ?? array() ) as $needle => $resp ) {
+			if ( false !== strpos( $url, (string) $needle ) ) {
+				return $resp;
+			}
 		}
 		return $GLOBALS['_http_response'] ?? array(
 			'response' => array( 'code' => 200 ),

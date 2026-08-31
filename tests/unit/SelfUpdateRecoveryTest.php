@@ -1,0 +1,913 @@
+<?php
+/**
+ * Self-update failure recovery (SiteAgent #77 / PR #78).
+ *
+ * `self_update()` used to download, verify, overwrite and reactivate — with no
+ * backup, no verification that the site still booted, and nothing to restore.
+ *
+ * The verdict is a FACT the new build writes, not an inference. Four review
+ * rounds found a case where every inferential signal lies (a cached home page,
+ * a 401 that means two different things, a 500 vs a 404 control, a log tail
+ * that is too short or the wrong file). So the updater leaves a nonce, makes
+ * one uncacheable request, and reads `aura_worker_boot`, which the new build
+ * writes as the last line of its own init. These tests simulate the new build
+ * by writing that beacon (or not) from the install effect.
+ *
+ * Breakage is a fact too: a shutdown handler in the dying process records a
+ * fatal in one of this plugin's files against the same nonce (the "fatal
+ * beacon"). The error-log scanner that preceded it produced review findings in
+ * eight of ten rounds and is gone. These tests simulate the fatal beacon the
+ * way the probe request would produce it: from `_http_effect`, via
+ * `aura_worker_record_fatal_beacon()`, with a file path under the plugin dir.
+ *
+ * Rollback is held to a post-condition: the plugin header on disk must read
+ * the version we came from.
+ *
+ * @package Aura_Worker\Tests
+ */
+
+use PHPUnit\Framework\TestCase;
+
+final class SelfUpdateRecoveryTest extends TestCase {
+
+	private string $slug = 'digitizer-site-worker';
+	private string $dir;
+
+	protected function setUp(): void {
+		$this->dir = WP_PLUGIN_DIR . '/' . $this->slug;
+		$this->rmdir( $this->dir );
+		mkdir( $this->dir, 0777, true );
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'OLD BUILD', AURA_WORKER_VERSION ) );
+
+		$GLOBALS['_mutations']      = array();
+		// Remove any beacon or nonce a previous test left, through the stub's OWN
+		// delete path: it keeps a row store beside `_options`, and clearing only
+		// `_options` let a stale beacon leak into the next test — which then
+		// read "stale beacon" for a build that had written nothing.
+		delete_option( 'aura_worker_boot' );
+		foreach ( array_keys( $GLOBALS['_options'] ?? array() ) as $k ) {
+			if ( 0 === strpos( (string) $k, 'aura_worker_boot_fatal' ) ) {
+				delete_option( $k );
+			}
+		}
+		delete_option( 'aura_worker_boot_nonce' );
+		delete_option( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+		// A deleted option is listed in `notoptions` and short-circuits get_option
+		// until something writes it again; clear that too so absence is absence.
+		$GLOBALS['_notoptions']     = array();
+		$GLOBALS['_wp_http_calls']  = array();
+		$GLOBALS['_http_error']     = false;
+		$GLOBALS['_http_response']         = array( 'response' => array( 'code' => 401 ), 'body' => '{}' );
+		$GLOBALS['_http_responses_by_url'] = array();
+		$GLOBALS['_install_result'] = true;
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( true );
+		};
+	}
+
+	protected function tearDown(): void {
+		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'], $GLOBALS['_http_error'], $GLOBALS['_http_effect'] );
+		delete_option( 'aura_worker_boot' );
+		foreach ( array_keys( $GLOBALS['_options'] ?? array() ) as $k ) {
+			if ( 0 === strpos( (string) $k, 'aura_worker_boot_fatal' ) ) {
+				delete_option( $k );
+			}
+		}
+		delete_option( 'aura_worker_boot_nonce' );
+		delete_option( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+		$this->rmdir( $this->dir );
+		foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+			unlink( $f );
+		}
+	}
+
+	private function rmdir( string $d ): void {
+		if ( ! is_dir( $d ) ) {
+			return;
+		}
+		foreach ( scandir( $d ) as $f ) {
+			if ( '.' === $f || '..' === $f ) {
+				continue;
+			}
+			$p = $d . '/' . $f;
+			is_dir( $p ) ? $this->rmdir( $p ) : unlink( $p );
+		}
+		rmdir( $d );
+	}
+
+	/** A plugin file with a real Version header, the way WordPress reads it. */
+	private function build( string $marker, string $version, ?string $constant = null ): string {
+		$constant = $constant ?? $version;
+		return "<?php\n/**\n * Plugin Name: SiteAgent\n * Version: {$version}\n */\ndefine( 'AURA_WORKER_VERSION', '{$constant}' );\n// {$marker}\n";
+	}
+
+	/** The marker inside the plugin file on disk — OLD BUILD or NEW BUILD. */
+	private function onDisk(): string {
+		$f = $this->dir . '/digitizer-site-worker.php';
+		if ( ! is_file( $f ) ) {
+			return '';
+		}
+		return preg_match( '/(OLD BUILD|NEW BUILD)/', (string) file_get_contents( $f ), $m ) ? $m[1] : '';
+	}
+
+	/**
+	 * What a real install does, then what the NEW build's own init would do on
+	 * the loopback request: write the beacon echoing the nonce the updater left.
+	 * `$boots = false` models a build that installs cleanly and fatals on load —
+	 * files on disk, no beacon.
+	 */
+	private function installNewBuild( bool $boots, string $version = '9.9.9' ): void {
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', $version ) );
+		// The beacon is written by the fresh process the LOOPBACK starts, not by
+		// the install. Modelling it at install time was the round-8 finding: at
+		// that moment the OLD build is what any request runs.
+		$GLOBALS['_http_effect'] = $boots
+			? function () use ( $version ) { Aura_Worker_Updater::write_boot_beacon( $version ); }
+			: null;
+	}
+
+	/**
+	 * What the dying process records when a fatal in OUR code ends the probe
+	 * request: the fatal beacon. Runs from `_http_effect`, i.e. at request time
+	 * with the nonce armed — the only moment it can be written.
+	 */
+	private function diedInOurCode(): void {
+		$dir = $this->dir;
+		$GLOBALS['_http_effect'] = function () use ( $dir ) {
+			aura_worker_record_fatal_beacon(
+				array( 'type' => E_ERROR, 'file' => $dir . '/includes/x.php', 'line' => 1, 'message' => 'Uncaught Error: boom' ),
+				'9.9.9',
+				$dir . '/'
+			);
+		};
+	}
+
+	/** An install whose build does not come up: no boot beacon, and a fatal beacon. */
+	private function brokenBuild(): void {
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+			$this->diedInOurCode();
+		};
+	}
+
+	private function selfUpdate(): array {
+		$updater = new Aura_Worker_Updater();
+		return $updater->self_update( 'https://github.com/Digitizers/SiteAgent/releases/download/v9.9.9/x.zip' );
+	}
+
+	public function test_a_healthy_update_keeps_the_new_build_and_reports_its_backup(): void {
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['backed_up'] );
+		$this->assertTrue( $res['health_checked'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
+
+	public function test_a_build_that_breaks_the_site_is_rolled_back(): void {
+		$this->brokenBuild();
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertFalse( $res['healthy'] );
+		// The only claim that matters: the previous build is back on disk.
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_build_whose_header_and_constant_disagree_is_a_failed_install(): void {
+		// Codex round-13: the beacon writers name the build by AURA_WORKER_VERSION;
+		// the verdict looks records up by the header. If they differ, the records
+		// are written under one name and read under another — nothing found,
+		// inconclusive, broken build left standing. Malformed build: restored.
+		$GLOBALS['_install_effect'] = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9', '9.9.8' ) );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertStringContainsString( 'disagree', $res['error'] );
+	}
+
+	public function test_a_build_with_no_constant_at_all_is_a_failed_install(): void {
+		$GLOBALS['_install_effect'] = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', "<?php\\n/**\\n * Plugin Name: SiteAgent\\n * Version: 9.9.9\\n */\\n// NEW BUILD\\n" );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+	}
+
+	public function test_a_fatal_recorded_BY_this_update_rolls_it_back(): void {
+		// The build installs, the probe request dies in our code, the dying
+		// process records it. Positive evidence of breakage; restored.
+		$this->brokenBuild();
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertSame( 'fail', $res['health']['checks']['fatal_beacon']['status'] );
+	}
+
+	public function test_an_install_that_fails_partway_is_rolled_back(): void {
+		// `install()` with overwrite_package deletes before it writes, so a
+		// failure can leave the directory incomplete. This is the case the
+		// backup most exists for.
+		$GLOBALS['_install_result'] = false;
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_wp_error_install_is_rolled_back_too(): void {
+		$GLOBALS['_install_result'] = new WP_Error( 'fs', 'filesystem exploded' );
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_an_unbackable_site_still_updates_and_says_it_had_no_way_back(): void {
+		// The #472 lesson, applied here: refusing would be safer for this one
+		// site and would make every site without a usable backup directory
+		// permanently un-updatable — a gate that can never pass. So the update
+		// proceeds and the result records that it was unrecoverable.
+		$backups = WP_CONTENT_DIR . '/aura-backups';
+		foreach ( glob( $backups . '/*.zip' ) ?: array() as $f ) {
+			unlink( $f );
+		}
+		// Make the backup impossible: no source directory to archive. The default
+		// install effect writes INTO that directory, so it has to go too —
+		// otherwise the test fails on its own fixture rather than on the
+		// behaviour it is describing.
+		$this->rmdir( $this->dir );
+		$GLOBALS['_install_effect'] = function () {
+			mkdir( $this->dir, 0777, true );
+			$this->installNewBuild( true );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['backed_up'] );
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['rolled_back'] );
+	}
+
+	public function test_a_restore_that_cannot_write_is_not_reported_as_a_rollback(): void {
+		// `extractTo()` returns false when the PHP process cannot write to
+		// WP_PLUGIN_DIR — the ordinary case being a site that updates over
+		// FTP/SSH. Reporting `rolled_back: true` there tells an operator the
+		// site was recovered when the plugin may be missing (Codex round-1 P1).
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+			$this->diedInOurCode();
+			// Corrupt the only backup so extraction cannot succeed.
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				file_put_contents( $f, 'not a zip' );
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertNotNull( $res['restore_error'] );
+	}
+
+	public function test_a_failed_restore_does_not_claim_in_its_MESSAGE_that_it_rolled_back(): void {
+		// The fields said `rolled_back: false` while the human-facing `error`
+		// still said the site "was rolled back" (Codex round-2 P2). A dashboard
+		// showing only the message told an operator the site had recovered while
+		// it was still carrying the broken build.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+			$this->diedInOurCode();
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				file_put_contents( $f, 'not a zip' );
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertStringNotContainsString( 'was rolled back', $res['error'] );
+		$this->assertStringContainsString( 'could not be rolled back', $res['error'] );
+	}
+
+	public function test_a_restore_that_left_the_wrong_build_on_disk_is_not_a_rollback(): void {
+		// The post-condition, and the reason it exists: every step can report
+		// success and the site still be running the broken build. Here the
+		// archive restores but the plugin file it puts back is not the version
+		// we came from, so `rolled_back` must be false however cleanly the
+		// extraction went.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+			$this->diedInOurCode();
+			// Rewrite the backup so it restores a DIFFERENT version.
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				$zip = new ZipArchive();
+				$zip->open( $f, ZipArchive::OVERWRITE );
+				$zip->addFromString(
+					'digitizer-site-worker/digitizer-site-worker.php',
+					$this->build( 'NEW BUILD', '7.7.7' )
+				);
+				$zip->close();
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertFalse( $res['rolled_back'], 'a restore that did not bring back the old version is not a rollback' );
+	}
+
+	public function test_the_verdict_is_the_beacon_the_new_build_wrote(): void {
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['verified'] );
+		$this->assertSame( 'pass', $res['health']['checks']['boot_beacon']['status'] );
+		// The request for a beacon is spent either way.
+		$this->assertFalse( isset( $GLOBALS['_options']['aura_worker_boot_nonce'] ) );
+	}
+
+	public function test_a_build_that_installs_but_never_boots_is_rolled_back(): void {
+		// Files on disk, loopback answered (so the request reached the site),
+		// no beacon: the build did not come up. This is the case the whole
+		// feature exists for, and the one every inferential probe got wrong
+		// somewhere.
+		$this->brokenBuild();
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_beacon_left_by_an_EARLIER_boot_does_not_count(): void {
+		// A stale beacon with some other nonce is exactly what a "did it boot"
+		// check must not be fooled by — the previous build booted; this one
+		// did not.
+		$GLOBALS['_options']['aura_worker_boot'] = array( 'version' => '9.9.9', 'nonce' => 'from-last-time' );
+		// Neither boots nor dies: nothing of ours is written for THIS nonce.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		// Not verified, and — with no fatal recorded either — inconclusive
+		// rather than rolled back: a stale beacon is not evidence of anything.
+		$this->assertFalse( $res['verified'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'stale beacon', $res['health']['checks']['boot_beacon']['detail'] );
+	}
+
+	public function test_a_beacon_from_the_WRONG_version_does_not_count(): void {
+		// The nonce matches but the build that answered is not the one we
+		// installed — an OPcache still serving the old files would look like this.
+		$GLOBALS['_install_effect'] = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			// The loopback is answered by the OLD version (OPcache still serving it).
+			$GLOBALS['_http_effect'] = function () { Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION ); };
+		};
+
+		$res = $this->selfUpdate();
+
+		// Not verified — the wrong build answered. And with no attributed fatal
+		// it is inconclusive rather than rolled back: absence of the right
+		// beacon is not positive evidence of breakage.
+		$this->assertFalse( $res['verified'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'a different build answered', $res['health']['checks']['boot_beacon']['detail'] );
+	}
+
+	public function test_no_beacon_and_no_attributed_fatal_is_inconclusive_and_the_update_stands(): void {
+		// Files installed, loopback answered 200, no beacon, nothing in the log
+		// naming this plugin. Two very different worlds look exactly like this
+		// from inside the site — a CDN/WAF/proxy that answered before WordPress
+		// ran, or a build that fatals on load with error logging off — and no
+		// external signal tells them apart (five review rounds tried). Rolling
+		// back here would make every edge-fronted site permanently
+		// un-updatable, so the update stands and is reported UNVERIFIED. The
+		// second world is the stated residual: the pre-#78 exposure, now
+		// visible in the update log rather than invisible.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['verified'] );
+		$this->assertTrue( $res['health']['inconclusive'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
+
+	public function test_an_edge_answering_before_WordPress_does_not_cause_a_rollback(): void {
+		// Codex round-5 P1: a 301 canonical redirect or a 403 challenge from a
+		// CDN/WAF is an HTTP response with no PHP behind it. "We got a response"
+		// must not be read as "PHP ran".
+		$GLOBALS['_http_response'] = array( 'response' => array( 'code' => 301 ), 'body' => '' );
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertTrue( $res['health']['inconclusive'] );
+	}
+
+	public function test_a_site_that_cannot_reach_itself_is_inconclusive_not_rolled_back(): void {
+		$GLOBALS['_http_error'] = true;
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['verified'] );
+		$this->assertFalse( $res['rolled_back'] );
+	}
+
+	public function test_ANOTHER_plugins_fatal_is_not_recorded_against_this_verdict(): void {
+		// The probe request boots our build, then some other plugin dies. The
+		// shutdown handler sees a fatal whose file is not under our directory
+		// and records nothing; the boot beacon stands.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => WP_PLUGIN_DIR . '/some-other-plugin/x.php', 'line' => 1, 'message' => 'theirs' ),
+					'9.9.9',
+					$dir . '/'
+				);
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['verified'] );
+	}
+
+	public function test_an_archive_that_lost_its_main_file_is_a_failed_install_and_is_restored(): void {
+		// Codex round-7 P1: Plugin_Upgrader accepts an archive whose main file
+		// was renamed — some other PHP file has a valid header — while the
+		// active-plugin entry still names the missing one. Nothing of ours loads
+		// on the loopback, so there is no beacon and no attributed fatal; the
+		// verdict would call that inconclusive and let a headless install stand.
+		// The main file's header is an on-disk FACT, so it is checked before the
+		// verdict is even asked.
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+			file_put_contents( $this->dir . '/renamed-main.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		// A clean rollback leaves nothing the broken release added: the restore
+		// removes the directory and re-extracts the backup, so the stray file
+		// must be gone. (The first version of this test tried to unlink it as
+		// cleanup and failed on PHP 7.4 — because the rollback had already done
+		// the job the test was about.)
+		$this->assertFileDoesNotExist( $this->dir . '/renamed-main.php' );
+	}
+
+	public function test_the_OLD_build_cannot_consume_the_nonce_during_the_install(): void {
+		// Codex round-8 P1: while install() runs, other requests are still
+		// served by the old build. If the nonce were armed before the install,
+		// one of them would write a beacon with the OLD version and delete the
+		// nonce — and a broken new build would read as "stale beacon" rather
+		// than "no beacon". The nonce must not exist until the install is done.
+		$GLOBALS['_install_effect'] = function () {
+			// A concurrent request on the old build, mid-install.
+			Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION );
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertSame( 'no beacon written', $res['health']['checks']['boot_beacon']['detail'] );
+		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
+	}
+
+	public function test_an_OLD_build_dying_after_the_nonce_was_armed_does_not_roll_back_a_healthy_new_build(): void {
+		// Codex round-11: a request that loaded the old build before the install
+		// can still be running when the nonce is armed, and die in old code. Its
+		// fatal record names the OLD version, so it is not about the build under
+		// verdict, and the new build's clean boot stands.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/old.php', 'line' => 1, 'message' => 'straggler' ),
+					AURA_WORKER_VERSION, // the OLD build died
+					$dir . '/'
+				);
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['verified'] );
+	}
+
+	public function test_a_fatal_recorded_BEFORE_a_clean_boot_on_another_request_still_rolls_back(): void {
+		// Codex round-11: two records with two owners, so the boot write cannot
+		// replace the fatal however the two requests interleave. Precedence is
+		// decided when the verdict reads, not when either writes.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/x.php', 'line' => 1, 'message' => 'died first' ),
+					'9.9.9',
+					$dir . '/'
+				);
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' ); // a second, clean request, later
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+	}
+
+	public function test_an_OLD_build_dying_AFTER_the_new_build_died_does_not_erase_the_evidence(): void {
+		// Codex round-12: with one shared fatal record, the straggler's later
+		// death (old version) overwrote the new build's, the verdict ignored the
+		// old-version record, and a build that had died after boot was reported
+		// healthy. One record per version: both deaths are kept, and the verdict
+		// reads the new build's.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/x.php', 'line' => 1, 'message' => 'new build died' ),
+					'9.9.9',
+					$dir . '/'
+				);
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/old.php', 'line' => 1, 'message' => 'straggler died later' ),
+					AURA_WORKER_VERSION,
+					$dir . '/'
+				);
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+	}
+
+	public function test_a_fatal_AFTER_the_boot_beacon_on_the_same_request_still_rolls_back(): void {
+		// Init completed and the boot beacon was written; then our code died
+		// later in the same request (dispatching the probe). The nonce is still
+		// armed — the updater spends it, not the boot write — so the dying
+		// process upgrades the beacon to fatal. Breakage wins.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/class-aura-worker-api.php', 'line' => 1, 'message' => 'died dispatching' ),
+					'9.9.9',
+					$dir . '/'
+				);
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_failed_install_is_held_to_the_same_post_condition_as_a_failed_boot(): void {
+		// Codex round-4 P1: the install-failure exit trusted restore_plugin()'s
+		// step result while the health-check exit checked the header. Here the
+		// restore "succeeds" but puts back a different version.
+		$GLOBALS['_install_result'] = false;
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				$zip = new ZipArchive();
+				$zip->open( $f, ZipArchive::OVERWRITE );
+				$zip->addFromString( 'digitizer-site-worker/digitizer-site-worker.php', $this->build( 'NEW BUILD', '7.7.7' ) );
+				$zip->close();
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertStringContainsString( 'could NOT be restored', $res['error'] );
+	}
+
+	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {
+		// No directory to back up, so no backup. The install itself lands (a
+		// fresh directory, real main file), the build does not boot, and it dies
+		// in our code — so the VERDICT is what fails, with nothing to restore.
+		$this->rmdir( $this->dir );
+		$GLOBALS['_install_effect'] = function () {
+			mkdir( $this->dir, 0777, true );
+			$this->installNewBuild( false );
+			$this->diedInOurCode();
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertFalse( $res['backed_up'] );
+		$this->assertFalse( $res['rolled_back'] );
+		// Nothing to restore is not the same as nothing wrong — an operator has
+		// to know this one needs hands.
+		$this->assertStringContainsString( 'no backup', strtolower( $res['error'] ) );
+	}
+
+	public function test_a_failed_install_is_rolled_back_even_without_a_filesystem_transport(): void {
+		// ZipArchive writes the backup without a WP_Filesystem transport, so on
+		// an FTP/SSH site with no stored credentials the backup exists and the
+		// restore is reached — where the directory-replace step dereferenced
+		// the null $wp_filesystem and fatalled instead of returning the
+		// documented failed-restore result (Codex round-14 P1). The restore has
+		// to complete, not merely fail politely: nothing here needs a transport.
+		$GLOBALS['_install_result'] = false;
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+		};
+		$GLOBALS['_wp_filesystem_unavailable'] = true;
+		$GLOBALS['wp_filesystem'] = null;
+
+		try {
+			$res = $this->selfUpdate();
+		} finally {
+			unset( $GLOBALS['_wp_filesystem_unavailable'] );
+			$GLOBALS['wp_filesystem'] = null;
+		}
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'], (string) ( $res['restore_error'] ?? '' ) );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_recovery_setup_that_cannot_be_built_does_not_fatal_a_successful_update(): void {
+		// Round 13 wrapped `new Aura_Worker_Rollback()` in try/catch and continued
+		// with null, so a site whose recovery setup ends the request can still
+		// update with `backed_up: false`. The success path then called
+		// `$rollback->cleanup_old_backups()` unconditionally — a fatal AFTER the
+		// plugin was replaced, in place of the result (Codex round-14 P1).
+		// The constructor only creates the directory when it is missing, so it
+		// has to be GONE — recursively: the snapshot tests leave a subdirectory
+		// in it, and a flat rmdir that fails quietly leaves this test asserting
+		// on a fixture that never took the path it describes.
+		$this->rmdir( WP_CONTENT_DIR . '/aura-backups' );
+		$this->assertDirectoryDoesNotExist( WP_CONTENT_DIR . '/aura-backups' );
+		$GLOBALS['_wp_mkdir_p_throws'] = true;
+
+		try {
+			$res = $this->selfUpdate();
+		} finally {
+			unset( $GLOBALS['_wp_mkdir_p_throws'] );
+		}
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['backed_up'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
+
+	public function test_a_second_self_update_while_one_is_running_is_refused_without_touching_the_site(): void {
+		// Two overlapping requests shared one nonce option: the second overwrote
+		// it before the first loopback wrote its beacon, so the first verifier
+		// saw a record carrying a nonce it never armed — unrelated, inconclusive,
+		// healthy — and a broken build stood with no rollback (Codex round-20 P1).
+		// One update per site at a time; the loser is told, and does nothing.
+		$holder = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		$this->assertNotSame( '', $holder );
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'already in progress', $res['error'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk(), 'the refused request must not install anything' );
+		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the refused request must not release a claim it does not hold' );
+	}
+
+	public function test_the_claim_is_released_after_a_successful_update_and_the_next_one_runs(): void {
+		$first = $this->selfUpdate();
+		$this->assertTrue( $first['success'] );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'a finished update must let go of the claim' );
+
+		$second = $this->selfUpdate();
+		$this->assertTrue( $second['success'], $second['error'] ?? '' );
+	}
+
+	public function test_the_claim_is_released_after_a_failed_install_too(): void {
+		$GLOBALS['_install_result'] = false;
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'every exit releases the claim, failure included' );
+	}
+
+	public function test_a_claim_left_by_a_request_that_died_does_not_block_updates_for_ever(): void {
+		// A fatal mid-update never reaches `finally`. A holder older than the
+		// takeover window is presumed dead and seized, so a site is never wedged
+		// past that window.
+		update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, 'deadfence|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the seizing request releases what it seized' );
+	}
+
+	public function test_a_request_that_outlived_the_takeover_does_not_release_its_successors_claim(): void {
+		// The round-20 lock released unconditionally. A self-update that ran past
+		// the takeover window was seized by a second request; when the first
+		// reached `finally` it deleted the SECOND's lock, and a third could then
+		// start beside the second — the race the lock exists to prevent (Codex
+		// round-21 P1). Release is fenced on the holder's own value.
+		$successor = '';
+		$GLOBALS['_install_effect'] = function () use ( &$successor ) {
+			$this->installNewBuild( true );
+			// Time passes past the window while this request is still working…
+			$held = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+			$this->assertNotSame( '', $held );
+			$fence = substr( $held, 0, strpos( $held, '|' ) );
+			update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+			// …and another request seizes the stale claim.
+			$successor = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+			$this->assertNotSame( '', $successor, 'the aged claim must be seizable' );
+			$this->assertNotSame( $fence, $successor );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the outlived request removed its successor\'s claim' );
+	}
+
+	public function test_the_claim_is_renewed_between_phases_so_a_live_update_is_never_seizable(): void {
+		// A fixed ten-minute age let a still-live update be seized as stale, and
+		// the fenced release (round 21) only stopped the loser from deleting the
+		// winner's claim — not the two from running side by side (Codex round-22
+		// P1). The lease is renewed before backup, before install and after it;
+		// here the row is aged during the install and must read fresh again by
+		// the time the loopback runs.
+		$seen_at_loopback = null;
+		$GLOBALS['_install_effect'] = function () use ( &$seen_at_loopback ) {
+			$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+			$fence = substr( $held, 0, (int) strpos( $held, '|' ) );
+			update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+			$GLOBALS['_http_effect'] = function () use ( &$seen_at_loopback ) {
+				$seen_at_loopback = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+			};
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertNotNull( $seen_at_loopback );
+		$stamp = (int) substr( $seen_at_loopback, (int) strpos( $seen_at_loopback, '|' ) + 1 );
+		$this->assertGreaterThan( time() - 60, $stamp, 'the lease was not renewed after the install: ' . $seen_at_loopback );
+	}
+
+	public function test_a_package_carrying_the_running_version_is_refused_and_the_old_files_restored(): void {
+		// Records are matched by VERSION. A same-version package makes the new
+		// build and the old one indistinguishable: a request that loaded the
+		// pre-update files and fatals after the nonce is armed writes a record the
+		// verdict would own, and a healthy replacement is rolled back on it (Codex
+		// round-23 P1). Aura never sends one; the plugin refuses it before probing.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( true, AURA_WORKER_VERSION );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'same-version', $res['error'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertSame( array(), $GLOBALS['_wp_http_calls'], 'no probe: there is nothing a probe could tell apart' );
+	}
+
+	public function test_the_generic_single_update_of_siteagent_waits_on_the_same_claim(): void {
+		// `/aura/v1/update/plugin` accepts SiteAgent's own file and replaced it
+		// with no claim taken, so it could land between a self-update's backup,
+		// install and probe (Codex round-23 P1). Another plugin is unaffected.
+		$holder = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		$this->assertNotSame( '', $holder );
+		$updater = new Aura_Worker_Updater();
+
+		$self = $updater->update_plugin( Aura_Worker_Updater::SELF_PLUGIN_FILE );
+
+		$this->assertFalse( $self['success'] );
+		$this->assertTrue( $self['in_progress'] );
+		$this->assertNotContains( 'Plugin_Upgrader::upgrade', $GLOBALS['_mutations'], 'SiteAgent must not have been upgraded while the claim is held' );
+
+		$other = $updater->update_plugin( 'akismet/akismet.php' );
+		$this->assertTrue( $other['success'], 'another plugin is not held up by the self-update claim' );
+		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the refused path must not release the claim' );
+	}
+
+	public function test_the_generic_single_update_of_siteagent_takes_and_releases_the_claim(): void {
+		$res = ( new Aura_Worker_Updater() )->update_plugin( Aura_Worker_Updater::SELF_PLUGIN_FILE );
+		$this->assertTrue( $res['success'] );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the generic path releases what it took' );
+	}
+
+	public function test_the_batch_skips_siteagent_while_a_self_update_holds_the_claim_and_does_the_rest(): void {
+		$holder = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		$this->assertNotSame( '', $holder );
+
+		$out = ( new Aura_Worker_Updater() )->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE, 'akismet/akismet.php' ), 5, false );
+
+		$by = array();
+		foreach ( $out['results'] as $r ) {
+			$by[ $r['plugin'] ] = $r;
+		}
+		$this->assertSame( 'skipped', $by[ Aura_Worker_Updater::SELF_PLUGIN_FILE ]['status'] );
+		$this->assertStringContainsString( 'self-update is in progress', $by[ Aura_Worker_Updater::SELF_PLUGIN_FILE ]['detail'] );
+		$this->assertNotSame( 'skipped', $by['akismet/akismet.php']['status'], 'the rest of the batch runs' );
+		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ) );
+	}
+
+	public function test_a_generic_rollback_of_siteagent_waits_on_the_claim_and_releases_it_after(): void {
+		// `/aura/v2/rollback/digitizer-site-worker` restored these files with no
+		// claim taken (Codex round-24 P1), so it could delete and re-extract the
+		// directory while a locked self-update was backing up, installing or
+		// probing it. Same claim, same busy answer, and the guarded path lets go
+		// of what it took.
+		if ( ! class_exists( 'Aura_Worker_Rollback' ) ) {
+			require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-rollback.php';
+		}
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		$updater = new Aura_Worker_Updater();
+
+		$holder = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		$this->assertNotSame( '', $holder );
+		$busy = $updater->restore_plugin_guarded( $rollback, $this->slug, $backup['backup_path'] );
+		$this->assertFalse( $busy['success'] );
+		$this->assertTrue( $busy['in_progress'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk(), 'a refused rollback must not have touched the files' );
+		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the refused path must not release a claim it does not hold' );
+
+		Aura_Worker_Magic_Link::release_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, $holder );
+		$res = $updater->restore_plugin_guarded( $rollback, $this->slug, $backup['backup_path'] );
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the guarded restore releases what it took' );
+	}
+}
