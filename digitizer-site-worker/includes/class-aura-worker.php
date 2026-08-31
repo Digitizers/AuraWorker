@@ -60,6 +60,17 @@ class Aura_Worker {
 		add_action( 'rest_api_init', array( $this->api, 'register_routes' ) );
 		add_action( 'rest_api_init', array( $this->mcp, 'register_routes' ) );
 
+		// The boot beacon — the fact `self_update()` reads to learn whether the
+		// build it installed came up (#78). LAST on `rest_api_init`, so on the
+		// verdict's probe request it runs only if file load, this init, and both
+		// route registrations above all completed; a fatal anywhere before it
+		// means no beacon, and absence is the verdict. It lives HERE, not in the
+		// entry file, because this method's unconditional body is the one place
+		// the route-table invariant (UnbindRefusalTest) guarantees every
+		// `rest_api_init` registration is visible — and because it makes the
+		// wiring testable: `has_filter()` can see it.
+		add_action( 'rest_api_init', array( 'Aura_Worker_Updater', 'emit_boot_beacon' ), PHP_INT_MAX );
+
 		// Which transport a call arrived on. Recorded before anything dispatches,
 		// because the abilities path has no other way to tell a gateway call from
 		// a co-installed MCP server serving the same ability.

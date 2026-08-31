@@ -34,6 +34,21 @@ final class BootBeaconTest extends TestCase {
 		$this->assertArrayNotHasKey( 'aura_worker_boot_nonce', $GLOBALS['_options'] );
 	}
 
+	public function test_the_beacon_is_hooked_last_on_rest_api_init_by_the_plugins_init(): void {
+		// The wiring, not just the writer. A beacon emitted at plugins_loaded
+		// vouched for a REST API that had not initialized yet (Codex round-9);
+		// it has to run after every route registration on the probe request.
+		$GLOBALS['_filters'] = array();
+		$plugin = new Aura_Worker();
+		$plugin->init();
+
+		$this->assertSame(
+			PHP_INT_MAX,
+			has_filter( 'rest_api_init', array( 'Aura_Worker_Updater', 'emit_boot_beacon' ) ),
+			'the beacon must be registered on rest_api_init at the lowest possible priority'
+		);
+	}
+
 	public function test_a_malformed_nonce_is_treated_as_no_request(): void {
 		update_option( 'aura_worker_boot_nonce', array( 'not', 'a', 'string' ), false );
 

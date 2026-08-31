@@ -569,6 +569,15 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * `rest_api_init` callback: emit the beacon for the build that is running.
+	 * Split from `write_boot_beacon()` so the version comes from the constant
+	 * at call time while the writer stays a pure, testable function.
+	 */
+	public static function emit_boot_beacon() {
+		self::write_boot_beacon( AURA_WORKER_VERSION );
+	}
+
+	/**
 	 * Write the boot beacon — the fact `verify_self_update()` reads.
 	 *
 	 * Called as the LAST line of `aura_worker_init()`, so it runs only if
@@ -577,8 +586,8 @@ class Aura_Worker_Updater {
 	 * database write; echoes the nonce so a beacon from an earlier boot cannot
 	 * satisfy a later verdict.
 	 *
-	 * Lives here, not in the entry file, so it can be unit-tested: the entry
-	 * file defines constants and cannot be required twice.
+	 * Hooked from `Aura_Worker::init()` via `emit_boot_beacon()`, last on
+	 * `rest_api_init`.
 	 *
 	 * @param string $version The version of the build that is now running.
 	 * @return bool Whether a beacon was written.

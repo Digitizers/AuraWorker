@@ -49,42 +49,8 @@ function aura_worker_init() {
 	aura_worker_maybe_upgrade();
 	$plugin = new Aura_Worker();
 	$plugin->init();
-	// The beacon is emitted at the END of this plugin's REST initialization,
-	// not here (Codex round-9 P1). `init()` only REGISTERS the route callbacks
-	// for the later `rest_api_init` hook; a new build that fatals inside
-	// `register_routes` does so after `plugins_loaded` is over, so a beacon
-	// written here would vouch for a REST API that cannot initialize. The
-	// verdict's probe is itself a REST request, so `rest_api_init` fires during
-	// it, and PHP_INT_MAX puts this after every route registration in the
-	// plugin. A fatal anywhere before it — file load, init, either
-	// register_routes — means it never runs.
-	add_action( 'rest_api_init', 'aura_worker_boot_beacon', PHP_INT_MAX );
 }
 
-/**
- * The boot beacon: a positive fact that THIS build came up.
- *
- * `Aura_Worker_Updater::self_update()` has to know whether the build it just
- * installed actually boots, and every way of INFERRING that from the outside —
- * status codes, error-log tails, control paths — turned out to have a case
- * where the signal lies (SiteAgent #78, nine review rounds). So the build says
- * so itself. Hooked LAST on `rest_api_init` (see `aura_worker_init()`): it runs
- * only if loading this plugin's files, `Aura_Worker::init()`, and every route
- * registration all completed on the probe request. Absence is the verdict.
- *
- * Written ONLY when the updater has left a nonce asking for it, so an ordinary
- * request performs no database write. The nonce is echoed back so the verdict
- * can tell a beacon written for THIS install from one left by an earlier boot,
- * without comparing clocks.
- *
- * This wiring is NOT covered by the unit suite — the entry file defines
- * constants and cannot be required twice — which is why the write itself lives
- * in `Aura_Worker_Updater::write_boot_beacon()`, where it is.
- */
-function aura_worker_boot_beacon() {
-	if ( class_exists( 'Aura_Worker_Updater' ) ) {
-		Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION );
-	}
 }
 
 /**
