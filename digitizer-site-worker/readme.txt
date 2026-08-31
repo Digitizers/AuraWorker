@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.13.0
+Stable tag: 2.14.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -249,6 +249,38 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 7. Connections: provider connections (Cloudways, Cloudflare, Bunny, Hostinger, Vultr, xCloud) with resource counts, status, and credential-rotation reminders.
 
 == Changelog ==
+
+= 2.14.0 =
+* Feature: **a self-update can now undo itself.** Before installing, SiteAgent
+  archives its current build — best-effort: a site without ZipArchive or with
+  an unwritable backup directory still updates, and the result says
+  `backed_up: false` so the caller knows this one had no way back. After
+  installing, SiteAgent asks the new build to prove it came up. The proof is
+  written by the build itself: a boot beacon recorded the first time the new
+  code serves a request, and a fatal beacon recorded by
+  a shutdown guard when the new code dies while loading. A build whose own
+  records say it broke is rolled back to the archived one, and compiled
+  copies are asked out of the opcode cache (best-effort — a host that
+  restricts `opcache_invalidate()` may serve the old compiled code until its
+  cache revalidates). The result reports exactly what happened (`backed_up`,
+  `verified`, `rolled_back`). When neither record appears, the update stands
+  and says it was not verified, never guessed.
+* Feature: **one SiteAgent mutation at a time.** Every path that can replace
+  SiteAgent's own files — the self-update, the generic plugin update, a batch
+  entry, the rollback endpoint — runs under a single per-site claim: taken by
+  a conditional insert, seizable only after its holder has gone silent for ten
+  minutes (a request that dies never releases), and released only by its
+  owner. The self-update additionally renews the claim between its phases,
+  so a slow step costs the lease nothing once the next phase begins. An
+  overlapping request is answered "in progress" and touches nothing.
+* Hardening: backups follow a symlink only while its target stays inside the
+  plugin folder — a link pointing out of the tree makes the backup report
+  itself incomplete instead of copying unrelated files into an archive.
+  Restores never delete through a symlink, root or child, and refuse to run at
+  all when a link cannot be removed. A package carrying the version already
+  running is refused, because its boot records could not be told apart from
+  the old build's. Backup filenames carry a per-operation suffix, so two
+  backups started in the same second never overwrite each other.
 
 = 2.13.0 =
 * Feature: **Aura can now disconnect a site in two phases, and the site
