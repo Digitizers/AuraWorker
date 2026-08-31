@@ -1,22 +1,20 @@
 <?php
 /**
- * Self-update failure recovery (SiteAgent #77).
+ * Self-update failure recovery (SiteAgent #77 / PR #78).
  *
  * `self_update()` used to download, verify, overwrite and reactivate — with no
  * backup, no verification that the site still booted, and nothing to restore.
- * `update_plugin_safely()` had given every OTHER plugin that cycle for
- * versions; the plugin that manages the site was the one updated without it.
  *
- * The check that makes this possible is the loopback: `run_health_check()`
- * begins with `wp_remote_get( home_url() )`, a SEPARATE process that loads the
- * new files. An in-process assertion after overwriting the running plugin
- * proves nothing, because the old code is already in memory and keeps
- * answering.
+ * The verdict is a FACT the new build writes, not an inference. Four review
+ * rounds found a case where every inferential signal lies (a cached home page,
+ * a 401 that means two different things, a 500 vs a 404 control, a log tail
+ * that is too short or the wrong file). So the updater leaves a nonce, makes
+ * one uncacheable request, and reads `aura_worker_boot`, which the new build
+ * writes as the last line of its own init. These tests simulate the new build
+ * by writing that beacon (or not) from the install effect.
  *
- * These tests drive the real Aura_Worker_Rollback against a real temp plugin
- * directory, so the zip round trip is exercised rather than mocked, and assert
- * on the CONTENT on disk — the only thing that says a rollback actually
- * happened.
+ * Rollback is held to a post-condition: the plugin header on disk must read
+ * the version we came from.
  *
  * @package Aura_Worker\Tests
  */
@@ -54,16 +52,17 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'OLD BUILD', AURA_WORKER_VERSION ) );
 
 		$GLOBALS['_mutations']      = array();
+		// A deleted option is listed in `notoptions` and short-circuits get_option
+		// until something writes it again; a previous test's spent nonce must
+		// not leak into this one.
+		$GLOBALS['_notoptions']     = array();
 		$GLOBALS['_wp_http_calls']  = array();
 		$GLOBALS['_http_error']     = false;
-		// A healthy site: the registered route refuses an anonymous caller (401)
-		// while an unregistered path under the same namespace 404s. The two
-		// differing is what proves the plugin registered.
-		$GLOBALS['_http_response']         = array( 'response' => array( 'code' => 404 ), 'body' => '{}' );
-		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteUp();
+		$GLOBALS['_http_response']         = array( 'response' => array( 'code' => 401 ), 'body' => '{}' );
+		$GLOBALS['_http_responses_by_url'] = array();
 		$GLOBALS['_install_result'] = true;
 		$GLOBALS['_install_effect'] = function () {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			$this->installNewBuild( true );
 		};
 	}
 
@@ -73,7 +72,8 @@ final class SelfUpdateRecoveryTest extends TestCase {
 			$this->prev_error_log = null;
 		}
 		@unlink( WP_CONTENT_DIR . '/sa-test-error.log' );
-		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'] );
+		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'], $GLOBALS['_http_error'] );
+		unset( $GLOBALS['_options']['aura_worker_boot'], $GLOBALS['_options']['aura_worker_boot_nonce'] );
 		$this->rmdir( $this->dir );
 		foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 			unlink( $f );
@@ -108,22 +108,24 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		return preg_match( '/(OLD BUILD|NEW BUILD)/', (string) file_get_contents( $f ), $m ) ? $m[1] : '';
 	}
 
-	/** Registered route refuses anonymously; an unregistered path 404s. */
-	private function pluginRouteUp(): array {
-		return array(
-			'__aura_probe_absent__' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
-			'aura/v1/status'        => array( 'response' => array( 'code' => 401 ), 'body' => '{"code":"rest_forbidden"}' ),
-			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
-		);
+	/**
+	 * What a real install does, then what the NEW build's own init would do on
+	 * the loopback request: write the beacon echoing the nonce the updater left.
+	 * `$boots = false` models a build that installs cleanly and fatals on load —
+	 * files on disk, no beacon.
+	 */
+	private function installNewBuild( bool $boots, string $version = '9.9.9' ): void {
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', $version ) );
+		if ( $boots ) {
+			Aura_Worker_Updater::write_boot_beacon( $version );
+		}
 	}
 
-	/** The aura route is indistinguishable from an absent one, and core REST works. */
-	private function pluginRouteGone(): array {
-		return array(
-			'__aura_probe_absent__' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
-			'aura/v1/status'        => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
-			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
-		);
+	/** An install whose build does not come up. */
+	private function brokenBuild(): void {
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
 	}
 
 	private function selfUpdate(): array {
@@ -141,74 +143,6 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertSame( 'NEW BUILD', $this->onDisk() );
 	}
 
-	public function test_the_verdict_asks_the_plugins_own_route_and_defeats_caches(): void {
-		// Two properties in one: the probe goes to an aura route (only the NEW
-		// build can answer it, unlike the home page, which proves only that
-		// WordPress renders), and it carries a unique query argument so a
-		// full-page cache or CDN cannot serve it without starting PHP.
-		$this->selfUpdate();
-
-		$urls = array_column( $GLOBALS['_wp_http_calls'], 'url' );
-		$this->assertNotEmpty( $urls );
-		$this->assertStringContainsString( 'aura/v1/status', $urls[0] );
-		$this->assertStringContainsString( 'aura_probe=', $urls[0] );
-	}
-
-	public function test_a_403_refusal_that_differs_from_an_absent_path_proves_registration(): void {
-		$GLOBALS['_http_responses_by_url'] = array(
-			'__aura_probe_absent__' => array( 'response' => array( 'code' => 404 ), 'body' => '{}' ),
-			'aura/v1/status'        => array( 'response' => array( 'code' => 403 ), 'body' => '{}' ),
-			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
-		);
-
-		$this->assertTrue( $this->selfUpdate()['success'] );
-	}
-
-	public function test_a_site_that_denies_anonymous_REST_globally_is_never_rolled_back_on_a_401(): void {
-		// The case a fixed "401/403 means registered" list gets wrong (Codex
-		// round-2 P1). An authentication filter answers 401 for EVERY path, so
-		// the aura route and a path that does not exist are indistinguishable —
-		// this probe has learned nothing and must not claim the plugin is up OR
-		// that it is down.
-		$GLOBALS['_http_responses_by_url'] = array(
-			'__aura_probe_absent__' => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
-			'aura/v1/status'        => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
-			'wp/v2/types'           => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
-		);
-
-		$res = $this->selfUpdate();
-
-		$this->assertTrue( $res['success'], 'inconclusive evidence must not destroy a working install' );
-		$this->assertFalse( $res['rolled_back'] );
-		$this->assertSame( 'NEW BUILD', $this->onDisk() );
-	}
-
-	public function test_a_401_that_an_ABSENT_path_also_returns_is_not_treated_as_registration(): void {
-		// The case that separates the control-comparison from a fixed
-		// "401/403 means registered" list. Anonymous REST demonstrably works
-		// here (core answers 200), yet a path that cannot exist answers 401 just
-		// like the real one — so nothing in the aura namespace is being routed
-		// by this plugin, and a status list would have called that healthy.
-		$GLOBALS['_http_responses_by_url'] = array(
-			'__aura_probe_absent__' => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
-			'aura/v1/status'        => array( 'response' => array( 'code' => 401 ), 'body' => '{}' ),
-			'wp/v2/types'           => array( 'response' => array( 'code' => 200 ), 'body' => '{}' ),
-		);
-
-		$res = $this->selfUpdate();
-
-		$this->assertFalse( $res['success'] );
-		$this->assertTrue( $res['rolled_back'] );
-		$this->assertSame( 'OLD BUILD', $this->onDisk() );
-	}
-
-	public function test_a_build_that_never_registered_is_rolled_back_even_when_REST_denies_anonymously(): void {
-		// Same 401-everywhere site, but core REST proves anonymous REST works.
-		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
-
-		$this->assertTrue( $this->selfUpdate()['rolled_back'] );
-	}
-
 	public function test_a_log_created_BY_the_new_build_is_read_from_byte_zero(): void {
 		// No log before the install; the new build fatals during bootstrap and
 		// creates one by doing so. Discarding a null offset lost exactly this
@@ -219,13 +153,9 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->prev_error_log = ini_get( 'error_log' );
 		ini_set( 'error_log', $log );
 
-		$GLOBALS['_http_responses_by_url'] = array(
-			'__aura_probe_absent__' => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
-			'aura/v1/status'        => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
-			'wp/v2/types'           => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
-		);
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			// Fatals during bootstrap: no beacon, and it CREATES the log.
+			$this->installNewBuild( false );
 			file_put_contents( $log, "[today] PHP Fatal error: cannot redeclare aura_worker_init()\n" );
 		};
 
@@ -237,7 +167,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	}
 
 	public function test_a_build_that_breaks_the_site_is_rolled_back(): void {
-		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
+		$this->brokenBuild();
 
 		$res = $this->selfUpdate();
 
@@ -272,7 +202,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$log = $this->useLog();
 		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			$this->installNewBuild( true );
 			file_put_contents( $log, "[today] PHP Notice: undefined index, harmless\n", FILE_APPEND );
 		};
 
@@ -289,7 +219,9 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$log = $this->useLog();
 		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			// Boots — the beacon is written — but fatals somewhere after; the log
+			// is the secondary evidence that still catches it.
+			$this->installNewBuild( true );
 			file_put_contents( $log, "[today] PHP Fatal error: the new build\n", FILE_APPEND );
 		};
 
@@ -307,7 +239,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$log = $this->useLog();
 		file_put_contents( $log, str_repeat( 'x', 4096 ) . "\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			$this->installNewBuild( true );
 			// Rotation: the log is now SHORTER than the offset taken before.
 			file_put_contents( $log, "[today] PHP Fatal error: from before rotation\n" );
 		};
@@ -362,7 +294,10 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// otherwise the test fails on its own fixture rather than on the
 		// behaviour it is describing.
 		$this->rmdir( $this->dir );
-		$GLOBALS['_install_effect'] = null;
+		$GLOBALS['_install_effect'] = function () {
+			mkdir( $this->dir, 0777, true );
+			$this->installNewBuild( true );
+		};
 
 		$res = $this->selfUpdate();
 
@@ -376,9 +311,8 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// WP_PLUGIN_DIR — the ordinary case being a site that updates over
 		// FTP/SSH. Reporting `rolled_back: true` there tells an operator the
 		// site was recovered when the plugin may be missing (Codex round-1 P1).
-		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
 		$GLOBALS['_install_effect'] = function () {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			$this->installNewBuild( false );
 			// Corrupt the only backup so extraction cannot succeed.
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				file_put_contents( $f, 'not a zip' );
@@ -397,9 +331,8 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// still said the site "was rolled back" (Codex round-2 P2). A dashboard
 		// showing only the message told an operator the site had recovered while
 		// it was still carrying the broken build.
-		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
-		$GLOBALS['_install_effect']        = function () {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				file_put_contents( $f, 'not a zip' );
 			}
@@ -418,9 +351,8 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// archive restores but the plugin file it puts back is not the version
 		// we came from, so `rolled_back` must be false however cleanly the
 		// extraction went.
-		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
-		$GLOBALS['_install_effect']        = function () {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
 			// Rewrite the backup so it restores a DIFFERENT version.
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				$zip = new ZipArchive();
@@ -445,13 +377,8 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// the window missed the entry the check exists for (Codex round-3).
 		$log = $this->useLog();
 		file_put_contents( $log, "start of window\n" );
-		$GLOBALS['_http_responses_by_url'] = array(
-			'__aura_probe_absent__' => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
-			'aura/v1/status'        => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
-			'wp/v2/types'           => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
-		);
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			$this->installNewBuild( true );
 			file_put_contents( $log, str_repeat( "PHP Notice: chatty deprecation\n", 6000 ), FILE_APPEND );
 			file_put_contents( $log, "[today] PHP Fatal error: the new build\n", FILE_APPEND );
 		};
@@ -466,9 +393,126 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		}
 	}
 
+	public function test_the_verdict_is_the_beacon_the_new_build_wrote(): void {
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['verified'] );
+		$this->assertSame( 'pass', $res['health']['checks']['boot_beacon']['status'] );
+		// The request for a beacon is spent either way.
+		$this->assertFalse( isset( $GLOBALS['_options']['aura_worker_boot_nonce'] ) );
+	}
+
+	public function test_a_build_that_installs_but_never_boots_is_rolled_back(): void {
+		// Files on disk, loopback answered (so the request reached the site),
+		// no beacon: the build did not come up. This is the case the whole
+		// feature exists for, and the one every inferential probe got wrong
+		// somewhere.
+		$this->brokenBuild();
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_beacon_left_by_an_EARLIER_boot_does_not_count(): void {
+		// A stale beacon with some other nonce is exactly what a "did it boot"
+		// check must not be fooled by — the previous build booted; this one
+		// did not.
+		$GLOBALS['_options']['aura_worker_boot'] = array( 'version' => '9.9.9', 'nonce' => 'from-last-time' );
+		$this->brokenBuild();
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'stale beacon', $res['health']['checks']['boot_beacon']['detail'] );
+	}
+
+	public function test_a_beacon_from_the_WRONG_version_does_not_count(): void {
+		// The nonce matches but the build that answered is not the one we
+		// installed — an OPcache still serving the old files would look like this.
+		$GLOBALS['_install_effect'] = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION ); // the OLD version booted
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+	}
+
+	public function test_a_site_that_cannot_reach_itself_is_inconclusive_not_rolled_back(): void {
+		// The loopback never got a request to the site, so "no beacon" proves
+		// nothing. Rolling back here would make every update fail for ever on a
+		// site whose firewall blocks self-requests — the unsatisfiable-gate
+		// shape Aura #472 lived in for months. Report it, keep the build.
+		$GLOBALS['_http_error'] = true;
+		$this->brokenBuild();
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['verified'] );
+		$this->assertTrue( $res['health']['inconclusive'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
+
+	public function test_a_failed_install_is_held_to_the_same_post_condition_as_a_failed_boot(): void {
+		// Codex round-4 P1: the install-failure exit trusted restore_plugin()'s
+		// step result while the health-check exit checked the header. Here the
+		// restore "succeeds" but puts back a different version.
+		$GLOBALS['_install_result'] = false;
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				$zip = new ZipArchive();
+				$zip->open( $f, ZipArchive::OVERWRITE );
+				$zip->addFromString( 'digitizer-site-worker/digitizer-site-worker.php', $this->build( 'NEW BUILD', '7.7.7' ) );
+				$zip->close();
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertStringContainsString( 'could NOT be restored', $res['error'] );
+	}
+
+	public function test_a_fatal_in_a_log_the_new_build_CREATED_under_a_different_path_is_found(): void {
+		// Codex round-4 P1: ini names a file that does not exist yet while
+		// debug.log does. The snapshot was taken on debug.log; the new build
+		// fatals into the ini file. Applying debug.log's offset to the new,
+		// shorter file read as "rotated" and the fatal was ignored.
+		$debug = WP_CONTENT_DIR . '/debug.log';
+		$ini   = WP_CONTENT_DIR . '/sa-ini-created.log';
+		@unlink( $ini );
+		file_put_contents( $debug, str_repeat( "old noise\n", 200 ) );
+		$this->prev_error_log = ini_get( 'error_log' );
+		ini_set( 'error_log', $ini ); // names a file that is not there yet
+
+		$GLOBALS['_install_effect'] = function () use ( $ini ) {
+			$this->installNewBuild( false );
+			file_put_contents( $ini, "[today] PHP Fatal error: the new build\n" );
+		};
+
+		try {
+			$res = $this->selfUpdate();
+			$this->assertFalse( $res['success'] );
+			$this->assertSame( 'fail', $res['health']['checks']['php_errors']['status'] );
+		} finally {
+			@unlink( $debug );
+			@unlink( $ini );
+		}
+	}
+
 	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {
 		$this->rmdir( $this->dir );
-		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
+		// Files land nowhere (no dir), and no beacon is written.
 		$GLOBALS['_install_effect'] = null;
 
 		$res = $this->selfUpdate();

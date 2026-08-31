@@ -226,11 +226,17 @@ class Aura_Worker_Updater {
 		$backup      = $rollback->backup_plugin( $plugin_slug );
 		$backup_path = ! empty( $backup['success'] ) ? $backup['backup_path'] : null;
 
-		// Where the error log ends BEFORE the install. The verdict below reads
-		// only past this point, so a fatal that was already in the log — from
-		// last month, from another plugin — cannot be attributed to this update
-		// and roll back a build that is fine (#77, Codex round-1 P2).
-		$log_offset = $this->error_log_size();
+		// Where the error log ends BEFORE the install, and WHICH file that was.
+		// The verdict reads only past this point, so a fatal already in the log
+		// cannot be attributed to this update (Codex round-1 P2); and it reads
+		// the SAME file, so an offset taken on debug.log is never applied to a
+		// PHP log the new build creates (Codex round-4 P1).
+		$log_snapshot = $this->error_log_snapshot();
+
+		// Ask the next boot of this plugin to announce itself. Random, so a
+		// beacon left by any earlier boot cannot satisfy this verdict.
+		$boot_nonce = bin2hex( random_bytes( 16 ) );
+		update_option( 'aura_worker_boot_nonce', $boot_nonce, false );
 
 		// Install from the verified local file (or the URL when no digest given).
 		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
@@ -247,7 +253,9 @@ class Aura_Worker_Updater {
 			return $this->self_update_install_failed(
 				$rollback,
 				$plugin_slug,
+				$plugin_file,
 				$backup_path,
+				$old_version,
 				$result->get_error_message()
 			);
 		}
@@ -258,7 +266,9 @@ class Aura_Worker_Updater {
 			return $this->self_update_install_failed(
 				$rollback,
 				$plugin_slug,
+				$plugin_file,
 				$backup_path,
+				$old_version,
 				__( 'Self-update failed — filesystem error.', 'digitizer-site-worker' ),
 				$last_msg
 			);
@@ -281,21 +291,17 @@ class Aura_Worker_Updater {
 
 		// Did THIS build come up? See `verify_self_update()` — the aggregate
 		// site health check cannot answer that question (Codex round-1).
-		$health_result = $this->verify_self_update( $log_offset );
+		$health_result = $this->verify_self_update( $new_version, $boot_nonce, $log_snapshot );
+		// Whatever happened, the request for a beacon is spent.
+		delete_option( 'aura_worker_boot_nonce' );
 		$healthy       = ! empty( $health_result['healthy'] );
 
 		if ( ! $healthy && null !== $backup_path ) {
 			// Restoring works even though the on-disk plugin is broken: this
 			// method, Aura_Worker_Rollback and ZipArchive are all already in
 			// memory from the pre-install require above.
-			$restore  = $rollback->restore_plugin( $plugin_slug, $backup_path );
-			// Do not infer recovery from "the steps did not report failure".
-			// Eleven findings on this branch were one class — a success value
-			// resting on evidence that could not support it — so the claim is
-			// checked directly now: after a restore, the plugin's own header
-			// must read the version we came from.
-			$restored = ! empty( $restore['success'] )
-				&& $old_version === $this->installed_version( $plugin_file );
+			$rb       = $this->attempt_rollback( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version );
+			$restored = $rb['restored'];
 			// The message has to agree with the fields (Codex round-2 P2). A
 			// dashboard that shows only `error` was told the site had recovered
 			// while `rolled_back` said otherwise — and the site may still be
@@ -317,7 +323,7 @@ class Aura_Worker_Updater {
 				'healthy'       => false,
 				'health'        => $health_result,
 				'rolled_back'   => $restored,
-				'restore_error' => $restored ? null : ( $restore['error'] ?? null ),
+				'restore_error' => $rb['error'],
 			);
 		}
 
@@ -357,6 +363,12 @@ class Aura_Worker_Updater {
 			'backed_up'    => null !== $backup_path,
 			'health_checked'=> true,
 			'healthy'      => true,
+			// `verified` is the beacon, specifically: a success with `verified:
+			// false` is an update that stood because the evidence was
+			// INCONCLUSIVE, not because the build was seen to boot. Aura's
+			// update log should be able to tell those apart.
+			'verified'     => ! empty( $health_result['verified'] ),
+			'health'       => $health_result,
 			'rolled_back'  => false,
 		);
 	}
@@ -388,9 +400,13 @@ class Aura_Worker_Updater {
 	 *
 	 * @return int|null
 	 */
-	private function error_log_size() {
+	private function error_log_snapshot() {
 		$log = $this->error_log_path();
-		return ( null !== $log && file_exists( $log ) ) ? (int) filesize( $log ) : null;
+		if ( null === $log ) {
+			return null;
+		}
+		clearstatcache( true, $log );
+		return array( 'path' => $log, 'size' => (int) filesize( $log ) );
 	}
 
 	/** The log both halves read. Mirrors Aura_Worker_Health's resolution order. */
@@ -408,30 +424,37 @@ class Aura_Worker_Updater {
 	 * @param int|null $offset Size of the log before the install.
 	 * @return int Count of new fatals; 0 when there is nothing to read.
 	 */
-	private function new_fatals_since( $offset ) {
-		$log = $this->error_log_path();
-		if ( null === $log ) {
-			return 0;
+	private function new_fatals_since( $snapshot ) {
+		$current = $this->error_log_path();
+		$total   = 0;
+
+		// The file we measured before the install, read from where it ended.
+		if ( is_array( $snapshot ) && file_exists( $snapshot['path'] ) ) {
+			$total += $this->fatals_in( $snapshot['path'], (int) $snapshot['size'] );
 		}
+		// A file that did not exist before and does now — the configured PHP
+		// log the new build CREATED by fatalling into it (Codex round-2 P1),
+		// possibly a different file from the one measured (round-4 P1). Read
+		// from byte zero: everything in it is after the install.
+		if ( null !== $current && ( ! is_array( $snapshot ) || $current !== $snapshot['path'] ) ) {
+			$total += $this->fatals_in( $current, 0 );
+		}
+		return $total;
+	}
 
-		// `null` offset means there was NO log before the install, so everything
-		// in one that exists now was written after it — read from byte zero
-		// (#77, Codex round-2 P1). Discarding it lost the most important case
-		// there is: a build that fatals during bootstrap and CREATES the log by
-		// doing so. Both REST probes then fail from that same bootstrap, which
-		// reads as inconclusive, and the broken build was called healthy and its
-		// backup pruned.
-		$from = ( null === $offset ) ? 0 : (int) $offset;
-
+	/**
+	 * Fatal/parse errors in one log file from byte $from to its end.
+	 *
+	 * @param string $log  Absolute path.
+	 * @param int    $from Byte offset to start at.
+	 * @return int
+	 */
+	private function fatals_in( $log, $from ) {
 		clearstatcache( true, $log );
 		$size = (int) filesize( $log );
-		// A log that SHRANK was rotated under us; there is no longer a window
-		// this update owns, so claim nothing rather than read someone else's.
-		// Only meaningful for a log that existed before — a new one starts at 0
-		// and cannot have rotated.
-		if ( null !== $offset && $size <= $from ) {
-			return 0;
-		}
+		// A log that SHRANK below its offset was rotated under us; there is no
+		// longer a window this update owns, so claim nothing rather than read
+		// someone else's.
 		if ( $size <= $from ) {
 			return 0;
 		}
@@ -474,97 +497,150 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * Write the boot beacon — the fact `verify_self_update()` reads.
+	 *
+	 * Called as the LAST line of `aura_worker_init()`, so it runs only if
+	 * loading this plugin and `Aura_Worker::init()` both completed. Writes only
+	 * when the updater has asked (left a nonce), so an ordinary request does no
+	 * database write; echoes the nonce so a beacon from an earlier boot cannot
+	 * satisfy a later verdict.
+	 *
+	 * Lives here, not in the entry file, so it can be unit-tested: the entry
+	 * file defines constants and cannot be required twice.
+	 *
+	 * @param string $version The version of the build that is now running.
+	 * @return bool Whether a beacon was written.
+	 */
+	public static function write_boot_beacon( $version ) {
+		$nonce = get_option( 'aura_worker_boot_nonce', '' );
+		if ( ! is_string( $nonce ) || '' === $nonce ) {
+			return false;
+		}
+		$written = update_option(
+			'aura_worker_boot',
+			array( 'version' => (string) $version, 'nonce' => $nonce ),
+			false
+		);
+		delete_option( 'aura_worker_boot_nonce' );
+		return (bool) $written;
+	}
+
+	/**
 	 * Did the build that was just installed actually come up?
 	 *
-	 * `Aura_Worker_Health::run_health_check()` cannot answer this, which is the
-	 * whole reason for a separate probe (Codex round-1 P1). It fetches the
-	 * anonymous home page with no cache-buster, so on any site behind a
-	 * full-page cache or CDN both of its HTTP probes are served from cache
-	 * WITHOUT starting PHP — nothing loads the new files — while its remaining
-	 * checks run inside this already-running old process. A build that fatals on
-	 * bootstrap was marked healthy and its backup pruned.
+	 * Answered from a FACT the new build writes, not inferred from the outside.
+	 * Four review rounds found a case where every inferential signal lies: the
+	 * home page served from a full-page cache without starting PHP; 401/403
+	 * meaning "registered" on one site and "REST closed to everyone" on
+	 * another; a 500 differing from a 404 control; a log tail that was too
+	 * short, or the wrong file. Each patch converged on nothing because the
+	 * question — "did this code boot?" — has no answer in status codes.
 	 *
-	 * So ask something only this plugin can answer, and make it uncacheable:
-	 * an unauthenticated GET to an `aura/v1` route with a unique query argument.
-	 * If the new build loaded and registered its routes the permission callback
-	 * refuses it — 401/403 — which is a PASS: the refusal itself proves the
-	 * route exists. A 404 means no such route, i.e. the plugin did not come up.
+	 * So: leave a nonce, make ONE uncacheable request so a fresh PHP process
+	 * loads the new files, then read `aura_worker_boot`. The new build's own
+	 * `aura_worker_boot_beacon()` writes it as the LAST line of init, echoing
+	 * the nonce. Beacon carrying our nonce and the new version ⇒ it booted.
 	 *
-	 * A 404 alone is not proof, though: some sites block the REST API for
-	 * anonymous callers entirely. So a failing Aura probe is only believed when
-	 * a CORE REST route answers normally from the same request — that separates
-	 * "this plugin is dead" from "REST is closed to strangers here". When core
-	 * REST is unreachable too, the evidence cannot support a rollback and this
-	 * reports healthy rather than destroying a working install on a guess.
+	 * What can still be wrong, stated rather than hidden:
+	 *  - The request never reached PHP at all (transport failure: the site
+	 *    cannot connect to itself). No beacon then proves nothing, and rolling
+	 *    back on it would make every update fail on such a site for ever — the
+	 *    unsatisfiable-gate shape Aura #472 spent months in. Reported as
+	 *    `inconclusive`, no rollback, `verified: false`.
+	 *  - A cache answering a REST URL that carries a random query argument and
+	 *    no-cache headers. Accepted as the residual; REST is not page-cached in
+	 *    any mainstream setup.
 	 *
-	 * @param int|null $log_offset Log size captured before the install.
-	 * @return array
+	 * The error log is secondary evidence only: new fatals written since the
+	 * install still fail the verdict, but their absence proves nothing.
+	 *
+	 * @param string     $new_version  Version read from the installed header.
+	 * @param string     $nonce        The nonce left in `aura_worker_boot_nonce`.
+	 * @param array|null $log_snapshot From `error_log_snapshot()`, before install.
+	 * @return array { healthy: bool, inconclusive: bool, checks: array }
 	 */
-	private function verify_self_update( $log_offset ) {
-		$bust = array( 'aura_probe' => (string) wp_rand( 100000, 999999 ) );
-		$args = array(
-			'timeout'     => 15,
-			'sslverify'   => false,
-			'headers'     => array( 'Cache-Control' => 'no-cache', 'Pragma' => 'no-cache' ),
-			'redirection' => 0,
+	private function verify_self_update( $new_version, $nonce, $log_snapshot ) {
+		$probe = wp_remote_get(
+			add_query_arg( array( 'aura_probe' => $nonce ), rest_url( 'aura/v1/status' ) ),
+			array(
+				'timeout'     => 15,
+				'sslverify'   => false,
+				'redirection' => 0,
+				'headers'     => array( 'Cache-Control' => 'no-cache', 'Pragma' => 'no-cache' ),
+			)
 		);
+		$reached = ! is_wp_error( $probe );
 
-		$code_of = function ( $url ) use ( $args ) {
-			$res = wp_remote_get( $url, $args );
-			return is_wp_error( $res ) ? 0 : (int) wp_remote_retrieve_response_code( $res );
-		};
+		// Read the fact UNCACHED: the option cache in this process may still hold
+		// the pre-install state.
+		wp_cache_delete( 'aura_worker_boot', 'options' );
+		$beacon = get_option( 'aura_worker_boot' );
+		$booted = is_array( $beacon )
+			&& isset( $beacon['nonce'], $beacon['version'] )
+			&& hash_equals( $nonce, (string) $beacon['nonce'] )
+			&& (string) $beacon['version'] === (string) $new_version;
 
-		$plugin_code  = $code_of( add_query_arg( $bust, rest_url( 'aura/v1/status' ) ) );
-		// The CONTROL: a path inside this plugin's namespace that is never
-		// registered. On a normal site an unregistered path answers 404 while a
-		// registered-but-refused one answers 401/403, so the two differ and the
-		// difference IS the proof of registration.
-		//
-		// Comparing against a control rather than against a fixed list of "good"
-		// statuses is what makes this survive a site that denies anonymous REST
-		// globally (Codex round-2 P1): there an authentication filter answers
-		// 401 for EVERY path, registered or not, so a bare `in_array( 401 )`
-		// would have accepted a build that never registered anything. When the
-		// two answers are identical this probe has learned nothing.
-		$missing_code = $code_of( add_query_arg( $bust, rest_url( 'aura/v1/__aura_probe_absent__' ) ) );
-		$plugin_up    = ( 0 !== $plugin_code ) && ( $plugin_code !== $missing_code );
+		$new_fatals = $this->new_fatals_since( $log_snapshot );
 
 		$checks = array(
-			'plugin_route' => array(
-				'status' => $plugin_up ? 'pass' : 'fail',
-				'detail' => 'HTTP ' . $plugin_code . ' vs HTTP ' . $missing_code . ' for an unregistered path',
+			'loopback'   => array(
+				'status' => $reached ? 'pass' : 'fail',
+				'detail' => $reached
+					? 'HTTP ' . (int) wp_remote_retrieve_response_code( $probe )
+					: $probe->get_error_message(),
+			),
+			'boot_beacon' => array(
+				'status' => $booted ? 'pass' : 'fail',
+				'detail' => $booted
+					? 'build ' . $new_version . ' reported boot'
+					: ( is_array( $beacon ) ? 'stale beacon' : 'no beacon written' ),
+			),
+			'php_errors' => array(
+				'status' => $new_fatals ? 'fail' : 'pass',
+				'detail' => $new_fatals ? $new_fatals . ' new fatal error(s) since the install' : 'No new fatal errors',
 			),
 		);
 
-		$core_reachable = null;
-		if ( ! $plugin_up ) {
-			// Does anonymous REST work here AT ALL? Only if it does can "the
-			// aura route is indistinguishable from an absent one" mean the
-			// plugin is down rather than the door being shut to everyone.
-			$core_code      = $code_of( add_query_arg( $bust, rest_url( 'wp/v2/types' ) ) );
-			$core_reachable = ( 200 === $core_code );
-			$checks['core_route'] = array(
-				'status' => $core_reachable ? 'pass' : 'fail',
-				'detail' => 'HTTP ' . $core_code,
-			);
-		}
-
-		$new_fatals       = $this->new_fatals_since( $log_offset );
-		$checks['php_errors'] = array(
-			'status' => $new_fatals ? 'fail' : 'pass',
-			'detail' => $new_fatals ? $new_fatals . ' new fatal error(s) since the install' : 'No new fatal errors',
-		);
-
-		// Roll back only on evidence that supports it: the plugin's own route is
-		// gone while core REST still answers, or this update wrote fatals.
-		$plugin_really_down = ! $plugin_up && true === $core_reachable;
-		$healthy            = ! $plugin_really_down && 0 === $new_fatals;
+		// Inconclusive = we could not even get a request to the site. Anything
+		// else is an answer: the request landed and the build did, or did not,
+		// say it booted.
+		$inconclusive = ! $reached && ! $booted;
+		$healthy      = ( $booted || $inconclusive ) && 0 === $new_fatals;
 
 		return array(
-			'healthy'       => $healthy,
-			'checks'        => $checks,
-			'inconclusive'  => ! $plugin_up && false === $core_reachable,
+			'healthy'      => $healthy,
+			'inconclusive' => $inconclusive,
+			'verified'     => $booted,
+			'checks'       => $checks,
 		);
+	}
+
+	/**
+	 * Put the previous build back and PROVE it is back.
+	 *
+	 * The single place a rollback is decided (Codex round-4 P1: the two exits
+	 * had drifted — one checked the header, one trusted the step result). Fifteen
+	 * findings on this branch were one class, a success value resting on
+	 * evidence that could not support it, so this returns success only on the
+	 * post-condition: the plugin's own header reads the version we came from.
+	 *
+	 * @return array { restored: bool, error: string|null }
+	 */
+	private function attempt_rollback( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version ) {
+		if ( null === $backup_path ) {
+			return array( 'restored' => false, 'error' => null );
+		}
+		$restore = $rollback->restore_plugin( $plugin_slug, $backup_path );
+		if ( empty( $restore['success'] ) ) {
+			return array( 'restored' => false, 'error' => (string) ( $restore['error'] ?? 'restore failed' ) );
+		}
+		if ( $old_version !== $this->installed_version( $plugin_file ) ) {
+			return array(
+				'restored' => false,
+				'error'    => 'restore completed but the plugin header does not read ' . $old_version,
+			);
+		}
+		return array( 'restored' => true, 'error' => null );
 	}
 
 	/**
@@ -581,13 +657,16 @@ class Aura_Worker_Updater {
 	 * @param string               $detail      Optional upgrader detail.
 	 * @return array
 	 */
-	private function self_update_install_failed( $rollback, $plugin_slug, $backup_path, $error, $detail = '' ) {
-		$restored = false;
-		$restore_error = null;
-		if ( null !== $backup_path ) {
-			$restore       = $rollback->restore_plugin( $plugin_slug, $backup_path );
-			$restored      = ! empty( $restore['success'] );
-			$restore_error = $restored ? null : ( $restore['error'] ?? null );
+	private function self_update_install_failed( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version, $error, $detail = '' ) {
+		$rb            = $this->attempt_rollback( $rollback, $plugin_slug, $plugin_file, $backup_path, $old_version );
+		$restored      = $rb['restored'];
+		$restore_error = $rb['error'];
+
+		// The message must carry the recovery outcome too (Codex round-4 P2): a
+		// consumer showing only `error` was told about the upgrader failure and
+		// not that the plugin may now be missing.
+		if ( null !== $backup_path && ! $restored ) {
+			$error .= ' ' . __( 'The previous build could NOT be restored — the plugin may be missing or incomplete.', 'digitizer-site-worker' );
 		}
 
 		$out = array(

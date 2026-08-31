@@ -49,6 +49,29 @@ function aura_worker_init() {
 	aura_worker_maybe_upgrade();
 	$plugin = new Aura_Worker();
 	$plugin->init();
+	aura_worker_boot_beacon();
+}
+
+/**
+ * The boot beacon: a positive fact that THIS build came up.
+ *
+ * `Aura_Worker_Updater::self_update()` has to know whether the build it just
+ * installed actually boots, and every way of INFERRING that from the outside —
+ * status codes, error-log tails, control paths — turned out to have a case
+ * where the signal lies (SiteAgent #78, four review rounds). So the build says
+ * so itself. Deliberately the LAST line of init: a fatal anywhere in loading
+ * this plugin's files or in `Aura_Worker::init()` means this never runs, and
+ * the absence of the beacon is the verdict.
+ *
+ * Written ONLY when the updater has left a nonce asking for it, so an ordinary
+ * request performs no database write. The nonce is echoed back so the verdict
+ * can tell a beacon written for THIS install from one left by an earlier boot,
+ * without comparing clocks.
+ */
+function aura_worker_boot_beacon() {
+	if ( class_exists( 'Aura_Worker_Updater' ) ) {
+		Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION );
+	}
 }
 
 /**
