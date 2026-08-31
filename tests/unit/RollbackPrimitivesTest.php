@@ -260,4 +260,40 @@ final class RollbackPrimitivesTest extends TestCase {
 		$this->assertFalse( $res['success'] );
 		$this->assertNotEmpty( $res['error'] );
 	}
+
+	public function test_a_restore_works_when_no_filesystem_transport_initialises(): void {
+		// Round 13 let construction and the backup survive a site whose
+		// WP_Filesystem() returns false. The restore then reached
+		// delete_directory(), which dereferenced the null $wp_filesystem and
+		// fatalled — after the backup was made, at the moment it was needed
+		// (Codex round-14 P1). The archive is written and read directly; the
+		// deletion between them has to be direct too.
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'] );
+		file_put_contents( $this->dir . '/main.php', 'BROKEN' );
+		file_put_contents( $this->dir . '/added-by-broken-build.php', 'x' );
+		mkdir( $this->dir . '/sub' );
+		file_put_contents( $this->dir . '/sub/deep.php', 'y' );
+
+		$GLOBALS['_wp_filesystem_unavailable'] = true;
+		$GLOBALS['wp_filesystem'] = null;
+		try {
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+		} finally {
+			unset( $GLOBALS['_wp_filesystem_unavailable'] );
+			$GLOBALS['wp_filesystem'] = null;
+			if ( is_file( $this->dir . '/sub/deep.php' ) ) {
+				unlink( $this->dir . '/sub/deep.php' );
+			}
+			if ( is_dir( $this->dir . '/sub' ) ) {
+				rmdir( $this->dir . '/sub' );
+			}
+		}
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+		$this->assertFileDoesNotExist( $this->dir . '/added-by-broken-build.php', 'a file the broken build added must not survive the restore' );
+		$this->assertDirectoryDoesNotExist( $this->dir . '/sub' );
+	}
 }

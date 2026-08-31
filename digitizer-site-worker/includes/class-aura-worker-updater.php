@@ -398,7 +398,13 @@ class Aura_Worker_Updater {
 		// thing anyone would restore. Bounded, not emptied: the most recent few
 		// stay, because "the update succeeded" and "the new build is good" are
 		// not the same claim on a site nobody has looked at yet.
-		$rollback->cleanup_old_backups( 3 );
+		//
+		// And only when there is a rollback object to ask: construction may have
+		// failed above and been deliberately continued past (Codex round-14 P1) —
+		// a successful update must not fatal on tidying up backups it never took.
+		if ( $rollback ) {
+			$rollback->cleanup_old_backups( 3 );
+		}
 
 		return array(
 			'success'      => true,

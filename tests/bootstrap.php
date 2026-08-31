@@ -20,6 +20,7 @@
  *   $GLOBALS['_install_effect'] — callable run inside install(), to mutate files
  *   $GLOBALS['_http_responses_by_url'] — substring => response, for multi-probe code
  *   $GLOBALS['_wp_filesystem_unavailable'] — WP_Filesystem() fails, $wp_filesystem null
+ *   $GLOBALS['_wp_mkdir_p_throws'] — wp_mkdir_p() throws instead of returning
  *
  * @package Aura_Worker\Tests
  */
@@ -1274,6 +1275,11 @@ if ( ! function_exists( 'apply_filters' ) ) {
 
 if ( ! function_exists( 'wp_mkdir_p' ) ) {
 	function wp_mkdir_p( string $dir ): bool {
+		// `_wp_mkdir_p_throws` models recovery setup that ENDS the request rather
+		// than reporting failure — the case a caller's try/catch continues past.
+		if ( ! empty( $GLOBALS['_wp_mkdir_p_throws'] ) ) {
+			throw new RuntimeException( 'wp_mkdir_p refused: ' . $dir );
+		}
 		return is_dir( $dir ) || mkdir( $dir, 0777, true );
 	}
 }

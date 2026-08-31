@@ -331,12 +331,50 @@ class Aura_Worker_Rollback {
 		if ( ! function_exists( 'WP_Filesystem' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 		}
-		WP_Filesystem();
-		$wp_filesystem->delete( $dir, true, 'd' );
+		// `WP_Filesystem()` returns false — and leaves `$wp_filesystem` null —
+		// when no transport initialises (FTP/SSH credentials not in wp-config).
+		// The backup that brought us here was written by ZipArchive directly and
+		// the extract that follows is direct too, so the one step between them
+		// must not fatal reaching for a transport neither of them needed: a
+		// restore that dies here leaves the plugin half-deleted and the caller
+		// with no result at all (#78, Codex round-14 P1). Delete directly instead.
+		if ( WP_Filesystem() && is_object( $wp_filesystem ) && method_exists( $wp_filesystem, 'delete' ) ) {
+			$wp_filesystem->delete( $dir, true, 'd' );
+		} else {
+			$this->delete_directory_directly( $dir );
+		}
 
 		// Report on the DIRECTORY, not on the call. `delete()`'s own return is
 		// not uniformly trustworthy across filesystem transports, and what the
 		// caller needs to know is one fact it can verify: is it gone?
 		return ! is_dir( $dir );
+	}
+
+	/**
+	 * Recursive deletion with PHP's own primitives, for a site with no
+	 * `WP_Filesystem` transport. Children first; a symlink is removed as a
+	 * link, never followed. Reports nothing — `delete_directory()` judges the
+	 * outcome by the one fact that matters, whether the directory is gone.
+	 *
+	 * @param string $dir Absolute path to the directory to remove.
+	 * @return void
+	 */
+	private function delete_directory_directly( $dir ) {
+		if ( ! is_dir( $dir ) ) {
+			return;
+		}
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
+			RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ( $iterator as $entry ) {
+			$path = $entry->getPathname();
+			if ( $entry->isDir() && ! $entry->isLink() ) {
+				@rmdir( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_rmdir
+			} else {
+				@unlink( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
+			}
+		}
+		@rmdir( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_rmdir
 	}
 }

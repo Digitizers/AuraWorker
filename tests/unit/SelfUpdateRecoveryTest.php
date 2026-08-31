@@ -663,4 +663,56 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// to know this one needs hands.
 		$this->assertStringContainsString( 'no backup', strtolower( $res['error'] ) );
 	}
+
+	public function test_a_failed_install_is_rolled_back_even_without_a_filesystem_transport(): void {
+		// ZipArchive writes the backup without a WP_Filesystem transport, so on
+		// an FTP/SSH site with no stored credentials the backup exists and the
+		// restore is reached — where the directory-replace step dereferenced
+		// the null $wp_filesystem and fatalled instead of returning the
+		// documented failed-restore result (Codex round-14 P1). The restore has
+		// to complete, not merely fail politely: nothing here needs a transport.
+		$GLOBALS['_install_result'] = false;
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+		};
+		$GLOBALS['_wp_filesystem_unavailable'] = true;
+		$GLOBALS['wp_filesystem'] = null;
+
+		try {
+			$res = $this->selfUpdate();
+		} finally {
+			unset( $GLOBALS['_wp_filesystem_unavailable'] );
+			$GLOBALS['wp_filesystem'] = null;
+		}
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'], (string) ( $res['restore_error'] ?? '' ) );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+	}
+
+	public function test_a_recovery_setup_that_cannot_be_built_does_not_fatal_a_successful_update(): void {
+		// Round 13 wrapped `new Aura_Worker_Rollback()` in try/catch and continued
+		// with null, so a site whose recovery setup ends the request can still
+		// update with `backed_up: false`. The success path then called
+		// `$rollback->cleanup_old_backups()` unconditionally — a fatal AFTER the
+		// plugin was replaced, in place of the result (Codex round-14 P1).
+		// The constructor only creates the directory when it is missing, so it
+		// has to be GONE — recursively: the snapshot tests leave a subdirectory
+		// in it, and a flat rmdir that fails quietly leaves this test asserting
+		// on a fixture that never took the path it describes.
+		$this->rmdir( WP_CONTENT_DIR . '/aura-backups' );
+		$this->assertDirectoryDoesNotExist( WP_CONTENT_DIR . '/aura-backups' );
+		$GLOBALS['_wp_mkdir_p_throws'] = true;
+
+		try {
+			$res = $this->selfUpdate();
+		} finally {
+			unset( $GLOBALS['_wp_mkdir_p_throws'] );
+		}
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['backed_up'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
 }
