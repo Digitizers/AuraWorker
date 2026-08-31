@@ -485,11 +485,13 @@ class Aura_Worker_Updater {
 			}
 			$remaining -= strlen( $chunk );
 			$window     = $overlap . $chunk;
-			$fatals    += preg_match_all( '/(PHP Fatal error|PHP Parse error)/i', $window, $m ) ? count( $m[0] ) : 0;
-			if ( '' !== $overlap && preg_match_all( '/(PHP Fatal error|PHP Parse error)/i', $overlap, $m2 ) ) {
-				$fatals -= count( $m2[0] );
+			$fatals    += $this->count_attributed_fatals( $window );
+			if ( '' !== $overlap ) {
+				$fatals -= $this->count_attributed_fatals( $overlap );
 			}
-			$overlap = substr( $window, -32 );
+			// Wide enough that a fatal line and the path it names never straddle
+			// a boundary without being wholly inside one window.
+			$overlap = substr( $window, -4096 );
 		}
 		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 
@@ -523,6 +525,25 @@ class Aura_Worker_Updater {
 		);
 		delete_option( 'aura_worker_boot_nonce' );
 		return (bool) $written;
+	}
+
+	/**
+	 * Fatal/parse-error LINES in a piece of log text that name this plugin's
+	 * directory. A fatal names the file it died in, so "was it ours?" is read
+	 * off the line rather than inferred from when it was written.
+	 *
+	 * @param string $text Log text.
+	 * @return int
+	 */
+	private function count_attributed_fatals( $text ) {
+		$n = 0;
+		foreach ( preg_split( '/\r?\n/', (string) $text ) as $line ) {
+			if ( preg_match( '/PHP (Fatal|Parse) error/i', $line )
+				&& false !== stripos( $line, '/digitizer-site-worker/' ) ) {
+				$n++;
+			}
+		}
+		return $n;
 	}
 
 	/**
@@ -597,15 +618,38 @@ class Aura_Worker_Updater {
 			),
 			'php_errors' => array(
 				'status' => $new_fatals ? 'fail' : 'pass',
-				'detail' => $new_fatals ? $new_fatals . ' new fatal error(s) since the install' : 'No new fatal errors',
+				'detail' => $new_fatals
+					? $new_fatals . ' new fatal error(s) in this plugin since the install'
+					: 'No new fatal errors attributed to this plugin',
 			),
 		);
 
-		// Inconclusive = we could not even get a request to the site. Anything
-		// else is an answer: the request landed and the build did, or did not,
-		// say it booted.
-		$inconclusive = ! $reached && ! $booted;
-		$healthy      = ( $booted || $inconclusive ) && 0 === $new_fatals;
+		// The decision rests on POSITIVE facts only, in both directions.
+		//
+		// Health: the beacon. Breakage: a new fatal that NAMES THIS PLUGIN'S
+		// DIRECTORY — PHP fatal lines carry the file path, so attribution is a
+		// fact in the message, not a guess from timing. An unrelated plugin's
+		// fatal landing in the shared log between snapshot and check cannot
+		// override a valid beacon (Codex round-5 P2).
+		//
+		// What is deliberately NOT a fact: "we got an HTTP response". A CDN, WAF
+		// or reverse proxy can answer a 301 or a 403 challenge before WordPress
+		// ever runs, and no beacon can be written then; treating that response
+		// as proof PHP was reached rolled back healthy builds on every site
+		// fronted that way — for ever (Codex round-5 P1). So `$reached` is
+		// reported and decides nothing.
+		//
+		// No beacon AND no attributed fatal is therefore INCONCLUSIVE: the
+		// update stands, `verified: false`. That includes a build that fatals
+		// on load on a site with error logging off — stated here rather than
+		// hidden. It is the pre-#78 exposure, now visible in Aura's update log
+		// as unverified and bounded by its 5-per-night cap; the alternative,
+		// rolling back on absence of evidence, makes every edge-fronted site
+		// permanently un-updatable, which is the worse failure and the one that
+		// hides.
+		$broken       = $new_fatals > 0;
+		$inconclusive = ! $booted && ! $broken;
+		$healthy      = ! $broken && ( $booted || $inconclusive );
 
 		return array(
 			'healthy'      => $healthy,

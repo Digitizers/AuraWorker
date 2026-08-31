@@ -121,10 +121,21 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		}
 	}
 
-	/** An install whose build does not come up. */
+	/** Append the fatal a dying build of THIS plugin leaves in the log. */
+	private function diedInOurCode(): void {
+		file_put_contents( $this->useLog(), "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\n", FILE_APPEND );
+	}
+
+	/**
+	 * An install whose build does not come up: no beacon, and the fatal it died
+	 * with in the error log — naming this plugin's directory, as PHP does.
+	 * That attributed fatal is the POSITIVE evidence a rollback needs.
+	 */
 	private function brokenBuild(): void {
-		$GLOBALS['_install_effect'] = function () {
+		$log = $this->useLog();
+		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			$this->installNewBuild( false );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
 		};
 	}
 
@@ -156,7 +167,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			// Fatals during bootstrap: no beacon, and it CREATES the log.
 			$this->installNewBuild( false );
-			file_put_contents( $log, "[today] PHP Fatal error: cannot redeclare aura_worker_init()\n" );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n" );
 		};
 
 		$res = $this->selfUpdate();
@@ -183,7 +194,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// fatal, whatever its age — so on a site with one old fatal every
 		// healthy self-update would have been rolled back (Codex round-1 P2).
 		$log = $this->useLog();
-		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
+		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: in /srv/wp-content/plugins/digitizer-site-worker/old.php:1\n" );
 
 		try {
 			$res = $this->selfUpdate();
@@ -200,7 +211,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// the update appends something harmless, so a scan that started at byte
 		// zero would find the OLD fatal and roll back a healthy build.
 		$log = $this->useLog();
-		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
+		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: in /srv/wp-content/plugins/digitizer-site-worker/old.php:1\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			$this->installNewBuild( true );
 			file_put_contents( $log, "[today] PHP Notice: undefined index, harmless\n", FILE_APPEND );
@@ -217,12 +228,12 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 	public function test_a_fatal_written_BY_this_update_does_roll_it_back(): void {
 		$log = $this->useLog();
-		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
+		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: in /srv/wp-content/plugins/digitizer-site-worker/old.php:1\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			// Boots — the beacon is written — but fatals somewhere after; the log
 			// is the secondary evidence that still catches it.
 			$this->installNewBuild( true );
-			file_put_contents( $log, "[today] PHP Fatal error: the new build\n", FILE_APPEND );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
 		};
 
 		try {
@@ -241,7 +252,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			$this->installNewBuild( true );
 			// Rotation: the log is now SHORTER than the offset taken before.
-			file_put_contents( $log, "[today] PHP Fatal error: from before rotation\n" );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n" );
 		};
 
 		try {
@@ -313,6 +324,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// site was recovered when the plugin may be missing (Codex round-1 P1).
 		$GLOBALS['_install_effect'] = function () {
 			$this->installNewBuild( false );
+			$this->diedInOurCode();
 			// Corrupt the only backup so extraction cannot succeed.
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				file_put_contents( $f, 'not a zip' );
@@ -333,6 +345,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// it was still carrying the broken build.
 		$GLOBALS['_install_effect'] = function () {
 			$this->installNewBuild( false );
+			$this->diedInOurCode();
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				file_put_contents( $f, 'not a zip' );
 			}
@@ -353,6 +366,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// extraction went.
 		$GLOBALS['_install_effect'] = function () {
 			$this->installNewBuild( false );
+			$this->diedInOurCode();
 			// Rewrite the backup so it restores a DIFFERENT version.
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				$zip = new ZipArchive();
@@ -380,7 +394,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			$this->installNewBuild( true );
 			file_put_contents( $log, str_repeat( "PHP Notice: chatty deprecation\n", 6000 ), FILE_APPEND );
-			file_put_contents( $log, "[today] PHP Fatal error: the new build\n", FILE_APPEND );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
 		};
 
 		try {
@@ -441,17 +455,27 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 		$res = $this->selfUpdate();
 
-		$this->assertFalse( $res['success'] );
-		$this->assertTrue( $res['rolled_back'] );
+		// Not verified — the wrong build answered. And with no attributed fatal
+		// it is inconclusive rather than rolled back: absence of the right
+		// beacon is not positive evidence of breakage.
+		$this->assertFalse( $res['verified'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'stale beacon', $res['health']['checks']['boot_beacon']['detail'] );
 	}
 
-	public function test_a_site_that_cannot_reach_itself_is_inconclusive_not_rolled_back(): void {
-		// The loopback never got a request to the site, so "no beacon" proves
-		// nothing. Rolling back here would make every update fail for ever on a
-		// site whose firewall blocks self-requests — the unsatisfiable-gate
-		// shape Aura #472 lived in for months. Report it, keep the build.
-		$GLOBALS['_http_error'] = true;
-		$this->brokenBuild();
+	public function test_no_beacon_and_no_attributed_fatal_is_inconclusive_and_the_update_stands(): void {
+		// Files installed, loopback answered 200, no beacon, nothing in the log
+		// naming this plugin. Two very different worlds look exactly like this
+		// from inside the site — a CDN/WAF/proxy that answered before WordPress
+		// ran, or a build that fatals on load with error logging off — and no
+		// external signal tells them apart (five review rounds tried). Rolling
+		// back here would make every edge-fronted site permanently
+		// un-updatable, so the update stands and is reported UNVERIFIED. The
+		// second world is the stated residual: the pre-#78 exposure, now
+		// visible in the update log rather than invisible.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
 
 		$res = $this->selfUpdate();
 
@@ -460,6 +484,75 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertTrue( $res['health']['inconclusive'] );
 		$this->assertFalse( $res['rolled_back'] );
 		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
+
+	public function test_an_edge_answering_before_WordPress_does_not_cause_a_rollback(): void {
+		// Codex round-5 P1: a 301 canonical redirect or a 403 challenge from a
+		// CDN/WAF is an HTTP response with no PHP behind it. "We got a response"
+		// must not be read as "PHP ran".
+		$GLOBALS['_http_response'] = array( 'response' => array( 'code' => 301 ), 'body' => '' );
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertTrue( $res['health']['inconclusive'] );
+	}
+
+	public function test_a_site_that_cannot_reach_itself_is_inconclusive_not_rolled_back(): void {
+		$GLOBALS['_http_error'] = true;
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertFalse( $res['verified'] );
+		$this->assertFalse( $res['rolled_back'] );
+	}
+
+	public function test_an_UNRELATED_fatal_in_the_shared_log_cannot_override_a_valid_beacon(): void {
+		// Codex round-5 P2: a busy site's other plugin dies between the snapshot
+		// and the check. The byte offset says "new"; the path in the line says
+		// "not ours". The line is the fact.
+		$log = $this->useLog();
+		$GLOBALS['_install_effect'] = function () use ( $log ) {
+			$this->installNewBuild( true );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/some-other-plugin/x.php:1\\n", FILE_APPEND );
+		};
+
+		try {
+			$res = $this->selfUpdate();
+			$this->assertTrue( $res['success'] );
+			$this->assertTrue( $res['verified'] );
+			$this->assertFalse( $res['rolled_back'] );
+		} finally {
+			unlink( $log );
+		}
+	}
+
+	public function test_a_fatal_in_THIS_plugin_rolls_back_even_when_the_beacon_was_written(): void {
+		// Boots — init completed — then dies in its own code on the probe. The
+		// beacon says "came up"; the attributed fatal says "and broke". Breakage
+		// wins.
+		$log = $this->useLog();
+		$GLOBALS['_install_effect'] = function () use ( $log ) {
+			$this->installNewBuild( true );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
+		};
+
+		try {
+			$res = $this->selfUpdate();
+			$this->assertFalse( $res['success'] );
+			$this->assertTrue( $res['rolled_back'] );
+			$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		} finally {
+			unlink( $log );
+		}
 	}
 
 	public function test_a_failed_install_is_held_to_the_same_post_condition_as_a_failed_boot(): void {
@@ -497,7 +590,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 		$GLOBALS['_install_effect'] = function () use ( $ini ) {
 			$this->installNewBuild( false );
-			file_put_contents( $ini, "[today] PHP Fatal error: the new build\n" );
+			file_put_contents( $ini, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n" );
 		};
 
 		try {
@@ -512,8 +605,10 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {
 		$this->rmdir( $this->dir );
-		// Files land nowhere (no dir), and no beacon is written.
-		$GLOBALS['_install_effect'] = null;
+		// Files land nowhere (no dir), no beacon — and the fatal it died with.
+		$GLOBALS['_install_effect'] = function () {
+			$this->diedInOurCode();
+		};
 
 		$res = $this->selfUpdate();
 
