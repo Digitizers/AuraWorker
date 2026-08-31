@@ -880,4 +880,34 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertNotSame( 'skipped', $by['akismet/akismet.php']['status'], 'the rest of the batch runs' );
 		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ) );
 	}
+
+	public function test_a_generic_rollback_of_siteagent_waits_on_the_claim_and_releases_it_after(): void {
+		// `/aura/v2/rollback/digitizer-site-worker` restored these files with no
+		// claim taken (Codex round-24 P1), so it could delete and re-extract the
+		// directory while a locked self-update was backing up, installing or
+		// probing it. Same claim, same busy answer, and the guarded path lets go
+		// of what it took.
+		if ( ! class_exists( 'Aura_Worker_Rollback' ) ) {
+			require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-rollback.php';
+		}
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		$updater = new Aura_Worker_Updater();
+
+		$holder = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		$this->assertNotSame( '', $holder );
+		$busy = $updater->restore_plugin_guarded( $rollback, $this->slug, $backup['backup_path'] );
+		$this->assertFalse( $busy['success'] );
+		$this->assertTrue( $busy['in_progress'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk(), 'a refused rollback must not have touched the files' );
+		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the refused path must not release a claim it does not hold' );
+
+		Aura_Worker_Magic_Link::release_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, $holder );
+		$res = $updater->restore_plugin_guarded( $rollback, $this->slug, $backup['backup_path'] );
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the guarded restore releases what it took' );
+	}
 }

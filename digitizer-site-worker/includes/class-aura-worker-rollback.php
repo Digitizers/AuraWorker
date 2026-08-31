@@ -331,7 +331,24 @@ class Aura_Worker_Rollback {
 		if ( false === $target || '' === $target ) {
 			return false;
 		}
-		$root = rtrim( $root, '/' );
+		return self::path_is_inside( $target, $root );
+	}
+
+	/**
+	 * Whether one canonical path is the other or lives under it — blind to the
+	 * separator, because `realpath()` answers with backslashes on Windows and a
+	 * containment check that appends '/' to the root would then classify every
+	 * INTERNAL link as external, forcing `backed_up: false` on such installs
+	 * (#78, Codex round-24 P2). The same normalisation core applies in
+	 * `WP_Filesystem_Direct::delete()`.
+	 *
+	 * @param string $target Canonical path being placed.
+	 * @param string $root   Canonical root.
+	 * @return bool
+	 */
+	private static function path_is_inside( $target, $root ) {
+		$target = str_replace( '\\', '/', (string) $target );
+		$root   = rtrim( str_replace( '\\', '/', (string) $root ), '/' );
 		return $target === $root || 0 === strpos( $target, $root . '/' );
 	}
 

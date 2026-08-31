@@ -883,6 +883,26 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * Restore a plugin from a backup, under the self-update claim when the
+	 * plugin is SiteAgent itself. The generic rollback route restored these
+	 * files with no claim taken (Codex round-24 P1), so it could delete and
+	 * re-extract the directory while a locked self-update was backing up,
+	 * installing or probing it.
+	 *
+	 * @param Aura_Worker_Rollback $rollback    Rollback helper (owns the backups).
+	 * @param string               $plugin_slug Plugin folder name.
+	 * @param string               $backup_path Backup zip to restore.
+	 * @return array restore_plugin()'s result, or the shared busy result.
+	 */
+	public function restore_plugin_guarded( $rollback, $plugin_slug, $backup_path ) {
+		$plugin_file = 'digitizer-site-worker' === $plugin_slug ? self::SELF_PLUGIN_FILE : $plugin_slug . '/-';
+		$result      = $this->guarding_self( $plugin_file, function () use ( $rollback, $plugin_slug, $backup_path ) {
+			return $rollback->restore_plugin( $plugin_slug, $backup_path );
+		}, $busy );
+		return $busy ? $this->self_update_busy() : $result;
+	}
+
+	/**
 	 * Run $work under the self-update claim when $plugin_file is this plugin;
 	 * run it plainly for any other plugin. $busy is set when the claim is held
 	 * by a self-update, in which case $work is not run and null is returned.

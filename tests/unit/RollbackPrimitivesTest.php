@@ -661,4 +661,18 @@ final class RollbackPrimitivesTest extends TestCase {
 			unlink( $this->dir . '/visible.php' );
 		}
 	}
+
+	public function test_path_containment_is_blind_to_the_separator(): void {
+		// realpath() answers with backslashes on Windows; a containment check
+		// appending '/' to the root classified every INTERNAL link as external,
+		// so such installs always got `backed_up: false` (Codex round-24 P2).
+		$m = new ReflectionMethod( Aura_Worker_Rollback::class, 'path_is_inside' );
+		$m->setAccessible( true );
+
+		$this->assertTrue( $m->invoke( null, 'C:\\plugins\\siteagent\\shared', 'C:\\plugins\\siteagent' ) );
+		$this->assertTrue( $m->invoke( null, 'C:\\plugins\\siteagent\\shared', 'C:/plugins/siteagent' ), 'mixed separators, same tree' );
+		$this->assertTrue( $m->invoke( null, '/p/siteagent', '/p/siteagent' ), 'the root itself is inside' );
+		$this->assertFalse( $m->invoke( null, 'C:\\plugins\\siteagent-evil\\x', 'C:\\plugins\\siteagent' ), 'a sibling with the root as prefix is NOT inside' );
+		$this->assertFalse( $m->invoke( null, '/home/user/secrets', '/p/siteagent' ) );
+	}
 }

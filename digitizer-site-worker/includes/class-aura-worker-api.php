@@ -871,7 +871,9 @@ class Aura_Worker_API {
 			$backup_path = $backups[0]['path'];
 		}
 
-		$result = $rollback->restore_plugin( $plugin_slug, $backup_path );
+		// SiteAgent's own restore runs under the self-update claim (Codex
+		// round-24 P1); every other plugin restores as before.
+		$result = $this->updater->restore_plugin_guarded( $rollback, $plugin_slug, $backup_path );
 		$status = $result['success'] ? 200 : 500;
 		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
