@@ -204,6 +204,32 @@ final class RollbackPrimitivesTest extends TestCase {
 		}
 	}
 
+	public function test_a_traversal_that_throws_comes_out_as_an_unsuccessful_backup_not_an_exception(): void {
+		// An unreadable subtree makes RecursiveDirectoryIterator throw on
+		// descent. That exception used to escape the "unsuccessful backup"
+		// contract and kill the request before the upgrader ran (Codex round-6).
+		$sub = $this->dir . '/locked';
+		mkdir( $sub, 0777, true );
+		file_put_contents( $sub . '/inner.php', '<?php' );
+		chmod( $sub, 0000 );
+		if ( @scandir( $sub ) !== false ) {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/inner.php' );
+			rmdir( $sub );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array() );
+		} finally {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/inner.php' );
+			rmdir( $sub );
+		}
+	}
+
 	public function test_backing_up_a_directory_that_is_not_there_fails_cleanly(): void {
 		$rollback = new Aura_Worker_Rollback();
 		$res      = $rollback->backup_plugin( 'sa-no-such-plugin' );

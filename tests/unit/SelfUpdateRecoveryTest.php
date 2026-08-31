@@ -535,6 +535,25 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		}
 	}
 
+	public function test_a_fatal_written_with_Windows_separators_is_still_attributed_to_this_plugin(): void {
+		// Codex round-6 P1: `C:\\...\\digitizer-site-worker\\x.php` never matched a
+		// forward-slash pattern, so a Windows-hosted build that died before its
+		// beacon stood as inconclusive with error logging on.
+		$log = $this->useLog();
+		$GLOBALS['_install_effect'] = function () use ( $log ) {
+			$this->installNewBuild( false );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in C:\\inetpub\\wp-content\\plugins\\digitizer-site-worker\\includes\\x.php:1\n", FILE_APPEND );
+		};
+
+		try {
+			$res = $this->selfUpdate();
+			$this->assertFalse( $res['success'] );
+			$this->assertTrue( $res['rolled_back'] );
+		} finally {
+			unlink( $log );
+		}
+	}
+
 	public function test_a_fatal_in_THIS_plugin_rolls_back_even_when_the_beacon_was_written(): void {
 		// Boots — init completed — then dies in its own code on the probe. The
 		// beacon says "came up"; the attributed fatal says "and broke". Breakage

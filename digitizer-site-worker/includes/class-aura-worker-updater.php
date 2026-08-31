@@ -538,8 +538,14 @@ class Aura_Worker_Updater {
 	private function count_attributed_fatals( $text ) {
 		$n = 0;
 		foreach ( preg_split( '/\r?\n/', (string) $text ) as $line ) {
-			if ( preg_match( '/PHP (Fatal|Parse) error/i', $line )
-				&& false !== stripos( $line, '/digitizer-site-worker/' ) ) {
+			// Windows hosts write `C:\\...\\digitizer-site-worker\\x.php`; a
+			// forward-slash-only match never attributed those (Codex round-6 P1),
+			// so a build that fatalled before its beacon stood as inconclusive
+			// with error logging ON. Normalise, then match the directory as a
+			// whole path segment.
+			$normalised = str_replace( '\\', '/', $line );
+			if ( preg_match( '/PHP (Fatal|Parse) error/i', $normalised )
+				&& false !== stripos( $normalised, '/digitizer-site-worker/' ) ) {
 				$n++;
 			}
 		}

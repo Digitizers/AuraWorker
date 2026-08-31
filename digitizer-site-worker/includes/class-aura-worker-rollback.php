@@ -71,8 +71,19 @@ class Aura_Worker_Rollback {
 		// installed directory, extract the few entries that made it, and report
 		// a successful rollback with most of the old build missing (#77, Codex
 		// round-3).
-		$complete = $this->add_directory_to_zip( $zip, $plugin_dir, $plugin_slug );
-		$closed   = $zip->close();
+		// Traversal itself can THROW — an unreadable subtree, a directory that
+		// vanishes mid-walk — and an exception here escaped the documented
+		// "unsuccessful backup" contract entirely: the request died before the
+		// upgrader ran, so a caller written to continue with `backed_up: false`
+		// never got the chance, and the site could not self-update until the
+		// filesystem was repaired (#77, Codex round-6 P1). Every way this can
+		// fail must come out the same door.
+		try {
+			$complete = $this->add_directory_to_zip( $zip, $plugin_dir, $plugin_slug );
+		} catch ( Throwable $e ) {
+			$complete = false;
+		}
+		$closed = $zip->close();
 
 		if ( ! $complete || ! $closed ) {
 			// Do not leave a plausible-looking archive lying around for a later
