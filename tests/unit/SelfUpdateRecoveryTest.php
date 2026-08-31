@@ -554,6 +554,27 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		}
 	}
 
+	public function test_an_archive_that_lost_its_main_file_is_a_failed_install_and_is_restored(): void {
+		// Codex round-7 P1: Plugin_Upgrader accepts an archive whose main file
+		// was renamed — some other PHP file has a valid header — while the
+		// active-plugin entry still names the missing one. Nothing of ours loads
+		// on the loopback, so there is no beacon and no attributed fatal; the
+		// verdict would call that inconclusive and let a headless install stand.
+		// The main file's header is an on-disk FACT, so it is checked before the
+		// verdict is even asked.
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+			file_put_contents( $this->dir . '/renamed-main.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		unlink( $this->dir . '/renamed-main.php' );
+	}
+
 	public function test_a_fatal_in_THIS_plugin_rolls_back_even_when_the_beacon_was_written(): void {
 		// Boots — init completed — then dies in its own code on the probe. The
 		// beacon says "came up"; the attributed fatal says "and broke". Breakage
@@ -623,9 +644,13 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	}
 
 	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {
+		// No directory to back up, so no backup. The install itself lands (a
+		// fresh directory, real main file), the build does not boot, and it dies
+		// in our code — so the VERDICT is what fails, with nothing to restore.
 		$this->rmdir( $this->dir );
-		// Files land nowhere (no dir), no beacon — and the fatal it died with.
 		$GLOBALS['_install_effect'] = function () {
+			mkdir( $this->dir, 0777, true );
+			$this->installNewBuild( false );
 			$this->diedInOurCode();
 		};
 

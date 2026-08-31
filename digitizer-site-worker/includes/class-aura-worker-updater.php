@@ -285,9 +285,27 @@ class Aura_Worker_Updater {
 			wp_cache_flush();
 		}
 
-		// Read new version from the updated file header.
-		$new_data    = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin_file, false, false );
-		$new_version = $new_data['Version'] ?? 'unknown';
+		// The install is only complete if the file WordPress will load is there
+		// and carries a version header (Codex round-7 P1). `Plugin_Upgrader` can
+		// return success for an archive that renamed or omitted the main file —
+		// another PHP file with a valid header satisfies it — while the active
+		// plugin entry still points at the missing one. The loopback then loads
+		// nothing of ours: no beacon, no attributed fatal, and the verdict below
+		// would read that as inconclusive and let a headless install stand. The
+		// header on disk is a fact of the same kind the restore is held to, so it
+		// is checked FIRST and a missing one is a failed install, restored like
+		// any other.
+		$new_version = $this->installed_version( $plugin_file );
+		if ( null === $new_version || '' === $new_version ) {
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				__( 'Self-update installed an archive without a readable main plugin file.', 'digitizer-site-worker' )
+			);
+		}
 
 		// Did THIS build come up? See `verify_self_update()` — the aggregate
 		// site health check cannot answer that question (Codex round-1).
