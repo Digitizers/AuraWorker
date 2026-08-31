@@ -572,7 +572,12 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['success'] );
 		$this->assertTrue( $res['rolled_back'] );
 		$this->assertSame( 'OLD BUILD', $this->onDisk() );
-		unlink( $this->dir . '/renamed-main.php' );
+		// A clean rollback leaves nothing the broken release added: the restore
+		// removes the directory and re-extracts the backup, so the stray file
+		// must be gone. (The first version of this test tried to unlink it as
+		// cleanup and failed on PHP 7.4 — because the rollback had already done
+		// the job the test was about.)
+		$this->assertFileDoesNotExist( $this->dir . '/renamed-main.php' );
 	}
 
 	public function test_a_fatal_in_THIS_plugin_rolls_back_even_when_the_beacon_was_written(): void {
