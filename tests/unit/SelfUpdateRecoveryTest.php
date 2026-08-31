@@ -155,6 +155,27 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['rolled_back'] );
 	}
 
+	public function test_a_restore_that_cannot_write_is_not_reported_as_a_rollback(): void {
+		// `extractTo()` returns false when the PHP process cannot write to
+		// WP_PLUGIN_DIR — the ordinary case being a site that updates over
+		// FTP/SSH. Reporting `rolled_back: true` there tells an operator the
+		// site was recovered when the plugin may be missing (Codex round-1 P1).
+		$GLOBALS['_http_response'] = array( 'response' => array( 'code' => 500 ), 'body' => 'error' );
+		$GLOBALS['_install_effect'] = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			// Corrupt the only backup so extraction cannot succeed.
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				file_put_contents( $f, 'not a zip' );
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertNotNull( $res['restore_error'] );
+	}
+
 	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {
 		$this->rmdir( $this->dir );
 		$GLOBALS['_http_response']  = array( 'response' => array( 'code' => 500 ), 'body' => 'error' );

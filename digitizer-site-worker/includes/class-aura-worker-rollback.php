@@ -48,6 +48,15 @@ class Aura_Worker_Rollback {
 			return array( 'success' => false, 'error' => "Plugin directory not found: $plugin_slug" );
 		}
 
+		// ext-zip is OPTIONAL in PHP. Without this guard `new ZipArchive()`
+		// raises an uncaught Error and the whole request dies — so a caller
+		// written to carry on with `backed_up: false` never gets the chance, and
+		// the endpoint fatals instead (#77, Codex round-1 P1). Answer the same
+		// shape every other failure here answers.
+		if ( ! class_exists( 'ZipArchive' ) ) {
+			return array( 'success' => false, 'error' => 'ZipArchive is not available on this site' );
+		}
+
 		$timestamp   = gmdate( 'Y-m-d_H-i-s' );
 		$backup_path = $this->backup_dir . $plugin_slug . '_' . $timestamp . '.zip';
 
@@ -70,20 +79,41 @@ class Aura_Worker_Rollback {
 	 * @return array { success: bool, error?: string }
 	 */
 	public function restore_plugin( $plugin_slug, $backup_path ) {
+		if ( ! class_exists( 'ZipArchive' ) ) {
+			return array( 'success' => false, 'error' => 'ZipArchive is not available on this site' );
+		}
 		if ( ! file_exists( $backup_path ) ) {
 			return array( 'success' => false, 'error' => 'Backup file not found' );
 		}
 		$plugin_dir = WP_PLUGIN_DIR . '/' . $plugin_slug;
-		if ( is_dir( $plugin_dir ) ) {
-			$this->delete_directory( $plugin_dir );
-		}
 
 		$zip = new ZipArchive();
 		if ( $zip->open( $backup_path ) !== true ) {
 			return array( 'success' => false, 'error' => 'Failed to open backup archive' );
 		}
-		$zip->extractTo( WP_PLUGIN_DIR );
-		$zip->close();
+
+		// Open the archive BEFORE deleting anything. The old order deleted the
+		// directory first and then discovered it could not read the backup —
+		// turning a recoverable state into an empty one.
+		if ( is_dir( $plugin_dir ) ) {
+			$this->delete_directory( $plugin_dir );
+		}
+
+		// `extractTo()` returns false when it cannot write — the ordinary case
+		// being a site whose PHP process does not own WP_PLUGIN_DIR because
+		// WordPress updates over FTP/SSH. Ignoring it reported a successful
+		// restore after deleting the directory, so a caller could claim
+		// `rolled_back: true` with the plugin missing (#77, Codex round-1 P1).
+		$extracted = $zip->extractTo( WP_PLUGIN_DIR );
+		$closed    = $zip->close();
+
+		if ( ! $extracted || ! $closed ) {
+			return array(
+				'success' => false,
+				'error'   => 'Failed to extract the backup archive — the plugin directory may be incomplete',
+			);
+		}
+
 		return array( 'success' => true );
 	}
 
