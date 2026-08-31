@@ -820,4 +820,64 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$stamp = (int) substr( $seen_at_loopback, (int) strpos( $seen_at_loopback, '|' ) + 1 );
 		$this->assertGreaterThan( time() - 60, $stamp, 'the lease was not renewed after the install: ' . $seen_at_loopback );
 	}
+
+	public function test_a_package_carrying_the_running_version_is_refused_and_the_old_files_restored(): void {
+		// Records are matched by VERSION. A same-version package makes the new
+		// build and the old one indistinguishable: a request that loaded the
+		// pre-update files and fatals after the nonce is armed writes a record the
+		// verdict would own, and a healthy replacement is rolled back on it (Codex
+		// round-23 P1). Aura never sends one; the plugin refuses it before probing.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( true, AURA_WORKER_VERSION );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'same-version', $res['error'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertSame( array(), $GLOBALS['_wp_http_calls'], 'no probe: there is nothing a probe could tell apart' );
+	}
+
+	public function test_the_generic_single_update_of_siteagent_waits_on_the_same_claim(): void {
+		// `/aura/v1/update/plugin` accepts SiteAgent's own file and replaced it
+		// with no claim taken, so it could land between a self-update's backup,
+		// install and probe (Codex round-23 P1). Another plugin is unaffected.
+		$holder = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		$this->assertNotSame( '', $holder );
+		$updater = new Aura_Worker_Updater();
+
+		$self = $updater->update_plugin( Aura_Worker_Updater::SELF_PLUGIN_FILE );
+
+		$this->assertFalse( $self['success'] );
+		$this->assertTrue( $self['in_progress'] );
+		$this->assertNotContains( 'Plugin_Upgrader::upgrade', $GLOBALS['_mutations'], 'SiteAgent must not have been upgraded while the claim is held' );
+
+		$other = $updater->update_plugin( 'akismet/akismet.php' );
+		$this->assertTrue( $other['success'], 'another plugin is not held up by the self-update claim' );
+		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the refused path must not release the claim' );
+	}
+
+	public function test_the_generic_single_update_of_siteagent_takes_and_releases_the_claim(): void {
+		$res = ( new Aura_Worker_Updater() )->update_plugin( Aura_Worker_Updater::SELF_PLUGIN_FILE );
+		$this->assertTrue( $res['success'] );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the generic path releases what it took' );
+	}
+
+	public function test_the_batch_skips_siteagent_while_a_self_update_holds_the_claim_and_does_the_rest(): void {
+		$holder = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		$this->assertNotSame( '', $holder );
+
+		$out = ( new Aura_Worker_Updater() )->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE, 'akismet/akismet.php' ), 5, false );
+
+		$by = array();
+		foreach ( $out['results'] as $r ) {
+			$by[ $r['plugin'] ] = $r;
+		}
+		$this->assertSame( 'skipped', $by[ Aura_Worker_Updater::SELF_PLUGIN_FILE ]['status'] );
+		$this->assertStringContainsString( 'self-update is in progress', $by[ Aura_Worker_Updater::SELF_PLUGIN_FILE ]['detail'] );
+		$this->assertNotSame( 'skipped', $by['akismet/akismet.php']['status'], 'the rest of the batch runs' );
+		$this->assertStringStartsWith( $holder . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ) );
+	}
 }

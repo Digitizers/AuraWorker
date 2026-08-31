@@ -21,6 +21,13 @@ class Aura_Worker_Updater {
 	const SELF_UPDATE_LOCK = 'aura_worker_self_update_lock';
 
 	/**
+	 * This plugin's own file, as WordPress names it. Every path that can replace
+	 * these files — self-update, the generic single update, the batch — takes
+	 * the SELF_UPDATE_LOCK claim first (Codex round-23 P1).
+	 */
+	const SELF_PLUGIN_FILE = 'digitizer-site-worker/digitizer-site-worker.php';
+
+	/**
 	 * Load required WordPress upgrade files.
 	 */
 	private function load_upgrade_dependencies() {
@@ -189,11 +196,7 @@ class Aura_Worker_Updater {
 		}
 		$fence = Aura_Worker_Magic_Link::take_claim( self::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
 		if ( '' === $fence ) {
-			return array(
-				'success'     => false,
-				'error'       => __( 'A SiteAgent self-update is already in progress on this site.', 'digitizer-site-worker' ),
-				'in_progress' => true,
-			);
+			return $this->self_update_busy();
 		}
 		try {
 			return $this->self_update_locked( $zip_url, $expected_sha256, $fence );
@@ -223,7 +226,7 @@ class Aura_Worker_Updater {
 		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-rollback.php';
 
 		$old_version = AURA_WORKER_VERSION;
-		$plugin_file = 'digitizer-site-worker/digitizer-site-worker.php';
+		$plugin_file = self::SELF_PLUGIN_FILE;
 		$plugin_slug = 'digitizer-site-worker';
 
 		// Under the same contract as the backup itself: anything the recovery
@@ -386,6 +389,29 @@ class Aura_Worker_Updater {
 					__( 'Self-update installed a build whose header (%1$s) and AURA_WORKER_VERSION constant (%2$s) disagree.', 'digitizer-site-worker' ),
 					$new_version,
 					null === $constant_version ? '(missing)' : $constant_version
+				)
+			);
+		}
+
+		// The verdict tells builds apart by VERSION — a record counts only when its
+		// version is the new one — so a package carrying the version already
+		// running is indistinguishable from the old build: a request that loaded
+		// the pre-update files and fatals after the nonce is armed writes a record
+		// this build would own, and a healthy replacement is rolled back on it
+		// (Codex round-23 P1). Aura never sends a same-version package — the
+		// rollout compares versions first — so refusing costs nothing real, and
+		// it is refused like any other malformed install: restored, and said so.
+		if ( $new_version === $old_version ) {
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$plugin_file,
+				$backup_path,
+				$old_version,
+				sprintf(
+					/* translators: %s: the version already installed */
+					__( 'Self-update refused a package carrying the version already running (%s): a same-version build cannot be told apart from the old one by its boot records.', 'digitizer-site-worker' ),
+					$new_version
 				)
 			);
 		}
@@ -798,6 +824,109 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * One plugin of a batch: backup, update, health check, rollback on failure.
+	 *
+	 * @param string               $plugin_file   Plugin file path.
+	 * @param Aura_Worker_Rollback $rollback      Shared rollback helper.
+	 * @param Aura_Worker_Health   $health        Shared health checker.
+	 * @param bool                 $create_backup Whether to back up first.
+	 * @return array { plugin, status, detail }
+	 */
+	private function batch_update_one( $plugin_file, $rollback, $health, $create_backup ) {
+		$slug        = dirname( $plugin_file );
+		$backup_path = null;
+		$entry       = array(
+			'plugin'  => $plugin_file,
+			'status'  => 'skipped',
+			'detail'  => '',
+		);
+
+		// 1. Backup.
+		if ( $create_backup ) {
+			$backup_result = $rollback->backup_plugin( $slug );
+			if ( $backup_result['success'] ) {
+				$backup_path = $backup_result['backup_path'];
+			} else {
+				$entry['status'] = 'failed';
+				$entry['detail'] = 'Backup failed: ' . $backup_result['error'];
+				return $entry;
+			}
+		}
+
+		// 2. Update.
+		$update_result = $this->update_single_plugin( $plugin_file );
+		if ( ! $update_result['success'] ) {
+			$entry['status'] = 'failed';
+			$entry['detail'] = $update_result['error'];
+			return $entry;
+		}
+
+		// 3. Health check.
+		$health_result = $health->run_health_check();
+		if ( ! $health_result['healthy'] ) {
+			// 4. Auto-rollback.
+			if ( $backup_path ) {
+				$restore_result  = $rollback->restore_plugin( $slug, $backup_path );
+				$entry['status'] = 'rolled_back';
+				$entry['detail'] = 'Health check failed; rollback ' . ( $restore_result['success'] ? 'succeeded' : 'failed: ' . $restore_result['error'] );
+			} else {
+				$entry['status'] = 'failed';
+				$entry['detail'] = 'Health check failed; no backup available for rollback';
+			}
+			return $entry;
+		}
+
+		// 5. Success.
+		$entry['status'] = 'updated';
+		$entry['detail'] = 'Update and health check passed';
+		return $entry;
+	}
+
+	/**
+	 * Run $work under the self-update claim when $plugin_file is this plugin;
+	 * run it plainly for any other plugin. $busy is set when the claim is held
+	 * by a self-update, in which case $work is not run and null is returned.
+	 *
+	 * @param string   $plugin_file Plugin being mutated.
+	 * @param callable $work        The mutation.
+	 * @param bool     $busy        Out: true when refused for a held claim.
+	 * @return mixed $work's return, or null when busy.
+	 */
+	private function guarding_self( $plugin_file, $work, &$busy ) {
+		$busy = false;
+		if ( self::SELF_PLUGIN_FILE !== $plugin_file ) {
+			return $work();
+		}
+		if ( ! class_exists( 'Aura_Worker_Magic_Link' ) ) {
+			require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-magic-link.php';
+		}
+		$fence = Aura_Worker_Magic_Link::take_claim( self::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		if ( '' === $fence ) {
+			$busy = true;
+			return null;
+		}
+		try {
+			return $work();
+		} finally {
+			Aura_Worker_Magic_Link::release_claim( self::SELF_UPDATE_LOCK, $fence );
+		}
+	}
+
+	/**
+	 * The result every SiteAgent-mutating path answers while a self-update
+	 * holds the claim.
+	 *
+	 * @return array
+	 */
+	private function self_update_busy() {
+		return array(
+			'success'     => false,
+			'error'       => __( 'A SiteAgent self-update is already in progress on this site.', 'digitizer-site-worker' ),
+			'in_progress' => true,
+		);
+	}
+
+	/**
 	 * Update a specific plugin.
 	 *
 	 * @param string $plugin_file Plugin file path (e.g., "akismet/akismet.php").
@@ -806,9 +935,18 @@ class Aura_Worker_Updater {
 	public function update_plugin( $plugin_file ) {
 		$this->load_upgrade_dependencies();
 
-		$skin     = new Automatic_Upgrader_Skin();
-		$upgrader = new Plugin_Upgrader( $skin );
-		$result   = $upgrader->upgrade( $plugin_file );
+		// This plugin's own update goes under the self-update claim, like every
+		// other path that can replace these files (Codex round-23 P1): a generic
+		// update landing between a self-update's backup, install and probe would
+		// have the beacon describing one build and the rollback restoring another.
+		$result = $this->guarding_self( $plugin_file, function () use ( $plugin_file ) {
+			$skin     = new Automatic_Upgrader_Skin();
+			$upgrader = new Plugin_Upgrader( $skin );
+			return $upgrader->upgrade( $plugin_file );
+		}, $busy );
+		if ( $busy ) {
+			return $this->self_update_busy();
+		}
 
 		if ( is_wp_error( $result ) ) {
 			return array(
@@ -1007,56 +1145,20 @@ class Aura_Worker_Updater {
 
 		foreach ( $chunks as $chunk ) {
 			foreach ( $chunk as $plugin_file ) {
-				$slug        = dirname( $plugin_file );
-				$backup_path = null;
-				$entry       = array(
-					'plugin'  => $plugin_file,
-					'status'  => 'skipped',
-					'detail'  => '',
-				);
-
-				// 1. Backup.
-				if ( $create_backup ) {
-					$backup_result = $rollback->backup_plugin( $slug );
-					if ( $backup_result['success'] ) {
-						$backup_path = $backup_result['backup_path'];
-					} else {
-						$entry['status'] = 'failed';
-						$entry['detail'] = 'Backup failed: ' . $backup_result['error'];
-						$results[]       = $entry;
-						continue;
-					}
+				// SiteAgent's own entry runs under the self-update claim (Codex
+				// round-23 P1); while a self-update holds it, the entry is skipped
+				// and says why, and the rest of the batch is unaffected.
+				$entry = $this->guarding_self( $plugin_file, function () use ( $plugin_file, $rollback, $health, $create_backup ) {
+					return $this->batch_update_one( $plugin_file, $rollback, $health, $create_backup );
+				}, $busy );
+				if ( $busy ) {
+					$entry = array(
+						'plugin' => $plugin_file,
+						'status' => 'skipped',
+						'detail' => 'A SiteAgent self-update is in progress on this site',
+					);
 				}
-
-				// 2. Update.
-				$update_result = $this->update_single_plugin( $plugin_file );
-				if ( ! $update_result['success'] ) {
-					$entry['status'] = 'failed';
-					$entry['detail'] = $update_result['error'];
-					$results[]       = $entry;
-					continue;
-				}
-
-				// 3. Health check.
-				$health_result = $health->run_health_check();
-				if ( ! $health_result['healthy'] ) {
-					// 4. Auto-rollback.
-					if ( $backup_path ) {
-						$restore_result  = $rollback->restore_plugin( $slug, $backup_path );
-						$entry['status'] = 'rolled_back';
-						$entry['detail'] = 'Health check failed; rollback ' . ( $restore_result['success'] ? 'succeeded' : 'failed: ' . $restore_result['error'] );
-					} else {
-						$entry['status'] = 'failed';
-						$entry['detail'] = 'Health check failed; no backup available for rollback';
-					}
-					$results[] = $entry;
-					continue;
-				}
-
-				// 5. Success.
-				$entry['status'] = 'updated';
-				$entry['detail'] = 'Update and health check passed';
-				$results[]       = $entry;
+				$results[] = $entry;
 			}
 
 			// Between chunks: flush caches and run garbage collection.
