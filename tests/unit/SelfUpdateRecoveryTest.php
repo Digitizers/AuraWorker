@@ -27,6 +27,25 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 	private string $slug = 'digitizer-site-worker';
 	private string $dir;
+	/** @var string|null Previous ini error_log, restored in tearDown. */
+	private $prev_error_log = null;
+
+	/**
+	 * Point the PHP error log at a file this test owns.
+	 *
+	 * The production resolver reads `ini_get( 'error_log' )` FIRST and only
+	 * falls back to WP_CONTENT_DIR/debug.log when it is empty or missing. A
+	 * developer machine usually leaves it empty, so writing to debug.log
+	 * happened to work locally — and CI sets it, so the same test wrote to a
+	 * file the code never read and saw no fatals. Assume nothing about the
+	 * environment: name the file.
+	 */
+	private function useLog(): string {
+		$log                  = WP_CONTENT_DIR . '/sa-test-error.log';
+		$this->prev_error_log = ini_get( 'error_log' );
+		ini_set( 'error_log', $log );
+		return $log;
+	}
 
 	protected function setUp(): void {
 		$this->dir = WP_PLUGIN_DIR . '/' . $this->slug;
@@ -46,6 +65,11 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	}
 
 	protected function tearDown(): void {
+		if ( null !== $this->prev_error_log ) {
+			ini_set( 'error_log', $this->prev_error_log );
+			$this->prev_error_log = null;
+		}
+		@unlink( WP_CONTENT_DIR . '/sa-test-error.log' );
 		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'] );
 		$this->rmdir( $this->dir );
 		foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
@@ -146,7 +170,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// The old aggregate check read the last 5KB of the log and failed on ANY
 		// fatal, whatever its age — so on a site with one old fatal every
 		// healthy self-update would have been rolled back (Codex round-1 P2).
-		$log = WP_CONTENT_DIR . '/debug.log';
+		$log = $this->useLog();
 		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
 
 		try {
@@ -163,7 +187,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// shields the offset logic and a whole-log scan looks identical. Here
 		// the update appends something harmless, so a scan that started at byte
 		// zero would find the OLD fatal and roll back a healthy build.
-		$log = WP_CONTENT_DIR . '/debug.log';
+		$log = $this->useLog();
 		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
@@ -180,7 +204,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	}
 
 	public function test_a_fatal_written_BY_this_update_does_roll_it_back(): void {
-		$log = WP_CONTENT_DIR . '/debug.log';
+		$log = $this->useLog();
 		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
@@ -198,7 +222,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	}
 
 	public function test_a_rotated_log_claims_nothing_rather_than_reading_someone_elses_window(): void {
-		$log = WP_CONTENT_DIR . '/debug.log';
+		$log = $this->useLog();
 		file_put_contents( $log, str_repeat( 'x', 4096 ) . "\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
 			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
@@ -251,8 +275,12 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		foreach ( glob( $backups . '/*.zip' ) ?: array() as $f ) {
 			unlink( $f );
 		}
-		// Make the backup impossible: no source directory to archive.
+		// Make the backup impossible: no source directory to archive. The default
+		// install effect writes INTO that directory, so it has to go too —
+		// otherwise the test fails on its own fixture rather than on the
+		// behaviour it is describing.
 		$this->rmdir( $this->dir );
+		$GLOBALS['_install_effect'] = null;
 
 		$res = $this->selfUpdate();
 
