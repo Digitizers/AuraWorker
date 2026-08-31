@@ -263,9 +263,11 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 * Feature: **one SiteAgent mutation at a time.** Every path that can replace
   SiteAgent's own files — the self-update, the generic plugin update, a batch
   entry, the rollback endpoint — runs under a single per-site claim: taken by
-  a conditional insert, renewed while the work continues, seized only from a
-  holder that died mid-request, and released only by its owner. An overlapping
-  request is answered "in progress" and touches nothing.
+  a conditional insert, seizable only after its holder has gone silent for ten
+  minutes (a request that dies never releases), and released only by its
+  owner. The self-update additionally renews the claim between its phases so
+  a slow download or install is never mistaken for a dead holder. An
+  overlapping request is answered "in progress" and touches nothing.
 * Hardening: backups follow a symlink only while its target stays inside the
   plugin folder — a link pointing out of the tree makes the backup report
   itself incomplete instead of copying unrelated files into an archive.
