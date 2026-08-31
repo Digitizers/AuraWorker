@@ -24,10 +24,17 @@
  * catch is a parse error in the entry file itself — nothing in it runs — and
  * that case yields no beacon at all, which the verdict reports as inconclusive.
  *
+ * Two RECORDS, not one (Codex round-11): the boot writer owns
+ * `aura_worker_boot`, the fatal writer owns `aura_worker_boot_fatal`, and each
+ * write is unconditional. Precedence between them is decided at READ time, in
+ * the verdict — a fatal outranks a boot, and either counts only when it names
+ * the version under verdict — so there is no read-then-write between two
+ * requests for one option to race on, and a straggling request still running
+ * the OLD build cannot launder or override the new build's record: its version
+ * says which build it was.
+ *
  * The nonce is spent by the UPDATER after its verdict, never by a writer here:
- * a boot beacon and a later fatal on the same request must both be able to
- * see it, and a fatal beacon must never be overwritten by a clean one for the
- * same nonce.
+ * a boot and a later fatal on the same request must both be able to see it.
  *
  * @package Aura_Worker
  */
@@ -47,8 +54,8 @@ function aura_worker_boot_nonce() {
 }
 
 /**
- * Record that the build booted. Writes only while a verdict is pending, and
- * never over a fatal already recorded for the same nonce.
+ * Record that the build booted. Writes only while a verdict is pending.
+ * Unconditional otherwise — precedence against a fatal is the verdict's job.
  *
  * @param string $version The version of the build that is running.
  * @return bool Whether a beacon was written.
@@ -58,16 +65,9 @@ function aura_worker_write_boot_beacon( $version ) {
 	if ( '' === $nonce ) {
 		return false;
 	}
-	$existing = get_option( 'aura_worker_boot' );
-	if ( is_array( $existing )
-		&& ! empty( $existing['fatal'] )
-		&& isset( $existing['nonce'] )
-		&& hash_equals( $nonce, (string) $existing['nonce'] ) ) {
-		return false; // a death already recorded for this verdict outranks a boot
-	}
 	return (bool) update_option(
 		'aura_worker_boot',
-		array( 'version' => (string) $version, 'nonce' => $nonce, 'fatal' => false ),
+		array( 'version' => (string) $version, 'nonce' => $nonce ),
 		false
 	);
 }
@@ -98,10 +98,10 @@ function aura_worker_is_own_fatal( $error, $plugin_dir ) {
 
 /**
  * Record that a fatal in this plugin ended the request. Writes only while a
- * verdict is pending; overwrites a clean boot beacon for the same nonce.
+ * verdict is pending, to its OWN record, so no boot write can replace it.
  *
- * @param array|null $error   From `error_get_last()`.
- * @param string     $version The version of the build that was running.
+ * @param array|null $error      From `error_get_last()`.
+ * @param string     $version    The version of the build that was running.
  * @param string     $plugin_dir This plugin's directory.
  * @return bool Whether a fatal beacon was written.
  */
@@ -111,11 +111,10 @@ function aura_worker_record_fatal_beacon( $error, $version, $plugin_dir ) {
 		return false;
 	}
 	return (bool) update_option(
-		'aura_worker_boot',
+		'aura_worker_boot_fatal',
 		array(
 			'version' => (string) $version,
 			'nonce'   => $nonce,
-			'fatal'   => true,
 			'file'    => basename( (string) $error['file'] ),
 			'message' => substr( (string) ( $error['message'] ?? '' ), 0, 200 ),
 		),

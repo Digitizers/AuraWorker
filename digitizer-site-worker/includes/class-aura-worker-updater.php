@@ -474,17 +474,29 @@ class Aura_Worker_Updater {
 		// Read the fact UNCACHED: the option cache in this process may still hold
 		// the pre-install state.
 		wp_cache_delete( 'aura_worker_boot', 'options' );
-		$beacon = get_option( 'aura_worker_boot' );
-		$ours   = is_array( $beacon )
-			&& isset( $beacon['nonce'] )
-			&& hash_equals( $nonce, (string) $beacon['nonce'] );
-		// Breakage: the dying process recorded a fatal in one of our files, for
-		// THIS verdict (includes/boot-beacon.php). A positive fact from the
-		// engine, not a line found in someone's log.
-		$broken = $ours && ! empty( $beacon['fatal'] );
-		$booted = $ours && ! $broken
-			&& isset( $beacon['version'] )
-			&& (string) $beacon['version'] === (string) $new_version;
+		wp_cache_delete( 'aura_worker_boot_fatal', 'options' );
+		$boot  = get_option( 'aura_worker_boot' );
+		$fatal = get_option( 'aura_worker_boot_fatal' );
+
+		// A record counts only if it is for THIS verdict (the nonce) and names
+		// THIS build (the version). The version test is what keeps a request
+		// still running the OLD build — one that loaded before the install and
+		// dies, or boots, after the nonce was armed — from overriding the new
+		// build's record in either direction (Codex round-11).
+		$for_this = function ( $record ) use ( $nonce, $new_version ) {
+			return is_array( $record )
+				&& isset( $record['nonce'], $record['version'] )
+				&& hash_equals( $nonce, (string) $record['nonce'] )
+				&& (string) $record['version'] === (string) $new_version;
+		};
+		// Precedence at READ time: a recorded death outranks a recorded boot.
+		// Two records, two owners, no write races between them (round-11).
+		$broken = $for_this( $fatal );
+		$booted = ! $broken && $for_this( $boot );
+		// For the detail strings only: does SOME record carry this nonce?
+		$ours = ( is_array( $boot ) && isset( $boot['nonce'] ) && hash_equals( $nonce, (string) $boot['nonce'] ) )
+			|| ( is_array( $fatal ) && isset( $fatal['nonce'] ) && hash_equals( $nonce, (string) $fatal['nonce'] ) );
+		$beacon = $boot;
 
 		$checks = array(
 			'loopback'   => array(
@@ -502,7 +514,7 @@ class Aura_Worker_Updater {
 			'fatal_beacon' => array(
 				'status' => $broken ? 'fail' : 'pass',
 				'detail' => $broken
-					? 'the build died in ' . (string) ( $beacon['file'] ?? '?' ) . ': ' . (string) ( $beacon['message'] ?? '' )
+					? 'the build died in ' . (string) ( $fatal['file'] ?? '?' ) . ': ' . (string) ( $fatal['message'] ?? '' )
 					: 'no fatal recorded by this plugin',
 			),
 		);

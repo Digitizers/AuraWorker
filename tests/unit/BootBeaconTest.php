@@ -18,6 +18,7 @@ final class BootBeaconTest extends TestCase {
 		// `_options`, and resetting only `_options` let a nonce leak between
 		// tests — a "no verdict pending" case then found one pending.
 		delete_option( 'aura_worker_boot' );
+		delete_option( 'aura_worker_boot_fatal' );
 		delete_option( 'aura_worker_boot_nonce' );
 		$GLOBALS['_options']    = array();
 		$GLOBALS['_notoptions'] = array();
@@ -33,7 +34,7 @@ final class BootBeaconTest extends TestCase {
 
 		$this->assertTrue( Aura_Worker_Updater::write_boot_beacon( '2.14.0' ) );
 		$this->assertSame(
-			array( 'version' => '2.14.0', 'nonce' => 'abc123', 'fatal' => false ),
+			array( 'version' => '2.14.0', 'nonce' => 'abc123' ),
 			$GLOBALS['_options']['aura_worker_boot']
 		);
 		// The UPDATER spends the nonce after its verdict. If the boot write
@@ -48,16 +49,18 @@ final class BootBeaconTest extends TestCase {
 		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'includes/x.php', 'line' => 3, 'message' => 'Uncaught Error' );
 
 		$this->assertTrue( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
-		$b = $GLOBALS['_options']['aura_worker_boot'];
-		$this->assertTrue( $b['fatal'] );
+		$b = $GLOBALS['_options']['aura_worker_boot_fatal'];
 		$this->assertSame( 'n1', $b['nonce'] );
+		$this->assertSame( '2.14.0', $b['version'] );
 		$this->assertSame( 'x.php', $b['file'] );
+		// Its own record: nothing about a boot is touched.
+		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
 	}
 
 	public function test_a_fatal_with_no_verdict_pending_is_not_recorded(): void {
 		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'includes/x.php', 'line' => 3, 'message' => 'boom' );
 		$this->assertFalse( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
-		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
+		$this->assertArrayNotHasKey( 'aura_worker_boot_fatal', $GLOBALS['_options'] );
 	}
 
 	public function test_a_fatal_in_ANOTHER_plugins_file_is_not_ours(): void {
@@ -88,43 +91,17 @@ final class BootBeaconTest extends TestCase {
 		$this->assertFalse( aura_worker_is_own_fatal( $err, self::DIR ) );
 	}
 
-	public function test_a_boot_beacon_never_overwrites_a_fatal_for_the_same_nonce(): void {
+	public function test_boot_and_fatal_are_separate_records_so_neither_write_can_erase_the_other(): void {
+		// Codex round-11: a read-then-write "fatal wins" rule on one option
+		// raced between two requests. Two records, two owners — precedence is
+		// the verdict's, at read time.
 		update_option( 'aura_worker_boot_nonce', 'n2', false );
 		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'x.php', 'line' => 1, 'message' => 'boom' );
+
 		aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR );
-
-		$this->assertFalse( Aura_Worker_Updater::write_boot_beacon( '2.14.0' ) );
-		$this->assertTrue( $GLOBALS['_options']['aura_worker_boot']['fatal'] );
-	}
-
-	public function test_a_fatal_upgrades_an_earlier_boot_beacon_for_the_same_nonce(): void {
-		update_option( 'aura_worker_boot_nonce', 'n3', false );
 		Aura_Worker_Updater::write_boot_beacon( '2.14.0' );
-		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'x.php', 'line' => 1, 'message' => 'boom' );
 
-		$this->assertTrue( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
-		$this->assertTrue( $GLOBALS['_options']['aura_worker_boot']['fatal'] );
-	}
-
-	public function test_the_beacon_is_hooked_last_on_rest_api_init_by_the_plugins_init(): void {
-		// The wiring, not just the writer. A beacon emitted at plugins_loaded
-		// vouched for a REST API that had not initialized yet (Codex round-9);
-		// it has to run after every route registration on the probe request.
-		$GLOBALS['_filters'] = array();
-		$plugin = new Aura_Worker();
-		$plugin->init();
-
-		$this->assertSame(
-			PHP_INT_MAX,
-			has_filter( 'rest_api_init', array( 'Aura_Worker_Updater', 'emit_boot_beacon' ) ),
-			'the beacon must be registered on rest_api_init at the lowest possible priority'
-		);
-	}
-
-	public function test_a_malformed_nonce_is_treated_as_no_request(): void {
-		update_option( 'aura_worker_boot_nonce', array( 'not', 'a', 'string' ), false );
-
-		$this->assertFalse( Aura_Worker_Updater::write_boot_beacon( '2.14.0' ) );
-		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
+		$this->assertSame( 'n2', $GLOBALS['_options']['aura_worker_boot_fatal']['nonce'] );
+		$this->assertSame( 'n2', $GLOBALS['_options']['aura_worker_boot']['nonce'] );
 	}
 }

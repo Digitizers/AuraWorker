@@ -45,6 +45,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// `_options` let a stale beacon leak into the next test — which then
 		// read "stale beacon" for a build that had written nothing.
 		delete_option( 'aura_worker_boot' );
+		delete_option( 'aura_worker_boot_fatal' );
 		delete_option( 'aura_worker_boot_nonce' );
 		// A deleted option is listed in `notoptions` and short-circuits get_option
 		// until something writes it again; clear that too so absence is absence.
@@ -328,7 +329,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// A stale beacon with some other nonce is exactly what a "did it boot"
 		// check must not be fooled by — the previous build booted; this one
 		// did not.
-		$GLOBALS['_options']['aura_worker_boot'] = array( 'version' => '9.9.9', 'nonce' => 'from-last-time', 'fatal' => false );
+		$GLOBALS['_options']['aura_worker_boot'] = array( 'version' => '9.9.9', 'nonce' => 'from-last-time' );
 		// Neither boots nor dies: nothing of ours is written for THIS nonce.
 		$GLOBALS['_install_effect'] = function () {
 			$this->installNewBuild( false );
@@ -479,6 +480,53 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 		$this->assertSame( 'no beacon written', $res['health']['checks']['boot_beacon']['detail'] );
 		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
+	}
+
+	public function test_an_OLD_build_dying_after_the_nonce_was_armed_does_not_roll_back_a_healthy_new_build(): void {
+		// Codex round-11: a request that loaded the old build before the install
+		// can still be running when the nonce is armed, and die in old code. Its
+		// fatal record names the OLD version, so it is not about the build under
+		// verdict, and the new build's clean boot stands.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/old.php', 'line' => 1, 'message' => 'straggler' ),
+					AURA_WORKER_VERSION, // the OLD build died
+					$dir . '/'
+				);
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['verified'] );
+	}
+
+	public function test_a_fatal_recorded_BEFORE_a_clean_boot_on_another_request_still_rolls_back(): void {
+		// Codex round-11: two records with two owners, so the boot write cannot
+		// replace the fatal however the two requests interleave. Precedence is
+		// decided when the verdict reads, not when either writes.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/x.php', 'line' => 1, 'message' => 'died first' ),
+					'9.9.9',
+					$dir . '/'
+				);
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' ); // a second, clean request, later
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
 	}
 
 	public function test_a_fatal_AFTER_the_boot_beacon_on_the_same_request_still_rolls_back(): void {

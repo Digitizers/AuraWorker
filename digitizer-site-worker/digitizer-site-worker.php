@@ -22,11 +22,42 @@ define( 'AURA_WORKER_VERSION', '2.13.0' );
 define( 'AURA_WORKER_FILE', __FILE__ );
 define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 
-// The boot beacon, BEFORE every other include, and the shutdown handler armed
-// immediately: a parse error in any include below must still be recorded by
-// the dying process (#78). See includes/boot-beacon.php.
+// The shutdown guard is armed BEFORE the first include (#78, Codex round-11):
+// the beacon file below is itself an include, and an archive that omitted or
+// broke it would otherwise die before the handler existed — the one failure
+// the handler is for, unrecorded. So the guard delegates to the beacon file
+// when it loaded, and carries a MINIMAL inline copy of the decision for when
+// it did not. That copy is the only beacon logic the unit suite cannot reach
+// (this file cannot be required twice); it is kept to the fewest lines that
+// still record "a fatal in one of our files ended this request".
+register_shutdown_function(
+	function () {
+		if ( function_exists( 'aura_worker_shutdown_beacon' ) ) {
+			aura_worker_shutdown_beacon();
+			return;
+		}
+		// Fallback: the beacon file never loaded.
+		$e = function_exists( 'error_get_last' ) ? error_get_last() : null;
+		if ( ! is_array( $e ) || ! isset( $e['type'], $e['file'] ) || ! function_exists( 'get_option' ) ) {
+			return;
+		}
+		$fatal = E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR;
+		$file  = str_replace( '\\', '/', (string) $e['file'] );
+		$dir   = rtrim( str_replace( '\\', '/', AURA_WORKER_DIR ), '/' ) . '/';
+		$nonce = get_option( 'aura_worker_boot_nonce', '' );
+		if ( 0 === ( (int) $e['type'] & $fatal ) || 0 !== stripos( $file, $dir ) || ! is_string( $nonce ) || '' === $nonce ) {
+			return;
+		}
+		update_option(
+			'aura_worker_boot_fatal',
+			array( 'version' => AURA_WORKER_VERSION, 'nonce' => $nonce, 'file' => basename( $file ), 'message' => substr( (string) ( $e['message'] ?? '' ), 0, 200 ) ),
+			false
+		);
+	}
+);
+
+// The boot beacon, before every other include. See includes/boot-beacon.php.
 require_once AURA_WORKER_DIR . 'includes/boot-beacon.php';
-register_shutdown_function( 'aura_worker_shutdown_beacon' );
 
 // Load dependencies.
 // The one rule the marker's credential list is read by — a pure function file
