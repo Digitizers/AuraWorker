@@ -2302,4 +2302,37 @@ class Aura_Worker_Magic_Link {
 		$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value LIKE %s", $claim_key, $wpdb->esc_like( $fence . '|' ) . '%' ) );
 		wp_cache_delete( $claim_key, 'options' );
 	}
+
+	/**
+	 * A per-site mutex for OTHER long-running work — today the plugin's own
+	 * self-update (#78, Codex rounds 20-21) — on the same claim row the connect
+	 * uses: taken by a conditional INSERT, seized only when older than
+	 * $takeover_after (a request that fatals never releases), and released only
+	 * by its holder — a DELETE fenced on the value — so a holder that outlived
+	 * the takeover cannot remove its successor's claim. Core's own
+	 * WP_Upgrader::release_lock() is an unconditional delete and has exactly
+	 * that hole.
+	 *
+	 * @param string $claim_key      Option name, under a prefix uninstall sweeps.
+	 * @param int    $takeover_after Seconds a holder must EXCEED to be seized.
+	 * @return string The fence to release with, or '' when not taken.
+	 */
+	public static function take_claim( $claim_key, $takeover_after ) {
+		return self::claim_magic_link( (string) $claim_key, (int) $takeover_after );
+	}
+
+	/**
+	 * Release a claim taken with take_claim(): removes the row only while it
+	 * still carries this fence. A holder whose claim was seized removes nothing.
+	 *
+	 * @param string $claim_key Option name.
+	 * @param string $fence     The fence take_claim() returned.
+	 * @return void
+	 */
+	public static function release_claim( $claim_key, $fence ) {
+		if ( '' === (string) $fence ) {
+			return;
+		}
+		self::release_magic_link( (string) $claim_key, (string) $fence );
+	}
 }

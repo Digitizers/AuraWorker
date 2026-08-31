@@ -15,10 +15,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Aura_Worker_Updater {
 
 	/**
-	 * Name of the per-site lock `self_update()` holds; core stores it as the
-	 * option `<name>.lock`.
+	 * Option holding the per-site self-update claim (`<fence>|<unix time>`);
+	 * under the prefix uninstall.php sweeps.
 	 */
-	const SELF_UPDATE_LOCK = 'aura_worker_self_update';
+	const SELF_UPDATE_LOCK = 'aura_worker_self_update_lock';
 
 	/**
 	 * Load required WordPress upgrade files.
@@ -175,12 +175,20 @@ class Aura_Worker_Updater {
 		// overwrote it before the first loopback wrote its beacon, so the first
 		// verifier read a record carrying a nonce it did not arm — "unrelated",
 		// inconclusive, healthy — and a broken release stood with no rollback;
-		// concurrent installs also back up and replace each other's files. The
-		// lock is core's own upgrade lock (a conditional INSERT, presumed dead
-		// and taken over after the timeout — a request that fatals mid-update
-		// never reaches `finally`). Its option is `aura_worker_self_update.lock`,
-		// under the prefix uninstall.php sweeps.
-		if ( ! WP_Upgrader::create_lock( self::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS ) ) {
+		// concurrent installs also back up and replace each other's files.
+		//
+		// The claim is the connect's own (#434): a conditional INSERT to take it,
+		// seized only when its holder is older than the takeover window (a request
+		// that fatals mid-update never reaches `finally`), and released ONLY by
+		// its holder — the DELETE is fenced on the value — so a request that ran
+		// past the window and was taken over cannot remove its successor's claim
+		// on its way out (Codex round-21 P1; core's WP_Upgrader::release_lock()
+		// is an unconditional delete with exactly that hole).
+		if ( ! class_exists( 'Aura_Worker_Magic_Link' ) ) {
+			require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-magic-link.php';
+		}
+		$fence = Aura_Worker_Magic_Link::take_claim( self::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		if ( '' === $fence ) {
 			return array(
 				'success'     => false,
 				'error'       => __( 'A SiteAgent self-update is already in progress on this site.', 'digitizer-site-worker' ),
@@ -190,7 +198,7 @@ class Aura_Worker_Updater {
 		try {
 			return $this->self_update_locked( $zip_url, $expected_sha256 );
 		} finally {
-			WP_Upgrader::release_lock( self::SELF_UPDATE_LOCK );
+			Aura_Worker_Magic_Link::release_claim( self::SELF_UPDATE_LOCK, $fence );
 		}
 	}
 

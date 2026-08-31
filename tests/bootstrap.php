@@ -1453,39 +1453,6 @@ if ( ! class_exists( 'Automatic_Upgrader_Skin' ) ) {
 	}
 }
 
-if ( ! class_exists( 'WP_Upgrader' ) ) {
-	/**
-	 * Only the lock half of core's WP_Upgrader, with core's semantics: the lock
-	 * is the option `<name>.lock` holding the time it was taken; taking it is a
-	 * single conditional INSERT (`INSERT IGNORE`), so a second taker fails while
-	 * the first holds it — unless the holder is older than the release timeout,
-	 * in which case it is presumed dead and the lock is taken over.
-	 */
-	class WP_Upgrader {
-		public static function create_lock( $lock_name, $release_timeout = null ) {
-			if ( ! $release_timeout ) {
-				$release_timeout = HOUR_IN_SECONDS;
-			}
-			$key = $lock_name . '.lock';
-			if ( array_key_exists( $key, $GLOBALS['_options'] ) ) {
-				if ( (int) $GLOBALS['_options'][ $key ] > time() - $release_timeout ) {
-					return false;
-				}
-				self::release_lock( $lock_name );
-			}
-			unset( $GLOBALS['_notoptions'][ $key ] );
-			$GLOBALS['_options'][ $key ]       = time();
-			$GLOBALS['_rows'][ $key ]          = (string) time();
-			$GLOBALS['_rows_autoload'][ $key ] = 'no';
-			return true;
-		}
-
-		public static function release_lock( $lock_name ) {
-			return delete_option( $lock_name . '.lock' );
-		}
-	}
-}
-
 if ( ! class_exists( 'Plugin_Upgrader' ) ) {
 	class Plugin_Upgrader {
 		public function __construct( $skin = null ) {}
