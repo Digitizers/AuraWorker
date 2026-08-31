@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.11.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.14.0-green" alt="Stable" />
 </p>
 
 ---
