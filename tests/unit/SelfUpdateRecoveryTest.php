@@ -52,9 +52,14 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'OLD BUILD', AURA_WORKER_VERSION ) );
 
 		$GLOBALS['_mutations']      = array();
+		// Remove any beacon or nonce a previous test left, through the stub's OWN
+		// delete path: it keeps a row store beside `_options`, and clearing only
+		// `_options` let a stale beacon leak into the next test — which then
+		// read "stale beacon" for a build that had written nothing.
+		delete_option( 'aura_worker_boot' );
+		delete_option( 'aura_worker_boot_nonce' );
 		// A deleted option is listed in `notoptions` and short-circuits get_option
-		// until something writes it again; a previous test's spent nonce must
-		// not leak into this one.
+		// until something writes it again; clear that too so absence is absence.
 		$GLOBALS['_notoptions']     = array();
 		$GLOBALS['_wp_http_calls']  = array();
 		$GLOBALS['_http_error']     = false;
@@ -72,8 +77,9 @@ final class SelfUpdateRecoveryTest extends TestCase {
 			$this->prev_error_log = null;
 		}
 		@unlink( WP_CONTENT_DIR . '/sa-test-error.log' );
-		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'], $GLOBALS['_http_error'] );
-		unset( $GLOBALS['_options']['aura_worker_boot'], $GLOBALS['_options']['aura_worker_boot_nonce'] );
+		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'], $GLOBALS['_http_error'], $GLOBALS['_http_effect'] );
+		delete_option( 'aura_worker_boot' );
+		delete_option( 'aura_worker_boot_nonce' );
 		$this->rmdir( $this->dir );
 		foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 			unlink( $f );
@@ -116,9 +122,12 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	 */
 	private function installNewBuild( bool $boots, string $version = '9.9.9' ): void {
 		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', $version ) );
-		if ( $boots ) {
-			Aura_Worker_Updater::write_boot_beacon( $version );
-		}
+		// The beacon is written by the fresh process the LOOPBACK starts, not by
+		// the install. Modelling it at install time was the round-8 finding: at
+		// that moment the OLD build is what any request runs.
+		$GLOBALS['_http_effect'] = $boots
+			? function () use ( $version ) { Aura_Worker_Updater::write_boot_beacon( $version ); }
+			: null;
 	}
 
 	/** Append the fatal a dying build of THIS plugin leaves in the log. */
@@ -450,7 +459,8 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// installed — an OPcache still serving the old files would look like this.
 		$GLOBALS['_install_effect'] = function () {
 			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
-			Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION ); // the OLD version booted
+			// The loopback is answered by the OLD version (OPcache still serving it).
+			$GLOBALS['_http_effect'] = function () { Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION ); };
 		};
 
 		$res = $this->selfUpdate();
@@ -578,6 +588,53 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// cleanup and failed on PHP 7.4 — because the rollback had already done
 		// the job the test was about.)
 		$this->assertFileDoesNotExist( $this->dir . '/renamed-main.php' );
+	}
+
+	public function test_the_OLD_build_cannot_consume_the_nonce_during_the_install(): void {
+		// Codex round-8 P1: while install() runs, other requests are still
+		// served by the old build. If the nonce were armed before the install,
+		// one of them would write a beacon with the OLD version and delete the
+		// nonce — and a broken new build would read as "stale beacon" rather
+		// than "no beacon". The nonce must not exist until the install is done.
+		$GLOBALS['_install_effect'] = function () {
+			// A concurrent request on the old build, mid-install.
+			Aura_Worker_Updater::write_boot_beacon( AURA_WORKER_VERSION );
+			$this->installNewBuild( false );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertSame( 'no beacon written', $res['health']['checks']['boot_beacon']['detail'] );
+		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
+	}
+
+	public function test_a_log_rotated_and_regrown_past_the_old_offset_is_read_from_zero(): void {
+		// Codex round-8 P1: the size-only rotation rule sees a replacement file
+		// that already grew past the old size as "the same file, grown", seeks
+		// to the old size, and skips the new file's beginning — where a
+		// bootstrap fatal lands.
+		$log = $this->useLog();
+		file_put_contents( $log, str_repeat( "old noise\n", 100 ) ); // ~1000 bytes
+		$ours = "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\n";
+		$GLOBALS['_install_effect'] = function () use ( $log, $ours ) {
+			$this->installNewBuild( false );
+			// Rotate: a NEW file under the same name, fatal at the very start,
+			// then enough noise to grow past the old size.
+			unlink( $log );
+			file_put_contents( $log, $ours . str_repeat( "new noise\n", 300 ) );
+		};
+
+		if ( 0 === (int) @fileinode( $log ) ) {
+			$this->markTestSkipped( 'filesystem exposes no inode; identity cannot be tracked here' );
+		}
+
+		try {
+			$res = $this->selfUpdate();
+			$this->assertFalse( $res['success'] );
+			$this->assertTrue( $res['rolled_back'] );
+		} finally {
+			@unlink( $log );
+		}
 	}
 
 	public function test_a_fatal_in_THIS_plugin_rolls_back_even_when_the_beacon_was_written(): void {

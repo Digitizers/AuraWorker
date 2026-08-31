@@ -2912,6 +2912,13 @@ if ( ! function_exists( 'wp_remote_get' ) ) {
 		if ( ! empty( $GLOBALS['_http_error'] ) ) {
 			return new WP_Error( 'http_request_failed', 'stubbed failure' );
 		}
+		// `_http_effect` models the FRESH PROCESS a loopback request starts:
+		// whatever the new build would do on boot (write its beacon, or not)
+		// happens here, at request time — not at install time, which is the
+		// wrong moment and was the round-8 finding.
+		if ( isset( $GLOBALS['_http_effect'] ) && is_callable( $GLOBALS['_http_effect'] ) ) {
+			call_user_func( $GLOBALS['_http_effect'], $url );
+		}
 		// Per-URL responses, matched by substring, for code that probes more
 		// than one endpoint in a single operation (the self-update verdict asks
 		// an Aura REST route, a core REST route and the home page, and has to

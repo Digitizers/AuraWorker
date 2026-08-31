@@ -233,11 +233,6 @@ class Aura_Worker_Updater {
 		// PHP log the new build creates (Codex round-4 P1).
 		$log_snapshot = $this->error_log_snapshot();
 
-		// Ask the next boot of this plugin to announce itself. Random, so a
-		// beacon left by any earlier boot cannot satisfy this verdict.
-		$boot_nonce = bin2hex( random_bytes( 16 ) );
-		update_option( 'aura_worker_boot_nonce', $boot_nonce, false );
-
 		// Install from the verified local file (or the URL when no digest given).
 		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
 
@@ -307,8 +302,19 @@ class Aura_Worker_Updater {
 			);
 		}
 
-		// Did THIS build come up? See `verify_self_update()` — the aggregate
-		// site health check cannot answer that question (Codex round-1).
+		// Ask the next boot of this plugin to announce itself. Armed HERE — after
+		// the install and the main-file check, immediately before the probe —
+		// and not before the install (Codex round-8 P1): while `install()` runs,
+		// any other front-end request is still served by the OLD build, which
+		// would consume the nonce, write a beacon carrying the old version, and
+		// leave the verdict a stale beacon instead of a missing one. Only a
+		// request that starts after this line can answer, and by then only the
+		// new build is on disk. Random, so a beacon from any earlier boot cannot
+		// satisfy this verdict either.
+		$boot_nonce = bin2hex( random_bytes( 16 ) );
+		update_option( 'aura_worker_boot_nonce', $boot_nonce, false );
+
+		// Did THIS build come up? See `verify_self_update()`.
 		$health_result = $this->verify_self_update( $new_version, $boot_nonce, $log_snapshot );
 		// Whatever happened, the request for a beacon is spent.
 		delete_option( 'aura_worker_boot_nonce' );
@@ -424,7 +430,17 @@ class Aura_Worker_Updater {
 			return null;
 		}
 		clearstatcache( true, $log );
-		return array( 'path' => $log, 'size' => (int) filesize( $log ) );
+		// Identity too, not just size (Codex round-8 P1): a log rotated and
+		// RECREATED under the same name that regrows past the old size is not
+		// the same file, and reading it from the old offset skips the start of
+		// the new one — where a bootstrap fatal lands. `fileinode()` is 0 on
+		// filesystems that have none (some Windows setups); then identity is
+		// unknown and only the size rule applies.
+		return array(
+			'path'  => $log,
+			'size'  => (int) filesize( $log ),
+			'inode' => (int) @fileinode( $log ),
+		);
 	}
 
 	/** The log both halves read. Mirrors Aura_Worker_Health's resolution order. */
@@ -446,9 +462,14 @@ class Aura_Worker_Updater {
 		$current = $this->error_log_path();
 		$total   = 0;
 
-		// The file we measured before the install, read from where it ended.
+		// The file we measured before the install, read from where it ended —
+		// unless it is no longer the same file. A replacement with a different
+		// inode is read from byte zero: everything in it is after the install.
 		if ( is_array( $snapshot ) && file_exists( $snapshot['path'] ) ) {
-			$total += $this->fatals_in( $snapshot['path'], (int) $snapshot['size'] );
+			clearstatcache( true, $snapshot['path'] );
+			$inode_now = (int) @fileinode( $snapshot['path'] );
+			$same_file = 0 === (int) $snapshot['inode'] || 0 === $inode_now || $inode_now === (int) $snapshot['inode'];
+			$total    += $this->fatals_in( $snapshot['path'], $same_file ? (int) $snapshot['size'] : 0 );
 		}
 		// A file that did not exist before and does now — the configured PHP
 		// log the new build CREATED by fatalling into it (Codex round-2 P1),
