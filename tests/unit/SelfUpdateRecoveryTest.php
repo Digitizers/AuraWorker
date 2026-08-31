@@ -45,7 +45,11 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// `_options` let a stale beacon leak into the next test — which then
 		// read "stale beacon" for a build that had written nothing.
 		delete_option( 'aura_worker_boot' );
-		delete_option( 'aura_worker_boot_fatal' );
+		foreach ( array_keys( $GLOBALS['_options'] ?? array() ) as $k ) {
+			if ( 0 === strpos( (string) $k, 'aura_worker_boot_fatal' ) ) {
+				delete_option( $k );
+			}
+		}
 		delete_option( 'aura_worker_boot_nonce' );
 		// A deleted option is listed in `notoptions` and short-circuits get_option
 		// until something writes it again; clear that too so absence is absence.
@@ -63,6 +67,11 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	protected function tearDown(): void {
 		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'], $GLOBALS['_http_error'], $GLOBALS['_http_effect'] );
 		delete_option( 'aura_worker_boot' );
+		foreach ( array_keys( $GLOBALS['_options'] ?? array() ) as $k ) {
+			if ( 0 === strpos( (string) $k, 'aura_worker_boot_fatal' ) ) {
+				delete_option( $k );
+			}
+		}
 		delete_option( 'aura_worker_boot_nonce' );
 		$this->rmdir( $this->dir );
 		foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
@@ -520,6 +529,36 @@ final class SelfUpdateRecoveryTest extends TestCase {
 					$dir . '/'
 				);
 				Aura_Worker_Updater::write_boot_beacon( '9.9.9' ); // a second, clean request, later
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+	}
+
+	public function test_an_OLD_build_dying_AFTER_the_new_build_died_does_not_erase_the_evidence(): void {
+		// Codex round-12: with one shared fatal record, the straggler's later
+		// death (old version) overwrote the new build's, the verdict ignored the
+		// old-version record, and a build that had died after boot was reported
+		// healthy. One record per version: both deaths are kept, and the verdict
+		// reads the new build's.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
+			$this->installNewBuild( true );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/x.php', 'line' => 1, 'message' => 'new build died' ),
+					'9.9.9',
+					$dir . '/'
+				);
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/old.php', 'line' => 1, 'message' => 'straggler died later' ),
+					AURA_WORKER_VERSION,
+					$dir . '/'
+				);
 			};
 		};
 

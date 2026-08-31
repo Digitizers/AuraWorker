@@ -49,7 +49,8 @@ register_shutdown_function(
 			return;
 		}
 		update_option(
-			'aura_worker_boot_fatal',
+			// Mirrors aura_worker_fatal_record_key(): one record per version.
+			'aura_worker_boot_fatal_' . preg_replace( '/[^A-Za-z0-9._-]/', '_', AURA_WORKER_VERSION ),
 			array( 'version' => AURA_WORKER_VERSION, 'nonce' => $nonce, 'file' => basename( $file ), 'message' => substr( (string) ( $e['message'] ?? '' ), 0, 200 ) ),
 			false
 		);

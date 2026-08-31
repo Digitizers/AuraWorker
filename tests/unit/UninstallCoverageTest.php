@@ -75,6 +75,11 @@ final class UninstallCoverageTest extends TestCase {
 	 * presence check would let a SECOND dynamic write appear in an
 	 * already-listed file without anyone deciding anything about it.
 	 *
+	 * - includes/boot-beacon.php — update_option( aura_worker_fatal_record_key() )
+	 *   is the fatal beacon, one record PER BUILD VERSION so two builds dying in
+	 *   the same window cannot overwrite each other (#78, Codex round-12):
+	 *   'aura_worker_boot_fatal_' . <version>. Swept by the 'aura_worker_'
+	 *   prefix in uninstall.php.
 	 * - includes/class-aura-worker-grant.php — add_option( $key ) reserving a
 	 *   single-use grant nonce: NONCE_PREFIX . hash → 'aura_grant_nonce_'.
 	 * - includes/class-aura-worker-rules.php — two add_option() claims, the
@@ -89,6 +94,7 @@ final class UninstallCoverageTest extends TestCase {
 	 *   another plugin and uninstall must never remove it.
 	 */
 	private const ACKNOWLEDGED_DYNAMIC_WRITES = array(
+		'includes/boot-beacon.php'                 => 1,
 		'includes/class-aura-worker-grant.php'     => 1,
 		'includes/class-aura-worker-rules.php'     => 2,
 		'includes/class-aura-worker-security.php'  => 1,

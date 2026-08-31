@@ -18,7 +18,11 @@ final class BootBeaconTest extends TestCase {
 		// `_options`, and resetting only `_options` let a nonce leak between
 		// tests — a "no verdict pending" case then found one pending.
 		delete_option( 'aura_worker_boot' );
-		delete_option( 'aura_worker_boot_fatal' );
+		foreach ( array_keys( $GLOBALS['_options'] ?? array() ) as $k ) {
+			if ( 0 === strpos( (string) $k, 'aura_worker_boot_fatal' ) ) {
+				delete_option( $k );
+			}
+		}
 		delete_option( 'aura_worker_boot_nonce' );
 		$GLOBALS['_options']    = array();
 		$GLOBALS['_notoptions'] = array();
@@ -49,7 +53,7 @@ final class BootBeaconTest extends TestCase {
 		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'includes/x.php', 'line' => 3, 'message' => 'Uncaught Error' );
 
 		$this->assertTrue( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
-		$b = $GLOBALS['_options']['aura_worker_boot_fatal'];
+		$b = $GLOBALS['_options'][ aura_worker_fatal_record_key( '2.14.0' ) ];
 		$this->assertSame( 'n1', $b['nonce'] );
 		$this->assertSame( '2.14.0', $b['version'] );
 		$this->assertSame( 'x.php', $b['file'] );
@@ -60,7 +64,7 @@ final class BootBeaconTest extends TestCase {
 	public function test_a_fatal_with_no_verdict_pending_is_not_recorded(): void {
 		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'includes/x.php', 'line' => 3, 'message' => 'boom' );
 		$this->assertFalse( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
-		$this->assertArrayNotHasKey( 'aura_worker_boot_fatal', $GLOBALS['_options'] );
+		$this->assertArrayNotHasKey( aura_worker_fatal_record_key( '2.14.0' ), $GLOBALS['_options'] );
 	}
 
 	public function test_a_fatal_in_ANOTHER_plugins_file_is_not_ours(): void {
@@ -101,7 +105,26 @@ final class BootBeaconTest extends TestCase {
 		aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR );
 		Aura_Worker_Updater::write_boot_beacon( '2.14.0' );
 
-		$this->assertSame( 'n2', $GLOBALS['_options']['aura_worker_boot_fatal']['nonce'] );
+		$this->assertSame( 'n2', $GLOBALS['_options'][ aura_worker_fatal_record_key( '2.14.0' ) ]['nonce'] );
 		$this->assertSame( 'n2', $GLOBALS['_options']['aura_worker_boot']['nonce'] );
+	}
+
+	public function test_two_builds_dying_in_the_same_window_keep_both_records(): void {
+		// Codex round-12: a shared fatal record was last-writer-wins across
+		// versions. One record per version keeps every death for the verdict to
+		// pick its own from.
+		update_option( 'aura_worker_boot_nonce', 'n4', false );
+		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'x.php', 'line' => 1, 'message' => 'boom' );
+
+		aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR );
+		aura_worker_record_fatal_beacon( $err, '2.13.0', self::DIR );
+
+		$this->assertSame( '2.14.0', $GLOBALS['_options'][ aura_worker_fatal_record_key( '2.14.0' ) ]['version'] );
+		$this->assertSame( '2.13.0', $GLOBALS['_options'][ aura_worker_fatal_record_key( '2.13.0' ) ]['version'] );
+	}
+
+	public function test_the_record_key_is_a_safe_option_name_for_any_version_string(): void {
+		$this->assertSame( 'aura_worker_boot_fatal_2.14.0-rc.1', aura_worker_fatal_record_key( '2.14.0-rc.1' ) );
+		$this->assertSame( 'aura_worker_boot_fatal_weird_version_', aura_worker_fatal_record_key( 'weird version!' ) );
 	}
 }

@@ -473,10 +473,13 @@ class Aura_Worker_Updater {
 
 		// Read the fact UNCACHED: the option cache in this process may still hold
 		// the pre-install state.
+		$fatal_key = aura_worker_fatal_record_key( $new_version );
 		wp_cache_delete( 'aura_worker_boot', 'options' );
-		wp_cache_delete( 'aura_worker_boot_fatal', 'options' );
+		wp_cache_delete( $fatal_key, 'options' );
 		$boot  = get_option( 'aura_worker_boot' );
-		$fatal = get_option( 'aura_worker_boot_fatal' );
+		// The NEW version's own fatal record. Per-version records (round-12) mean
+		// an old build's straggler death cannot have overwritten this one.
+		$fatal = get_option( $fatal_key );
 
 		// A record counts only if it is for THIS verdict (the nonce) and names
 		// THIS build (the version). The version test is what keeps a request

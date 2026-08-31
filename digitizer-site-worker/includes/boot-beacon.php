@@ -24,8 +24,10 @@
  * catch is a parse error in the entry file itself — nothing in it runs — and
  * that case yields no beacon at all, which the verdict reports as inconclusive.
  *
- * Two RECORDS, not one (Codex round-11): the boot writer owns
- * `aura_worker_boot`, the fatal writer owns `aura_worker_boot_fatal`, and each
+ * Separate RECORDS, never a shared one (Codex rounds 11–12): the boot writer
+ * owns `aura_worker_boot`; the fatal writer owns ONE record PER VERSION,
+ * `aura_worker_boot_fatal_<version>`, so a straggling old build and the new
+ * build dying in the same window cannot overwrite each other either. Every
  * write is unconditional. Precedence between them is decided at READ time, in
  * the verdict — a fatal outranks a boot, and either counts only when it names
  * the version under verdict — so there is no read-then-write between two
@@ -97,8 +99,22 @@ function aura_worker_is_own_fatal( $error, $plugin_dir ) {
 }
 
 /**
+ * The option that holds the fatal record for one build version. Per version
+ * (Codex round-12): a single fatal record was last-writer-wins across builds,
+ * so an old build's straggler death, landing after the new build's, erased the
+ * evidence the verdict needed. One record per version, no read-modify-write.
+ *
+ * @param string $version Build version.
+ * @return string Option name.
+ */
+function aura_worker_fatal_record_key( $version ) {
+	return 'aura_worker_boot_fatal_' . preg_replace( '/[^A-Za-z0-9._-]/', '_', (string) $version );
+}
+
+/**
  * Record that a fatal in this plugin ended the request. Writes only while a
- * verdict is pending, to its OWN record, so no boot write can replace it.
+ * verdict is pending, to the record for ITS OWN version, so neither a boot
+ * write nor another build's death can replace it.
  *
  * @param array|null $error      From `error_get_last()`.
  * @param string     $version    The version of the build that was running.
@@ -111,7 +127,7 @@ function aura_worker_record_fatal_beacon( $error, $version, $plugin_dir ) {
 		return false;
 	}
 	return (bool) update_option(
-		'aura_worker_boot_fatal',
+		aura_worker_fatal_record_key( $version ),
 		array(
 			'version' => (string) $version,
 			'nonce'   => $nonce,
