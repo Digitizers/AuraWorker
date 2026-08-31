@@ -15,6 +15,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Aura_Worker_Updater {
 
 	/**
+	 * Name of the per-site lock `self_update()` holds; core stores it as the
+	 * option `<name>.lock`.
+	 */
+	const SELF_UPDATE_LOCK = 'aura_worker_self_update';
+
+	/**
 	 * Load required WordPress upgrade files.
 	 */
 	private function load_upgrade_dependencies() {
@@ -164,6 +170,39 @@ class Aura_Worker_Updater {
 	public function self_update( $zip_url, $expected_sha256 = '' ) {
 		$this->load_upgrade_dependencies();
 
+		// ONE self-update at a time per site (Codex round-20 P1). The verdict
+		// rests on a single nonce option: a second request overlapping the first
+		// overwrote it before the first loopback wrote its beacon, so the first
+		// verifier read a record carrying a nonce it did not arm — "unrelated",
+		// inconclusive, healthy — and a broken release stood with no rollback;
+		// concurrent installs also back up and replace each other's files. The
+		// lock is core's own upgrade lock (a conditional INSERT, presumed dead
+		// and taken over after the timeout — a request that fatals mid-update
+		// never reaches `finally`). Its option is `aura_worker_self_update.lock`,
+		// under the prefix uninstall.php sweeps.
+		if ( ! WP_Upgrader::create_lock( self::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS ) ) {
+			return array(
+				'success'     => false,
+				'error'       => __( 'A SiteAgent self-update is already in progress on this site.', 'digitizer-site-worker' ),
+				'in_progress' => true,
+			);
+		}
+		try {
+			return $this->self_update_locked( $zip_url, $expected_sha256 );
+		} finally {
+			WP_Upgrader::release_lock( self::SELF_UPDATE_LOCK );
+		}
+	}
+
+	/**
+	 * The self-update proper. Runs only under the lock `self_update()` holds, so
+	 * the nonce it arms is the only one armed on this site.
+	 *
+	 * @param string $zip_url         See self_update().
+	 * @param string $expected_sha256 See self_update().
+	 * @return array
+	 */
+	private function self_update_locked( $zip_url, $expected_sha256 = '' ) {
 		// Load the recovery classes BEFORE the install, so their code is in
 		// memory from the OLD build. After `install()` this plugin's directory
 		// has been replaced; a class first required afterwards would be read

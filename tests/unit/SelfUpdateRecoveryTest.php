@@ -51,6 +51,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 			}
 		}
 		delete_option( 'aura_worker_boot_nonce' );
+		delete_option( Aura_Worker_Updater::SELF_UPDATE_LOCK . '.lock' );
 		// A deleted option is listed in `notoptions` and short-circuits get_option
 		// until something writes it again; clear that too so absence is absence.
 		$GLOBALS['_notoptions']     = array();
@@ -73,6 +74,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 			}
 		}
 		delete_option( 'aura_worker_boot_nonce' );
+		delete_option( Aura_Worker_Updater::SELF_UPDATE_LOCK . '.lock' );
 		$this->rmdir( $this->dir );
 		foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 			unlink( $f );
@@ -714,5 +716,53 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['backed_up'] );
 		$this->assertFalse( $res['rolled_back'] );
 		$this->assertSame( 'NEW BUILD', $this->onDisk() );
+	}
+
+	public function test_a_second_self_update_while_one_is_running_is_refused_without_touching_the_site(): void {
+		// Two overlapping requests shared one nonce option: the second overwrote
+		// it before the first loopback wrote its beacon, so the first verifier
+		// saw a record carrying a nonce it never armed — unrelated, inconclusive,
+		// healthy — and a broken build stood with no rollback (Codex round-20 P1).
+		// One update per site at a time; the loser is told, and does nothing.
+		$this->assertTrue( WP_Upgrader::create_lock( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS ) );
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'already in progress', $res['error'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk(), 'the refused request must not install anything' );
+		$this->assertNotFalse( get_option( Aura_Worker_Updater::SELF_UPDATE_LOCK . '.lock' ), 'the refused request must not release a lock it does not hold' );
+	}
+
+	public function test_the_lock_is_released_after_a_successful_update_and_the_next_one_runs(): void {
+		$first = $this->selfUpdate();
+		$this->assertTrue( $first['success'] );
+		$this->assertFalse( get_option( Aura_Worker_Updater::SELF_UPDATE_LOCK . '.lock' ), 'a finished update must let go of the lock' );
+
+		$second = $this->selfUpdate();
+		$this->assertTrue( $second['success'], $second['error'] ?? '' );
+	}
+
+	public function test_the_lock_is_released_after_a_failed_install_too(): void {
+		$GLOBALS['_install_result'] = false;
+		$GLOBALS['_install_effect'] = function () {
+			unlink( $this->dir . '/digitizer-site-worker.php' );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertFalse( get_option( Aura_Worker_Updater::SELF_UPDATE_LOCK . '.lock' ), 'every exit releases the lock, failure included' );
+	}
+
+	public function test_a_lock_left_by_a_request_that_died_does_not_block_updates_for_ever(): void {
+		// A fatal mid-update never reaches `finally`. Core's lock presumes a
+		// holder older than the release timeout dead and lets the next taker in,
+		// so a site is never wedged past that window.
+		update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK . '.lock', time() - 11 * MINUTE_IN_SECONDS );
+
+		$res = $this->selfUpdate();
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
 	}
 }
