@@ -502,4 +502,55 @@ final class RollbackPrimitivesTest extends TestCase {
 			}
 		}
 	}
+
+	public function test_a_link_that_cannot_be_removed_stops_the_restore_before_any_deleter_runs(): void {
+		// Stripping links at the entry (round 17) assumed the unlink worked. With
+		// the plugin directory read-only to PHP and the link's target writable,
+		// the unlink fails quietly, the link stays, and the transport deleter
+		// then walks through it and empties the target before the root deletion
+		// fails (Codex round-18 P1). A link that is still there is a reason to
+		// stop, not a detail to proceed past.
+		$target = sys_get_temp_dir() . '/sa-ro-target-' . getmypid();
+		mkdir( $target, 0777, true );
+		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
+		symlink( $target, $this->dir . '/linked' );
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+		chmod( $this->dir, 0555 );
+		if ( @file_put_contents( $this->dir . '/probe', 'x' ) !== false ) {
+			chmod( $this->dir, 0777 );
+			unlink( $this->dir . '/probe' );
+			unlink( $this->dir . '/linked' );
+			unlink( $target . '/inner.php' );
+			rmdir( $target );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $target . '/inner.php' ), 'the target was deleted through a link that could not be removed' );
+			$this->assertFalse( $res['success'] );
+			$this->assertStringContainsString( 'Could not remove', $res['error'] );
+			$this->assertTrue( is_link( $this->dir . '/linked' ) );
+		} finally {
+			chmod( $this->dir, 0777 );
+			if ( is_link( $this->dir . '/linked' ) ) {
+				unlink( $this->dir . '/linked' );
+			} elseif ( is_dir( $this->dir . '/linked' ) ) {
+				if ( is_file( $this->dir . '/linked/inner.php' ) ) {
+					unlink( $this->dir . '/linked/inner.php' );
+				}
+				rmdir( $this->dir . '/linked' );
+			}
+			if ( is_file( $target . '/inner.php' ) ) {
+				unlink( $target . '/inner.php' );
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
 }

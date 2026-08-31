@@ -370,8 +370,13 @@ class Aura_Worker_Rollback {
 			@unlink( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
 			return ! is_dir( $dir ) && ! is_link( $dir );
 		}
-		if ( is_dir( $dir ) ) {
-			$this->unlink_symlinks_under( $dir );
+		// And a link that could NOT be removed — the plugin directory read-only
+		// to PHP while the target stays writable — is a link a deleter would
+		// still follow. Nothing runs past it (Codex round-18 P1): the restore
+		// reports that the directory could not be cleared, which is true, and
+		// the target keeps its contents, which is the point.
+		if ( is_dir( $dir ) && ! $this->unlink_symlinks_under( $dir ) ) {
+			return false;
 		}
 		global $wp_filesystem;
 		if ( ! function_exists( 'WP_Filesystem' ) ) {
@@ -403,18 +408,26 @@ class Aura_Worker_Rollback {
 	 * property wanted here: the link is a leaf, and the target is left alone.
 	 *
 	 * @param string $dir Absolute path to a real directory.
-	 * @return void
+	 * @return bool Whether NO symlink remains under the directory — judged by
+	 *              looking again, not by what unlink() said.
 	 */
 	private function unlink_symlinks_under( $dir ) {
 		$iterator = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
 			RecursiveIteratorIterator::CHILD_FIRST
 		);
+		$all_gone = true;
 		foreach ( $iterator as $entry ) {
-			if ( $entry->isLink() ) {
-				@unlink( $entry->getPathname() ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
+			if ( ! $entry->isLink() ) {
+				continue;
+			}
+			$path = $entry->getPathname();
+			@unlink( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
+			if ( is_link( $path ) ) {
+				$all_gone = false;
 			}
 		}
+		return $all_gone;
 	}
 
 	/**
