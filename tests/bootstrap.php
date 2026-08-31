@@ -16,6 +16,8 @@
  *   $GLOBALS['_admins']        — get_users() administrator IDs
  *   $GLOBALS['_current_user']  — last wp_set_current_user() id
  *   $GLOBALS['_did_actions']   — do_action() call log
+ *   $GLOBALS['_install_result'] — Plugin_Upgrader::install() return (default true)
+ *   $GLOBALS['_install_effect'] — callable run inside install(), to mutate files
  *
  * @package Aura_Worker\Tests
  */
@@ -1437,7 +1439,13 @@ if ( ! class_exists( 'Plugin_Upgrader' ) ) {
 
 		public function install( $package, $args = array() ) {
 			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::install';
-			return true;
+			// `_install_effect` lets a test act on the filesystem the way a real
+			// install does (replace the plugin directory), so a rollback can be
+			// asserted on CONTENT rather than on a return value.
+			if ( isset( $GLOBALS['_install_effect'] ) && is_callable( $GLOBALS['_install_effect'] ) ) {
+				call_user_func( $GLOBALS['_install_effect'] );
+			}
+			return $GLOBALS['_install_result'] ?? true;
 		}
 	}
 }
@@ -1861,6 +1869,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( '' !== $this->last_error ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
+			}
+			// The liveness probe Aura_Worker_Health::check_db_connection() issues.
+			// A reachable database answers '1' — a string, which is what the
+			// production comparison (`=== '1'`) is written against. Honouring
+			// `_sa_wpdb_error` above means a test can still make the database
+			// look broken; this branch only says what a WORKING one returns.
+			if ( 'SELECT 1' === trim( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return '1';
 			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;

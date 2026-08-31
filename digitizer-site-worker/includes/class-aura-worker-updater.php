@@ -164,8 +164,19 @@ class Aura_Worker_Updater {
 	public function self_update( $zip_url, $expected_sha256 = '' ) {
 		$this->load_upgrade_dependencies();
 
+		// Load the recovery classes BEFORE the install, so their code is in
+		// memory from the OLD build. After `install()` this plugin's directory
+		// has been replaced; a class first required afterwards would be read
+		// from the new files — which are exactly what we may be about to decide
+		// are broken. `batch_update_plugins()` takes the same precaution.
+		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-health.php';
+		require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-rollback.php';
+
 		$old_version = AURA_WORKER_VERSION;
 		$plugin_file = 'digitizer-site-worker/digitizer-site-worker.php';
+		$plugin_slug = 'digitizer-site-worker';
+
+		$rollback = new Aura_Worker_Rollback();
 
 		$skin     = new Automatic_Upgrader_Skin();
 		$upgrader = new Plugin_Upgrader( $skin );
@@ -200,6 +211,21 @@ class Aura_Worker_Updater {
 			$install_source = $tmp;
 		}
 
+		// Back up this plugin's own directory so a bad build can be undone.
+		// Taken HERE, not at the top: everything above can still refuse the
+		// update (a bad digest, a failed download), and a backup made for an
+		// install that never runs is just a zip nobody asked for.
+		//
+		// A backup that CANNOT be made does not refuse the update. Refusing
+		// would be safer for this one site and would silently make every site
+		// without ZipArchive — or with an unwritable backup dir — permanently
+		// un-updatable: a gate that can never pass, which is the defect Aura
+		// #472 spent months not noticing. The result reports `backed_up`, so the
+		// caller records which updates had no way back instead of the plugin
+		// quietly deciding that for it.
+		$backup      = $rollback->backup_plugin( $plugin_slug );
+		$backup_path = ! empty( $backup['success'] ) ? $backup['backup_path'] : null;
+
 		// Install from the verified local file (or the URL when no digest given).
 		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
 
@@ -207,20 +233,28 @@ class Aura_Worker_Updater {
 			wp_delete_file( $tmp );
 		}
 
+		// A FAILED install is the case that most needs the backup: `install()`
+		// with `overwrite_package` deletes before it writes, so a failure
+		// partway can leave this plugin's directory incomplete. Restoring here
+		// is what makes a failed self-update survivable rather than terminal.
 		if ( is_wp_error( $result ) ) {
-			return array(
-				'success' => false,
-				'error'   => $result->get_error_message(),
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$backup_path,
+				$result->get_error_message()
 			);
 		}
 
 		if ( false === $result ) {
 			$messages = $skin->get_upgrade_messages();
 			$last_msg = ! empty( $messages ) ? end( $messages ) : '';
-			return array(
-				'success' => false,
-				'error'   => __( 'Self-update failed — filesystem error.', 'digitizer-site-worker' ),
-				'detail'  => $last_msg,
+			return $this->self_update_install_failed(
+				$rollback,
+				$plugin_slug,
+				$backup_path,
+				__( 'Self-update failed — filesystem error.', 'digitizer-site-worker' ),
+				$last_msg
 			);
 		}
 
@@ -239,6 +273,65 @@ class Aura_Worker_Updater {
 		$new_data    = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin_file, false, false );
 		$new_version = $new_data['Version'] ?? 'unknown';
 
+		// Verify the site still boots, from a SEPARATE PHP process.
+		//
+		// This is the whole reason the check is meaningful here. An in-process
+		// assertion after overwriting the running plugin proves almost nothing:
+		// the old code is already loaded and would keep answering. The health
+		// check's first probe is `wp_remote_get( home_url() )` — a real request,
+		// served by a fresh process that loads the NEW files. If the new build
+		// fatals on load, that request fails and we learn it here rather than
+		// from a customer.
+		$health        = new Aura_Worker_Health();
+		$health_result = $health->run_health_check();
+		$healthy       = ! empty( $health_result['healthy'] );
+
+		if ( ! $healthy && null !== $backup_path ) {
+			// Restoring works even though the on-disk plugin is broken: this
+			// method, Aura_Worker_Rollback and ZipArchive are all already in
+			// memory from the pre-install require above.
+			$restore = $rollback->restore_plugin( $plugin_slug, $backup_path );
+			return array(
+				'success'       => false,
+				'error'         => sprintf(
+					/* translators: %s: version that was rolled back to */
+					__( 'SiteAgent update failed its health check and was rolled back to %s.', 'digitizer-site-worker' ),
+					$old_version
+				),
+				'old_version'   => $old_version,
+				'new_version'   => $new_version,
+				'backed_up'     => true,
+				'health_checked'=> true,
+				'healthy'       => false,
+				'health'        => $health_result,
+				'rolled_back'   => ! empty( $restore['success'] ),
+				'restore_error' => empty( $restore['success'] ) ? ( $restore['error'] ?? null ) : null,
+			);
+		}
+
+		if ( ! $healthy ) {
+			// Unhealthy with nothing to restore. Say so plainly instead of
+			// reporting a success the site cannot support — the operator needs
+			// to know this one needs hands.
+			return array(
+				'success'       => false,
+				'error'         => __( 'SiteAgent update failed its health check and no backup was available to roll back.', 'digitizer-site-worker' ),
+				'old_version'   => $old_version,
+				'new_version'   => $new_version,
+				'backed_up'     => false,
+				'health_checked'=> true,
+				'healthy'       => false,
+				'health'        => $health_result,
+				'rolled_back'   => false,
+			);
+		}
+
+		// The update stuck, so older copies of this plugin are no longer the
+		// thing anyone would restore. Bounded, not emptied: the most recent few
+		// stay, because "the update succeeded" and "the new build is good" are
+		// not the same claim on a site nobody has looked at yet.
+		$rollback->cleanup_old_backups( 3 );
+
 		return array(
 			'success'      => true,
 			'message'      => sprintf(
@@ -249,7 +342,48 @@ class Aura_Worker_Updater {
 			),
 			'old_version'  => $old_version,
 			'new_version'  => $new_version,
+			'backed_up'    => null !== $backup_path,
+			'health_checked'=> true,
+			'healthy'      => true,
+			'rolled_back'  => false,
 		);
+	}
+
+	/**
+	 * Shared exit for a self-update whose install did not complete: put the
+	 * previous build back when there is one, and report what happened either
+	 * way. Deliberately one function — the two failure shapes above differ only
+	 * in their message, and duplicating the restore would let the two drift
+	 * until one of them silently stopped restoring.
+	 *
+	 * @param Aura_Worker_Rollback $rollback    Loaded before the install.
+	 * @param string               $plugin_slug This plugin's directory name.
+	 * @param string|null          $backup_path Backup zip, or null if none was made.
+	 * @param string               $error       Message describing the failure.
+	 * @param string               $detail      Optional upgrader detail.
+	 * @return array
+	 */
+	private function self_update_install_failed( $rollback, $plugin_slug, $backup_path, $error, $detail = '' ) {
+		$restored = false;
+		$restore_error = null;
+		if ( null !== $backup_path ) {
+			$restore       = $rollback->restore_plugin( $plugin_slug, $backup_path );
+			$restored      = ! empty( $restore['success'] );
+			$restore_error = $restored ? null : ( $restore['error'] ?? null );
+		}
+
+		$out = array(
+			'success'       => false,
+			'error'         => $error,
+			'backed_up'     => null !== $backup_path,
+			'health_checked'=> false,
+			'rolled_back'   => $restored,
+			'restore_error' => $restore_error,
+		);
+		if ( '' !== $detail ) {
+			$out['detail'] = $detail;
+		}
+		return $out;
 	}
 
 	/**
