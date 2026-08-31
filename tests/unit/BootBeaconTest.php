@@ -14,6 +14,11 @@ use PHPUnit\Framework\TestCase;
 final class BootBeaconTest extends TestCase {
 
 	protected function setUp(): void {
+		// Through the stub's own delete path: it keeps a row store beside
+		// `_options`, and resetting only `_options` let a nonce leak between
+		// tests — a "no verdict pending" case then found one pending.
+		delete_option( 'aura_worker_boot' );
+		delete_option( 'aura_worker_boot_nonce' );
 		$GLOBALS['_options']    = array();
 		$GLOBALS['_notoptions'] = array();
 	}
@@ -23,15 +28,82 @@ final class BootBeaconTest extends TestCase {
 		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
 	}
 
-	public function test_a_requested_boot_writes_version_and_nonce_and_spends_the_request(): void {
+	public function test_a_requested_boot_writes_version_and_nonce_and_leaves_the_nonce_for_the_updater(): void {
 		update_option( 'aura_worker_boot_nonce', 'abc123', false );
 
 		$this->assertTrue( Aura_Worker_Updater::write_boot_beacon( '2.14.0' ) );
 		$this->assertSame(
-			array( 'version' => '2.14.0', 'nonce' => 'abc123' ),
+			array( 'version' => '2.14.0', 'nonce' => 'abc123', 'fatal' => false ),
 			$GLOBALS['_options']['aura_worker_boot']
 		);
-		$this->assertArrayNotHasKey( 'aura_worker_boot_nonce', $GLOBALS['_options'] );
+		// The UPDATER spends the nonce after its verdict. If the boot write
+		// spent it, a fatal later in the same request could not be recorded.
+		$this->assertSame( 'abc123', $GLOBALS['_options']['aura_worker_boot_nonce'] );
+	}
+
+	private const DIR = '/srv/wp-content/plugins/digitizer-site-worker/';
+
+	public function test_a_fatal_in_our_file_with_a_nonce_armed_is_recorded(): void {
+		update_option( 'aura_worker_boot_nonce', 'n1', false );
+		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'includes/x.php', 'line' => 3, 'message' => 'Uncaught Error' );
+
+		$this->assertTrue( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
+		$b = $GLOBALS['_options']['aura_worker_boot'];
+		$this->assertTrue( $b['fatal'] );
+		$this->assertSame( 'n1', $b['nonce'] );
+		$this->assertSame( 'x.php', $b['file'] );
+	}
+
+	public function test_a_fatal_with_no_verdict_pending_is_not_recorded(): void {
+		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'includes/x.php', 'line' => 3, 'message' => 'boom' );
+		$this->assertFalse( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
+		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
+	}
+
+	public function test_a_fatal_in_ANOTHER_plugins_file_is_not_ours(): void {
+		$err = array( 'type' => E_ERROR, 'file' => '/srv/wp-content/plugins/other/x.php', 'line' => 1, 'message' => 'theirs' );
+		$this->assertFalse( aura_worker_is_own_fatal( $err, self::DIR ) );
+	}
+
+	public function test_a_warning_or_notice_is_not_a_fatal(): void {
+		foreach ( array( E_WARNING, E_NOTICE, E_DEPRECATED, E_USER_WARNING ) as $type ) {
+			$err = array( 'type' => $type, 'file' => self::DIR . 'x.php', 'line' => 1, 'message' => 'meh' );
+			$this->assertFalse( aura_worker_is_own_fatal( $err, self::DIR ), 'type ' . $type );
+		}
+	}
+
+	public function test_a_parse_error_in_an_include_counts(): void {
+		$err = array( 'type' => E_PARSE, 'file' => self::DIR . 'includes/class-aura-worker.php', 'line' => 9, 'message' => 'syntax error' );
+		$this->assertTrue( aura_worker_is_own_fatal( $err, self::DIR ) );
+	}
+
+	public function test_windows_separators_still_attribute(): void {
+		$err = array( 'type' => E_ERROR, 'file' => 'C:\\inetpub\\wp-content\\plugins\\digitizer-site-worker\\includes\\x.php', 'line' => 1, 'message' => 'boom' );
+		$this->assertTrue( aura_worker_is_own_fatal( $err, 'C:\\inetpub\\wp-content\\plugins\\digitizer-site-worker\\' ) );
+	}
+
+	public function test_a_sibling_directory_with_our_name_as_a_prefix_is_not_ours(): void {
+		// digitizer-site-worker-pro/ must not attribute to digitizer-site-worker/.
+		$err = array( 'type' => E_ERROR, 'file' => '/srv/wp-content/plugins/digitizer-site-worker-pro/x.php', 'line' => 1, 'message' => 'boom' );
+		$this->assertFalse( aura_worker_is_own_fatal( $err, self::DIR ) );
+	}
+
+	public function test_a_boot_beacon_never_overwrites_a_fatal_for_the_same_nonce(): void {
+		update_option( 'aura_worker_boot_nonce', 'n2', false );
+		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'x.php', 'line' => 1, 'message' => 'boom' );
+		aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR );
+
+		$this->assertFalse( Aura_Worker_Updater::write_boot_beacon( '2.14.0' ) );
+		$this->assertTrue( $GLOBALS['_options']['aura_worker_boot']['fatal'] );
+	}
+
+	public function test_a_fatal_upgrades_an_earlier_boot_beacon_for_the_same_nonce(): void {
+		update_option( 'aura_worker_boot_nonce', 'n3', false );
+		Aura_Worker_Updater::write_boot_beacon( '2.14.0' );
+		$err = array( 'type' => E_ERROR, 'file' => self::DIR . 'x.php', 'line' => 1, 'message' => 'boom' );
+
+		$this->assertTrue( aura_worker_record_fatal_beacon( $err, '2.14.0', self::DIR ) );
+		$this->assertTrue( $GLOBALS['_options']['aura_worker_boot']['fatal'] );
 	}
 
 	public function test_the_beacon_is_hooked_last_on_rest_api_init_by_the_plugins_init(): void {

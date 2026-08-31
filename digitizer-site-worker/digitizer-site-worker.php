@@ -22,6 +22,12 @@ define( 'AURA_WORKER_VERSION', '2.13.0' );
 define( 'AURA_WORKER_FILE', __FILE__ );
 define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 
+// The boot beacon, BEFORE every other include, and the shutdown handler armed
+// immediately: a parse error in any include below must still be recorded by
+// the dying process (#78). See includes/boot-beacon.php.
+require_once AURA_WORKER_DIR . 'includes/boot-beacon.php';
+register_shutdown_function( 'aura_worker_shutdown_beacon' );
+
 // Load dependencies.
 // The one rule the marker's credential list is read by — a pure function file
 // with no side effects, so uninstall.php can require it without loading the

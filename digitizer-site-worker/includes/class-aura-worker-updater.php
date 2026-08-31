@@ -226,12 +226,6 @@ class Aura_Worker_Updater {
 		$backup      = $rollback->backup_plugin( $plugin_slug );
 		$backup_path = ! empty( $backup['success'] ) ? $backup['backup_path'] : null;
 
-		// Where the error log ends BEFORE the install, and WHICH file that was.
-		// The verdict reads only past this point, so a fatal already in the log
-		// cannot be attributed to this update (Codex round-1 P2); and it reads
-		// the SAME file, so an offset taken on debug.log is never applied to a
-		// PHP log the new build creates (Codex round-4 P1).
-		$log_snapshot = $this->error_log_snapshot();
 
 		// Install from the verified local file (or the URL when no digest given).
 		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
@@ -315,7 +309,7 @@ class Aura_Worker_Updater {
 		update_option( 'aura_worker_boot_nonce', $boot_nonce, false );
 
 		// Did THIS build come up? See `verify_self_update()`.
-		$health_result = $this->verify_self_update( $new_version, $boot_nonce, $log_snapshot );
+		$health_result = $this->verify_self_update( $new_version, $boot_nonce );
 		// Whatever happened, the request for a beacon is spent.
 		delete_option( 'aura_worker_boot_nonce' );
 		$healthy       = ! empty( $health_result['healthy'] );
@@ -418,217 +412,17 @@ class Aura_Worker_Updater {
 	}
 
 	/**
-	 * Current size of the PHP error log, or null when there is none to read.
-	 * Paired with `new_fatals_since()` so a verdict can consider only what this
-	 * update wrote.
-	 *
-	 * @return int|null
-	 */
-	private function error_log_snapshot() {
-		$log = $this->error_log_path();
-		if ( null === $log ) {
-			return null;
-		}
-		clearstatcache( true, $log );
-		$size = (int) filesize( $log );
-		// Identity too, not just size (Codex round-8 P1): a log rotated and
-		// RECREATED under the same name that regrows past the old size is not
-		// the same file, and reading it from the old offset skips the start of
-		// the new one — where a bootstrap fatal lands.
-		//
-		// Identity is a CONTENT fact — the bytes just before the offset — not
-		// the inode. The first version used `fileinode()` and passed on macOS,
-		// whose APFS allocates inodes monotonically; Linux filesystems commonly
-		// hand a freed inode straight back to the next file created, so a
-		// rotate-and-recreate came back with the SAME inode and the check was
-		// blind exactly where WordPress runs. The test caught it in CI, not
-		// locally — the environment-dependent pass this branch keeps finding.
-		return array(
-			'path' => $log,
-			'size' => $size,
-			'tail' => $this->bytes_before( $log, $size, 256 ),
-		);
-	}
-
-	/**
-	 * The last $n bytes of $file before position $end — the fingerprint that
-	 * says "this is still the file I measured". A log shorter than $n is
-	 * fingerprinted whole.
-	 *
-	 * @return string
-	 */
-	private function bytes_before( $file, $end, $n ) {
-		$n    = (int) min( $n, $end );
-		if ( $n <= 0 ) {
-			return '';
-		}
-		$fp = fopen( $file, 'r' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
-		if ( false === $fp ) {
-			return '';
-		}
-		fseek( $fp, $end - $n );
-		$bytes = (string) fread( $fp, $n ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
-		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
-		return $bytes;
-	}
-
-	/** The log both halves read. Mirrors Aura_Worker_Health's resolution order. */
-	private function error_log_path() {
-		$log = ini_get( 'error_log' );
-		if ( empty( $log ) || ! file_exists( $log ) ) {
-			$log = WP_CONTENT_DIR . '/debug.log';
-		}
-		return file_exists( $log ) ? $log : null;
-	}
-
-	/**
-	 * Fatal/parse errors written to the log AFTER $offset bytes.
-	 *
-	 * @param int|null $offset Size of the log before the install.
-	 * @return int Count of new fatals; 0 when there is nothing to read.
-	 */
-	private function new_fatals_since( $snapshot ) {
-		$current = $this->error_log_path();
-		$total   = 0;
-
-		// The file we measured before the install, read from where it ended —
-		// unless it is no longer the same file. A replacement with a different
-		// inode is read from byte zero: everything in it is after the install.
-		if ( is_array( $snapshot ) && file_exists( $snapshot['path'] ) ) {
-			// Same file iff the bytes that ended it then are still there now.
-			$same_file = hash_equals(
-				(string) $snapshot['tail'],
-				$this->bytes_before( $snapshot['path'], (int) $snapshot['size'], 256 )
-			);
-			$total += $this->fatals_in( $snapshot['path'], $same_file ? (int) $snapshot['size'] : 0 );
-		}
-		// A file that did not exist before and does now — the configured PHP
-		// log the new build CREATED by fatalling into it (Codex round-2 P1),
-		// possibly a different file from the one measured (round-4 P1). Read
-		// from byte zero: everything in it is after the install.
-		if ( null !== $current && ( ! is_array( $snapshot ) || $current !== $snapshot['path'] ) ) {
-			$total += $this->fatals_in( $current, 0 );
-		}
-		return $total;
-	}
-
-	/**
-	 * Fatal/parse errors in one log file from byte $from to its end.
-	 *
-	 * @param string $log  Absolute path.
-	 * @param int    $from Byte offset to start at.
-	 * @return int
-	 */
-	private function fatals_in( $log, $from ) {
-		clearstatcache( true, $log );
-		$size = (int) filesize( $log );
-		// A log that SHRANK below its offset was rotated under us; there is no
-		// longer a window this update owns, so claim nothing rather than read
-		// someone else's.
-		if ( $size <= $from ) {
-			return 0;
-		}
-		$fp = fopen( $log, 'r' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
-		if ( false === $fp ) {
-			return 0;
-		}
-
-		// Scan the WHOLE window, in chunks — not its first 64 KiB (Codex
-		// round-3). The install and three loopback probes can emit that much in
-		// notices and deprecations before the bootstrap fatal, and reading only
-		// the beginning missed exactly the entry this exists to find. A
-		// bootstrap failure also makes all three REST probes fail identically,
-		// so REST reads as inconclusive and the missed fatal is the only
-		// evidence left.
-		//
-		// `$overlap` carries the tail of each chunk into the next so a phrase
-		// straddling a boundary is still matched, then its own matches are
-		// subtracted so nothing is counted twice.
-		fseek( $fp, $from );
-		$remaining = $size - $from;
-		$overlap   = '';
-		$fatals    = 0;
-		while ( $remaining > 0 ) {
-			$chunk = fread( $fp, (int) min( $remaining, 65536 ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
-			if ( false === $chunk || '' === $chunk ) {
-				break;
-			}
-			$remaining -= strlen( $chunk );
-			$window     = $overlap . $chunk;
-			$fatals    += $this->count_attributed_fatals( $window );
-			if ( '' !== $overlap ) {
-				$fatals -= $this->count_attributed_fatals( $overlap );
-			}
-			// Wide enough that a fatal line and the path it names never straddle
-			// a boundary without being wholly inside one window.
-			$overlap = substr( $window, -4096 );
-		}
-		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
-
-		return max( 0, $fatals );
-	}
-
-	/**
-	 * `rest_api_init` callback: emit the beacon for the build that is running.
-	 * Split from `write_boot_beacon()` so the version comes from the constant
-	 * at call time while the writer stays a pure, testable function.
+	 * `rest_api_init` callback: emit the boot beacon for the running build.
+	 * Hooked LAST from `Aura_Worker::init()`. The write itself lives in
+	 * includes/boot-beacon.php, the one owner of `aura_worker_boot`.
 	 */
 	public static function emit_boot_beacon() {
 		self::write_boot_beacon( AURA_WORKER_VERSION );
 	}
 
-	/**
-	 * Write the boot beacon — the fact `verify_self_update()` reads.
-	 *
-	 * Called as the LAST line of `aura_worker_init()`, so it runs only if
-	 * loading this plugin and `Aura_Worker::init()` both completed. Writes only
-	 * when the updater has asked (left a nonce), so an ordinary request does no
-	 * database write; echoes the nonce so a beacon from an earlier boot cannot
-	 * satisfy a later verdict.
-	 *
-	 * Hooked from `Aura_Worker::init()` via `emit_boot_beacon()`, last on
-	 * `rest_api_init`.
-	 *
-	 * @param string $version The version of the build that is now running.
-	 * @return bool Whether a beacon was written.
-	 */
+	/** Thin wrapper kept for callers and tests; see aura_worker_write_boot_beacon(). */
 	public static function write_boot_beacon( $version ) {
-		$nonce = get_option( 'aura_worker_boot_nonce', '' );
-		if ( ! is_string( $nonce ) || '' === $nonce ) {
-			return false;
-		}
-		$written = update_option(
-			'aura_worker_boot',
-			array( 'version' => (string) $version, 'nonce' => $nonce ),
-			false
-		);
-		delete_option( 'aura_worker_boot_nonce' );
-		return (bool) $written;
-	}
-
-	/**
-	 * Fatal/parse-error LINES in a piece of log text that name this plugin's
-	 * directory. A fatal names the file it died in, so "was it ours?" is read
-	 * off the line rather than inferred from when it was written.
-	 *
-	 * @param string $text Log text.
-	 * @return int
-	 */
-	private function count_attributed_fatals( $text ) {
-		$n = 0;
-		foreach ( preg_split( '/\r?\n/', (string) $text ) as $line ) {
-			// Windows hosts write `C:\\...\\digitizer-site-worker\\x.php`; a
-			// forward-slash-only match never attributed those (Codex round-6 P1),
-			// so a build that fatalled before its beacon stood as inconclusive
-			// with error logging ON. Normalise, then match the directory as a
-			// whole path segment.
-			$normalised = str_replace( '\\', '/', $line );
-			if ( preg_match( '/PHP (Fatal|Parse) error/i', $normalised )
-				&& false !== stripos( $normalised, '/digitizer-site-worker/' ) ) {
-				$n++;
-			}
-		}
-		return $n;
+		return aura_worker_write_boot_beacon( $version );
 	}
 
 	/**
@@ -657,15 +451,15 @@ class Aura_Worker_Updater {
 	 *    no-cache headers. Accepted as the residual; REST is not page-cached in
 	 *    any mainstream setup.
 	 *
-	 * The error log is secondary evidence only: new fatals written since the
-	 * install still fail the verdict, but their absence proves nothing.
+	 * Breakage is a fact too: the dying process records a fatal in one of our
+	 * files against the same nonce (includes/boot-beacon.php). Nothing is read
+	 * from anyone's log.
 	 *
 	 * @param string     $new_version  Version read from the installed header.
 	 * @param string     $nonce        The nonce left in `aura_worker_boot_nonce`.
-	 * @param array|null $log_snapshot From `error_log_snapshot()`, before install.
 	 * @return array { healthy: bool, inconclusive: bool, checks: array }
 	 */
-	private function verify_self_update( $new_version, $nonce, $log_snapshot ) {
+	private function verify_self_update( $new_version, $nonce ) {
 		$probe = wp_remote_get(
 			add_query_arg( array( 'aura_probe' => $nonce ), rest_url( 'aura/v1/status' ) ),
 			array(
@@ -681,12 +475,16 @@ class Aura_Worker_Updater {
 		// the pre-install state.
 		wp_cache_delete( 'aura_worker_boot', 'options' );
 		$beacon = get_option( 'aura_worker_boot' );
-		$booted = is_array( $beacon )
-			&& isset( $beacon['nonce'], $beacon['version'] )
-			&& hash_equals( $nonce, (string) $beacon['nonce'] )
+		$ours   = is_array( $beacon )
+			&& isset( $beacon['nonce'] )
+			&& hash_equals( $nonce, (string) $beacon['nonce'] );
+		// Breakage: the dying process recorded a fatal in one of our files, for
+		// THIS verdict (includes/boot-beacon.php). A positive fact from the
+		// engine, not a line found in someone's log.
+		$broken = $ours && ! empty( $beacon['fatal'] );
+		$booted = $ours && ! $broken
+			&& isset( $beacon['version'] )
 			&& (string) $beacon['version'] === (string) $new_version;
-
-		$new_fatals = $this->new_fatals_since( $log_snapshot );
 
 		$checks = array(
 			'loopback'   => array(
@@ -699,23 +497,22 @@ class Aura_Worker_Updater {
 				'status' => $booted ? 'pass' : 'fail',
 				'detail' => $booted
 					? 'build ' . $new_version . ' reported boot'
-					: ( is_array( $beacon ) ? 'stale beacon' : 'no beacon written' ),
+					: ( $ours ? ( $broken ? 'died before booting' : 'a different build answered' ) : ( is_array( $beacon ) ? 'stale beacon' : 'no beacon written' ) ),
 			),
-			'php_errors' => array(
-				'status' => $new_fatals ? 'fail' : 'pass',
-				'detail' => $new_fatals
-					? $new_fatals . ' new fatal error(s) in this plugin since the install'
-					: 'No new fatal errors attributed to this plugin',
+			'fatal_beacon' => array(
+				'status' => $broken ? 'fail' : 'pass',
+				'detail' => $broken
+					? 'the build died in ' . (string) ( $beacon['file'] ?? '?' ) . ': ' . (string) ( $beacon['message'] ?? '' )
+					: 'no fatal recorded by this plugin',
 			),
 		);
 
 		// The decision rests on POSITIVE facts only, in both directions.
 		//
-		// Health: the beacon. Breakage: a new fatal that NAMES THIS PLUGIN'S
-		// DIRECTORY — PHP fatal lines carry the file path, so attribution is a
-		// fact in the message, not a guess from timing. An unrelated plugin's
-		// fatal landing in the shared log between snapshot and check cannot
-		// override a valid beacon (Codex round-5 P2).
+		// Health: the boot beacon. Breakage: the fatal beacon — written by the
+		// dying process itself when a fatal in one of OUR files ended a request
+		// while this verdict was pending. Attribution is the file PHP names,
+		// checked against our directory; another plugin's death cannot count.
 		//
 		// What is deliberately NOT a fact: "we got an HTTP response". A CDN, WAF
 		// or reverse proxy can answer a 301 or a 403 challenge before WordPress
@@ -724,15 +521,14 @@ class Aura_Worker_Updater {
 		// fronted that way — for ever (Codex round-5 P1). So `$reached` is
 		// reported and decides nothing.
 		//
-		// No beacon AND no attributed fatal is therefore INCONCLUSIVE: the
-		// update stands, `verified: false`. That includes a build that fatals
-		// on load on a site with error logging off — stated here rather than
-		// hidden. It is the pre-#78 exposure, now visible in Aura's update log
-		// as unverified and bounded by its 5-per-night cap; the alternative,
-		// rolling back on absence of evidence, makes every edge-fronted site
-		// permanently un-updatable, which is the worse failure and the one that
-		// hides.
-		$broken       = $new_fatals > 0;
+		// No beacon of either kind is therefore INCONCLUSIVE: the update stands,
+		// `verified: false`. The one case that produces that is a parse error in
+		// the ENTRY FILE itself — nothing in it runs, so neither handler is ever
+		// armed. Stated here rather than hidden: it is visible in Aura's update
+		// log as unverified and bounded by the 5-per-night cap, and the
+		// alternative — rolling back on absence of evidence — makes every
+		// edge-fronted site permanently un-updatable, the worse failure and the
+		// one that hides.
 		$inconclusive = ! $booted && ! $broken;
 		$healthy      = ! $broken && ( $booted || $inconclusive );
 

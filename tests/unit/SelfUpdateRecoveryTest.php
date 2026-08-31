@@ -13,6 +13,13 @@
  * writes as the last line of its own init. These tests simulate the new build
  * by writing that beacon (or not) from the install effect.
  *
+ * Breakage is a fact too: a shutdown handler in the dying process records a
+ * fatal in one of this plugin's files against the same nonce (the "fatal
+ * beacon"). The error-log scanner that preceded it produced review findings in
+ * eight of ten rounds and is gone. These tests simulate the fatal beacon the
+ * way the probe request would produce it: from `_http_effect`, via
+ * `aura_worker_record_fatal_beacon()`, with a file path under the plugin dir.
+ *
  * Rollback is held to a post-condition: the plugin header on disk must read
  * the version we came from.
  *
@@ -25,25 +32,6 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 	private string $slug = 'digitizer-site-worker';
 	private string $dir;
-	/** @var string|null Previous ini error_log, restored in tearDown. */
-	private $prev_error_log = null;
-
-	/**
-	 * Point the PHP error log at a file this test owns.
-	 *
-	 * The production resolver reads `ini_get( 'error_log' )` FIRST and only
-	 * falls back to WP_CONTENT_DIR/debug.log when it is empty or missing. A
-	 * developer machine usually leaves it empty, so writing to debug.log
-	 * happened to work locally — and CI sets it, so the same test wrote to a
-	 * file the code never read and saw no fatals. Assume nothing about the
-	 * environment: name the file.
-	 */
-	private function useLog(): string {
-		$log                  = WP_CONTENT_DIR . '/sa-test-error.log';
-		$this->prev_error_log = ini_get( 'error_log' );
-		ini_set( 'error_log', $log );
-		return $log;
-	}
 
 	protected function setUp(): void {
 		$this->dir = WP_PLUGIN_DIR . '/' . $this->slug;
@@ -72,11 +60,6 @@ final class SelfUpdateRecoveryTest extends TestCase {
 	}
 
 	protected function tearDown(): void {
-		if ( null !== $this->prev_error_log ) {
-			ini_set( 'error_log', $this->prev_error_log );
-			$this->prev_error_log = null;
-		}
-		@unlink( WP_CONTENT_DIR . '/sa-test-error.log' );
 		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'], $GLOBALS['_http_error'], $GLOBALS['_http_effect'] );
 		delete_option( 'aura_worker_boot' );
 		delete_option( 'aura_worker_boot_nonce' );
@@ -130,21 +113,27 @@ final class SelfUpdateRecoveryTest extends TestCase {
 			: null;
 	}
 
-	/** Append the fatal a dying build of THIS plugin leaves in the log. */
+	/**
+	 * What the dying process records when a fatal in OUR code ends the probe
+	 * request: the fatal beacon. Runs from `_http_effect`, i.e. at request time
+	 * with the nonce armed — the only moment it can be written.
+	 */
 	private function diedInOurCode(): void {
-		file_put_contents( $this->useLog(), "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\n", FILE_APPEND );
+		$dir = $this->dir;
+		$GLOBALS['_http_effect'] = function () use ( $dir ) {
+			aura_worker_record_fatal_beacon(
+				array( 'type' => E_ERROR, 'file' => $dir . '/includes/x.php', 'line' => 1, 'message' => 'Uncaught Error: boom' ),
+				'9.9.9',
+				$dir . '/'
+			);
+		};
 	}
 
-	/**
-	 * An install whose build does not come up: no beacon, and the fatal it died
-	 * with in the error log — naming this plugin's directory, as PHP does.
-	 * That attributed fatal is the POSITIVE evidence a rollback needs.
-	 */
+	/** An install whose build does not come up: no boot beacon, and a fatal beacon. */
 	private function brokenBuild(): void {
-		$log = $this->useLog();
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
+		$GLOBALS['_install_effect'] = function () {
 			$this->installNewBuild( false );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
+			$this->diedInOurCode();
 		};
 	}
 
@@ -163,29 +152,6 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertSame( 'NEW BUILD', $this->onDisk() );
 	}
 
-	public function test_a_log_created_BY_the_new_build_is_read_from_byte_zero(): void {
-		// No log before the install; the new build fatals during bootstrap and
-		// creates one by doing so. Discarding a null offset lost exactly this
-		// case, and both REST probes fail from the same bootstrap, so the REST
-		// evidence reads as inconclusive (Codex round-2 P1).
-		$log = WP_CONTENT_DIR . '/sa-test-error.log';
-		@unlink( $log );
-		$this->prev_error_log = ini_get( 'error_log' );
-		ini_set( 'error_log', $log );
-
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			// Fatals during bootstrap: no beacon, and it CREATES the log.
-			$this->installNewBuild( false );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n" );
-		};
-
-		$res = $this->selfUpdate();
-
-		$this->assertFalse( $res['success'] );
-		$this->assertTrue( $res['rolled_back'] );
-		$this->assertSame( 'OLD BUILD', $this->onDisk() );
-	}
-
 	public function test_a_build_that_breaks_the_site_is_rolled_back(): void {
 		$this->brokenBuild();
 
@@ -198,87 +164,17 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertSame( 'OLD BUILD', $this->onDisk() );
 	}
 
-	public function test_a_fatal_already_in_the_log_does_not_roll_back_a_healthy_update(): void {
-		// The old aggregate check read the last 5KB of the log and failed on ANY
-		// fatal, whatever its age — so on a site with one old fatal every
-		// healthy self-update would have been rolled back (Codex round-1 P2).
-		$log = $this->useLog();
-		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: in /srv/wp-content/plugins/digitizer-site-worker/old.php:1\n" );
+	public function test_a_fatal_recorded_BY_this_update_rolls_it_back(): void {
+		// The build installs, the probe request dies in our code, the dying
+		// process records it. Positive evidence of breakage; restored.
+		$this->brokenBuild();
 
-		try {
-			$res = $this->selfUpdate();
-			$this->assertTrue( $res['success'] );
-			$this->assertSame( 'NEW BUILD', $this->onDisk() );
-		} finally {
-			unlink( $log );
-		}
-	}
+		$res = $this->selfUpdate();
 
-	public function test_an_old_fatal_is_ignored_even_when_the_log_grows_afterwards(): void {
-		// The discriminating case. If the log does not grow, an early return
-		// shields the offset logic and a whole-log scan looks identical. Here
-		// the update appends something harmless, so a scan that started at byte
-		// zero would find the OLD fatal and roll back a healthy build.
-		$log = $this->useLog();
-		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: in /srv/wp-content/plugins/digitizer-site-worker/old.php:1\n" );
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			$this->installNewBuild( true );
-			file_put_contents( $log, "[today] PHP Notice: undefined index, harmless\n", FILE_APPEND );
-		};
-
-		try {
-			$res = $this->selfUpdate();
-			$this->assertTrue( $res['success'] );
-			$this->assertSame( 'NEW BUILD', $this->onDisk() );
-		} finally {
-			unlink( $log );
-		}
-	}
-
-	public function test_a_fatal_written_BY_this_update_does_roll_it_back(): void {
-		$log = $this->useLog();
-		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: in /srv/wp-content/plugins/digitizer-site-worker/old.php:1\n" );
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			// Boots — the beacon is written — but fatals somewhere after; the log
-			// is the secondary evidence that still catches it.
-			$this->installNewBuild( true );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
-		};
-
-		try {
-			$res = $this->selfUpdate();
-			$this->assertFalse( $res['success'] );
-			$this->assertTrue( $res['rolled_back'] );
-			$this->assertSame( 'OLD BUILD', $this->onDisk() );
-		} finally {
-			unlink( $log );
-		}
-	}
-
-	public function test_a_rotated_log_is_read_from_zero_so_a_fatal_in_the_new_file_counts(): void {
-		// Rotation replaced the file under the same name, SHORTER than the old
-		// offset, with one of our fatals in it. An earlier version of this test
-		// expected "claims nothing" — the size rule's behaviour, which treated a
-		// shrunk file as an unowned window. That was wrong: a replacement file
-		// was created after the snapshot, so everything in it is after the
-		// install, and a fatal there is exactly the evidence being looked for.
-		// Identity is by content now, and a replacement is read from zero
-		// whether it is shorter or longer than the file it replaced.
-		$log = $this->useLog();
-		file_put_contents( $log, str_repeat( 'x', 4096 ) . "\n" );
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			$this->installNewBuild( false );
-			unlink( $log );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\n" );
-		};
-
-		try {
-			$res = $this->selfUpdate();
-			$this->assertFalse( $res['success'] );
-			$this->assertTrue( $res['rolled_back'] );
-		} finally {
-			unlink( $log );
-		}
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		$this->assertSame( 'fail', $res['health']['checks']['fatal_beacon']['status'] );
 	}
 
 	public function test_an_install_that_fails_partway_is_rolled_back(): void {
@@ -404,28 +300,6 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['rolled_back'], 'a restore that did not bring back the old version is not a rollback' );
 	}
 
-	public function test_a_fatal_far_past_the_first_64KiB_of_the_window_is_still_found(): void {
-		// The install and three probes can emit that much in notices and
-		// deprecations before the bootstrap fatal; reading only the beginning of
-		// the window missed the entry the check exists for (Codex round-3).
-		$log = $this->useLog();
-		file_put_contents( $log, "start of window\n" );
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			$this->installNewBuild( true );
-			file_put_contents( $log, str_repeat( "PHP Notice: chatty deprecation\n", 6000 ), FILE_APPEND );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
-		};
-
-		try {
-			$res = $this->selfUpdate();
-			$this->assertFalse( $res['success'] );
-			$this->assertTrue( $res['rolled_back'] );
-			$this->assertSame( 'OLD BUILD', $this->onDisk() );
-		} finally {
-			unlink( $log );
-		}
-	}
-
 	public function test_the_verdict_is_the_beacon_the_new_build_wrote(): void {
 		$res = $this->selfUpdate();
 
@@ -454,13 +328,18 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// A stale beacon with some other nonce is exactly what a "did it boot"
 		// check must not be fooled by — the previous build booted; this one
 		// did not.
-		$GLOBALS['_options']['aura_worker_boot'] = array( 'version' => '9.9.9', 'nonce' => 'from-last-time' );
-		$this->brokenBuild();
+		$GLOBALS['_options']['aura_worker_boot'] = array( 'version' => '9.9.9', 'nonce' => 'from-last-time', 'fatal' => false );
+		// Neither boots nor dies: nothing of ours is written for THIS nonce.
+		$GLOBALS['_install_effect'] = function () {
+			$this->installNewBuild( false );
+		};
 
 		$res = $this->selfUpdate();
 
-		$this->assertFalse( $res['success'] );
-		$this->assertTrue( $res['rolled_back'] );
+		// Not verified, and — with no fatal recorded either — inconclusive
+		// rather than rolled back: a stale beacon is not evidence of anything.
+		$this->assertFalse( $res['verified'] );
+		$this->assertFalse( $res['rolled_back'] );
 		$this->assertSame( 'stale beacon', $res['health']['checks']['boot_beacon']['detail'] );
 	}
 
@@ -480,7 +359,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// beacon is not positive evidence of breakage.
 		$this->assertFalse( $res['verified'] );
 		$this->assertFalse( $res['rolled_back'] );
-		$this->assertSame( 'stale beacon', $res['health']['checks']['boot_beacon']['detail'] );
+		$this->assertSame( 'a different build answered', $res['health']['checks']['boot_beacon']['detail'] );
 	}
 
 	public function test_no_beacon_and_no_attributed_fatal_is_inconclusive_and_the_update_stands(): void {
@@ -535,43 +414,27 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['rolled_back'] );
 	}
 
-	public function test_an_UNRELATED_fatal_in_the_shared_log_cannot_override_a_valid_beacon(): void {
-		// Codex round-5 P2: a busy site's other plugin dies between the snapshot
-		// and the check. The byte offset says "new"; the path in the line says
-		// "not ours". The line is the fact.
-		$log = $this->useLog();
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
+	public function test_ANOTHER_plugins_fatal_is_not_recorded_against_this_verdict(): void {
+		// The probe request boots our build, then some other plugin dies. The
+		// shutdown handler sees a fatal whose file is not under our directory
+		// and records nothing; the boot beacon stands.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
 			$this->installNewBuild( true );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/some-other-plugin/x.php:1\\n", FILE_APPEND );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => WP_PLUGIN_DIR . '/some-other-plugin/x.php', 'line' => 1, 'message' => 'theirs' ),
+					'9.9.9',
+					$dir . '/'
+				);
+			};
 		};
 
-		try {
-			$res = $this->selfUpdate();
-			$this->assertTrue( $res['success'] );
-			$this->assertTrue( $res['verified'] );
-			$this->assertFalse( $res['rolled_back'] );
-		} finally {
-			unlink( $log );
-		}
-	}
+		$res = $this->selfUpdate();
 
-	public function test_a_fatal_written_with_Windows_separators_is_still_attributed_to_this_plugin(): void {
-		// Codex round-6 P1: `C:\\...\\digitizer-site-worker\\x.php` never matched a
-		// forward-slash pattern, so a Windows-hosted build that died before its
-		// beacon stood as inconclusive with error logging on.
-		$log = $this->useLog();
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			$this->installNewBuild( false );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in C:\\inetpub\\wp-content\\plugins\\digitizer-site-worker\\includes\\x.php:1\n", FILE_APPEND );
-		};
-
-		try {
-			$res = $this->selfUpdate();
-			$this->assertFalse( $res['success'] );
-			$this->assertTrue( $res['rolled_back'] );
-		} finally {
-			unlink( $log );
-		}
+		$this->assertTrue( $res['success'] );
+		$this->assertTrue( $res['verified'] );
 	}
 
 	public function test_an_archive_that_lost_its_main_file_is_a_failed_install_and_is_restored(): void {
@@ -618,52 +481,29 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertArrayNotHasKey( 'aura_worker_boot', $GLOBALS['_options'] );
 	}
 
-	public function test_a_log_rotated_and_regrown_past_the_old_offset_is_read_from_zero(): void {
-		// Codex round-8 P1: the size-only rotation rule sees a replacement file
-		// that already grew past the old size as "the same file, grown", seeks
-		// to the old size, and skips the new file's beginning — where a
-		// bootstrap fatal lands. Identity is a CONTENT fact (the bytes before
-		// the offset), not the inode: on Linux a freed inode is commonly handed
-		// straight back, and an inode-based version of this passed on macOS and
-		// failed in CI.
-		$log = $this->useLog();
-		file_put_contents( $log, str_repeat( "old noise\n", 100 ) ); // ~1000 bytes
-		$ours = "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\n";
-		$GLOBALS['_install_effect'] = function () use ( $log, $ours ) {
-			$this->installNewBuild( false );
-			// Rotate: a NEW file under the same name, fatal at the very start,
-			// then enough noise to grow past the old size.
-			unlink( $log );
-			file_put_contents( $log, $ours . str_repeat( "new noise\n", 300 ) );
-		};
-
-		try {
-			$res = $this->selfUpdate();
-			$this->assertFalse( $res['success'] );
-			$this->assertTrue( $res['rolled_back'] );
-		} finally {
-			@unlink( $log );
-		}
-	}
-
-	public function test_a_fatal_in_THIS_plugin_rolls_back_even_when_the_beacon_was_written(): void {
-		// Boots — init completed — then dies in its own code on the probe. The
-		// beacon says "came up"; the attributed fatal says "and broke". Breakage
-		// wins.
-		$log = $this->useLog();
-		$GLOBALS['_install_effect'] = function () use ( $log ) {
+	public function test_a_fatal_AFTER_the_boot_beacon_on_the_same_request_still_rolls_back(): void {
+		// Init completed and the boot beacon was written; then our code died
+		// later in the same request (dispatching the probe). The nonce is still
+		// armed — the updater spends it, not the boot write — so the dying
+		// process upgrades the beacon to fatal. Breakage wins.
+		$dir = $this->dir;
+		$GLOBALS['_install_effect'] = function () use ( $dir ) {
 			$this->installNewBuild( true );
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n", FILE_APPEND );
+			$GLOBALS['_http_effect'] = function () use ( $dir ) {
+				Aura_Worker_Updater::write_boot_beacon( '9.9.9' );
+				aura_worker_record_fatal_beacon(
+					array( 'type' => E_ERROR, 'file' => $dir . '/includes/class-aura-worker-api.php', 'line' => 1, 'message' => 'died dispatching' ),
+					'9.9.9',
+					$dir . '/'
+				);
+			};
 		};
 
-		try {
-			$res = $this->selfUpdate();
-			$this->assertFalse( $res['success'] );
-			$this->assertTrue( $res['rolled_back'] );
-			$this->assertSame( 'OLD BUILD', $this->onDisk() );
-		} finally {
-			unlink( $log );
-		}
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['rolled_back'] );
+		$this->assertSame( 'OLD BUILD', $this->onDisk() );
 	}
 
 	public function test_a_failed_install_is_held_to_the_same_post_condition_as_a_failed_boot(): void {
@@ -685,33 +525,6 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 		$this->assertFalse( $res['rolled_back'] );
 		$this->assertStringContainsString( 'could NOT be restored', $res['error'] );
-	}
-
-	public function test_a_fatal_in_a_log_the_new_build_CREATED_under_a_different_path_is_found(): void {
-		// Codex round-4 P1: ini names a file that does not exist yet while
-		// debug.log does. The snapshot was taken on debug.log; the new build
-		// fatals into the ini file. Applying debug.log's offset to the new,
-		// shorter file read as "rotated" and the fatal was ignored.
-		$debug = WP_CONTENT_DIR . '/debug.log';
-		$ini   = WP_CONTENT_DIR . '/sa-ini-created.log';
-		@unlink( $ini );
-		file_put_contents( $debug, str_repeat( "old noise\n", 200 ) );
-		$this->prev_error_log = ini_get( 'error_log' );
-		ini_set( 'error_log', $ini ); // names a file that is not there yet
-
-		$GLOBALS['_install_effect'] = function () use ( $ini ) {
-			$this->installNewBuild( false );
-			file_put_contents( $ini, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n" );
-		};
-
-		try {
-			$res = $this->selfUpdate();
-			$this->assertFalse( $res['success'] );
-			$this->assertSame( 'fail', $res['health']['checks']['php_errors']['status'] );
-		} finally {
-			@unlink( $debug );
-			@unlink( $ini );
-		}
 	}
 
 	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {

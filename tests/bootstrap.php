@@ -2665,6 +2665,7 @@ if ( ! function_exists( 'has_post_thumbnail' ) ) {
 // Load the classes under test
 // ---------------------------------------------------------------------------
 
+require_once SA_PLUGIN_DIR . '/includes/boot-beacon.php';
 require_once SA_PLUGIN_DIR . '/includes/tools/class-tool-base.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-tools.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-security.php';
