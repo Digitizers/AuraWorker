@@ -69,7 +69,13 @@ class Aura_Worker_Rollback {
 			return array( 'success' => false, 'error' => 'ZipArchive is not available on this site' );
 		}
 
-		$timestamp   = gmdate( 'Y-m-d_H-i-s' );
+		// The name carries a per-operation suffix beside the timestamp: two
+		// backups of the same plugin starting in the same second — the approved
+		// backup tool beside a self-update's automatic one — used to compute the
+		// SAME path, and ZipArchive::OVERWRITE then let the later one replace the
+		// recovery archive mid-install with a mixed-build snapshot while this
+		// call had already reported `backed_up: true` (#78, Codex round-25 P2).
+		$timestamp   = gmdate( 'Y-m-d_H-i-s' ) . '-' . bin2hex( random_bytes( 4 ) );
 		$backup_path = $this->backup_dir . $plugin_slug . '_' . $timestamp . '.zip';
 
 		$zip = new ZipArchive();
@@ -195,7 +201,7 @@ class Aura_Worker_Rollback {
 
 		foreach ( $files as $file ) {
 			$filename = basename( $file );
-			if ( preg_match( '/^(.+)_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.zip$/', $filename, $matches ) ) {
+			if ( preg_match( '/^(.+)_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?:-[0-9a-f]{8})?\.zip$/', $filename, $matches ) ) {
 				$slug = $matches[1];
 				if ( $plugin_slug && $slug !== $plugin_slug ) {
 					continue;

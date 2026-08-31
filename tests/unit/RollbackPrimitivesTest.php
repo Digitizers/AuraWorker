@@ -675,4 +675,26 @@ final class RollbackPrimitivesTest extends TestCase {
 		$this->assertFalse( $m->invoke( null, 'C:\\plugins\\siteagent-evil\\x', 'C:\\plugins\\siteagent' ), 'a sibling with the root as prefix is NOT inside' );
 		$this->assertFalse( $m->invoke( null, '/home/user/secrets', '/p/siteagent' ) );
 	}
+
+	public function test_two_backups_in_the_same_second_never_share_a_file(): void {
+		// The filename was the slug plus a one-second timestamp, and the archive
+		// opens with OVERWRITE — so the approved backup tool starting beside a
+		// self-update's automatic backup in the same second wrote the same path,
+		// and the later close replaced the recovery archive after installation
+		// had begun (Codex round-25 P2). Each backup owns a per-operation suffix.
+		$rollback = new Aura_Worker_Rollback();
+		$a = $rollback->backup_plugin( $this->slug );
+		$b = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $a['success'] && $b['success'] );
+
+		$pattern = '/_' . preg_quote( gmdate( 'Y-m-d_' ), '/' ) . '\\d{2}-\\d{2}-\\d{2}-[0-9a-f]{8}\\.zip$/';
+		$this->assertMatchesRegularExpression( $pattern, $a['backup_path'], 'the name must carry a per-operation suffix, not the second alone' );
+		$this->assertNotSame( $a['backup_path'], $b['backup_path'] );
+		$this->assertFileExists( $a['backup_path'] );
+		$this->assertFileExists( $b['backup_path'] );
+
+		$listed = $rollback->list_backups( $this->slug );
+		$this->assertCount( 2, $listed, 'list_backups must still recognise the suffixed names' );
+		$this->assertSame( $this->slug, $listed[0]['plugin_slug'] );
+	}
 }
