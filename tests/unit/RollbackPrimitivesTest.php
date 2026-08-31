@@ -414,4 +414,92 @@ final class RollbackPrimitivesTest extends TestCase {
 			}
 		}
 	}
+
+	public function test_a_restore_with_a_transport_does_not_delete_through_a_symlinked_plugin_root(): void {
+		// Round 16 put the root-link guard inside the DIRECT fallback only. With
+		// the ordinary transport available, WP_Filesystem_Direct::delete() still
+		// treated a link to a directory as a directory and emptied the target
+		// (Codex round-17 P1). Links are now handled at the one entry both
+		// deleters are reached through, so this is the round-16 case with the
+		// transport left ON — and the stub mirrors core's walk-through.
+		$target = sys_get_temp_dir() . '/sa-checkout-t-' . getmypid();
+		mkdir( $target . '/inc', 0777, true );
+		file_put_contents( $target . '/main.php', 'ORIGINAL' );
+		file_put_contents( $target . '/inc/lib.php', 'SHARED' );
+		unlink( $this->dir . '/main.php' );
+		rmdir( $this->dir );
+		symlink( $target, $this->dir );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertSame( 'SHARED', @file_get_contents( $target . '/inc/lib.php' ), 'the symlink target was deleted through' );
+			$this->assertFalse( is_link( $this->dir ), 'the link itself was left standing' );
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertSame( 'ORIGINAL', @file_get_contents( $this->dir . '/main.php' ) );
+		} finally {
+			if ( is_link( $this->dir ) ) {
+				unlink( $this->dir );
+			}
+			foreach ( array( $this->dir, $target ) as $d ) {
+				if ( is_dir( $d ) && ! is_link( $d ) ) {
+					foreach ( array( '/inc/lib.php', '/main.php' ) as $f ) {
+						if ( is_file( $d . $f ) ) {
+							unlink( $d . $f );
+						}
+					}
+					if ( is_dir( $d . '/inc' ) ) {
+						rmdir( $d . '/inc' );
+					}
+				}
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
+
+	public function test_a_restore_with_a_transport_does_not_delete_through_a_symlinked_subdirectory(): void {
+		// The same walk-through, one level down: a linked SUBDIRECTORY left in
+		// place at restore time is deleted through by core's transport. The link
+		// is stripped before any deleter runs; the archive (round 15) already
+		// holds the target's contents, so the restore brings the code back as a
+		// real directory and the target is untouched.
+		$target = sys_get_temp_dir() . '/sa-linked-sub-' . getmypid();
+		mkdir( $target, 0777, true );
+		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
+		symlink( $target, $this->dir . '/linked' );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+			file_put_contents( $this->dir . '/main.php', 'BROKEN' );
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $target . '/inner.php' ), 'the linked subdirectory was deleted through' );
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertFalse( is_link( $this->dir . '/linked' ) );
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $this->dir . '/linked/inner.php' ) );
+			$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+		} finally {
+			if ( is_link( $this->dir . '/linked' ) ) {
+				unlink( $this->dir . '/linked' );
+			} elseif ( is_dir( $this->dir . '/linked' ) ) {
+				if ( is_file( $this->dir . '/linked/inner.php' ) ) {
+					unlink( $this->dir . '/linked/inner.php' );
+				}
+				rmdir( $this->dir . '/linked' );
+			}
+			if ( is_file( $target . '/inner.php' ) ) {
+				unlink( $target . '/inner.php' );
+			}
+			if ( is_dir( $target ) ) {
+				rmdir( $target );
+			}
+		}
+	}
 }

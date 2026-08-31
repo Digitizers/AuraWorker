@@ -357,6 +357,22 @@ class Aura_Worker_Rollback {
 	 * @param string $dir Absolute path to the directory to remove.
 	 */
 	private function delete_directory( $dir ) {
+		// Symlinks first, at the ONE entry every deleter is reached through (#78,
+		// Codex rounds 16-17). `WP_Filesystem_Direct::delete()` asks is_file()
+		// then is_dir(), both of which follow a link, so a link to a directory is
+		// walked into and its target emptied — a shared checkout outside
+		// WP_PLUGIN_DIR destroyed by a rollback, and the link itself left
+		// standing. Teaching each deleter the lesson separately is how the first
+		// guard ended up on only one of two branches; so a plugin root that is
+		// itself a link goes as a link here, and every link underneath is removed
+		// as a link here, and whichever deleter runs afterwards has none to follow.
+		if ( is_link( $dir ) ) {
+			@unlink( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
+			return ! is_dir( $dir ) && ! is_link( $dir );
+		}
+		if ( is_dir( $dir ) ) {
+			$this->unlink_symlinks_under( $dir );
+		}
 		global $wp_filesystem;
 		if ( ! function_exists( 'WP_Filesystem' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -378,6 +394,27 @@ class Aura_Worker_Rollback {
 		// not uniformly trustworthy across filesystem transports, and what the
 		// caller needs to know is one fact it can verify: is it gone?
 		return ! is_dir( $dir );
+	}
+
+	/**
+	 * Remove every symlink under a directory AS A LINK, at any depth, without
+	 * following any of them. `RecursiveDirectoryIterator` does not descend into
+	 * a linked directory unless told to (FOLLOW_SYMLINKS), which is exactly the
+	 * property wanted here: the link is a leaf, and the target is left alone.
+	 *
+	 * @param string $dir Absolute path to a real directory.
+	 * @return void
+	 */
+	private function unlink_symlinks_under( $dir ) {
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
+			RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ( $iterator as $entry ) {
+			if ( $entry->isLink() ) {
+				@unlink( $entry->getPathname() ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
+			}
+		}
 	}
 
 	/**

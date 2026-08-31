@@ -2449,11 +2449,16 @@ if ( ! class_exists( 'SA_Test_Filesystem' ) ) {
 			if ( false !== $type && ( is_file( $path ) || is_dir( $path ) || is_link( $path ) ) ) {
 				$GLOBALS['_mutations'][] = 'SA_Test_Filesystem::delete';
 			}
-			if ( is_file( $path ) || is_link( $path ) ) {
+			// Mirrors core's symlink behaviour, which is the point of routing the
+			// rollback through here: WP_Filesystem_Direct::delete() asks is_file()
+			// then is_dir() — both FOLLOW a link — so a link to a directory is walked
+			// into and its TARGET emptied, and the rmdir on the link itself then
+			// fails. Only a dangling link (neither file nor dir) is unlinked as such.
+			if ( is_file( $path ) ) {
 				return @unlink( $path );
 			}
 			if ( ! is_dir( $path ) ) {
-				return false;
+				return is_link( $path ) ? @unlink( $path ) : false;
 			}
 			$items = array_diff( scandir( $path ), array( '.', '..' ) );
 			foreach ( $items as $item ) {
