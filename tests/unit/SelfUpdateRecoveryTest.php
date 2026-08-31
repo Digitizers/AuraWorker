@@ -255,17 +255,27 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		}
 	}
 
-	public function test_a_rotated_log_claims_nothing_rather_than_reading_someone_elses_window(): void {
+	public function test_a_rotated_log_is_read_from_zero_so_a_fatal_in_the_new_file_counts(): void {
+		// Rotation replaced the file under the same name, SHORTER than the old
+		// offset, with one of our fatals in it. An earlier version of this test
+		// expected "claims nothing" — the size rule's behaviour, which treated a
+		// shrunk file as an unowned window. That was wrong: a replacement file
+		// was created after the snapshot, so everything in it is after the
+		// install, and a fatal there is exactly the evidence being looked for.
+		// Identity is by content now, and a replacement is read from zero
+		// whether it is shorter or longer than the file it replaced.
 		$log = $this->useLog();
 		file_put_contents( $log, str_repeat( 'x', 4096 ) . "\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			$this->installNewBuild( true );
-			// Rotation: the log is now SHORTER than the offset taken before.
-			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\\n" );
+			$this->installNewBuild( false );
+			unlink( $log );
+			file_put_contents( $log, "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\n" );
 		};
 
 		try {
-			$this->assertTrue( $this->selfUpdate()['success'] );
+			$res = $this->selfUpdate();
+			$this->assertFalse( $res['success'] );
+			$this->assertTrue( $res['rolled_back'] );
 		} finally {
 			unlink( $log );
 		}
@@ -612,7 +622,10 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// Codex round-8 P1: the size-only rotation rule sees a replacement file
 		// that already grew past the old size as "the same file, grown", seeks
 		// to the old size, and skips the new file's beginning — where a
-		// bootstrap fatal lands.
+		// bootstrap fatal lands. Identity is a CONTENT fact (the bytes before
+		// the offset), not the inode: on Linux a freed inode is commonly handed
+		// straight back, and an inode-based version of this passed on macOS and
+		// failed in CI.
 		$log = $this->useLog();
 		file_put_contents( $log, str_repeat( "old noise\n", 100 ) ); // ~1000 bytes
 		$ours = "[today] PHP Fatal error:  Uncaught Error in /srv/wp-content/plugins/digitizer-site-worker/includes/x.php:1\n";
@@ -623,10 +636,6 @@ final class SelfUpdateRecoveryTest extends TestCase {
 			unlink( $log );
 			file_put_contents( $log, $ours . str_repeat( "new noise\n", 300 ) );
 		};
-
-		if ( 0 === (int) @fileinode( $log ) ) {
-			$this->markTestSkipped( 'filesystem exposes no inode; identity cannot be tracked here' );
-		}
 
 		try {
 			$res = $this->selfUpdate();

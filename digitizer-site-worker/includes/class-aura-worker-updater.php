@@ -430,17 +430,46 @@ class Aura_Worker_Updater {
 			return null;
 		}
 		clearstatcache( true, $log );
+		$size = (int) filesize( $log );
 		// Identity too, not just size (Codex round-8 P1): a log rotated and
 		// RECREATED under the same name that regrows past the old size is not
 		// the same file, and reading it from the old offset skips the start of
-		// the new one — where a bootstrap fatal lands. `fileinode()` is 0 on
-		// filesystems that have none (some Windows setups); then identity is
-		// unknown and only the size rule applies.
+		// the new one — where a bootstrap fatal lands.
+		//
+		// Identity is a CONTENT fact — the bytes just before the offset — not
+		// the inode. The first version used `fileinode()` and passed on macOS,
+		// whose APFS allocates inodes monotonically; Linux filesystems commonly
+		// hand a freed inode straight back to the next file created, so a
+		// rotate-and-recreate came back with the SAME inode and the check was
+		// blind exactly where WordPress runs. The test caught it in CI, not
+		// locally — the environment-dependent pass this branch keeps finding.
 		return array(
-			'path'  => $log,
-			'size'  => (int) filesize( $log ),
-			'inode' => (int) @fileinode( $log ),
+			'path' => $log,
+			'size' => $size,
+			'tail' => $this->bytes_before( $log, $size, 256 ),
 		);
+	}
+
+	/**
+	 * The last $n bytes of $file before position $end — the fingerprint that
+	 * says "this is still the file I measured". A log shorter than $n is
+	 * fingerprinted whole.
+	 *
+	 * @return string
+	 */
+	private function bytes_before( $file, $end, $n ) {
+		$n    = (int) min( $n, $end );
+		if ( $n <= 0 ) {
+			return '';
+		}
+		$fp = fopen( $file, 'r' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
+		if ( false === $fp ) {
+			return '';
+		}
+		fseek( $fp, $end - $n );
+		$bytes = (string) fread( $fp, $n ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		return $bytes;
 	}
 
 	/** The log both halves read. Mirrors Aura_Worker_Health's resolution order. */
@@ -466,10 +495,12 @@ class Aura_Worker_Updater {
 		// unless it is no longer the same file. A replacement with a different
 		// inode is read from byte zero: everything in it is after the install.
 		if ( is_array( $snapshot ) && file_exists( $snapshot['path'] ) ) {
-			clearstatcache( true, $snapshot['path'] );
-			$inode_now = (int) @fileinode( $snapshot['path'] );
-			$same_file = 0 === (int) $snapshot['inode'] || 0 === $inode_now || $inode_now === (int) $snapshot['inode'];
-			$total    += $this->fatals_in( $snapshot['path'], $same_file ? (int) $snapshot['size'] : 0 );
+			// Same file iff the bytes that ended it then are still there now.
+			$same_file = hash_equals(
+				(string) $snapshot['tail'],
+				$this->bytes_before( $snapshot['path'], (int) $snapshot['size'], 256 )
+			);
+			$total += $this->fatals_in( $snapshot['path'], $same_file ? (int) $snapshot['size'] : 0 );
 		}
 		// A file that did not exist before and does now — the configured PHP
 		// log the new build CREATED by fatalling into it (Codex round-2 P1),
