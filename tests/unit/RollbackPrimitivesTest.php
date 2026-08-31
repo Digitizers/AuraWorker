@@ -296,4 +296,66 @@ final class RollbackPrimitivesTest extends TestCase {
 		$this->assertFileDoesNotExist( $this->dir . '/added-by-broken-build.php', 'a file the broken build added must not survive the restore' );
 		$this->assertDirectoryDoesNotExist( $this->dir . '/sub' );
 	}
+
+	public function test_a_symlinked_directory_is_archived_by_its_contents_and_restored_whole(): void {
+		// The iterator yielded a symlinked directory as a directory and did not
+		// descend into it, so the archive held an empty dir and called itself
+		// complete; a restore then put an EMPTY directory where plugin code had
+		// been, and the main-file check — which never looks there — still said
+		// `rolled_back: true` (Codex round-15 P1). A restore extracts real
+		// directories, so the target's contents are what the backup must hold.
+		$target = sys_get_temp_dir() . '/sa-linked-target-' . getmypid();
+		mkdir( $target . '/deeper', 0777, true );
+		file_put_contents( $target . '/inner.php', 'LINKED CODE' );
+		file_put_contents( $target . '/deeper/leaf.php', 'LEAF' );
+		symlink( $target, $this->dir . '/linked' );
+		$rollback = new Aura_Worker_Rollback();
+
+		try {
+			$backup = $rollback->backup_plugin( $this->slug );
+			$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+			// The broken build removed the link; the restore has to bring the
+			// code back, not an empty directory named after it.
+			unlink( $this->dir . '/linked' );
+			file_put_contents( $this->dir . '/main.php', 'BROKEN' );
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+
+			$this->assertTrue( $res['success'], $res['error'] ?? '' );
+			$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ) );
+			$this->assertSame( 'LINKED CODE', @file_get_contents( $this->dir . '/linked/inner.php' ), 'the linked directory came back empty' );
+			$this->assertSame( 'LEAF', @file_get_contents( $this->dir . '/linked/deeper/leaf.php' ) );
+		} finally {
+			foreach ( array( $this->dir . '/linked', $target ) as $d ) {
+				if ( is_link( $d ) ) {
+					unlink( $d );
+				} elseif ( is_dir( $d ) ) {
+					foreach ( array( '/deeper/leaf.php', '/inner.php' ) as $f ) {
+						if ( is_file( $d . $f ) ) {
+							unlink( $d . $f );
+						}
+					}
+					if ( is_dir( $d . '/deeper' ) ) {
+						rmdir( $d . '/deeper' );
+					}
+					rmdir( $d );
+				}
+			}
+		}
+	}
+
+	public function test_a_symlink_looping_back_into_the_plugin_makes_the_backup_incomplete_not_endless(): void {
+		// Following links is what the fix above does; a link to an ancestor of
+		// the directory being walked would then never end. It cannot be put in
+		// an archive faithfully, so the backup reports itself incomplete and is
+		// not kept — the same door every other gap comes out of.
+		symlink( $this->dir, $this->dir . '/loop' );
+		try {
+			$res = ( new Aura_Worker_Rollback() )->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame( array(), glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array() );
+		} finally {
+			unlink( $this->dir . '/loop' );
+		}
+	}
 }

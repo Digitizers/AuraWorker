@@ -236,33 +236,63 @@ class Aura_Worker_Rollback {
 	/**
 	 * Recursively add a directory's contents to an open ZipArchive.
 	 *
+	 * A symlinked DIRECTORY is followed into its target and its contents
+	 * archived under the link's path (#78, Codex round-15 P1). The previous
+	 * iterator yielded the link as a directory but did not descend, so the
+	 * archive held an empty directory and still called itself complete — and a
+	 * restore then replaced that subtree with an empty one while the main-file
+	 * check, which never looks there, reported `rolled_back: true`. A restore
+	 * extracts real directories, so the target's contents ARE what has to be
+	 * in the archive. A link back into an ancestor of the directory being
+	 * walked cannot be represented and would never end; it makes the backup
+	 * incomplete, which `backup_plugin()` reports and refuses to keep.
+	 *
 	 * @param ZipArchive $zip         Open zip archive instance.
 	 * @param string     $dir         Absolute path to the source directory.
 	 * @param string     $relative_to Prefix for zip entry paths.
+	 * @param array      $chain       Real paths of the directories on the current
+	 *                                descent, keyed by path — the loop guard.
+	 * @return bool Whether EVERY entry went in.
 	 */
-	private function add_directory_to_zip( $zip, $dir, $relative_to ) {
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
-			RecursiveIteratorIterator::SELF_FIRST
-		);
+	private function add_directory_to_zip( $zip, $dir, $relative_to, array $chain = array() ) {
+		$real = realpath( $dir );
+		if ( false === $real || '' === $real || isset( $chain[ $real ] ) || ! is_readable( $dir ) ) {
+			return false;
+		}
+		$chain[ $real ] = true;
+		$entries        = scandir( $dir );
+		if ( false === $entries ) {
+			return false;
+		}
 		$complete = true;
-		foreach ( $iterator as $file ) {
-			$path = $relative_to . '/' . $iterator->getSubPathName();
-			if ( $file->isDir() ) {
-				$added = $zip->addEmptyDir( $path );
-			} else {
-				// `getRealPath()` answers false for a dangling symlink or a file
-				// that vanished mid-traversal, and PHP 8 throws a ValueError if
-				// that reaches `addFile()` — so the backup would fatal instead
-				// of reporting itself incomplete, which is the opposite of the
-				// point. Record the gap and keep going.
-				$real  = $file->getRealPath();
-				$added = ( false === $real || '' === $real ) ? false : $zip->addFile( $real, $path );
+		foreach ( $entries as $name ) {
+			if ( '.' === $name || '..' === $name ) {
+				continue;
 			}
-			// One entry that did not go in makes this archive an incomplete
-			// record of the build — a file vanishing mid-traversal, a full
-			// volume. Saying so is the difference between a backup and a
-			// half-backup nobody knows is half.
+			$path  = $dir . '/' . $name;
+			$entry = $relative_to . '/' . $name;
+			if ( is_dir( $path ) ) {
+				// `is_dir()` follows a link, so a symlinked directory arrives here
+				// and is walked like any other; the chain stops it from looping.
+				if ( ! $zip->addEmptyDir( $entry ) ) {
+					$complete = false;
+				}
+				if ( ! $this->add_directory_to_zip( $zip, $path, $entry, $chain ) ) {
+					$complete = false;
+				}
+				continue;
+			}
+			// `realpath()` answers false for a dangling symlink or a file that
+			// vanished mid-traversal, and PHP 8 throws a ValueError if that reaches
+			// `addFile()` — so the backup would fatal instead of reporting itself
+			// incomplete, which is the opposite of the point. Record the gap and
+			// keep going: one entry that did not go in makes this archive an
+			// incomplete record of the build, and saying so is the difference
+			// between a backup and a half-backup nobody knows is half.
+			$real_file = realpath( $path );
+			$added     = ( false === $real_file || '' === $real_file || ! is_file( $real_file ) )
+				? false
+				: $zip->addFile( $real_file, $entry );
 			if ( ! $added ) {
 				$complete = false;
 			}
