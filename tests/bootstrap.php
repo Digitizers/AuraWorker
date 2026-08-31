@@ -1405,6 +1405,15 @@ if ( ! function_exists( 'wp_clean_plugins_cache' ) ) {
 
 if ( ! function_exists( 'get_plugin_data' ) ) {
 	function get_plugin_data( $plugin_file, $markup = true, $translate = true ) {
+		// Read the header out of the FILE, the way WordPress does. A constant
+		// 'unknown' cannot express "the old build is back on disk", which is the
+		// post-condition a rollback is now held to.
+		if ( is_string( $plugin_file ) && file_exists( $plugin_file ) ) {
+			$head = (string) file_get_contents( $plugin_file );
+			if ( preg_match( '/^[ \t\/*#@]*Version:\s*(.+)$/mi', $head, $m ) ) {
+				return array( 'Version' => trim( $m[1] ) );
+			}
+		}
 		return array( 'Version' => 'unknown' );
 	}
 }

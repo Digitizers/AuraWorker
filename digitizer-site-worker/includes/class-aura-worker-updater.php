@@ -288,8 +288,14 @@ class Aura_Worker_Updater {
 			// Restoring works even though the on-disk plugin is broken: this
 			// method, Aura_Worker_Rollback and ZipArchive are all already in
 			// memory from the pre-install require above.
-			$restore    = $rollback->restore_plugin( $plugin_slug, $backup_path );
-			$restored   = ! empty( $restore['success'] );
+			$restore  = $rollback->restore_plugin( $plugin_slug, $backup_path );
+			// Do not infer recovery from "the steps did not report failure".
+			// Eleven findings on this branch were one class — a success value
+			// resting on evidence that could not support it — so the claim is
+			// checked directly now: after a restore, the plugin's own header
+			// must read the version we came from.
+			$restored = ! empty( $restore['success'] )
+				&& $old_version === $this->installed_version( $plugin_file );
 			// The message has to agree with the fields (Codex round-2 P2). A
 			// dashboard that shows only `error` was told the site had recovered
 			// while `rolled_back` said otherwise — and the site may still be
@@ -356,6 +362,26 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * The version WordPress reads from a plugin's own file header, right now.
+	 * The one post-condition a rollback can be held to: the old build is back
+	 * only if the file on disk says so.
+	 *
+	 * @param string $plugin_file Plugin file relative to WP_PLUGIN_DIR.
+	 * @return string|null
+	 */
+	private function installed_version( $plugin_file ) {
+		$path = WP_PLUGIN_DIR . '/' . $plugin_file;
+		if ( ! file_exists( $path ) ) {
+			return null;
+		}
+		if ( function_exists( 'wp_clean_plugins_cache' ) ) {
+			wp_clean_plugins_cache( false );
+		}
+		$data = get_plugin_data( $path, false, false );
+		return isset( $data['Version'] ) ? (string) $data['Version'] : null;
+	}
+
+	/**
 	 * Current size of the PHP error log, or null when there is none to read.
 	 * Paired with `new_fatals_since()` so a verdict can consider only what this
 	 * update wrote.
@@ -413,11 +439,38 @@ class Aura_Worker_Updater {
 		if ( false === $fp ) {
 			return 0;
 		}
+
+		// Scan the WHOLE window, in chunks — not its first 64 KiB (Codex
+		// round-3). The install and three loopback probes can emit that much in
+		// notices and deprecations before the bootstrap fatal, and reading only
+		// the beginning missed exactly the entry this exists to find. A
+		// bootstrap failure also makes all three REST probes fail identically,
+		// so REST reads as inconclusive and the missed fatal is the only
+		// evidence left.
+		//
+		// `$overlap` carries the tail of each chunk into the next so a phrase
+		// straddling a boundary is still matched, then its own matches are
+		// subtracted so nothing is counted twice.
 		fseek( $fp, $from );
-		$tail = (string) fread( $fp, min( $size - $from, 65536 ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+		$remaining = $size - $from;
+		$overlap   = '';
+		$fatals    = 0;
+		while ( $remaining > 0 ) {
+			$chunk = fread( $fp, (int) min( $remaining, 65536 ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+			if ( false === $chunk || '' === $chunk ) {
+				break;
+			}
+			$remaining -= strlen( $chunk );
+			$window     = $overlap . $chunk;
+			$fatals    += preg_match_all( '/(PHP Fatal error|PHP Parse error)/i', $window, $m ) ? count( $m[0] ) : 0;
+			if ( '' !== $overlap && preg_match_all( '/(PHP Fatal error|PHP Parse error)/i', $overlap, $m2 ) ) {
+				$fatals -= count( $m2[0] );
+			}
+			$overlap = substr( $window, -32 );
+		}
 		fclose( $fp ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 
-		return preg_match_all( '/(PHP Fatal error|PHP Parse error)/i', $tail, $m ) ? count( $m[0] ) : 0;
+		return max( 0, $fatals );
 	}
 
 	/**

@@ -138,12 +138,70 @@ final class RollbackPrimitivesTest extends TestCase {
 		}
 	}
 
+	public function test_the_files_a_restore_must_drop_from_the_cache_are_every_php_file_it_wrote(): void {
+		// Files on disk are not what PHP runs: the failed release was already
+		// compiled by the loopback probe, and where `opcache.validate_timestamps`
+		// is off the workers keep executing that cached code however correct the
+		// bytes are (Codex round-3).
+		//
+		// This pins WHICH files a restore has to drop — the part with judgement
+		// in it. The `opcache_invalidate()` call itself is deliberately NOT
+		// covered: PHP defines that function even where OPcache is disabled, so
+		// a recording stub can never stand in for it, and a test that asserted
+		// around that would be passing for a reason unrelated to its claim.
+		mkdir( $this->dir . '/sub', 0777, true );
+		file_put_contents( $this->dir . '/sub/inner.php', '<?php' );
+		file_put_contents( $this->dir . '/readme.txt', 'not php' );
+
+		$m = new ReflectionMethod( Aura_Worker_Rollback::class, 'php_files_under' );
+		$m->setAccessible( true );
+		$found = $m->invoke( new Aura_Worker_Rollback(), $this->dir );
+
+		sort( $found );
+		$this->assertSame(
+			array( realpath( $this->dir . '/main.php' ), realpath( $this->dir . '/sub/inner.php' ) ),
+			$found,
+			'every PHP file it restored, and nothing else'
+		);
+
+		unlink( $this->dir . '/sub/inner.php' );
+		rmdir( $this->dir . '/sub' );
+		unlink( $this->dir . '/readme.txt' );
+	}
+
 	public function test_a_missing_backup_file_is_refused(): void {
 		$rollback = new Aura_Worker_Rollback();
 		$restore  = $rollback->restore_plugin( $this->slug, WP_CONTENT_DIR . '/aura-backups/nope.zip' );
 
 		$this->assertFalse( $restore['success'] );
 		$this->assertTrue( is_dir( $this->dir ) );
+	}
+
+	public function test_an_archive_that_could_not_take_every_file_is_not_offered_as_a_backup(): void {
+		// A partially populated but perfectly readable zip used to come back as
+		// `success: true`, and a later restore would delete the installed
+		// directory, extract the few entries that made it, and call that a
+		// rollback (Codex round-3). An incomplete archive is not a backup, and
+		// it must not be left on disk for something else to trust.
+		$rollback = new Aura_Worker_Rollback();
+
+		// A dangling symlink is the honest version of "a file disappeared during
+		// traversal": the iterator yields it, `getRealPath()` answers false, and
+		// `addFile()` cannot take it.
+		$dangling = $this->dir . '/vanished.php';
+		symlink( $this->dir . '/definitely-not-here.php', $dangling );
+
+		try {
+			$res = $rollback->backup_plugin( $this->slug );
+			$this->assertFalse( $res['success'] );
+			$this->assertSame(
+				array(),
+				glob( WP_CONTENT_DIR . '/aura-backups/' . $this->slug . '_*.zip' ) ?: array(),
+				'an incomplete archive must not be left behind'
+			);
+		} finally {
+			unlink( $dangling );
+		}
 	}
 
 	public function test_backing_up_a_directory_that_is_not_there_fails_cleanly(): void {

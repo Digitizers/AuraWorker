@@ -65,8 +65,26 @@ class Aura_Worker_Rollback {
 			return array( 'success' => false, 'error' => 'Failed to create zip archive' );
 		}
 
-		$this->add_directory_to_zip( $zip, $plugin_dir, $plugin_slug );
-		$zip->close();
+		// An archive is only a backup if everything got in AND it closed. Both
+		// were ignored, so a partially populated but perfectly readable zip was
+		// handed back as usable — and `restore_plugin()` would then delete the
+		// installed directory, extract the few entries that made it, and report
+		// a successful rollback with most of the old build missing (#77, Codex
+		// round-3).
+		$complete = $this->add_directory_to_zip( $zip, $plugin_dir, $plugin_slug );
+		$closed   = $zip->close();
+
+		if ( ! $complete || ! $closed ) {
+			// Do not leave a plausible-looking archive lying around for a later
+			// restore to trust.
+			if ( file_exists( $backup_path ) ) {
+				wp_delete_file( $backup_path );
+			}
+			return array(
+				'success' => false,
+				'error'   => 'Backup archive is incomplete — not every file could be added',
+			);
+		}
 
 		return array( 'success' => true, 'backup_path' => $backup_path );
 	}
@@ -124,6 +142,15 @@ class Aura_Worker_Rollback {
 				'error'   => 'Failed to extract the backup archive — the plugin directory may be incomplete',
 			);
 		}
+
+		// Files on disk are not what PHP runs. The failed release was already
+		// compiled by the loopback probe, and on a server with
+		// `opcache.validate_timestamps=0` (or a long revalidation window) the
+		// workers keep executing that cached broken code no matter what these
+		// bytes say — so "restored" would be true of the filesystem and false of
+		// the site (#77, Codex round-3). Extracting directly bypasses the
+		// per-file invalidation WordPress's own upgrader does.
+		$this->invalidate_opcache( $plugin_dir );
 
 		return array( 'success' => true );
 	}
@@ -195,10 +222,80 @@ class Aura_Worker_Rollback {
 			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
 			RecursiveIteratorIterator::SELF_FIRST
 		);
+		$complete = true;
 		foreach ( $iterator as $file ) {
 			$path = $relative_to . '/' . $iterator->getSubPathName();
-			$file->isDir() ? $zip->addEmptyDir( $path ) : $zip->addFile( $file->getRealPath(), $path );
+			if ( $file->isDir() ) {
+				$added = $zip->addEmptyDir( $path );
+			} else {
+				// `getRealPath()` answers false for a dangling symlink or a file
+				// that vanished mid-traversal, and PHP 8 throws a ValueError if
+				// that reaches `addFile()` — so the backup would fatal instead
+				// of reporting itself incomplete, which is the opposite of the
+				// point. Record the gap and keep going.
+				$real  = $file->getRealPath();
+				$added = ( false === $real || '' === $real ) ? false : $zip->addFile( $real, $path );
+			}
+			// One entry that did not go in makes this archive an incomplete
+			// record of the build — a file vanishing mid-traversal, a full
+			// volume. Saying so is the difference between a backup and a
+			// half-backup nobody knows is half.
+			if ( ! $added ) {
+				$complete = false;
+			}
 		}
+		return $complete;
+	}
+
+	/**
+	 * Drop compiled copies of every PHP file under a directory.
+	 *
+	 * Best-effort by nature: OPcache may be absent, disabled for CLI, or
+	 * restricted — none of which is a reason to fail a restore that otherwise
+	 * succeeded. What it must not do is stay silent about a stale cache it could
+	 * have cleared.
+	 *
+	 * @param string $dir Absolute path just restored.
+	 * @return void
+	 */
+	private function invalidate_opcache( $dir ) {
+		if ( ! function_exists( 'opcache_invalidate' ) ) {
+			return;
+		}
+		foreach ( $this->php_files_under( $dir ) as $file ) {
+			@opcache_invalidate( $file, true ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		}
+	}
+
+	/**
+	 * Every PHP file under a directory, absolute paths.
+	 *
+	 * Split out from `invalidate_opcache()` so the part with judgement in it —
+	 * WHICH files a restore has to drop from the cache — is testable. The
+	 * invalidation itself is a one-line call the test runtime cannot observe,
+	 * because PHP defines `opcache_invalidate()` even where OPcache is off, so
+	 * a recording stub can never take its place.
+	 *
+	 * @param string $dir Absolute directory path.
+	 * @return string[]
+	 */
+	private function php_files_under( $dir ) {
+		if ( ! is_dir( $dir ) ) {
+			return array();
+		}
+		$out      = array();
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS )
+		);
+		foreach ( $iterator as $file ) {
+			if ( $file->isFile() && 'php' === strtolower( $file->getExtension() ) ) {
+				$real = $file->getRealPath();
+				if ( false !== $real && '' !== $real ) {
+					$out[] = $real;
+				}
+			}
+		}
+		return $out;
 	}
 
 	/**

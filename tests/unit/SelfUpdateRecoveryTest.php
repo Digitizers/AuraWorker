@@ -51,7 +51,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->dir = WP_PLUGIN_DIR . '/' . $this->slug;
 		$this->rmdir( $this->dir );
 		mkdir( $this->dir, 0777, true );
-		file_put_contents( $this->dir . '/digitizer-site-worker.php', 'OLD BUILD' );
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'OLD BUILD', AURA_WORKER_VERSION ) );
 
 		$GLOBALS['_mutations']      = array();
 		$GLOBALS['_wp_http_calls']  = array();
@@ -63,7 +63,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteUp();
 		$GLOBALS['_install_result'] = true;
 		$GLOBALS['_install_effect'] = function () {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
 		};
 	}
 
@@ -94,9 +94,18 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		rmdir( $d );
 	}
 
+	/** A plugin file with a real Version header, the way WordPress reads it. */
+	private function build( string $marker, string $version ): string {
+		return "<?php\n/**\n * Plugin Name: SiteAgent\n * Version: {$version}\n */\n// {$marker}\n";
+	}
+
+	/** The marker inside the plugin file on disk — OLD BUILD or NEW BUILD. */
 	private function onDisk(): string {
 		$f = $this->dir . '/digitizer-site-worker.php';
-		return is_file( $f ) ? (string) file_get_contents( $f ) : '';
+		if ( ! is_file( $f ) ) {
+			return '';
+		}
+		return preg_match( '/(OLD BUILD|NEW BUILD)/', (string) file_get_contents( $f ), $m ) ? $m[1] : '';
 	}
 
 	/** Registered route refuses anonymously; an unregistered path 404s. */
@@ -216,7 +225,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 			'wp/v2/types'           => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
 		);
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
 			file_put_contents( $log, "[today] PHP Fatal error: cannot redeclare aura_worker_init()\n" );
 		};
 
@@ -263,7 +272,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$log = $this->useLog();
 		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
 			file_put_contents( $log, "[today] PHP Notice: undefined index, harmless\n", FILE_APPEND );
 		};
 
@@ -280,7 +289,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$log = $this->useLog();
 		file_put_contents( $log, "[01-Jan-2020] PHP Fatal error: something last year\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
 			file_put_contents( $log, "[today] PHP Fatal error: the new build\n", FILE_APPEND );
 		};
 
@@ -298,7 +307,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$log = $this->useLog();
 		file_put_contents( $log, str_repeat( 'x', 4096 ) . "\n" );
 		$GLOBALS['_install_effect'] = function () use ( $log ) {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
 			// Rotation: the log is now SHORTER than the offset taken before.
 			file_put_contents( $log, "[today] PHP Fatal error: from before rotation\n" );
 		};
@@ -369,7 +378,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// site was recovered when the plugin may be missing (Codex round-1 P1).
 		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
 		$GLOBALS['_install_effect'] = function () {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
 			// Corrupt the only backup so extraction cannot succeed.
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				file_put_contents( $f, 'not a zip' );
@@ -390,7 +399,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		// it was still carrying the broken build.
 		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
 		$GLOBALS['_install_effect']        = function () {
-			file_put_contents( $this->dir . '/digitizer-site-worker.php', 'NEW BUILD' );
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
 			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
 				file_put_contents( $f, 'not a zip' );
 			}
@@ -401,6 +410,60 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['rolled_back'] );
 		$this->assertStringNotContainsString( 'was rolled back', $res['error'] );
 		$this->assertStringContainsString( 'could not be rolled back', $res['error'] );
+	}
+
+	public function test_a_restore_that_left_the_wrong_build_on_disk_is_not_a_rollback(): void {
+		// The post-condition, and the reason it exists: every step can report
+		// success and the site still be running the broken build. Here the
+		// archive restores but the plugin file it puts back is not the version
+		// we came from, so `rolled_back` must be false however cleanly the
+		// extraction went.
+		$GLOBALS['_http_responses_by_url'] = $this->pluginRouteGone();
+		$GLOBALS['_install_effect']        = function () {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			// Rewrite the backup so it restores a DIFFERENT version.
+			foreach ( glob( WP_CONTENT_DIR . '/aura-backups/*.zip' ) ?: array() as $f ) {
+				$zip = new ZipArchive();
+				$zip->open( $f, ZipArchive::OVERWRITE );
+				$zip->addFromString(
+					'digitizer-site-worker/digitizer-site-worker.php',
+					$this->build( 'NEW BUILD', '7.7.7' )
+				);
+				$zip->close();
+			}
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertFalse( $res['rolled_back'], 'a restore that did not bring back the old version is not a rollback' );
+	}
+
+	public function test_a_fatal_far_past_the_first_64KiB_of_the_window_is_still_found(): void {
+		// The install and three probes can emit that much in notices and
+		// deprecations before the bootstrap fatal; reading only the beginning of
+		// the window missed the entry the check exists for (Codex round-3).
+		$log = $this->useLog();
+		file_put_contents( $log, "start of window\n" );
+		$GLOBALS['_http_responses_by_url'] = array(
+			'__aura_probe_absent__' => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
+			'aura/v1/status'        => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
+			'wp/v2/types'           => array( 'response' => array( 'code' => 500 ), 'body' => '' ),
+		);
+		$GLOBALS['_install_effect'] = function () use ( $log ) {
+			file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+			file_put_contents( $log, str_repeat( "PHP Notice: chatty deprecation\n", 6000 ), FILE_APPEND );
+			file_put_contents( $log, "[today] PHP Fatal error: the new build\n", FILE_APPEND );
+		};
+
+		try {
+			$res = $this->selfUpdate();
+			$this->assertFalse( $res['success'] );
+			$this->assertTrue( $res['rolled_back'] );
+			$this->assertSame( 'OLD BUILD', $this->onDisk() );
+		} finally {
+			unlink( $log );
+		}
 	}
 
 	public function test_an_unhealthy_update_with_no_backup_reports_failure_rather_than_success(): void {
