@@ -51,8 +51,6 @@ function aura_worker_init() {
 	$plugin->init();
 }
 
-}
-
 /**
  * Run the one-time repairs a version change needs, then record the version.
  *
