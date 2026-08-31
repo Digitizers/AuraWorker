@@ -553,4 +553,73 @@ final class RollbackPrimitivesTest extends TestCase {
 			}
 		}
 	}
+
+	public function test_a_restore_whose_traversal_throws_comes_out_as_a_failed_restore_not_an_exception(): void {
+		// The link strip at the deletion entry walks the tree with
+		// RecursiveDirectoryIterator, which throws on a subdirectory PHP cannot
+		// read. Nothing above it caught that, so the self-update request died
+		// during recovery instead of returning `rolled_back: false` with a
+		// `restore_error` (Codex round-19 P1) — the backup side's round-6 lesson,
+		// unlearnt on the restore side.
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+
+		$sub = $this->dir . '/locked';
+		mkdir( $sub, 0777, true );
+		file_put_contents( $sub . '/inner.php', '<?php' );
+		chmod( $sub, 0000 );
+		if ( @scandir( $sub ) !== false ) {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/inner.php' );
+			rmdir( $sub );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$res = $rollback->restore_plugin( $this->slug, $backup['backup_path'] );
+			$this->assertFalse( $res['success'] );
+			$this->assertStringContainsString( 'Could not remove', $res['error'] );
+			$this->assertSame( 'ORIGINAL', file_get_contents( $this->dir . '/main.php' ), 'nothing was deleted' );
+		} finally {
+			chmod( $sub, 0777 );
+			if ( is_file( $sub . '/inner.php' ) ) {
+				unlink( $sub . '/inner.php' );
+			}
+			if ( is_dir( $sub ) ) {
+				rmdir( $sub );
+			}
+		}
+	}
+
+	public function test_the_opcache_sweep_survives_a_subtree_it_cannot_read(): void {
+		// The same iterator, after a restore that already SUCCEEDED: a throw here
+		// would turn a completed rollback into a dead request. The sweep is
+		// best-effort by contract, so it returns — whatever it managed to see
+		// before the throw, which depends on listing order and is not asserted.
+		$sub = $this->dir . '/locked';
+		mkdir( $sub, 0777, true );
+		file_put_contents( $sub . '/hidden.php', '<?php' );
+		file_put_contents( $this->dir . '/visible.php', '<?php' );
+		chmod( $sub, 0000 );
+		if ( @scandir( $sub ) !== false ) {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/hidden.php' );
+			rmdir( $sub );
+			unlink( $this->dir . '/visible.php' );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+
+		try {
+			$m = new ReflectionMethod( Aura_Worker_Rollback::class, 'php_files_under' );
+			$m->setAccessible( true );
+			$found = $m->invoke( new Aura_Worker_Rollback(), $this->dir );
+			$this->assertIsArray( $found, 'the sweep must return, not throw' );
+		} finally {
+			chmod( $sub, 0777 );
+			unlink( $sub . '/hidden.php' );
+			rmdir( $sub );
+			unlink( $this->dir . '/visible.php' );
+		}
+	}
 }

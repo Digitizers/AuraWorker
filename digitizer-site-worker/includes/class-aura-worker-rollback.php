@@ -336,27 +336,66 @@ class Aura_Worker_Rollback {
 		if ( ! is_dir( $dir ) ) {
 			return array();
 		}
-		$out      = array();
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS )
-		);
-		foreach ( $iterator as $file ) {
-			if ( $file->isFile() && 'php' === strtolower( $file->getExtension() ) ) {
-				$real = $file->getRealPath();
-				if ( false !== $real && '' !== $real ) {
-					$out[] = $real;
+		$out = array();
+		// Best-effort by contract (see `invalidate_opcache()`): a subtree PHP
+		// cannot read makes the iterator throw, and a restore that had already
+		// succeeded must not die on its cache sweep (Codex round-19). What was
+		// collected before the throw is still worth invalidating.
+		try {
+			$iterator = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS )
+			);
+			foreach ( $iterator as $file ) {
+				if ( $file->isFile() && 'php' === strtolower( $file->getExtension() ) ) {
+					$real = $file->getRealPath();
+					if ( false !== $real && '' !== $real ) {
+						$out[] = $real;
+					}
 				}
 			}
+		} catch ( Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+			// Partial list; see above.
 		}
 		return $out;
 	}
 
 	/**
-	 * Recursively delete a directory and all its contents.
+	 * Recursively delete a directory and all its contents, and say whether it
+	 * is gone.
+	 *
+	 * Guard and verdict only; the work is `clear_directory()`. Every traversal
+	 * in this class can THROW — `RecursiveDirectoryIterator` raises on a
+	 * directory PHP cannot read or one that vanishes mid-walk — and a throw
+	 * here escaped `restore_plugin()` and `attempt_rollback()` alike, so the
+	 * self-update request terminated during recovery instead of returning
+	 * `rolled_back: false` with a `restore_error` (#78, Codex round-19 P1; the
+	 * backup side learnt the same lesson in round 6). Whatever happens inside,
+	 * the answer is the one fact the caller can verify.
 	 *
 	 * @param string $dir Absolute path to the directory to remove.
+	 * @return bool Whether the directory is gone.
 	 */
 	private function delete_directory( $dir ) {
+		try {
+			$this->clear_directory( $dir );
+		} catch ( Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+			// Fall through to the fact below: a traversal that could not finish
+			// left the directory where it was, and that is what gets reported.
+		}
+		// Report on the DIRECTORY, not on the call. `delete()`'s own return is
+		// not uniformly trustworthy across filesystem transports, and what the
+		// caller needs to know is one fact it can verify: is it gone?
+		return ! is_dir( $dir ) && ! is_link( $dir );
+	}
+
+	/**
+	 * The deletion itself: links first, then whichever deleter the site has.
+	 * May throw; `delete_directory()` is the only caller and catches.
+	 *
+	 * @param string $dir Absolute path to the directory to remove.
+	 * @return void
+	 */
+	private function clear_directory( $dir ) {
 		// Symlinks first, at the ONE entry every deleter is reached through (#78,
 		// Codex rounds 16-17). `WP_Filesystem_Direct::delete()` asks is_file()
 		// then is_dir(), both of which follow a link, so a link to a directory is
@@ -368,7 +407,7 @@ class Aura_Worker_Rollback {
 		// as a link here, and whichever deleter runs afterwards has none to follow.
 		if ( is_link( $dir ) ) {
 			@unlink( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.unlink_unlink
-			return ! is_dir( $dir ) && ! is_link( $dir );
+			return;
 		}
 		// And a link that could NOT be removed — the plugin directory read-only
 		// to PHP while the target stays writable — is a link a deleter would
@@ -376,7 +415,7 @@ class Aura_Worker_Rollback {
 		// reports that the directory could not be cleared, which is true, and
 		// the target keeps its contents, which is the point.
 		if ( is_dir( $dir ) && ! $this->unlink_symlinks_under( $dir ) ) {
-			return false;
+			return;
 		}
 		global $wp_filesystem;
 		if ( ! function_exists( 'WP_Filesystem' ) ) {
@@ -395,10 +434,6 @@ class Aura_Worker_Rollback {
 			$this->delete_directory_directly( $dir );
 		}
 
-		// Report on the DIRECTORY, not on the call. `delete()`'s own return is
-		// not uniformly trustworthy across filesystem transports, and what the
-		// caller needs to know is one fact it can verify: is it gone?
-		return ! is_dir( $dir );
 	}
 
 	/**
