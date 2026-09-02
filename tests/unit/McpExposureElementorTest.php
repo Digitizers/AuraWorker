@@ -266,6 +266,18 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( 200, strlen( $this->block()['version'] ) );
 	}
 
+	public function test_the_no_mbstring_clip_never_splits_a_character(): void {
+		// Codex round-6 P2: a byte substr() at 200 could cut an emoji in half
+		// and hand JSON encoding invalid UTF-8.
+		$name = 'Elementor MCP ' . str_repeat( "\u{1F642}", 200 );
+		$out  = Aura_Tool_Audit_Mcp_Exposure::clip_fallback( $name );
+		$this->assertSame( 200, mb_strlen( $out ) );
+		$this->assertTrue( (bool) preg_match( '//u', $out ) ); // valid UTF-8
+		$this->assertSame( 'Elementor MCP ', substr( $out, 0, 14 ) );
+		$this->assertSame( '', Aura_Tool_Audit_Mcp_Exposure::clip_fallback( "abc\xff\xfe" ) ); // invalid UTF-8 → nothing
+		$this->assertSame( 'short', Aura_Tool_Audit_Mcp_Exposure::clip_fallback( 'short' ) );
+	}
+
 	public function test_elementor_module_from_is_pure(): void {
 		$m = Aura_Tool_Audit_Mcp_Exposure::elementor_module_from(
 			array( 'installed' => true, 'version' => '4.3.0', 'class_present' => true, 'active' => false ),

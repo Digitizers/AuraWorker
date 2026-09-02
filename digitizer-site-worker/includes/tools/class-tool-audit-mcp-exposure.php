@@ -251,7 +251,29 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 */
 	protected function clip( $s ) {
 		$s = (string) $s;
-		return function_exists( 'mb_substr' ) ? mb_substr( $s, 0, static::ELEMENTOR_STRING_MAX ) : substr( $s, 0, static::ELEMENTOR_STRING_MAX );
+		// WordPress polyfills mb_substr() (wp-includes/compat.php) when the
+		// mbstring extension is absent, so this branch is the normal one.
+		if ( function_exists( 'mb_substr' ) ) {
+			return mb_substr( $s, 0, static::ELEMENTOR_STRING_MAX );
+		}
+		return static::clip_fallback( $s );
+	}
+
+	/**
+	 * Character-aware clip without mbstring: a byte substr() can cut a
+	 * multibyte character in half and hand JSON encoding invalid UTF-8.
+	 * A value that is not valid UTF-8 to begin with is reported as nothing
+	 * rather than as bytes the response cannot carry.
+	 *
+	 * @param string $s Value.
+	 * @return string
+	 */
+	public static function clip_fallback( $s ) {
+		$s = (string) $s;
+		if ( preg_match( '/^.{0,' . (int) static::ELEMENTOR_STRING_MAX . '}/us', $s, $m ) ) {
+			return $m[0];
+		}
+		return '';
 	}
 
 	/**
