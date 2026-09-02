@@ -723,8 +723,10 @@ final class UnbindCleanupTest extends TestCase {
 	/**
 	 * The breadcrumb exists so an eternally pending tombstone can be
 	 * explained, and it travels wherever the site sends diagnostics — so it
-	 * carries the owner and nothing else. Naming the nonce, the uuid or the
-	 * token here would leak a credential identifier into any listener. (#434 N5)
+	 * carries only the owner and a reason (here unproven for a reason other
+	 * than "oversized", so the empty string; 2.15.0). Naming the nonce, the
+	 * uuid or the token here would leak a credential identifier into any
+	 * listener. (#434 N5)
 	 */
 	public function test_the_breadcrumb_names_the_owner_and_carries_no_secret(): void {
 		$GLOBALS['_sa_app_password_read_fail'][3] = true;
@@ -735,7 +737,7 @@ final class UnbindCleanupTest extends TestCase {
 
 		$fired = $this->probe_unproven();
 		$this->assertCount( 1, $fired );
-		$this->assertSame( array( 3 ), $fired[0]['args'], 'the owner, and only the owner' );
+		$this->assertSame( array( 3, '' ), $fired[0]['args'], 'the owner and an empty reason, nothing else' );
 		$this->assertStringNotContainsString( 'uuid-manual', wp_json_encode( $fired[0]['args'] ), 'no credential identifier rides the breadcrumb' );
 	}
 

@@ -151,22 +151,43 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 	 * must have is FRESHNESS, not unpredictability.
 	 *
 	 * @since 2.13.0
+	 * @since 2.15.0 the $max_bytes bound.
 	 *
-	 * @param int $owner Owner user ID.
+	 * @param int $owner     Owner user ID.
+	 * @param int $max_bytes Optional. When > 0, a row whose serialised value
+	 *                       exceeds it answers null (oversized, never
+	 *                       decoded); 0 = unbounded, the 2.13.0 behaviour.
 	 * @return array|null The list — empty for a user with no row, or a row that
 	 *                    does not hold an array, exactly as core reads both —
 	 *                    or NULL for a read that proved nothing, which no
 	 *                    caller may treat as an absence.
 	 */
-	function aura_worker_app_password_list( $owner ) {
+	function aura_worker_app_password_list( $owner, $max_bytes = 0 ) {
 		global $wpdb;
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
 			return null; // no way to confirm: never a proof of absence
 		}
 		static $seq = 0;
 		++$seq;
-		$nonce = $seq . '-' . wp_generate_uuid4();
-		$sql   = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, (int) $owner, '_application_passwords' );
+		$nonce     = $seq . '-' . wp_generate_uuid4();
+		$max_bytes = (int) $max_bytes;
+		if ( $max_bytes > 0 ) {
+			// The byte bound lives IN the statement that returns the value: a
+			// probe-then-fetch would let a concurrent usermeta write swap an
+			// oversized value in between, and the fetch would decode it. The
+			// LEFT JOIN over a one-row derived table keeps the probe row coming
+			// back when the user has no meta row (len NULL) — the nonce proof
+			// must not depend on the row existing.
+			$sql = $wpdb->prepare(
+				"SELECT %s AS probe, m.len, m.v FROM (SELECT 1 AS one) AS o LEFT JOIN (SELECT LENGTH(meta_value) AS len, IF(LENGTH(meta_value) <= %d, meta_value, NULL) AS v FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS m ON 1 = 1",
+				$nonce,
+				$max_bytes,
+				(int) $owner,
+				'_application_passwords'
+			);
+		} else {
+			$sql = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, (int) $owner, '_application_passwords' );
+		}
 		// core's prepare() answers null when it refuses the call: the earlier,
 		// cheaper refusal, and it keeps "we never asked" from being reported as
 		// "we asked and were told nothing".
@@ -179,8 +200,19 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 			// No row, or somebody else's row: this call proved nothing, and an
 			// unprovable probe owes app_passwords forever, so leave a
 			// breadcrumb rather than a tombstone that never explains itself.
-			do_action( 'aura_worker_app_password_probe_unproven', (int) $owner );
+			do_action( 'aura_worker_app_password_probe_unproven', (int) $owner, '' );
 			return null;
+		}
+		if ( $max_bytes > 0 ) {
+			if ( ! isset( $row->len ) ) {
+				return array(); // no row at all: that user holds no Application Passwords
+			}
+			if ( ! isset( $row->v ) ) {
+				// The row exists and exceeds the bound: the value was never
+				// returned, so it was never decoded. Not an absence.
+				do_action( 'aura_worker_app_password_probe_unproven', (int) $owner, 'oversized' );
+				return null;
+			}
 		}
 		$raw = isset( $row->v ) ? $row->v : null;
 		if ( null === $raw ) {

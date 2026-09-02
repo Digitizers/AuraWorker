@@ -2007,6 +2007,26 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 						: null, // no row at all
 				);
 			}
+			// The BOUNDED per-user read (2.15.0, the Elementor door): the same
+			// nonce proof, with the byte bound folded into the statement so the
+			// value decoded is the value measured. LEFT JOIN over a one-row
+			// derived table keeps the probe row coming back when the user has
+			// no meta row at all (len NULL, v NULL).
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, m\.len, m\.v FROM \(SELECT 1 AS one\) AS o LEFT JOIN \(SELECT LENGTH\(meta_value\) AS len, IF\(LENGTH\(meta_value\) <= (\d+), meta_value, NULL\) AS v FROM \S+ WHERE user_id = (\d+) AND meta_key = '_application_passwords' LIMIT 1\) AS m ON 1 = 1$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$max  = (int) $m[2];
+				$user = (int) $m[3];
+				if ( ! empty( $GLOBALS['_sa_app_password_read_fail'][ $user ] ) ) {
+					$this->last_error = 'read failed';
+					return null;
+				}
+				if ( ! isset( $GLOBALS['_app_passwords'][ $user ] ) ) {
+					return (object) array( 'probe' => $m[1], 'len' => null, 'v' => null );
+				}
+				$raw = serialize( $GLOBALS['_app_passwords'][ $user ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+				$len = strlen( $raw );
+				return (object) array( 'probe' => $m[1], 'len' => $len, 'v' => $len <= $max ? $raw : null );
+			}
 			// Reformatting the production probe would otherwise unhook every
 			// I5/M12/N1 test silently — they would fall through to $_db_row,
 			// read null, and go on passing while proving nothing. LOUD instead.
