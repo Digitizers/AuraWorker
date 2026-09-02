@@ -583,20 +583,21 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 				$unproven[] = $uid; // over the byte bound: never decoded
 				continue;
 			}
-			// is_serialized() first, the same gate maybe_unserialize() applies,
-			// so a plain non-serialized string (not the documented shape) is
-			// unproven without ever handing unserialize() bytes it will warn
-			// on. allowed_classes => false on the actual decode: this
+			// aura_worker_unserialize_array() (credential-rules.php): this
 			// meta_value comes from a usermeta scan with no capability
-			// filter, so it must be treated as untrusted — a plain
-			// unserialize()/maybe_unserialize() would let a crafted payload
-			// instantiate arbitrary classes and fire __wakeup()/__destruct()
-			// gadgets. Forcing classes off turns any serialized object into
-			// __PHP_Incomplete_Class instead, which is not an array and lands
-			// the row in consent_unproven below — never decoded as consent.
-			$data = is_serialized( $row->v, true )
-				? unserialize( (string) $row->v, array( 'allowed_classes' => false ) )
-				: false;
+			// filter, so it must be treated as untrusted — allowed_classes
+			// => false keeps a crafted payload from instantiating arbitrary
+			// classes and firing __wakeup()/__destruct() gadgets (a
+			// serialized object becomes __PHP_Incomplete_Class instead,
+			// which is not an array and lands the row in consent_unproven
+			// below — never decoded as consent), and the shared helper's
+			// warning suppression keeps a payload that PASSES
+			// is_serialized() but does not actually unserialize cleanly
+			// (a corrupted element count) from warning — which, under a
+			// warnings-to-exceptions handler, would throw out of this one
+			// row's decode and replace the WHOLE consent subtree instead of
+			// just marking this uid unproven (#434 Codex round-7 P2).
+			$data = aura_worker_unserialize_array( $row->v );
 			if ( ! is_array( $data ) || ! array_key_exists( 'allowed', $data ) ) {
 				$unproven[] = $uid; // a row that is not the documented shape
 				continue;
@@ -782,22 +783,58 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	/**
 	 * How many edit_posts users the site has. A seam.
 	 *
+	 * `count_total => true` makes WP_User_Query run the main SELECT and then
+	 * a second statement, `SELECT FOUND_ROWS()`, via `$wpdb->get_var()` —
+	 * which flushes `$wpdb->last_error`. A main query that fails, followed by
+	 * a FOUND_ROWS that succeeds (it always does; it has nothing to fail on),
+	 * leaves `last_error` empty by the time `get_total()` returns: the total
+	 * reads as a confident 0, with no `{ error }` subtree, for a query that
+	 * never ran (Codex round-7 P2 — the same "empty answer look identical to
+	 * a real one" failure mode `results_failed()` exists to close for the
+	 * direct-SQL seams).
+	 *
+	 * `found_users_query` is the one hook WP_User_Query fires between those
+	 * two statements — AFTER the main query, BEFORE FOUND_ROWS — so a filter
+	 * registered there sees `last_error` in the window before it is cleared.
+	 * The filter is added just before the query is built and removed in a
+	 * `finally`, so a throw from either `new \WP_User_Query()` or
+	 * `get_total()` cannot leave it registered for a later call. The error is
+	 * treated as a failure if EITHER the filter captured one OR `last_error`
+	 * is still non-empty afterwards — the same page-query check below is
+	 * unchanged, kept as a fallback for a build that never reaches FOUND_ROWS
+	 * at all (a driver-level failure before the SQL is even issued).
+	 *
 	 * @return int
 	 */
 	protected function context_users_total() {
 		global $wpdb;
 		static::clear_last_error( $wpdb );
-		$q = new \WP_User_Query(
-			array(
-				'capability'  => 'edit_posts',
-				'fields'      => 'ID',
-				'number'      => 1,
-				'count_total' => true,
-			)
-		);
-		$total = $q->get_total();
-		if ( is_object( $wpdb ) && ! empty( $wpdb->last_error ) ) {
-			throw new \RuntimeException( 'user query failed: ' . esc_html( $wpdb->last_error ) );
+		$captured_error = '';
+		$capture_error  = static function ( $found_rows_sql ) use ( $wpdb, &$captured_error ) {
+			if ( is_object( $wpdb ) && ! empty( $wpdb->last_error ) ) {
+				$captured_error = (string) $wpdb->last_error;
+			}
+			return $found_rows_sql;
+		};
+		add_filter( 'found_users_query', $capture_error );
+		try {
+			$q = new \WP_User_Query(
+				array(
+					'capability'  => 'edit_posts',
+					'fields'      => 'ID',
+					'number'      => 1,
+					'count_total' => true,
+				)
+			);
+			$total = $q->get_total();
+		} finally {
+			remove_filter( 'found_users_query', $capture_error );
+		}
+		$error = '' !== $captured_error
+			? $captured_error
+			: ( is_object( $wpdb ) && ! empty( $wpdb->last_error ) ? (string) $wpdb->last_error : '' );
+		if ( '' !== $error ) {
+			throw new \RuntimeException( 'user query failed: ' . esc_html( $error ) );
 		}
 		return (int) $total;
 	}

@@ -103,4 +103,40 @@ final class AppPasswordListBoundedTest extends TestCase {
 		$GLOBALS['_sa_app_password_raw'][7] = 'not-serialized-garbage';
 		$this->assertSame( array(), aura_worker_app_password_list( 7, 262144 ) );
 	}
+
+	public function test_a_valid_envelope_with_a_corrupt_element_count_is_an_empty_array_without_warning(): void {
+		// Codex round-7 P2: is_serialized() is a SHAPE check — it passes a
+		// payload declaring 2 elements while holding 1, and a bare
+		// unserialize() on that shape emits E_WARNING. This test passing at
+		// all IS the proof: PHPUnit 10 turns an escaped warning into an error,
+		// so a suppression regression fails this test with the warning
+		// itself, not a mismatched assertion.
+		$GLOBALS['_sa_app_password_raw'][7] = 'a:2:{s:7:"allowed";b:1;}';
+		$this->assertSame( array(), aura_worker_app_password_list( 7 ) );
+	}
+
+	// --- aura_worker_unserialize_array() directly (finding 4b) -----------------
+
+	public function test_unserialize_array_returns_a_valid_array(): void {
+		$this->assertSame(
+			array( 'allowed' => true ),
+			aura_worker_unserialize_array( serialize( array( 'allowed' => true ) ) ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+		);
+	}
+
+	public function test_unserialize_array_returns_false_for_the_corrupt_envelope(): void {
+		$this->assertFalse( aura_worker_unserialize_array( 'a:2:{s:7:"allowed";b:1;}' ) );
+	}
+
+	public function test_unserialize_array_returns_false_for_a_serialised_object(): void {
+		// Not class_exists()-dependent: allowed_classes => false turns the
+		// object into __PHP_Incomplete_Class regardless of whether stdClass
+		// (or any named class) is loaded, and __PHP_Incomplete_Class is not
+		// an array either way.
+		$this->assertFalse( aura_worker_unserialize_array( 'O:8:"stdClass":1:{s:4:"uuid";s:3:"u-1";}' ) );
+	}
+
+	public function test_unserialize_array_returns_false_for_a_plain_string(): void {
+		$this->assertFalse( aura_worker_unserialize_array( 'not-serialized-garbage' ) );
+	}
 }

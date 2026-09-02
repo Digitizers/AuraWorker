@@ -121,6 +121,65 @@ if ( ! function_exists( 'aura_worker_credential_owner' ) ) {
 	}
 }
 
+if ( ! function_exists( 'aura_worker_unserialize_array' ) ) {
+	/**
+	 * Decode a serialized value into an array, or prove it cannot be — without
+	 * ever letting `unserialize()` warn.
+	 *
+	 * `is_serialized()` is a SHAPE check, not a correctness one: a payload like
+	 * `a:2:{s:7:"allowed";b:1;}` declares two elements and holds one, passes
+	 * the shape check, and makes `unserialize()` emit an `E_WARNING` — which on
+	 * a site configured to display errors corrupts the REST JSON this plugin
+	 * answers with, and under any handler that turns warnings into exceptions
+	 * (PHPUnit's own default, a site's own error handler) throws OUT of a
+	 * single-row decode and takes down whatever larger structure was being
+	 * built around it (Codex round-7 P2). A caller that decodes one row out of
+	 * many — consent, an Application Password list — must be able to treat
+	 * THAT row as unproven and keep going; it cannot do that if the decode
+	 * itself can end the request.
+	 *
+	 * The warning is suppressed with `set_error_handler()`, restored in a
+	 * `finally` so a throw from elsewhere cannot leave the handler in place —
+	 * never with `@`, which silences every notice a warning-to-exception
+	 * handler might otherwise still want to see from code this doesn't own.
+	 *
+	 * `allowed_classes => false`: this decodes untrusted, database-sourced
+	 * bytes (a usermeta row, a LIKE-selected candidate), so a plain
+	 * `unserialize()` would let a crafted payload instantiate arbitrary
+	 * classes and fire `__wakeup()`/`__destruct()` gadgets. A serialised
+	 * object becomes `__PHP_Incomplete_Class` instead — not an array, so it
+	 * falls through to `false` here exactly like every other non-array shape.
+	 *
+	 * @since 2.15.0
+	 *
+	 * @param mixed $raw Whatever the stored value holds.
+	 * @return array|false The decoded array, or false when it is not a
+	 *                      serialized array, or the decode itself warned.
+	 */
+	function aura_worker_unserialize_array( $raw ) {
+		if ( ! is_string( $raw ) || ! is_serialized( $raw, true ) ) {
+			return false;
+		}
+		$warned = false;
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		set_error_handler(
+			static function () use ( &$warned ) {
+				$warned = true;
+				return true; // suppress: never let the warning propagate
+			}
+		);
+		try {
+			$value = unserialize( $raw, array( 'allowed_classes' => false ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
+		} finally {
+			restore_error_handler();
+		}
+		if ( $warned || ! is_array( $value ) ) {
+			return false;
+		}
+		return $value;
+	}
+}
+
 if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 	/**
 	 * That user's Application Password list, PROVEN to have been read.
@@ -232,21 +291,19 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 		if ( null === $raw ) {
 			return array(); // no row at all: that user holds no Application Passwords
 		}
-		// allowed_classes => false: this helper now also serves rows selected
-		// by a LIKE over the value itself (the Elementor-door candidate scan),
-		// so the value must be treated as untrusted the same way the consent
-		// decode (class-tool-audit-mcp-exposure.php) and the snapshot payload
-		// decode (class-aura-worker-snapshots.php) already do — a plain
-		// maybe_unserialize()/unserialize() would let a crafted payload
-		// instantiate arbitrary classes and fire __wakeup()/__destruct()
-		// gadgets. is_serialized() first is the same gate maybe_unserialize()
-		// applies, so a plain non-serialized string never reaches unserialize()
-		// at all. A serialised object becomes __PHP_Incomplete_Class, which is
-		// not an array and falls through to array() below — behaviour-identical
-		// to maybe_unserialize() for every array this ever legitimately held.
-		$list = is_serialized( $raw, true )
-			? unserialize( (string) $raw, array( 'allowed_classes' => false ) ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
-			: false;
+		// aura_worker_unserialize_array(): this helper now also serves rows
+		// selected by a LIKE over the value itself (the Elementor-door
+		// candidate scan), so the value must be treated as untrusted the
+		// same way the consent decode (class-tool-audit-mcp-exposure.php)
+		// and the snapshot payload decode (class-aura-worker-snapshots.php)
+		// already do — allowed_classes => false keeps a crafted payload
+		// from instantiating arbitrary classes and firing
+		// __wakeup()/__destruct() gadgets, and the shared helper's warning
+		// suppression keeps a shape that passes is_serialized() but does
+		// not actually unserialize cleanly from throwing under a
+		// warnings-to-exceptions handler instead of just failing this one
+		// row (#434 Codex round-7 P2).
+		$list = aura_worker_unserialize_array( $raw );
 		return is_array( $list ) ? $list : array();
 	}
 }

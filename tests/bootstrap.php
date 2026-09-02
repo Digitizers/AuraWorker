@@ -1211,6 +1211,35 @@ if ( ! function_exists( 'add_action' ) ) {
 	}
 }
 
+if ( ! function_exists( 'remove_filter' ) ) {
+	/**
+	 * Core's remove_filter(): drops the first registration on $tag matching
+	 * both $callback and $priority (core's own matching rule) — not every
+	 * registration of that callback, so two add_filter() calls at different
+	 * priorities are independent, same as in WordPress.
+	 */
+	function remove_filter( string $tag, $callback, int $priority = 10 ): bool {
+		if ( empty( $GLOBALS['_filters'][ $tag ] ) ) {
+			return false;
+		}
+		foreach ( $GLOBALS['_filters'][ $tag ] as $i => $entry ) {
+			$cb        = ( is_array( $entry ) && array_key_exists( 'callback', $entry ) ) ? $entry['callback'] : $entry;
+			$entry_pri = ( is_array( $entry ) && isset( $entry['priority'] ) ) ? (int) $entry['priority'] : 10;
+			if ( $cb === $callback && $entry_pri === $priority ) {
+				unset( $GLOBALS['_filters'][ $tag ][ $i ] );
+				return true;
+			}
+		}
+		return false;
+	}
+}
+
+if ( ! function_exists( 'remove_action' ) ) {
+	function remove_action( string $tag, $callback, int $priority = 10 ): bool {
+		return remove_filter( $tag, $callback, $priority );
+	}
+}
+
 if ( ! function_exists( 'has_filter' ) ) {
 	/**
 	 * Core's has_filter(): the priority a callback is registered at, or false.
@@ -2648,6 +2677,14 @@ $GLOBALS['_post_counts']  = array();
 // empty result / zero total, never a throw — mirrors the direct-SQL seams'
 // $GLOBALS['_sa_wpdb_results_error'] knob for the same shape (Codex round-3 P2).
 $GLOBALS['_sa_user_query_error'] = null;
+// When true AND _sa_user_query_error is set: models the main query failing
+// and THEN a count_total query's own SELECT FOUND_ROWS() succeeding and
+// flushing $wpdb->last_error clean — the shape that made get_total() alone
+// answer 0 with no trace of the failure (Codex round-7 P2). The
+// found_users_query filter (applied below, matching WP_User_Query::query()'s
+// real timing: after the main query, before FOUND_ROWS) is the one seam that
+// still sees the error in that case.
+$GLOBALS['_sa_user_query_error_cleared_by_found_rows'] = false;
 
 if ( ! class_exists( 'WP_User_Query' ) ) {
 	class WP_User_Query {
@@ -2659,6 +2696,18 @@ if ( ! class_exists( 'WP_User_Query' ) ) {
 			$GLOBALS['_user_queries'][] = $this->query_vars;
 			if ( ! empty( $GLOBALS['_sa_user_query_error'] ) && isset( $GLOBALS['wpdb'] ) ) {
 				$GLOBALS['wpdb']->last_error = (string) $GLOBALS['_sa_user_query_error'];
+			}
+			// Real WP_User_Query::query() applies this filter, with the SQL of
+			// the about-to-run SELECT FOUND_ROWS(), whenever count_total is
+			// requested — AFTER the main query has run and BEFORE FOUND_ROWS
+			// does, regardless of whether the main query succeeded. Fired here,
+			// at construction, since this stub (like core) resolves the whole
+			// query — main statement and total — inside the constructor.
+			if ( ! empty( $this->query_vars['count_total'] ) ) {
+				apply_filters( 'found_users_query', 'SELECT FOUND_ROWS()', $this );
+				if ( ! empty( $GLOBALS['_sa_user_query_error_cleared_by_found_rows'] ) && isset( $GLOBALS['wpdb'] ) ) {
+					$GLOBALS['wpdb']->last_error = '';
+				}
 			}
 		}
 
@@ -3518,6 +3567,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_user_queries'] = array();
 	$GLOBALS['_post_counts']  = array();
 	$GLOBALS['_sa_user_query_error'] = null;
+	$GLOBALS['_sa_user_query_error_cleared_by_found_rows'] = false;
 	$GLOBALS['_home_url']       = 'https://example.com';
 	$GLOBALS['_site_url']       = 'https://example.com';
 	$GLOBALS['_wp_query_posts'] = array();

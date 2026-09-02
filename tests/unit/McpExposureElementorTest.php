@@ -439,6 +439,19 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( array( 5, 6 ), $b['consent_unproven'] );
 	}
 
+	public function test_a_row_with_a_valid_envelope_but_a_corrupt_serialization_is_unproven_without_warning(): void {
+		// Codex round-7 P2: is_serialized() is a SHAPE check — it passes a
+		// payload that declares 2 elements and holds 1, which makes a bare
+		// unserialize() emit E_WARNING. This test passing at all IS the proof:
+		// PHPUnit converts an escaped E_WARNING into a fatal error, so if the
+		// fix's warning suppression ever regresses, this test does not merely
+		// fail an assertion — it errors out with the warning itself.
+		$this->tool->consent_rows = array( self::consent_row( 5, 'a:2:{s:7:"allowed";b:1;}' ) );
+		$b                         = $this->block();
+		$this->assertSame( array(), $b['consent'] );
+		$this->assertSame( array( 5 ), $b['consent_unproven'] );
+	}
+
 	public function test_fifty_one_consent_rows_are_fifty_and_truncated(): void {
 		$rows = array();
 		for ( $i = 1; $i <= 51; $i++ ) {
@@ -995,6 +1008,37 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['coverage'] );
 		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['app_passwords']['other'] );
 		// mcp_module and consent, read independently, are untouched.
+		$this->assertFalse( $b['installed'] );
+		$this->assertArrayNotHasKey( 'error', $b['mcp_module'] );
+		$this->assertSame( array(), $b['consent'] );
+	}
+
+	public function test_a_count_query_failure_cleared_by_found_rows_is_still_caught(): void {
+		// Codex round-7 P2: count_total => true runs the main SELECT and then
+		// SELECT FOUND_ROWS() via $wpdb->get_var(), which flushes
+		// $wpdb->last_error — so a failed main query followed by a successful
+		// FOUND_ROWS leaves last_error empty by the time get_total() returns,
+		// and the round-3 fix above (which reads last_error only AFTER
+		// get_total()) would read 0 with no error. The bootstrap's
+		// _sa_user_query_error_cleared_by_found_rows knob models exactly that
+		// clearing; context_users_total()'s found_users_query filter is what
+		// still sees the error, since it fires between the two statements.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+		};
+		$GLOBALS['_sa_user_query_error'] = 'Table wp_users doesnt exist';
+		$GLOBALS['_sa_user_query_error_cleared_by_found_rows'] = true;
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['coverage'] );
+		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['app_passwords']['other'] );
 		$this->assertFalse( $b['installed'] );
 		$this->assertArrayNotHasKey( 'error', $b['mcp_module'] );
 		$this->assertSame( array(), $b['consent'] );
