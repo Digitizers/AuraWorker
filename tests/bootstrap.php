@@ -2650,6 +2650,7 @@ if ( ! function_exists( 'wp_insert_post' ) ) {
 			'comment_status' => $args['comment_status'] ?? 'open',
 			'ping_status'    => $args['ping_status'] ?? 'open',
 		);
+		do_action( 'wp_insert_post', $id, $GLOBALS['_posts'][ $id ], false );
 		return $id;
 	}
 }
@@ -2681,6 +2682,9 @@ if ( ! function_exists( 'wp_update_post' ) ) {
 			$GLOBALS['_posts'][ $id ]->$k = $v;
 		}
 		$GLOBALS['_mutations'][] = 'wp_update_post';
+		// Core fires this for updates too — the $update flag (true here) is what
+		// an observer keys on to tell an update apart from a fresh insert.
+		do_action( 'wp_insert_post', $id, $GLOBALS['_posts'][ $id ], true );
 		return $id;
 	}
 }
@@ -3158,28 +3162,125 @@ if ( ! function_exists( 'wp_get_abilities' ) ) {
 	}
 }
 
+if ( ! class_exists( 'WP_Ability' ) ) {
+	/**
+	 * Core's ability object, reduced to what the governor touches: the
+	 * STORED execute callback (protected, no getter — WP 7.1 shape) and
+	 * execute(). Reading it back by Reflection is the production path (R2).
+	 */
+	class WP_Ability {
+		protected $name;
+		protected $execute_callback;
+		protected $permission_callback;
+		protected $meta = array();
+		public function __construct( string $name, array $args ) {
+			$this->name                = $name;
+			$this->execute_callback    = $args['execute_callback'] ?? null;
+			$this->permission_callback = $args['permission_callback'] ?? null;
+			$this->meta                = is_array( $args['meta'] ?? null ) ? $args['meta'] : array();
+		}
+		public function get_name(): string { return $this->name; }
+		public function get_meta(): array { return $this->meta; }
+		public function execute( $input = null ) {
+			if ( ! is_callable( $this->execute_callback ) ) {
+				return new WP_Error( 'ability_invalid_execute_callback', 'no callback' );
+			}
+			return call_user_func( $this->execute_callback, $input );
+		}
+		/** Core's public permission check (class-wp-ability.php:623), reduced. */
+		public function check_permissions( $input = null ) {
+			if ( ! is_callable( $this->permission_callback ) ) {
+				return new WP_Error( 'ability_invalid_permission_callback', 'no permission callback' );
+			}
+			$r = call_user_func( $this->permission_callback, $input );
+			return is_wp_error( $r ) ? $r : ( true === $r );
+		}
+	}
+}
+
 if ( ! function_exists( 'sa_register_ability' ) ) {
 	/**
-	 * Seed one ability into the stub registry.
+	 * Core's WP_Abilities_Registry::register(), reduced: the args filter,
+	 * then the object.
+	 *
+	 * NOTE: unlike the registry-shaped array wp_register_ability() (above)
+	 * stores for AbilitiesTest/AbilitiesForeignTransportTest/
+	 * AbilitiesGrantReuseTest (which read $GLOBALS['_abilities'][...] as a
+	 * plain array — the production registration path via
+	 * Aura_Worker_Abilities::register()), this seeds a real WP_Ability OBJECT
+	 * — the shape McpExposureAuditTest's direct sa_register_ability() calls
+	 * use, and the shape the door governor's Reflection-based read (R2)
+	 * needs. Meta goes under the 'meta' key of $args, matching core's own
+	 * register() signature (execute_callback / permission_callback / meta).
 	 *
 	 * @param string $name Ability name.
-	 * @param array  $meta Ability meta (mcp.type, annotations.readonly, ...).
+	 * @param array  $args execute_callback, permission_callback, meta.
 	 */
-	function sa_register_ability( string $name, array $meta = array() ): void {
-		$GLOBALS['_abilities'][ $name ] = new class( $name, $meta ) {
-			private string $name;
-			private array $meta;
-			public function __construct( string $name, array $meta ) {
-				$this->name = $name;
-				$this->meta = $meta;
+	function sa_register_ability( string $name, array $args ): WP_Ability {
+		$args = apply_filters( 'wp_register_ability_args', $args, $name );
+		$GLOBALS['_abilities'][ $name ] = new WP_Ability( $name, $args );
+		return $GLOBALS['_abilities'][ $name ];
+	}
+}
+
+if ( ! function_exists( 'wp_get_ability' ) ) {
+	function wp_get_ability( string $name ) {
+		$a = $GLOBALS['_abilities'][ $name ] ?? null;
+		return $a instanceof WP_Ability ? $a : null;
+	}
+}
+
+if ( ! function_exists( 'get_post_type' ) ) {
+	function get_post_type( $post = null ) {
+		$p = get_post( $post );
+		return $p ? ( $p->post_type ?? false ) : false;
+	}
+}
+
+if ( ! function_exists( 'wp_get_current_user' ) ) {
+	function wp_get_current_user() {
+		$id = get_current_user_id();
+		return (object) array( 'ID' => $id, 'user_login' => $GLOBALS['_user_logins'][ $id ] ?? ( $id > 0 ? 'user' . $id : '' ) );
+	}
+}
+
+if ( ! function_exists( 'wp_trash_post' ) ) {
+	/**
+	 * Core: with EMPTY_TRASH_DAYS at 0, wp_trash_post() DELETES (post.php),
+	 * which is exactly the case the door refuses to restore through.
+	 */
+	function wp_trash_post( $post_id ) {
+		$id = (int) $post_id;
+		if ( ! isset( $GLOBALS['_posts'][ $id ] ) ) {
+			return false;
+		}
+		if ( defined( 'EMPTY_TRASH_DAYS' ) && 0 === (int) EMPTY_TRASH_DAYS ) {
+			return wp_delete_post( $id, true );
+		}
+		if ( 'trash' === ( $GLOBALS['_posts'][ $id ]->post_status ?? '' ) ) {
+			return false; // core: already trashed
+		}
+		$GLOBALS['_posts'][ $id ]->post_status = 'trash';
+		$GLOBALS['_trashed'][]                 = $id;
+		return $GLOBALS['_posts'][ $id ];
+	}
+}
+
+if ( ! function_exists( 'get_posts' ) ) {
+	function get_posts( array $args = array() ) {
+		$types  = (array) ( $args['post_type'] ?? 'post' );
+		$status = $args['post_status'] ?? 'publish';
+		$out    = array();
+		foreach ( $GLOBALS['_posts'] as $id => $p ) {
+			if ( ! in_array( $p->post_type ?? '', $types, true ) ) {
+				continue;
 			}
-			public function get_name(): string {
-				return $this->name;
+			if ( 'any' !== $status && ( $p->post_status ?? '' ) !== $status ) {
+				continue;
 			}
-			public function get_meta(): array {
-				return $this->meta;
-			}
-		};
+			$out[] = ( 'ids' === ( $args['fields'] ?? '' ) ) ? (int) $id : $p;
+		}
+		return $out;
 	}
 }
 
@@ -3602,6 +3703,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
 	$GLOBALS['_posts']        = array();
+	$GLOBALS['_trashed']      = array(); // wp_trash_post()'s trace — see the stub above.
+	$GLOBALS['_user_logins']  = array(); // wp_get_current_user()'s user_login lookup — see the stub above.
 	$GLOBALS['_post_meta']    = array();
 	$GLOBALS['_cleaned_post_cache'] = array();
 	$GLOBALS['_did_delete_expired'] = false;

@@ -53,7 +53,7 @@ final class McpExposureAuditTest extends TestCase {
 	public function test_an_ability_declaring_no_type_counts_as_exposed(): void {
 		// Absent means 'tool' to every consumer, which is why the default is the
 		// dangerous one and why the fork had to start declaring something else.
-		sa_register_ability( 'someplugin/do-thing', $this->write_meta() );
+		sa_register_ability( 'someplugin/do-thing', array( 'meta' => $this->write_meta() ) );
 
 		$result = $this->tool->execute( array() );
 
@@ -68,7 +68,7 @@ final class McpExposureAuditTest extends TestCase {
 		// MCP types, which are equally "not tool" for this rule.
 		foreach ( array( 'private', 'resource', 'prompt' ) as $type ) {
 			sa_reset_state();
-			sa_register_ability( 'someplugin/do-thing', $this->write_meta( array( 'mcp' => array( 'type' => $type ) ) ) );
+			sa_register_ability( 'someplugin/do-thing', array( 'meta' => $this->write_meta( array( 'mcp' => array( 'type' => $type ) ) ) ) );
 
 			$result = $this->tool->execute( array() );
 
@@ -79,7 +79,7 @@ final class McpExposureAuditTest extends TestCase {
 	}
 
 	public function test_an_ability_declaring_tool_explicitly_counts_as_exposed(): void {
-		sa_register_ability( 'someplugin/do-thing', $this->write_meta( array( 'mcp' => array( 'type' => 'tool' ) ) ) );
+		sa_register_ability( 'someplugin/do-thing', array( 'meta' => $this->write_meta( array( 'mcp' => array( 'type' => 'tool' ) ) ) ) );
 
 		$this->assertSame( 1, $this->tool->execute( array() )['abilities']['discoverable_by_type_rule'] );
 	}
@@ -87,8 +87,8 @@ final class McpExposureAuditTest extends TestCase {
 	public function test_exposed_reads_are_counted_separately_from_writes(): void {
 		// Read tools reachable from another server are the expected state, not a
 		// finding — conflating the two would make every site look alarming.
-		sa_register_ability( 'someplugin/list-things', $this->read_meta() );
-		sa_register_ability( 'someplugin/do-thing', $this->write_meta() );
+		sa_register_ability( 'someplugin/list-things', array( 'meta' => $this->read_meta() ) );
+		sa_register_ability( 'someplugin/do-thing', array( 'meta' => $this->write_meta() ) );
 
 		$result = $this->tool->execute( array() );
 
@@ -113,7 +113,7 @@ final class McpExposureAuditTest extends TestCase {
 		// able to see that without inferring it. Both facts are in one response,
 		// which is why the counts stay honest on a site with no door — they say
 		// what would be handed over the moment one is installed.
-		sa_register_ability( 'someplugin/do-thing', $this->write_meta() );
+		sa_register_ability( 'someplugin/do-thing', array( 'meta' => $this->write_meta() ) );
 
 		$result = $this->tool->execute( array() );
 
@@ -126,7 +126,7 @@ final class McpExposureAuditTest extends TestCase {
 	public function test_the_ability_scan_is_bounded_and_says_so(): void {
 		$cap = Aura_Tool_Audit_Mcp_Exposure::MAX_ABILITIES;
 		for ( $i = 0; $i < $cap + 5; $i++ ) {
-			sa_register_ability( 'someplugin/tool-' . $i, $this->read_meta() );
+			sa_register_ability( 'someplugin/tool-' . $i, array( 'meta' => $this->read_meta() ) );
 		}
 
 		$result = $this->tool->execute( array() );
@@ -142,7 +142,7 @@ final class McpExposureAuditTest extends TestCase {
 		// to say so without knowing which one tripped.
 		$named = Aura_Tool_Audit_Mcp_Exposure::MAX_NAMED;
 		for ( $i = 0; $i < $named + 3; $i++ ) {
-			sa_register_ability( 'someplugin/write-' . $i, $this->write_meta() );
+			sa_register_ability( 'someplugin/write-' . $i, array( 'meta' => $this->write_meta() ) );
 		}
 
 		$result = $this->tool->execute( array() );
