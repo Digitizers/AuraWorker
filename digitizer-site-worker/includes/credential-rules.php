@@ -200,7 +200,7 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 			// No row, or somebody else's row: this call proved nothing, and an
 			// unprovable probe owes app_passwords forever, so leave a
 			// breadcrumb rather than a tombstone that never explains itself.
-			do_action( 'aura_worker_app_password_probe_unproven', (int) $owner, '' );
+			do_action( 'aura_worker_app_password_probe_unproven', (int) $owner );
 			return null;
 		}
 		if ( $max_bytes > 0 ) {
