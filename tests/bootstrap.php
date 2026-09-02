@@ -2544,6 +2544,31 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return $n;
 			}
 
+			// Aura_Worker_Door_Holds::take_lock()'s stale-lock replacement
+			// (round-1 finding on task 4's review): a DELETE fenced on the
+			// exact bytes the caller read as stale, byte-for-byte like the
+			// UPDATE CAS branches above — never the LIKE-prefix fence below,
+			// which matches on a PREFIX of the value rather than all of it.
+			// Scoped to the lock name only, the same way is_door_log_insert
+			// is scoped above: a second exact-value fence elsewhere would
+			// want its own seam rather than borrowing this one.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
+				list( , $name, $expected ) = array_map( 'stripslashes', $m );
+				if ( 'aura_worker_door_hold_lock' === $name ) {
+					// A racer replacing the lock's value in the window between
+					// this caller's own read and this delete — the window
+					// round-1's fix exists to close.
+					sa_before_swap();
+				}
+				if ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $expected ) {
+					return 0; // Someone else wrote (or already deleted) first.
+				}
+				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+				$GLOBALS['_notoptions'][ $name ]   = true;
+				$GLOBALS['_option_writes'][]       = array( 'delete', $name );
+				return 1;
+			}
+
 			// The bare delete Aura_Worker_Door_Holds::claim() and ::reject() issue
 			// on a held row's exact name: no fence, no LIKE — just "does this row
 			// still exist", and the row count answers it. claim() moves a hold by

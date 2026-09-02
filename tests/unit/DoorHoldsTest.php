@@ -66,6 +66,46 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ) ); // …and the lock is still released
 	}
 
+	public function test_two_racers_on_a_stale_lock_only_one_of_them_takes_it(): void {
+		$stale = time() - Aura_Worker_Door_Holds::LOCK_S - 1;
+		add_option( Aura_Worker_Door_Holds::LOCK, $stale, '', 'no' );
+		// Racer B replaces the crashed holder's lock with its OWN fresh one
+		// in the exact window between this call's read of the stale bytes
+		// and its fenced delete keyed on them — the race round-1's fix
+		// closes. A distinguishable timestamp (far in the future) so the
+		// assertion below cannot be satisfied by A's own writes.
+		$racers_lock = time() + 100000;
+		$GLOBALS['_sa_before_swap'] = static function () use ( $racers_lock ) {
+			$GLOBALS['_sa_before_swap']                       = null; // fires once
+			$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $racers_lock;
+			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = (string) $racers_lock;
+		};
+		$err = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertInstanceOf( WP_Error::class, $err );
+		$this->assertSame( 'aura_hold_busy', $err->get_error_code(), 'A never got past the fenced delete: its own insert_unique() keeps meeting a lock it does not own' );
+		$this->assertSame( $racers_lock, $GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ], "the racer's lock was never overwritten by A" );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::count(), 'no held row leaked while the lock could not be taken' );
+	}
+
+	public function test_the_fenced_lock_delete_never_removes_a_value_it_did_not_read(): void {
+		global $wpdb;
+		$stale = time() - Aura_Worker_Door_Holds::LOCK_S - 1;
+		add_option( Aura_Worker_Door_Holds::LOCK, $stale, '', 'no' ); // what a reader would see
+		// Something replaces the lock's value between that read and the
+		// delete fenced on it — the exact window round-1's fix closes,
+		// exercised directly against the fenced-DELETE SQL shape itself
+		// rather than through take_lock()'s retry loop.
+		$fresh = time();
+		$GLOBALS['_sa_before_swap'] = static function () use ( $fresh ) {
+			$GLOBALS['_sa_before_swap']                       = null;
+			$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $fresh;
+			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = (string) $fresh;
+		};
+		$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", Aura_Worker_Door_Holds::LOCK, (string) $stale ) );
+		$this->assertSame( 0, (int) $gone, 'the delete was fenced on stale bytes that no longer match' );
+		$this->assertSame( $fresh, $GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ], 'the value that replaced it survives' );
+	}
+
 	public function test_the_51st_hold_is_refused_queue_full(): void {
 		for ( $i = 0; $i < 50; $i++ ) {
 			$this->assertIsString( Aura_Worker_Door_Holds::hold( $this->call() ) );

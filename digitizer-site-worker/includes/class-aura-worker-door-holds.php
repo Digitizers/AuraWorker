@@ -51,20 +51,46 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
-	 * Takes the hold-queue mutex; a lock older than LOCK_S is a crashed holder and is replaced.
+	 * Takes the hold-queue mutex; a lock older than LOCK_S is a crashed
+	 * holder and is replaced — but the replacement is a DELETE fenced on the
+	 * exact bytes this call read as stale, never an unconditional
+	 * delete_option(). Two racers both meeting the same crashed lock would
+	 * otherwise interleave as: A deletes, A inserts (wins), B deletes — B's
+	 * unconditional delete has no idea A's row is not the stale one it saw a
+	 * moment ago, so it removes A's brand-new lock, B inserts (wins too), and
+	 * A's own `finally` release later deletes OUT FROM UNDER B. The cap check
+	 * in hold_locked() would then run for both at once — unserialized despite
+	 * the mutex (round-1 finding on task 4's review). Fencing the delete on
+	 * the read bytes means only the racer whose delete actually hits the
+	 * stale row gets to insert next; a racer that loses the delete just loops
+	 * and meets whichever lock is there afterwards.
 	 *
 	 * @return bool
 	 */
 	private static function take_lock() {
+		global $wpdb;
 		for ( $i = 0; $i < 3; $i++ ) {
 			if ( Aura_Worker_Door_Log::insert_unique( self::LOCK, time() ) ) {
 				return true;
 			}
 			wp_cache_delete( self::LOCK, 'options' );
-			$held = (int) get_option( self::LOCK, 0 );
+			$raw = self::raw_bytes( self::LOCK );
+			if ( null === $raw ) {
+				continue; // the row vanished between the failed insert and this read
+			}
+			$held = (int) $raw;
 			if ( $held && time() - $held > self::LOCK_S ) {
-				delete_option( self::LOCK ); // whoever's insert_unique() wins next owns it
-				continue;
+				$wpdb->last_error = '';
+				$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::LOCK, $raw ) );
+				wp_cache_delete( self::LOCK, 'options' );
+				wp_cache_delete( 'notoptions', 'options' );
+				if ( 1 === (int) $gone ) {
+					continue; // whoever's insert_unique() wins next owns it
+				}
+				// Lost the delete race — some other caller's fence matched
+				// instead (or already won and released). Fall through to the
+				// same backoff a live lock gets; the next iteration re-reads
+				// whatever is there now.
 			}
 			usleep( 50000 );
 		}
@@ -315,6 +341,23 @@ class Aura_Worker_Door_Holds {
 		}
 		$val = maybe_unserialize( $raw );
 		return is_array( $val ) ? $val : null;
+	}
+
+	/**
+	 * The DATABASE's raw, still-serialized bytes for one option — never this
+	 * request's option cache, and never unserialized. take_lock() fences its
+	 * stale-lock delete on exactly these bytes (compared byte-for-byte, the
+	 * same way write_option_where()'s UPDATE compares its `$before`), so the
+	 * fence can only match the row this call actually read, never a fresher
+	 * one a racer already installed.
+	 *
+	 * @param string $option Option.
+	 * @return string|null
+	 */
+	private static function raw_bytes( $option ) {
+		global $wpdb;
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		return null === $raw ? null : (string) $raw;
 	}
 
 	/** @param string $ref Ref. @return string */
