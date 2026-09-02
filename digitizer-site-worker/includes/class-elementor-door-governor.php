@@ -112,15 +112,34 @@ class Aura_Worker_Elementor_Door {
 	private static $pinned_ruleset = null;
 	/** @var array|null the ack a replay carries (Task 8) */
 	private static $replay_ack = null;
+	/** @var bool|null memoised presence — see active() */
+	private static $active = null;
 
 	/* ------------------------------------------------------------------ */
 	/* Wiring                                                              */
 	/* ------------------------------------------------------------------ */
 
+	/**
+	 * Wire the seam UNCONDITIONALLY.
+	 *
+	 * This used to return early unless Elementor's MCP module class already
+	 * existed — and that was the one fail-OPEN path in a fail-closed design
+	 * (Ruling P6). Both plugins bootstrap on `plugins_loaded` at priority 10,
+	 * and same-priority callbacks fire in plugin-inclusion order, which is
+	 * alphabetical: `digitizer-site-worker` runs BEFORE `elementor`. On such
+	 * a site the class did not exist yet, so no wrapper was installed,
+	 * `verify_coverage` never ran, `close_transport` was never hooked — and
+	 * /elementor/mcp served every write ungoverned while `status_fragment()`
+	 * reported the door closed.
+	 *
+	 * Every hook below is inert on a site without Elementor: `wrap_args`
+	 * touches only `elementor/*` slugs, `verify_coverage` has nothing to
+	 * verify, `close_transport` matches only the two door route prefixes,
+	 * `observe_insert` is scoped to a governed request in flight, and the
+	 * cleanup action is fired by Elementor alone. Presence is decided LAZILY
+	 * instead — see active().
+	 */
 	public static function init() {
-		if ( ! class_exists( self::MODULE_CLASS ) && empty( $GLOBALS['_sa_force_door'] ) ) {
-			return; // nothing here runs on a site without the module
-		}
 		add_filter( 'wp_register_ability_args', array( __CLASS__, 'wrap_args' ), PHP_INT_MAX, 2 );
 		add_action( 'wp_abilities_api_init', array( __CLASS__, 'verify_coverage' ), PHP_INT_MAX );
 		add_filter( 'rest_request_before_callbacks', array( __CLASS__, 'close_transport' ), 2, 3 );
@@ -140,11 +159,11 @@ class Aura_Worker_Elementor_Door {
 		self::$pinned_ruleset      = null;
 		self::$replay_ack          = null;
 		self::$request             = null;
-		// The unit suite has no Elementor MCP module to detect, so init() is
-		// told to wire itself anyway. Named for the test bootstrap's other
-		// `_sa_*` seams rather than for this plugin, which is what the sniff
-		// objects to; it is written ONLY from this test-only method.
-		$GLOBALS['_sa_force_door'] = true; // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedVariableFound -- test seam, see above.
+		self::$active              = null;
+		// $GLOBALS['_sa_force_door'] — active()'s test override, standing in
+		// for the module class this suite cannot define — is reset by
+		// sa_reset_state(), not written here: production code reads that
+		// seam, it never defines it.
 	}
 
 	/** @param callable $fn Test seam. */
@@ -163,11 +182,65 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Is there an Elementor door on this site at all?
+	 *
+	 * Asked at `wp_abilities_api_init` and at request time — never at
+	 * `plugins_loaded`, where the answer is a race (Ruling P6). Two
+	 * witnesses, because either can be the one that is ready:
+	 *
+	 * 1. Elementor's MCP module class, looked up WITHOUT autoloading
+	 *    (`class_exists( …, false )`): by the time anything asks, Elementor's
+	 *    own autoloader has run and the class is loaded if the module is on.
+	 * 2. The Abilities registry holding any `elementor/*` id — the module is
+	 *    what registers them, so one of them IS the module, whatever the
+	 *    class name does next release.
+	 *
+	 * Only a POSITIVE answer is memoised: within one request the registry
+	 * only grows and an autoloader only becomes available, so `true` cannot
+	 * turn back into `false` — but a `false` read before Elementor registered
+	 * must not be frozen, which is the very load order this exists for.
+	 *
+	 * @return bool
+	 */
+	public static function active() {
+		if ( true === self::$active ) {
+			return true;
+		}
+		// The suite cannot define Elementor's module class; this stands in
+		// for witness 1. Read only — never written by production code.
+		if ( ! empty( $GLOBALS['_sa_force_door'] ) ) {
+			self::$active = true;
+			return true;
+		}
+		if ( class_exists( self::MODULE_CLASS, false ) ) {
+			self::$active = true;
+			return true;
+		}
+		if ( function_exists( 'wp_get_abilities' ) ) {
+			foreach ( wp_get_abilities() as $ability ) {
+				$name = is_object( $ability ) && method_exists( $ability, 'get_name' ) ? (string) $ability->get_name() : '';
+				if ( 0 === strpos( $name, 'elementor/' ) ) {
+					self::$active = true;
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * What `/status` says about the door (Task 9 fills the rest of it).
 	 *
-	 * @return array { epoch, seam, door }
+	 * ABSENT on a site with no door: Aura keys on the fragment's presence to
+	 * decide whether this site is governed at all, so a site without
+	 * Elementor must not report a door — open or closed.
+	 *
+	 * @return array|null { epoch, seam, door }
 	 */
 	public static function status_fragment() {
+		if ( ! self::active() ) {
+			return null;
+		}
 		return array(
 			'epoch' => Aura_Worker_Door_Log::epoch(),
 			'seam'  => self::$seam,
@@ -211,6 +284,14 @@ class Aura_Worker_Elementor_Door {
 	 * filter, which would inspect a fresh wrapper instead of what is stored.
 	 */
 	public static function verify_coverage() {
+		if ( ! self::active() ) {
+			// No Elementor, no door, nothing to govern — and emphatically NOT
+			// a coverage failure: closing the transport here would 503 a
+			// route that does not exist on this site (Ruling P6).
+			self::$seam        = 'ok';
+			self::$seam_reason = 'inactive: no Elementor MCP module on this site';
+			return;
+		}
 		if ( ! function_exists( 'wp_get_abilities' ) ) {
 			self::$seam        = 'unavailable';
 			self::$seam_reason = 'abilities api absent';
@@ -280,6 +361,9 @@ class Aura_Worker_Elementor_Door {
 		}
 		if ( ! self::route_is_door( $request->get_route() ) ) {
 			return $response;
+		}
+		if ( ! self::active() ) {
+			return $response; // a door that does not exist is not closed
 		}
 		if ( 'ok' === self::$seam ) {
 			return $response;

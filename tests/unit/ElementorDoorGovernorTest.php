@@ -342,6 +342,69 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertCount( 1, Aura_Worker_Door_Log::log_after( 0 ), 'settled, so the log is served past it' );
 	}
 
+	/* --------------------------------------------------------------- */
+	/* Presence: wired always, decided lazily (Ruling P6)                */
+	/* --------------------------------------------------------------- */
+
+	/**
+	 * The load-order hazard the early return used to open: both plugins
+	 * bootstrap on `plugins_loaded` at 10 and `digitizer-site-worker` sorts
+	 * before `elementor`, so the module class can be absent at init() on a
+	 * site that very much has a door. Wiring must not depend on it.
+	 *
+	 * setUp() has already called init() with no module class and an empty
+	 * ability registry — this is that site.
+	 */
+	public function test_init_wires_every_hook_even_with_no_elementor_present(): void {
+		// has_filter() throughout — in core has_action() IS has_filter(), and
+		// only this one answers with the PRIORITY, which is half of what is
+		// being pinned here.
+		$this->assertSame( PHP_INT_MAX, has_filter( 'wp_register_ability_args', array( 'Aura_Worker_Elementor_Door', 'wrap_args' ) ) );
+		$this->assertSame( PHP_INT_MAX, has_filter( 'wp_abilities_api_init', array( 'Aura_Worker_Elementor_Door', 'verify_coverage' ) ) );
+		$this->assertSame( 2, has_filter( 'rest_request_before_callbacks', array( 'Aura_Worker_Elementor_Door', 'close_transport' ) ), 'after open_frame at 1, before guard_core_any at 5' );
+		$this->assertSame( 1, has_filter( 'wp_insert_post', array( 'Aura_Worker_Elementor_Door', 'observe_insert' ) ) );
+		$this->assertSame( 1, has_filter( 'elementor/global_classes/cleanup', array( 'Aura_Worker_Elementor_Door', 'capture_class_cleanup' ) ) );
+	}
+
+	/** No Elementor: no door — so nothing is governed, and nothing is closed. */
+	public function test_a_site_without_elementor_reports_no_door_and_is_not_closed(): void {
+		$this->assertFalse( Aura_Worker_Elementor_Door::active() );
+		$this->assertNull( Aura_Worker_Elementor_Door::status_fragment(), 'Aura keys on the fragment being absent' );
+		do_action( 'wp_abilities_api_init' );
+		$this->assertSame( 'ok', Aura_Worker_Elementor_Door::seam(), 'nothing to cover is not a coverage failure' );
+		$req = new WP_REST_Request( 'POST', '/elementor/mcp' );
+		$this->assertNull( Aura_Worker_Elementor_Door::close_transport( null, array(), $req ), 'a door that does not exist is not closed' );
+	}
+
+	/**
+	 * The module class absent when init() ran, an `elementor/*` write
+	 * registered afterwards: the registry is the second witness, the ability
+	 * is wrapped all the same, and the door reports itself.
+	 */
+	public function test_an_elementor_ability_registered_after_init_is_governed(): void {
+		$this->assertFalse( Aura_Worker_Elementor_Door::active(), 'a false answer must not be memoised — this is the load-order case' );
+		$this->register( 'elementor/publish-document' );
+		$this->assertTrue( Aura_Worker_Elementor_Door::active() );
+		$read = new ReflectionProperty( WP_Ability::class, 'execute_callback' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$read->setAccessible( true );
+		}
+		$this->assertNotSame( $this->inner['elementor/publish-document'], $read->getValue( wp_get_ability( 'elementor/publish-document' ) ), 'wrapped despite the module class being absent at init()' );
+		do_action( 'wp_abilities_api_init' );
+		$this->assertSame( 'ok', Aura_Worker_Elementor_Door::seam() );
+		$this->assertSame( 'open', Aura_Worker_Elementor_Door::status_fragment()['door'] );
+	}
+
+	/** The other witness: Elementor's module class, stood in for by the seam. */
+	public function test_the_module_alone_makes_the_governor_active(): void {
+		$this->assertFalse( Aura_Worker_Elementor_Door::active() );
+		$GLOBALS['_sa_force_door'] = true; // stands in for class_exists( MODULE_CLASS )
+		$this->assertTrue( Aura_Worker_Elementor_Door::active(), 'the module is a door even before it registers an ability' );
+		do_action( 'wp_abilities_api_init' );
+		$this->assertSame( 'ok', Aura_Worker_Elementor_Door::seam(), 'a module that has registered nothing yet leaves nothing uncovered' );
+		$this->assertIsArray( Aura_Worker_Elementor_Door::status_fragment() );
+	}
+
 	/** The `/status` fragment Task 9 fills: the epoch, the seam and the door. */
 	public function test_status_fragment_reports_the_epoch_seam_and_door(): void {
 		$this->registerAll();
