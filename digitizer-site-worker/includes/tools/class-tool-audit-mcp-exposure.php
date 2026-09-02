@@ -270,6 +270,14 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 * A seam: tests override it, since a suite cannot define-then-undefine
 	 * ELEMENTOR_VERSION or unload a class.
 	 *
+	 * `installed` and `version` are decided from the installed-plugin
+	 * INVENTORY, not only from runtime signals: a deactivated Elementor loads
+	 * neither ELEMENTOR_VERSION nor `\Elementor\Plugin`, yet remains on disk
+	 * with its consent/password rows still meaningful (Codex round-1 P2).
+	 * `class_present` / `active` stay runtime-only — they answer whether the
+	 * MCP module itself is live, which a plugin on disk but deactivated is
+	 * not.
+	 *
 	 * @return array { installed, version, class_present, active }
 	 */
 	protected function elementor_env() {
@@ -279,12 +287,51 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		if ( $class_present && is_callable( array( $class, 'is_active' ) ) ) {
 			$active = (bool) call_user_func( array( $class, 'is_active' ) );
 		}
+
+		$header          = $this->elementor_plugin_header();
+		$header_version  = is_array( $header ) && isset( $header['Version'] ) && is_string( $header['Version'] ) && '' !== $header['Version']
+			? $header['Version']
+			: null;
+
 		return array(
-			'installed'     => defined( 'ELEMENTOR_VERSION' ) || class_exists( '\\Elementor\\Plugin' ),
-			'version'       => defined( 'ELEMENTOR_VERSION' ) ? (string) ELEMENTOR_VERSION : null,
+			'installed'     => defined( 'ELEMENTOR_VERSION' ) || class_exists( '\\Elementor\\Plugin' ) || is_array( $header ),
+			'version'       => defined( 'ELEMENTOR_VERSION' ) ? (string) ELEMENTOR_VERSION : $header_version,
 			'class_present' => $class_present,
 			'active'        => $active,
 		);
+	}
+
+	/**
+	 * The installed-plugin inventory's header for Elementor's own file, or
+	 * null when it is absent or unreadable. A seam — tests override it.
+	 *
+	 * Reads `get_plugins()`, the same core inventory function
+	 * `Aura_Worker_Updater::get_migration_registry()` uses to detect
+	 * Elementor, following its precedent for loading it
+	 * (`includes/class-aura-worker-updater.php`, ~line 1224). Unlike that
+	 * caller this does NOT use `is_plugin_active()`: a deactivated plugin
+	 * remaining ON DISK is exactly the case this seam exists to still report.
+	 * A missing admin include, or a non-array/missing entry, degrades to
+	 * "not in inventory" rather than a fatal — this is a read-only audit
+	 * tool that must never break a site's report over an environment quirk.
+	 *
+	 * @return array|null
+	 */
+	protected function elementor_plugin_header() {
+		if ( ! defined( 'ABSPATH' ) ) {
+			return null;
+		}
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		if ( ! function_exists( 'get_plugins' ) ) {
+			return null;
+		}
+		$plugins = get_plugins();
+		if ( ! is_array( $plugins ) || ! isset( $plugins['elementor/elementor.php'] ) || ! is_array( $plugins['elementor/elementor.php'] ) ) {
+			return null;
+		}
+		return $plugins['elementor/elementor.php'];
 	}
 
 	/**

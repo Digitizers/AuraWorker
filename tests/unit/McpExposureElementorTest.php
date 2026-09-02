@@ -20,6 +20,8 @@ class SA_Elementor_Fake_Tool extends Aura_Tool_Audit_Mcp_Exposure {
 	/** @var array */
 	public $env = array( 'installed' => true, 'version' => '4.3.0-beta1', 'class_present' => true, 'active' => true );
 	/** @var array|null */
+	public $plugin_header = null;
+	/** @var array|null */
 	public $abilities = array();
 	/** @var array */
 	public $server_list = array( array( 'id' => 'elementor-mcp-server', 'route' => '/elementor/mcp', 'tool_count' => 27 ) );
@@ -46,6 +48,9 @@ class SA_Elementor_Fake_Tool extends Aura_Tool_Audit_Mcp_Exposure {
 	protected function elementor_env() {
 		$this->maybe_throw( 'env' );
 		return $this->env;
+	}
+	protected function elementor_plugin_header() {
+		return $this->plugin_header;
 	}
 	protected function elementor_ability_names() {
 		$this->maybe_throw( 'abilities' );
@@ -197,6 +202,89 @@ final class McpExposureElementorTest extends TestCase {
 			array( array( 'id' => 'angie' ) )
 		);
 		$this->assertSame( array( 'class_present' => true, 'active' => false, 'abilities_registered' => 2, 'server_id' => null ), $m );
+	}
+
+	// --- Codex round-1 P2: a deactivated Elementor is still "installed" ----
+	// via the plugin inventory, never only via runtime signals. These three
+	// run the REAL elementor_env()/elementor_plugin_header() (the fake tool
+	// overrides elementor_env() wholesale, so it cannot exercise this path).
+
+	public function test_a_deactivated_elementor_is_installed_with_its_header_version(): void {
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_plugin_header() {
+				return array( 'Name' => 'Elementor', 'Version' => '4.3.0-beta1' );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$b = $real->execute( array() )['elementor'];
+		$this->assertTrue( $b['installed'] );
+		$this->assertSame( '4.3.0-beta1', $b['version'] );
+		$this->assertFalse( $b['mcp_module']['class_present'] );
+		$this->assertNull( $b['mcp_module']['active'] ); // the class is not loaded in the suite
+	}
+
+	public function test_no_header_and_no_runtime_signal_is_not_installed(): void {
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_plugin_header() {
+				return null;
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$b = $real->execute( array() )['elementor'];
+		$this->assertFalse( $b['installed'] );
+		$this->assertNull( $b['version'] );
+	}
+
+	public function test_the_real_plugin_inventory_answers_installed_and_version(): void {
+		// The bootstrap's get_plugins() stub reads this global (~line 1332);
+		// sa_reset_state() also unsets it, but the finally{} below is belt and
+		// braces so a failed assertion still cannot leak it into later tests.
+		$GLOBALS['_installed_plugins'] = array(
+			'elementor/elementor.php' => array( 'Name' => 'Elementor', 'Version' => '4.2.4' ),
+		);
+		try {
+			$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+				protected function consent_rows() {
+					return array();
+				}
+				protected function elementor_candidate_ids() {
+					return array();
+				}
+				protected function context_user_ids( $offset, $number ) {
+					return array();
+				}
+				protected function context_users_total() {
+					return 0;
+				}
+			};
+			$b = $real->execute( array() )['elementor'];
+			$this->assertTrue( $b['installed'] );
+			$this->assertSame( '4.2.4', $b['version'] );
+		} finally {
+			unset( $GLOBALS['_installed_plugins'] );
+		}
 	}
 
 	// --- Task 3: consent ----------------------------------------------------
