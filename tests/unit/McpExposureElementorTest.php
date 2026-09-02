@@ -62,6 +62,10 @@ class SA_Elementor_Fake_Tool extends Aura_Tool_Audit_Mcp_Exposure {
 		$this->maybe_throw( 'servers' );
 		return $this->server_list;
 	}
+	protected function ability_exposure( $abilities_active ) {
+		$this->maybe_throw( 'exposure' );
+		return parent::ability_exposure( $abilities_active );
+	}
 
 	protected function consent_rows() {
 		++$this->consent_rows_calls;
@@ -265,6 +269,23 @@ final class McpExposureElementorTest extends TestCase {
 			$this->assertArrayHasKey( $key, $result );
 		}
 		$this->assertIsArray( $result['elementor']['consent'] );
+	}
+
+	public function test_a_throw_in_the_ability_scan_never_leaves_execute(): void {
+		// Codex round-9 P2 (same class as round 8): ability_exposure() scans
+		// the registry AFTER the block is built, outside its isolation — a
+		// third-party ability throwing from get_meta() discarded the whole
+		// audit. Now `abilities` and `coverage` become { error } and every
+		// other key, the elementor block included, still lands intact.
+		$this->tool->throw_in = array( 'exposure' );
+		$result = $this->tool->execute( array() );
+		$this->assertSame( array( 'error' => 'exposure exploded' ), $result['abilities'] );
+		$this->assertSame( array( 'error' => 'exposure exploded' ), $result['coverage'] );
+		$this->assertIsArray( $result['servers'] );
+		$this->assertIsArray( $result['angie'] );
+		$this->assertTrue( $result['elementor']['installed'] );
+		$this->assertSame( '4.3.0-beta1', $result['elementor']['version'] );
+		$this->assertArrayNotHasKey( 'error', $result['elementor']['mcp_module'] );
 	}
 
 	public function test_strings_are_clipped_at_200(): void {

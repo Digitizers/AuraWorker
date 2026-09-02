@@ -128,13 +128,28 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		}
 		$discovery_failed = $servers instanceof \Throwable;
 
+		// The ability scan is the other registry read outside the block, and it
+		// ran AFTER the block was built: a third-party ability whose get_meta()
+		// or get_name() throws discarded the whole audit — installation facts,
+		// per-subtree errors and all (Codex round-9 P2, same class as round 8).
+		// Every top-level key execute() returns is now isolated: nothing a
+		// single plugin does can suppress what the rest of the audit read.
+		try {
+			$exposure = $this->ability_exposure( $abilities_active );
+		} catch ( \Throwable $e ) {
+			$exposure = array(
+				'abilities' => $this->subtree_error( $e ),
+				'coverage'  => $this->subtree_error( $e ),
+			);
+		}
+
 		return array(
 			'abilities_api_active' => $abilities_active,
 			'mcp_adapter'          => $this->adapter_state(),
 			'servers'              => $discovery_failed ? $this->subtree_error( $servers ) : $servers,
 			'angie'                => $discovery_failed ? $this->subtree_error( $servers ) : $this->angie_state( $servers ),
 			'elementor'            => $this->elementor_state( $servers ),
-		) + $this->ability_exposure( $abilities_active );
+		) + $exposure;
 	}
 
 	/**
