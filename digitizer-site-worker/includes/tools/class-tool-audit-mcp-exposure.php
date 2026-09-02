@@ -478,6 +478,118 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	}
 
 	/**
+	 * Users whose serialised Application Password list contains the prefix —
+	 * a PRE-FILTER over all users, distinct, ordered, bounded. A seam.
+	 *
+	 * @return int[]
+	 */
+	protected function elementor_candidate_ids() {
+		global $wpdb;
+		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
+			throw new \RuntimeException( 'database unavailable' );
+		}
+		$sql = $wpdb->prepare(
+			"SELECT DISTINCT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s ORDER BY user_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			'_application_passwords',
+			'%' . $wpdb->esc_like( static::ELEMENTOR_PASSWORD_PREFIX ) . '%',
+			static::ELEMENTOR_LIST_CAP + 1
+		);
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			throw new \RuntimeException( 'candidate statement could not be prepared' );
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_results( $sql );
+		if ( ! is_array( $rows ) ) {
+			throw new \RuntimeException( 'candidate statement failed' . ( ! empty( $wpdb->last_error ) ? ': ' . esc_html( $wpdb->last_error ) : '' ) );
+		}
+		$ids = array();
+		foreach ( $rows as $row ) {
+			if ( isset( $row->user_id ) && (int) $row->user_id > 0 ) {
+				$ids[] = (int) $row->user_id;
+			}
+		}
+		return $ids;
+	}
+
+	/**
+	 * One user's Application Password list, byte-bounded, PROVEN read or null. A seam.
+	 *
+	 * @param int $uid User id.
+	 * @return array|null
+	 */
+	protected function password_list( $uid ) {
+		return aura_worker_app_password_list( (int) $uid, static::MAX_APP_PASSWORD_BYTES );
+	}
+
+	/**
+	 * A stored Application Password item as the block reports it.
+	 *
+	 * @param int   $uid  Owner.
+	 * @param array $item Core's stored item.
+	 * @return array { user_id, login, name, created, last_used, last_ip }
+	 */
+	protected function password_entry( $uid, array $item ) {
+		return array(
+			'user_id'   => (int) $uid,
+			'login'     => $this->login_for( $uid, $this->user_login( $uid ) ),
+			'name'      => $this->clip( isset( $item['name'] ) ? $item['name'] : '' ),
+			'created'   => isset( $item['created'] ) && is_numeric( $item['created'] ) ? (int) $item['created'] : null,
+			'last_used' => isset( $item['last_used'] ) && is_numeric( $item['last_used'] ) ? (int) $item['last_used'] : null,
+			'last_ip'   => isset( $item['last_ip'] ) && is_string( $item['last_ip'] ) && '' !== $item['last_ip'] ? $this->clip( $item['last_ip'] ) : null,
+		);
+	}
+
+	/**
+	 * Does a stored item carry an Elementor-issued name?
+	 *
+	 * @param mixed $item Stored item.
+	 * @return bool
+	 */
+	protected static function is_elementor_named( $item ) {
+		return is_array( $item ) && isset( $item['name'] ) && is_string( $item['name'] ) && 0 === strpos( $item['name'], static::ELEMENTOR_PASSWORD_PREFIX );
+	}
+
+	/**
+	 * The Elementor-password subtree.
+	 *
+	 * @return array { elementor, elementor_entries_truncated, elementor_unproven, candidates_read, elementor_truncated }
+	 */
+	protected function elementor_passwords() {
+		$candidates = $this->elementor_candidate_ids();
+		$truncated  = count( $candidates ) > static::ELEMENTOR_LIST_CAP;
+		$candidates = array_slice( $candidates, 0, static::ELEMENTOR_LIST_CAP );
+		$entries    = array();
+		$unproven   = array();
+		$entries_truncated = false;
+		$read       = 0;
+		foreach ( $candidates as $uid ) {
+			++$read;
+			$list = $this->password_list( $uid );
+			if ( null === $list ) {
+				$unproven[] = (int) $uid; // a LIKE match is not a name read
+				continue;
+			}
+			foreach ( $list as $item ) {
+				if ( ! static::is_elementor_named( $item ) ) {
+					continue;
+				}
+				if ( count( $entries ) >= static::ELEMENTOR_LIST_CAP ) {
+					$entries_truncated = true;
+					break 2;
+				}
+				$entries[] = $this->password_entry( $uid, $item );
+			}
+		}
+		return array(
+			'elementor'                   => $entries,
+			'elementor_entries_truncated' => $entries_truncated,
+			'elementor_unproven'          => $unproven,
+			'candidates_read'             => $read,
+			'elementor_truncated'         => $truncated,
+		);
+	}
+
+	/**
 	 * The `elementor` block: four scans, each failing on its own.
 	 *
 	 * @return array
@@ -501,21 +613,21 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			$out['mcp_module'] = $this->subtree_error( $e );
 		}
 
-		// Tasks 4–5 add Elementor passwords, context here.
+		// Task 5 adds context here.
 		try {
 			$out += $this->elementor_consent();
 		} catch ( \Throwable $e ) {
 			$out['consent'] = $this->subtree_error( $e );
 		}
-		$out['app_passwords']     = array(
-			'elementor'                   => array(),
-			'elementor_entries_truncated' => false,
-			'elementor_unproven'          => array(),
-			'candidates_read'             => 0,
-			'elementor_truncated'         => false,
-			'other'                       => array( 'users_checked' => 0, 'count' => 0, 'recently_used' => 0, 'unproven' => array() ),
-		);
-		$out['coverage']          = array( 'users_total' => 0, 'users_checked' => 0, 'truncated' => false, 'cap' => static::ELEMENTOR_CONTEXT_CAP );
+		try {
+			$passwords = $this->elementor_passwords();
+		} catch ( \Throwable $e ) {
+			$passwords = array( 'elementor' => $this->subtree_error( $e ) );
+		}
+		// Task 5 adds 'other' and coverage here.
+		$passwords['other']   = array( 'users_checked' => 0, 'count' => 0, 'recently_used' => 0, 'unproven' => array() );
+		$out['app_passwords'] = $passwords;
+		$out['coverage']      = array( 'users_total' => 0, 'users_checked' => 0, 'truncated' => false, 'cap' => static::ELEMENTOR_CONTEXT_CAP );
 		return $out;
 	}
 

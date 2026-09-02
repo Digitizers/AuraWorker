@@ -378,4 +378,144 @@ final class McpExposureElementorTest extends TestCase {
 		);
 		$this->assertSame( array( 262144, 'elementor_mcp_consent', 51 ), $prepared[0]['args'] );
 	}
+
+	// --- Task 4: Elementor passwords -----------------------------------------
+
+	private static function pw( array $over = array() ): array {
+		return $over + array(
+			'uuid'      => 'u-' . wp_generate_uuid4(),
+			'app_id'    => '',
+			'name'      => 'Elementor MCP - Claude Desktop (2026-09-01 22:25:05)',
+			'password'  => 'hash',
+			'created'   => 1788000000,
+			'last_used' => null,
+			'last_ip'   => null,
+		);
+	}
+
+	private function passwords(): array {
+		return $this->block()['app_passwords'];
+	}
+
+	public function test_an_elementor_named_password_is_reported_with_full_detail(): void {
+		$this->tool->candidates = array( 3 );
+		$this->tool->lists      = array( 3 => array( self::pw( array( 'last_used' => 1788100000, 'last_ip' => '203.0.113.9' ) ) ) );
+		$p = $this->passwords();
+		$this->assertSame(
+			array( array( 'user_id' => 3, 'login' => 'user3', 'name' => 'Elementor MCP - Claude Desktop (2026-09-01 22:25:05)', 'created' => 1788000000, 'last_used' => 1788100000, 'last_ip' => '203.0.113.9' ) ),
+			$p['elementor']
+		);
+		$this->assertSame( 1, $p['candidates_read'] );
+		$this->assertFalse( $p['elementor_truncated'] );
+		$this->assertFalse( $p['elementor_entries_truncated'] );
+		$this->assertSame( array(), $p['elementor_unproven'] );
+	}
+
+	public function test_only_names_with_the_prefix_are_reported_the_like_is_a_prefilter(): void {
+		// 'Not Elementor MCP' matches the LIKE and must not be reported.
+		$this->tool->candidates = array( 3 );
+		$this->tool->lists      = array( 3 => array( self::pw( array( 'name' => 'Not Elementor MCP' ) ), self::pw( array( 'name' => 'Aura SiteAgent' ) ), self::pw() ) );
+		$p = $this->passwords();
+		$this->assertCount( 1, $p['elementor'] );
+		$this->assertSame( 1, $p['candidates_read'] );
+	}
+
+	public function test_a_candidate_whose_list_cannot_be_read_is_unproven_not_empty(): void {
+		$this->tool->candidates = array( 3, 4 );
+		$this->tool->lists      = array( 3 => null, 4 => array( self::pw() ) );
+		$p = $this->passwords();
+		$this->assertSame( array( 3 ), $p['elementor_unproven'] );
+		$this->assertSame( 4, $p['elementor'][0]['user_id'] );
+		$this->assertSame( 2, $p['candidates_read'] );
+	}
+
+	public function test_fifty_one_candidates_read_fifty_and_truncated(): void {
+		$this->tool->candidates = range( 1, 51 );
+		$p = $this->passwords();
+		$this->assertTrue( $p['elementor_truncated'] );
+		$this->assertSame( 50, $p['candidates_read'] );
+		$this->assertSame( range( 1, 50 ), $this->tool->reads );
+	}
+
+	public function test_entries_are_capped_at_fifty_across_candidates(): void {
+		$this->tool->candidates = array( 1, 2 );
+		$this->tool->lists      = array(
+			1 => array_fill( 0, 30, self::pw() ),
+			2 => array_fill( 0, 30, self::pw() ),
+		);
+		$p = $this->passwords();
+		$this->assertCount( 50, $p['elementor'] );
+		$this->assertTrue( $p['elementor_entries_truncated'] );
+		$this->assertFalse( $p['elementor_truncated'] );
+		$this->assertSame( 2, $p['candidates_read'] );
+	}
+
+	public function test_exactly_fifty_entries_is_not_truncated(): void {
+		$this->tool->candidates = array( 1 );
+		$this->tool->lists      = array( 1 => array_fill( 0, 50, self::pw() ) );
+		$this->assertFalse( $this->passwords()['elementor_entries_truncated'] );
+	}
+
+	public function test_created_and_last_used_are_ints_or_null_and_strings_are_clipped(): void {
+		$this->tool->candidates = array( 1 );
+		$this->tool->lists      = array( 1 => array( self::pw( array( 'name' => 'Elementor MCP ' . str_repeat( 'n', 300 ), 'created' => '1788000000', 'last_used' => 'yesterday', 'last_ip' => 5 ) ) ) );
+		$e = $this->passwords()['elementor'][0];
+		$this->assertSame( 200, strlen( $e['name'] ) );
+		$this->assertSame( 1788000000, $e['created'] );
+		$this->assertNull( $e['last_used'] );
+		$this->assertNull( $e['last_ip'] );
+	}
+
+	public function test_a_list_item_that_is_not_an_array_is_skipped(): void {
+		$this->tool->candidates = array( 1 );
+		$this->tool->lists      = array( 1 => array( 'garbage', self::pw() ) );
+		$this->assertCount( 1, $this->passwords()['elementor'] );
+	}
+
+	public function test_a_throw_in_the_password_scan_replaces_only_that_subtree(): void {
+		$this->tool->throw_in = array( 'candidates' );
+		$p = $this->passwords();
+		$this->assertSame( array( 'error' => 'candidates exploded' ), $p['elementor'] );
+		$this->assertArrayNotHasKey( 'elementor_truncated', $p );
+		$this->assertArrayNotHasKey( 'candidates_read', $p );
+		$this->assertArrayHasKey( 'other', $p ); // context still ran
+	}
+
+	public function test_the_candidate_statement_is_distinct_ordered_and_bounded(): void {
+		// The REAL seam against the bootstrap's $wpdb; the stub models the LIKE.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$GLOBALS['_app_passwords'] = array(
+			9 => array( self::pw() ),
+			2 => array( self::pw( array( 'name' => 'Aura SiteAgent' ) ) ),
+			5 => array( self::pw( array( 'name' => 'Not Elementor MCP' ) ) ),
+		);
+		$p = $real->execute( array() )['elementor']['app_passwords'];
+		$this->assertSame( 2, $p['candidates_read'] ); // users 5 and 9 matched the LIKE
+		$this->assertCount( 1, $p['elementor'] );
+		$this->assertSame( 9, $p['elementor'][0]['user_id'] );
+		$prepared = array_values( array_filter( $GLOBALS['_db_prepared'], static function ( $p ) {
+			return false !== strpos( $p['query'], 'SELECT DISTINCT user_id' );
+		} ) );
+		$this->assertCount( 1, $prepared );
+		$this->assertSame( 'SELECT DISTINCT user_id FROM wp_usermeta WHERE meta_key = %s AND meta_value LIKE %s ORDER BY user_id ASC LIMIT %d', $prepared[0]['query'] );
+		$this->assertSame( array( '_application_passwords', '%Elementor MCP%', 51 ), $prepared[0]['args'] );
+		// And each candidate was read through the BOUNDED helper.
+		$bounded = array_filter( $GLOBALS['_db_queries'], static function ( $q ) {
+			return false !== strpos( $q, 'IF(LENGTH(meta_value) <= 262144' );
+		} );
+		$this->assertCount( 2, $bounded );
+	}
 }

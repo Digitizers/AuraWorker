@@ -1847,6 +1847,30 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					? $GLOBALS['_sa_app_password_scan_answer']
 					: $rows;
 			}
+			// The Elementor-door candidate scan (2.15.0): distinct owners whose
+			// serialised list contains the prefix, ordered, bounded. Modelled
+			// over $GLOBALS['_app_passwords'] the way MySQL runs the LIKE.
+			if ( preg_match( "/^SELECT DISTINCT user_id FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%' ORDER BY user_id ASC LIMIT (\d+)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				if ( ! empty( $GLOBALS['_sa_app_password_scan_fail'] ) ) {
+					$this->last_error = 'scan failed';
+					return null;
+				}
+				$needle = str_replace( array( '\\_', '\\%', '\\\\' ), array( '_', '%', '\\' ), stripslashes( $m[1] ) );
+				$ids    = array();
+				foreach ( $GLOBALS['_app_passwords'] as $user => $list ) {
+					// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+					if ( false !== strpos( serialize( $list ), $needle ) ) {
+						$ids[] = (int) $user;
+					}
+				}
+				sort( $ids );
+				$rows = array();
+				foreach ( array_slice( $ids, 0, (int) $m[2] ) as $id ) {
+					$rows[] = (object) array( 'user_id' => $id );
+				}
+				return $rows;
+			}
 			// Reformatting the site-wide holder statement would otherwise
 			// unhook every test that depends on it silently — they would fall
 			// through to $_db_rows and go on passing while proving nothing.
