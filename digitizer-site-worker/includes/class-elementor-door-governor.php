@@ -677,19 +677,24 @@ class Aura_Worker_Elementor_Door {
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
 			return new WP_Error( 'aura_log_failed', 'The door log could not record this call; it was not run.', array( 'status' => 503 ) );
 		}
-		$kind          = isset( self::WRITE_TABLE[ $slug ] ) ? self::WRITE_TABLE[ $slug ] : null;
+		$kind = isset( self::WRITE_TABLE[ $slug ] ) ? self::WRITE_TABLE[ $slug ] : null;
+		// `create-page` always creates; a `manage-component` naming no id is
+		// creating one too, and takes the same path — mutex, watermark, and a
+		// creation envelope AFTER, because there is nothing to capture before.
+		$creating      = self::is_creating( $slug, $input );
 		self::$request = array(
 			'seq'        => $seq,
 			'slug'       => $slug,
 			'kind'       => $kind,
+			'creating'   => $creating,
 			'created'    => array(),
 			'suspected'  => array(),
 			'collateral' => array(),
 		);
 
-		// Snapshot before the write (Task 6 fills snapshot_for; creation captures after).
+		// Snapshot before the write (a creation captures after).
 		$snapshot_id = null;
-		if ( 'page_create' !== $kind ) {
+		if ( ! $creating ) {
 			$snap = self::snapshot_for( $slug, $touches, $input );
 			if ( empty( $snap['success'] ) ) {
 				Aura_Worker_Door_Log::settle(
@@ -755,7 +760,7 @@ class Aura_Worker_Elementor_Door {
 		if ( null !== $snapshot_id ) {
 			$terminal['snapshot_id'] = $snapshot_id;
 		}
-		if ( 'page_create' === $kind ) {
+		if ( $creating ) {
 			$creation = self::finish_creation( $seq, $result, $failed ); // Task 7
 			if ( is_wp_error( $creation ) ) {
 				return $creation; // compensated + settled inside
@@ -910,21 +915,235 @@ class Aura_Worker_Elementor_Door {
 	private static $request = null;
 
 	/**
-	 * Capture the target before a write (Task 6 implements the kinds).
+	 * Capture the target before a write.
+	 *
+	 * One envelope per call, whatever the target's shape: a page or component
+	 * is its own post + PAGE_META_KEYS; the design system is the kit post,
+	 * EVERY `e_global_class` and EVERY `e_default_style` post, and the kit +
+	 * class/style meta keys, in ONE `posts` envelope carrying `cpts` — so its
+	 * restore also deletes a class or style the write ADDED (Ruling R3).
 	 *
 	 * @param string $slug    Ability.
 	 * @param array  $touches Touches.
 	 * @param array  $input   Input.
-	 * @return array { success, snapshot?, error? }
+	 * @return array { success, snapshot?, error?, code?, creation? }
 	 */
 	private static function snapshot_for( $slug, array $touches, array $input ) {
 		if ( null !== self::$snapshotter ) {
 			return call_user_func( self::$snapshotter, $slug, $touches, $input );
 		}
-		return array(
-			'success' => false,
-			'error'   => 'snapshot kinds not implemented',
-		); // Task 6
+		$snaps = new Aura_Worker_Snapshots();
+		$door  = array(
+			'seq'     => isset( self::$request['seq'] ) ? self::$request['seq'] : null,
+			'ability' => $slug,
+		);
+		switch ( isset( self::WRITE_TABLE[ $slug ] ) ? self::WRITE_TABLE[ $slug ] : '' ) {
+			case 'page':
+				return $snaps->snapshot_posts(
+					array( (int) $touches[0]['id'] ),
+					self::PAGE_META_KEYS,
+					array( 'kind_label' => 'page', 'door' => $door )
+				);
+			case 'component':
+				$id = isset( $input['id'] ) && is_numeric( $input['id'] ) ? (int) $input['id'] : 0;
+				if ( $id > 0 && self::CPT_COMPONENT !== get_post_type( $id ) ) {
+					// Never snapshot it as something else: an envelope that named
+					// the wrong shape would restore the wrong thing.
+					return array(
+						'success' => false,
+						'code'    => 'aura_target_unattributed',
+						'error'   => 'not a component post: ' . $id,
+					);
+				}
+				if ( $id > 0 ) {
+					return $snaps->snapshot_posts(
+						array( $id ),
+						self::PAGE_META_KEYS,
+						array( 'kind_label' => 'component', 'door' => $door )
+					);
+				}
+				// A manage-component that names no id is CREATING one: nothing
+				// exists to capture yet, so the creation path captures after.
+				return array( 'success' => true, 'snapshot' => array( 'id' => null ), 'creation' => true );
+			case 'design_system':
+				$ids  = array_merge(
+					array( self::kit_id() ),
+					get_posts( array( 'post_type' => self::CPT_GLOBAL_CLASS, 'post_status' => 'any', 'numberposts' => -1, 'fields' => 'ids' ) ),
+					get_posts( array( 'post_type' => self::CPT_DEFAULT_STYLE, 'post_status' => 'any', 'numberposts' => -1, 'fields' => 'ids' ) )
+				);
+				$keys = array_merge(
+					self::KIT_META_KEYS,
+					array(
+						'_elementor_global_class_id',
+						'_elementor_global_class_data',
+						'_elementor_global_class_data_preview',
+						'_elementor_global_class_edited',
+						'_elementor_default_style_tag',
+						'_elementor_default_style_data',
+						'_elementor_version',
+					)
+				);
+				return $snaps->snapshot_posts(
+					array_values( array_unique( array_map( 'intval', $ids ) ) ),
+					$keys,
+					array(
+						'cpts'       => array( self::CPT_GLOBAL_CLASS, self::CPT_DEFAULT_STYLE ),
+						'kind_label' => 'design_system',
+						'door'       => $door,
+					)
+				);
+		}
+		return array( 'success' => false, 'error' => 'no snapshot kind for ' . $slug );
+	}
+
+	/**
+	 * The active kit's post id — 0 when unknown, which makes the capture fail,
+	 * which refuses the write. A design-system envelope without the kit is not
+	 * a rollback point.
+	 *
+	 * @return int
+	 */
+	private static function kit_id() {
+		if ( isset( $GLOBALS['_sa_kit_id'] ) ) {
+			return (int) $GLOBALS['_sa_kit_id']; // test seam; never written by production code
+		}
+		if ( class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::$instance->kits_manager ) ) {
+			return (int) \Elementor\Plugin::$instance->kits_manager->get_active_id();
+		}
+		return 0;
+	}
+
+	/**
+	 * Is this call CREATING its target? A `create-page` always is; a
+	 * `manage-component` that names no id is too — both have nothing to
+	 * capture before the write and take the creation path instead.
+	 *
+	 * @param string $slug  Ability.
+	 * @param array  $input Input.
+	 * @return bool
+	 */
+	private static function is_creating( $slug, array $input ) {
+		$kind = isset( self::WRITE_TABLE[ $slug ] ) ? self::WRITE_TABLE[ $slug ] : null;
+		if ( 'page_create' === $kind ) {
+			return true;
+		}
+		return 'component' === $kind && ! ( isset( $input['id'] ) && is_numeric( $input['id'] ) && (int) $input['id'] > 0 );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* A restore is itself a governed write                                */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Before a door envelope is restored: capture the CURRENT state the same
+	 * way, so the restore is itself a Change that can be undone.
+	 *
+	 * @param array $record The envelope being restored.
+	 * @return array { success, snapshot?, error? }
+	 */
+	public static function pre_restore_capture( array $record ) {
+		$snaps = new Aura_Worker_Snapshots();
+		$door  = array( 'restore_of' => (string) ( isset( $record['id'] ) ? $record['id'] : '' ) );
+		switch ( (string) ( isset( $record['door_kind'] ) ? $record['door_kind'] : '' ) ) {
+			case 'design_system':
+				// The CURRENT set, not the old envelope's targets: a class or
+				// style added since would be deleted by the restore's set
+				// semantics, and only a capture that enumerated it can bring it
+				// back.
+				return self::snapshot_for(
+					'elementor/manage-classes',
+					array( array( 'type' => 'design_system', 'id' => '*' ) ),
+					array()
+				);
+			case 'page':
+			case 'component':
+			case 'creation_restore':
+				$opts = array( 'kind_label' => (string) $record['door_kind'], 'door' => $door );
+				if ( ! empty( $record['cpts'] ) ) {
+					$opts['cpts'] = $record['cpts'];
+				}
+				// A record missing its targets captures nothing, and a capture of
+				// nothing refuses the restore — which is the right answer for an
+				// envelope that cannot say what it covered.
+				return $snaps->snapshot_posts(
+					(array) ( isset( $record['targets'] ) ? $record['targets'] : array() ),
+					(array) ( isset( $record['keys'] ) ? $record['keys'] : array() ),
+					$opts
+				);
+			case 'creation':
+				// Undoing a creation trashes the created posts; capturing them
+				// first is what lets the trash itself be undone.
+				return $snaps->snapshot_posts(
+					(array) ( isset( $record['created_post_ids'] ) ? $record['created_post_ids'] : array() ),
+					self::PAGE_META_KEYS,
+					array( 'kind_label' => 'creation_restore', 'door' => $door )
+				);
+		}
+		return array( 'success' => true, 'snapshot' => null ); // not a door envelope: nothing to log
+	}
+
+	/**
+	 * Reserve the door entry for a restore BEFORE anything is captured or
+	 * written — the same admission every governed write gets. Logging after
+	 * the fact would let a restore run unrecorded when the log was closed or
+	 * the insert failed.
+	 *
+	 * @param array  $record   The envelope about to be restored.
+	 * @param string $aura_ref Aura's correlation id for this restore.
+	 * @return int|WP_Error seq, or aura_log_full / aura_log_failed.
+	 */
+	public static function open_restore_entry( array $record, $aura_ref = '' ) {
+		if ( Aura_Worker_Door_Log::is_closed() ) {
+			Aura_Worker_Door_Log::bump_refused();
+			return self::log_full_error();
+		}
+		$actor = self::actor();
+		$seq   = Aura_Worker_Door_Log::open_pending(
+			array(
+				'ability'    => 'aura/restore',
+				'actor'      => is_wp_error( $actor ) ? array( 'user_id' => 0, 'login' => 'aura', 'via' => 'rest' ) : $actor,
+				'touches'    => array(),
+				'verdict'    => 'allow',
+				'restore_of' => (string) ( isset( $record['id'] ) ? $record['id'] : '' ),
+				// Aura's own correlation id for this restore (its AgentAction's
+				// doorRef), echoed on the entry so ingestion patches THAT row
+				// instead of minting a second one.
+				'ref'        => '' === (string) $aura_ref ? null : preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $aura_ref ),
+			)
+		);
+		if ( is_wp_error( $seq ) ) {
+			return $seq;
+		}
+		// Admission: the row is the reservation. Count, back out above the bound.
+		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
+			Aura_Worker_Door_Log::discard( $seq );
+			Aura_Worker_Door_Log::close();
+			Aura_Worker_Door_Log::bump_refused();
+			return self::log_full_error();
+		}
+		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
+			return new WP_Error( 'aura_log_failed', 'The door log could not record this restore; it was not run.', array( 'status' => 503 ) );
+		}
+		return $seq;
+	}
+
+	/**
+	 * Settle the reserved restore entry.
+	 *
+	 * @param int        $seq     The reserved entry.
+	 * @param array|null $pre     Pre-restore envelope (or null).
+	 * @param array      $outcome restore()'s result.
+	 */
+	public static function settle_restore_entry( $seq, $pre, array $outcome ) {
+		Aura_Worker_Door_Log::settle(
+			(int) $seq,
+			array(
+				'result'      => empty( $outcome['success'] ) ? 'failed' : 'ok',
+				'snapshot_id' => is_array( $pre ) ? (string) $pre['id'] : null,
+				'trashed'     => isset( $outcome['trashed'] ) ? $outcome['trashed'] : null,
+				'error'       => isset( $outcome['error'] ) ? $outcome['error'] : null,
+			)
+		);
 	}
 
 	/**

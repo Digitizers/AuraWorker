@@ -24,6 +24,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Aura_Worker_Snapshots {
 
 	/**
+	 * Door envelope kinds the retention sweep may prune (Ruling R6). The
+	 * pre-existing kinds (`file|option|post|meta|posts` without a door label)
+	 * are never pruned — they are taken by the power tools, whose retention is
+	 * the operator's to decide.
+	 */
+	const DOOR_KINDS = array( 'page', 'component', 'design_system', 'creation', 'creation_restore' );
+
+	/**
 	 * Directory where snapshots are stored.
 	 *
 	 * @var string
@@ -277,9 +285,16 @@ class Aura_Worker_Snapshots {
 	 *
 	 * @param int[]        $post_ids  Post IDs to capture (each may or may not exist).
 	 * @param string|array $meta_keys Meta key(s) to capture per existing post.
+	 * @param array        $opts      Optional door metadata:
+	 *                                `cpts`       — post types this capture is the WHOLE set of,
+	 *                                               so restore also deletes a post of those types
+	 *                                               that the write ADDED (Ruling R3);
+	 *                                `kind_label` — the door kind (`page|component|design_system|
+	 *                                               creation_restore`) stored as `door_kind`;
+	 *                                `door`       — `{ seq, ability }` for the audit trail.
 	 * @return array { success: bool, snapshot?: array, error?: string }
 	 */
-	public function snapshot_posts( $post_ids, $meta_keys ) {
+	public function snapshot_posts( $post_ids, $meta_keys, $opts = array() ) {
 		if ( ! is_array( $post_ids ) || empty( $post_ids ) ) {
 			return array( 'success' => false, 'error' => 'No post ids given to snapshot.' );
 		}
@@ -339,12 +354,47 @@ class Aura_Worker_Snapshots {
 			);
 		}
 
+		$meta = array(
+			'kind'    => 'posts',
+			'targets' => array_map( 'intval', array_keys( $captured ) ),
+			'keys'    => array_values( array_map( 'strval', $meta_keys ) ),
+		);
+		if ( ! empty( $opts['cpts'] ) && is_array( $opts['cpts'] ) ) {
+			$meta['cpts'] = array_values( array_map( 'strval', $opts['cpts'] ) );
+		}
+		if ( ! empty( $opts['kind_label'] ) ) {
+			$meta['door_kind'] = (string) $opts['kind_label'];
+		}
+		if ( ! empty( $opts['door'] ) && is_array( $opts['door'] ) ) {
+			$meta['door'] = $opts['door'];
+		}
+
+		$record = $this->persist( $meta, serialize( $captured ) );
+		if ( false === $record ) {
+			return array( 'success' => false, 'error' => 'Failed to persist snapshot (disk full or unwritable).' );
+		}
+		return array( 'success' => true, 'snapshot' => $record );
+	}
+
+	/**
+	 * A creation: there was nothing to capture BEFORE, so the envelope names
+	 * what the write made. Kind `creation`; its restore is a governed trash
+	 * (never a delete — see the `creation` case in restore()).
+	 *
+	 * @param int[]  $post_ids  The ids the write created.
+	 * @param string $post_type Their post type.
+	 * @param array  $door      `{ seq, ability }` for the audit trail.
+	 * @return array { success: bool, snapshot?: array, error?: string }
+	 */
+	public function snapshot_creation( array $post_ids, $post_type, array $door ) {
 		$record = $this->persist(
 			array(
-				'kind'    => 'posts',
-				'targets' => array_map( 'intval', array_keys( $captured ) ),
-			),
-			serialize( $captured )
+				'kind'             => 'creation',
+				'door_kind'        => 'creation',
+				'created_post_ids' => array_values( array_map( 'intval', $post_ids ) ),
+				'post_type'        => (string) $post_type,
+				'door'             => $door,
+			)
 		);
 		if ( false === $record ) {
 			return array( 'success' => false, 'error' => 'Failed to persist snapshot (disk full or unwritable).' );
@@ -553,74 +603,157 @@ class Aura_Worker_Snapshots {
 				return $this->restore_meta_map( $post_id, $captured );
 
 			case 'posts':
-				$payload_path = $record['payload_path'] ?? '';
-				if ( ! $payload_path || ! file_exists( $payload_path ) ) {
-					return array( 'success' => false, 'error' => 'Snapshot payload missing.' );
-				}
-				$captured = $this->unserialize_payload( file_get_contents( $payload_path ) );
-				// A tampered payload that serialized an object is stripped to an
-				// incomplete class. Reject both a top-level one (not an array) and one
-				// nested inside a captured post/meta value, before any of it is written.
-				if ( ! is_array( $captured ) || $this->contains_stripped_object( $captured ) ) {
-					return array( 'success' => false, 'error' => 'Snapshot payload corrupt.' );
-				}
-				foreach ( $captured as $pid => $info ) {
-					$pid    = (int) $pid;
-					$exists = (bool) get_post( $pid );
-					$was    = ! empty( $info['existed'] );
+				return $this->restore_posts_record( $record );
 
-					if ( ! $was ) {
-						// Absent at capture. If the write CREATED it, delete to roll
-						// back; if still absent, nothing to do. Verify by existence —
-						// wp_delete_post's return is unreliable (a pre_delete_post
-						// filter can short-circuit it to a truthy value without
-						// deleting), so a truthy return doesn't prove removal.
-						if ( $exists ) {
-							wp_delete_post( $pid, true );
-							if ( get_post( $pid ) ) {
-								return array( 'success' => false, 'error' => 'Failed to delete created post: ' . $pid );
-							}
-						}
+			case 'creation_restore':
+				// The pre-restore capture of a creation restore: a `posts` envelope
+				// under another name, restored exactly the same way. (Every envelope
+				// this plugin writes for that kind carries `kind: posts` and only the
+				// `door_kind` label; the case is here so a record that names the door
+				// kind directly is not answered "unsupported".)
+				return $this->restore_posts_record( $record );
+
+			case 'creation':
+				// Core's wp_trash_post() DELETES when the trash is off (post.php), so
+				// on such a site "undo the creation" is not reversible at all. Refuse
+				// BEFORE touching anything rather than destroy the page silently.
+				if ( defined( 'EMPTY_TRASH_DAYS' ) && 0 === (int) EMPTY_TRASH_DAYS ) {
+					return array(
+						'success' => false,
+						'code'    => 'aura_trash_disabled',
+						'error'   => 'this site has the trash disabled — the created page cannot be undone reversibly; delete it by hand',
+					);
+				}
+				$trashed = array();
+				$already = array();
+				foreach ( (array) ( $record['created_post_ids'] ?? array() ) as $pid ) {
+					$pid  = (int) $pid;
+					$post = get_post( $pid );
+					if ( ! $post ) {
+						continue; // gone already: nothing to undo
+					}
+					if ( 'trash' === $post->post_status ) {
+						$already[] = $pid;
 						continue;
 					}
-
-					$fields = is_array( $info['fields'] ?? null ) ? $info['fields'] : array();
-
-					if ( ! $exists ) {
-						// Present at capture, deleted by the write — recreate it with
-						// its ORIGINAL id (import_id) so id references stay valid.
-						$insert              = $fields;
-						$insert['import_id'] = $pid;
-						$new                 = wp_insert_post( wp_slash( $insert ), true );
-						if ( is_wp_error( $new ) ) {
-							return array( 'success' => false, 'error' => 'Failed to recreate post ' . $pid . ': ' . $new->get_error_message() );
-						}
-						if ( (int) $new !== $pid ) {
-							return array( 'success' => false, 'error' => 'Recreated post got id ' . (int) $new . ', expected ' . $pid . ' (id already taken).' );
-						}
-					} elseif ( ! empty( $fields ) ) {
-						// Present at capture AND still present — but the write may have
-						// changed its fields (e.g. a "delete" that trashed it: status →
-						// 'trash', row kept). Revert the captured fields, not just meta.
-						$update       = $fields;
-						$update['ID'] = $pid;
-						$upd          = wp_update_post( wp_slash( $update ), true );
-						if ( is_wp_error( $upd ) ) {
-							return array( 'success' => false, 'error' => 'Failed to restore fields of post ' . $pid . ': ' . $upd->get_error_message() );
-						}
+					// wp_trash_post()'s return is not proof (a filter can short-circuit
+					// it); the status is.
+					wp_trash_post( $pid );
+					$after = get_post( $pid );
+					if ( ! $after || 'trash' !== $after->post_status ) {
+						return array( 'success' => false, 'error' => 'Failed to trash created post: ' . $pid );
 					}
-
-					$meta = is_array( $info['meta'] ?? null ) ? $info['meta'] : array();
-					$res  = $this->restore_meta_map( $pid, $meta );
-					if ( empty( $res['success'] ) ) {
-						return $res;
-					}
+					$trashed[] = $pid;
 				}
-				return array( 'success' => true );
+				return array( 'success' => true, 'trashed' => $trashed, 'already' => $already );
 
 			default:
 				return array( 'success' => false, 'error' => 'Unsupported snapshot kind: ' . $record['kind'] );
 		}
+	}
+
+	/**
+	 * The `posts` restore: put every captured id back (recreating one the write
+	 * deleted, reverting one it changed), then — for a SET-typed capture — remove
+	 * every post of the captured types that was not in the set.
+	 *
+	 * @param array $record The envelope.
+	 * @return array { success: bool, error?: string }
+	 */
+	private function restore_posts_record( array $record ) {
+		$payload_path = $record['payload_path'] ?? '';
+		if ( ! $payload_path || ! file_exists( $payload_path ) ) {
+			return array( 'success' => false, 'error' => 'Snapshot payload missing.' );
+		}
+		$captured = $this->unserialize_payload( file_get_contents( $payload_path ) );
+		// A tampered payload that serialized an object is stripped to an
+		// incomplete class. Reject both a top-level one (not an array) and one
+		// nested inside a captured post/meta value, before any of it is written.
+		if ( ! is_array( $captured ) || $this->contains_stripped_object( $captured ) ) {
+			return array( 'success' => false, 'error' => 'Snapshot payload corrupt.' );
+		}
+		foreach ( $captured as $pid => $info ) {
+			$pid    = (int) $pid;
+			$exists = (bool) get_post( $pid );
+			$was    = ! empty( $info['existed'] );
+
+			if ( ! $was ) {
+				// Absent at capture. If the write CREATED it, delete to roll
+				// back; if still absent, nothing to do. Verify by existence —
+				// wp_delete_post's return is unreliable (a pre_delete_post
+				// filter can short-circuit it to a truthy value without
+				// deleting), so a truthy return doesn't prove removal.
+				if ( $exists ) {
+					wp_delete_post( $pid, true );
+					if ( get_post( $pid ) ) {
+						return array( 'success' => false, 'error' => 'Failed to delete created post: ' . $pid );
+					}
+				}
+				continue;
+			}
+
+			$fields = is_array( $info['fields'] ?? null ) ? $info['fields'] : array();
+
+			if ( ! $exists ) {
+				// Present at capture, deleted by the write — recreate it with
+				// its ORIGINAL id (import_id) so id references stay valid.
+				$insert              = $fields;
+				$insert['import_id'] = $pid;
+				$new                 = wp_insert_post( wp_slash( $insert ), true );
+				if ( is_wp_error( $new ) ) {
+					return array( 'success' => false, 'error' => 'Failed to recreate post ' . $pid . ': ' . $new->get_error_message() );
+				}
+				if ( (int) $new !== $pid ) {
+					return array( 'success' => false, 'error' => 'Recreated post got id ' . (int) $new . ', expected ' . $pid . ' (id already taken).' );
+				}
+			} elseif ( ! empty( $fields ) ) {
+				// Present at capture AND still present — but the write may have
+				// changed its fields (e.g. a "delete" that trashed it: status →
+				// 'trash', row kept). Revert the captured fields, not just meta.
+				$update       = $fields;
+				$update['ID'] = $pid;
+				$upd          = wp_update_post( wp_slash( $update ), true );
+				if ( is_wp_error( $upd ) ) {
+					return array( 'success' => false, 'error' => 'Failed to restore fields of post ' . $pid . ': ' . $upd->get_error_message() );
+				}
+			}
+
+			$meta = is_array( $info['meta'] ?? null ) ? $info['meta'] : array();
+			$res  = $this->restore_meta_map( $pid, $meta );
+			if ( empty( $res['success'] ) ) {
+				return $res;
+			}
+		}
+		// A SET-typed capture (design_system): a post of those types that was
+		// NOT in the capture was ADDED by the write — remove it, or the restored
+		// order meta points at rows that should not exist.
+		// An EMPTY capture is never evidence that everything is an addition —
+		// snapshot_posts() refuses an empty id list, so an envelope that reaches
+		// here with nothing captured is truncated, not a record of an empty set.
+		// Without this guard such a payload would wipe every class and style on
+		// the site.
+		if ( ! empty( $captured ) && ! empty( $record['cpts'] ) && is_array( $record['cpts'] ) ) {
+			$keep = array_map( 'intval', array_keys( $captured ) );
+			$all  = get_posts(
+				array(
+					'post_type'   => $record['cpts'],
+					'post_status' => 'any',
+					'numberposts' => -1,
+					'fields'      => 'ids',
+				)
+			);
+			foreach ( $all as $extra ) {
+				if ( in_array( (int) $extra, $keep, true ) ) {
+					continue;
+				}
+				// Verified by existence, not by the return — see above.
+				wp_delete_post( (int) $extra, true );
+				if ( get_post( (int) $extra ) ) {
+					return array( 'success' => false, 'error' => 'Failed to remove added post: ' . (int) $extra );
+				}
+			}
+		}
+		return array( 'success' => true );
 	}
 
 	/**
@@ -644,6 +777,36 @@ class Aura_Worker_Snapshots {
 			return strcmp( $b['id'], $a['id'] );
 		} );
 		return $out;
+	}
+
+	/**
+	 * Delete door envelopes older than $days (Ruling R6).
+	 *
+	 * Keyed on `door_kind`, never on `kind`: a door capture of a page IS a
+	 * `posts` envelope, and the power tools' own `posts`/`file`/`option`
+	 * captures must survive this sweep untouched.
+	 *
+	 * @param int      $days  Age in days; anything older goes.
+	 * @param string[] $kinds The `door_kind` values to prune (see DOOR_KINDS).
+	 * @return int How many were deleted.
+	 */
+	public function prune_older_than( $days, array $kinds ) {
+		$cut = time() - (int) $days * DAY_IN_SECONDS;
+		$n   = 0;
+		foreach ( $this->list_snapshots() as $rec ) {
+			if ( ! in_array( (string) ( $rec['door_kind'] ?? '' ), $kinds, true ) ) {
+				continue;
+			}
+			// The stamp persist() wrote is a UTC wall clock with no zone on it.
+			$at = strtotime( (string) ( $rec['created_gmt'] ?? '' ) . ' UTC' );
+			if ( false === $at || $at >= $cut ) {
+				continue;
+			}
+			if ( $this->delete( $rec['id'] ) ) {
+				$n++;
+			}
+		}
+		return $n;
 	}
 
 	/**

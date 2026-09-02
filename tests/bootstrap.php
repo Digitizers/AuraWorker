@@ -2692,6 +2692,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
+	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
+	// kits_manager cannot be instantiated here, so a test that needs an active
+	// kit sets this. UNSET by default so the production lookup is what runs
+	// when no test asked for one.
+	unset( $GLOBALS['_sa_kit_id'] );
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
@@ -3881,6 +3886,11 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
+	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
+	// kits_manager cannot be instantiated here, so a test that needs an active
+	// kit sets this. UNSET by default so the production lookup is what runs
+	// when no test asked for one.
+	unset( $GLOBALS['_sa_kit_id'] );
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).

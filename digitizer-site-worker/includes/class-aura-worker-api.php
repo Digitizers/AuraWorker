@@ -298,6 +298,12 @@ class Aura_Worker_API {
 					'sanitize_callback' => 'sanitize_text_field',
 					'description'       => __( 'Snapshot id to restore.', 'digitizer-site-worker' ),
 				),
+				'aura_ref' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( "Aura's correlation id for this restore; echoed on the door-log entry.", 'digitizer-site-worker' ),
+				),
 			),
 		) );
 
@@ -1161,9 +1167,45 @@ class Aura_Worker_API {
 		}
 
 		$snapshots = new Aura_Worker_Snapshots();
-		$result    = $snapshots->restore( $id );
+		$record    = $snapshots->get( $id );
+		$pre       = null;
+		$seq       = null;
+		if ( is_array( $record ) && in_array( (string) ( $record['door_kind'] ?? '' ), Aura_Worker_Snapshots::DOOR_KINDS, true ) ) {
+			// A door restore is itself a governed write: RESERVE the log entry
+			// first (a closed or failing log refuses the restore, as it refuses
+			// any other write), then capture, then restore, then settle.
+			$seq = Aura_Worker_Elementor_Door::open_restore_entry( $record, (string) $request->get_param( 'aura_ref' ) );
+			if ( is_wp_error( $seq ) ) {
+				return $seq;
+			}
+			$cap = Aura_Worker_Elementor_Door::pre_restore_capture( $record );
+			if ( empty( $cap['success'] ) ) {
+				Aura_Worker_Elementor_Door::settle_restore_entry( $seq, null, array( 'success' => false, 'error' => 'pre-restore capture failed: ' . (string) ( $cap['error'] ?? '' ) ) );
+				return new WP_REST_Response( array( 'success' => false, 'error' => 'Could not capture the current state before restoring: ' . (string) ( $cap['error'] ?? '' ) ), 503 );
+			}
+			$pre = $cap['snapshot'];
+			// The pre-restore id lands on the pending row BEFORE the restore
+			// mutates anything: an interrupted restore must still name the
+			// envelope that undoes it.
+			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'snapshot_id' => (string) $pre['id'] ) ) ) {
+				Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, array( 'success' => false, 'error' => 'could not record the pre-restore snapshot' ) );
+				return new WP_REST_Response( array( 'success' => false, 'error' => 'Could not record the pre-restore snapshot; nothing was restored.' ), 503 );
+			}
+		}
+		if ( ! is_array( $record ) ) {
+			// 404 means ONE thing: the envelope is not on this site.
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array( 'success' => false, 'error' => 'Snapshot not found.' ) ), 404 );
+		}
 
-		$status = $result['success'] ? 200 : 404;
+		$result = $snapshots->restore( $id );
+		if ( null !== $seq ) {
+			Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, $result );
+		}
+
+		// 200 restored; 409 a designated refusal (aura_trash_disabled); 500 an
+		// execution failure of an envelope that IS here — never 404, which Aura
+		// reads as "no longer restorable on the site".
+		$status = $result['success'] ? 200 : ( isset( $result['code'] ) ? 409 : 500 );
 		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
