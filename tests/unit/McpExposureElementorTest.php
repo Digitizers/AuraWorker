@@ -143,6 +143,7 @@ final class McpExposureElementorTest extends TestCase {
 					'other'     => array( 'error' => 'manage_options required' ),
 				),
 				'coverage'      => array( 'error' => 'manage_options required' ),
+				'governor'      => array( 'error' => 'manage_options required' ),
 			),
 			$b
 		);

@@ -1631,6 +1631,90 @@ class Aura_Worker_Elementor_Door {
 		wp_cache_delete( 'notoptions', 'options' );
 	}
 
+	/**
+	 * The last 30 days of one bump_counter() name, in ONE query — the shape
+	 * `Aura_Worker_Rules::sweep_options()`'s value-parsed branch already reads
+	 * by (name, value) pairs under a single LIKE, with the cutoff applied in
+	 * PHP rather than in SQL. That, not `Aura_Worker_Rules::count_24h()`'s own
+	 * 24 `get_option()` calls, is the shape to follow here: `bump_counter()`'s
+	 * hour suffix is NOT zero-padded (unlike `Aura_Worker_Rules::bucket_name()`),
+	 * so a string bound could never order it, and 30 days is 720 buckets — 720
+	 * `get_option()` calls is the exact cost this method exists to avoid.
+	 *
+	 * `ctype_digit()` on the suffix, the same defensive read
+	 * `Aura_Worker_Door_Log::ROW_REGEXP` applies to log rows sharing a prefix
+	 * with non-numeric options: nothing today shares this prefix with a
+	 * non-numeric suffix, but a row that somehow did must be skipped rather
+	 * than miscounted.
+	 *
+	 * @param string   $name log_ungoverned|unobserved|hook_missed|unknown_ability.
+	 * @param int|null $now  Unix time; injected for tests.
+	 * @return int
+	 */
+	public static function count_30d( $name, $now = null ) {
+		global $wpdb;
+		$now    = null === $now ? time() : (int) $now;
+		$oldest = (int) floor( ( $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		$prefix = 'aura_worker_door_c_' . $name . '_h';
+		$rows   = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$wpdb->esc_like( $prefix ) . '%'
+			),
+			ARRAY_A
+		);
+		$sum = 0;
+		foreach ( (array) $rows as $row ) {
+			if ( ! isset( $row['option_name'], $row['option_value'] ) ) {
+				continue;
+			}
+			$suffix = substr( (string) $row['option_name'], strlen( $prefix ) );
+			if ( '' === $suffix || ! ctype_digit( $suffix ) ) {
+				continue; // not one of THIS name's hour buckets
+			}
+			if ( (int) $suffix >= $oldest ) {
+				$sum += (int) $row['option_value'];
+			}
+		}
+		return $sum;
+	}
+
+	/**
+	 * The `elementor.governor` block of `audit_mcp_exposure` (Task 11): what
+	 * THIS site's door log and hold queue say, for the fleet rollup — a site
+	 * whose log is full, whose hold queue is full, or whose seam never
+	 * verified, without polling `/status`.
+	 *
+	 * `{ active: false }` ALONE when this site carries no door (Ruling P6):
+	 * the caller already gates the whole `elementor` block on manage_options,
+	 * and there is nothing else honest to report about a door that is not
+	 * there. `seam` is reported exactly as `verify_coverage()` last left it —
+	 * `unchecked` when that has not run in this request is an honest answer,
+	 * not a gap; the audit never forces a coverage check of its own.
+	 *
+	 * @return array
+	 */
+	public static function governor_block() {
+		if ( ! self::active() ) {
+			return array( 'active' => false );
+		}
+		$epoch = Aura_Worker_Door_Log::epoch();
+		return array(
+			'active'              => true,
+			'epoch'               => '' === $epoch ? null : $epoch,
+			'seam'                => self::$seam,
+			'door'                => Aura_Worker_Door_Log::is_closed() ? 'closed' : 'open',
+			'held_count'          => Aura_Worker_Door_Holds::count(),
+			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(),
+			'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),
+			'unobserved_30d'      => self::count_30d( 'unobserved' ),
+			'hook_missed_30d'     => self::count_30d( 'hook_missed' ),
+			'unknown_ability_30d' => self::count_30d( 'unknown_ability' ),
+			'queue_full'          => Aura_Worker_Door_Holds::count() >= Aura_Worker_Door_Holds::CAP,
+			'log_full'            => Aura_Worker_Door_Log::full_report(),
+		);
+	}
+
 	/** @return WP_Error */
 	private static function log_full_error() {
 		return new WP_Error( 'aura_log_full', __( "Aura has not acknowledged this site's door log; the door is closed to writes until it does", 'digitizer-site-worker' ), array( 'status' => 503 ) );

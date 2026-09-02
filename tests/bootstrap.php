@@ -3920,6 +3920,17 @@ function sa_reset_state(): void {
 	if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
 		Aura_Worker_Call_Context::reset(); // the dispatching route is a static too
 	}
+	if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+		// The door's presence/seam memo is a static too (Ruling P6 memoises a
+		// POSITIVE active() answer for the rest of the process). Until Task 11
+		// nothing outside the door's own test files ever called into this
+		// class, so the leak was silent; audit_mcp_exposure's governor block
+		// now calls active() on every run, so a test file that never touches
+		// the door (McpExposureElementorTest) can otherwise inherit `true`
+		// left behind by an earlier one that does, and see a governor block
+		// where it expected none.
+		Aura_Worker_Elementor_Door::reset_for_tests();
+	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
