@@ -138,6 +138,18 @@ final class ElementorDoorCreationTest extends TestCase {
 		return $files ? $files : array();
 	}
 
+	/** Every stored `creation` envelope, decoded. */
+	private function creationEnvelopes(): array {
+		$out = array();
+		foreach ( $this->envelopes() as $path ) {
+			$rec = json_decode( file_get_contents( $path ), true );
+			if ( is_array( $rec ) && 'creation' === ( $rec['door_kind'] ?? '' ) ) {
+				$out[] = $rec;
+			}
+		}
+		return $out;
+	}
+
 	private function envelope( string $id ): array {
 		$snaps = new Aura_Worker_Snapshots();
 		$rec   = $snaps->get( $id );
@@ -719,4 +731,78 @@ final class ElementorDoorCreationTest extends TestCase {
 		$this->assertSame( array( $made ), $row['created_post_ids'] );
 		$this->assertSame( 'post', $this->envelope( (string) $row['snapshot_id'] )['post_type'] );
 	}
+	/* ------------------------------------------------------------------ */
+	/* Round 1: a creation is finished ONCE, and released by its owner     */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * A throw AFTER finish_creation() already returned. The catch must NOT
+	 * finish the creation a second time: that would write a duplicate envelope
+	 * and — if the store failed that time — trash the very post the first
+	 * envelope had just made restorable, with no mutex held.
+	 */
+	public function test_a_throw_after_the_creation_finished_does_not_finish_it_again(): void {
+		// One-shot: the terminal settle's compare-and-swap throws. `settled_at`
+		// appears in no other write of this request.
+		$GLOBALS['_sa_before_swap'] = static function () {
+			if ( false === strpos( (string) $GLOBALS['wpdb']->last_query, 'settled_at' ) ) {
+				return;
+			}
+			$GLOBALS['_sa_before_swap'] = null; // the catch's own settle must land
+			throw new RuntimeException( 'the row would not settle' );
+		};
+
+		$made = 0;
+		$out  = $this->createPage(
+			function () use ( &$made ) {
+				$made = $this->insertPage();
+				return array( 'id' => $made );
+			}
+		);
+
+		$this->assertSame( 'aura_governor_error', $out->get_error_code() );
+		$this->assertCount( 1, $this->creationEnvelopes(), 'exactly one creation envelope' );
+		$this->assertSame( 'draft', get_post( $made )->post_status, 'the post the envelope covers is not trashed' );
+
+		$row = $this->row( 1 );
+		$this->assertSame( 'failed', $row['result'] );
+		$this->assertTrue( $row['may_have_run'] );
+		$this->assertSame( 'exception', $row['reason'] );
+		$this->assertSame( array( $made ), $row['created_post_ids'] );
+		$this->assertSame( $this->creationEnvelopes()[0]['id'], $row['snapshot_id'], "the first finish's envelope is what the entry names" );
+		$this->assertArrayNotHasKey( 'compensated', $row );
+
+		// Released exactly once, by the request that took it.
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ) );
+		$deletes = array_filter(
+			$GLOBALS['_option_writes'],
+			static function ( $w ) {
+				return array( 'delete', Aura_Worker_Elementor_Door::CREATING ) === $w;
+			}
+		);
+		$this->assertCount( 1, $deletes );
+	}
+
+	/**
+	 * A throw while ANOTHER creation holds the mutex: this request never took
+	 * the row, so nothing on its failure path may delete it — a released mutex
+	 * would let a third call in beside the one still running.
+	 */
+	public function test_a_throw_taking_the_mutex_never_releases_another_requests(): void {
+		$GLOBALS['_options'][ Aura_Worker_Elementor_Door::CREATING ] = array( 'seq' => 99, 'started_at' => gmdate( 'c' ) );
+		$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::CREATING ]    = maybe_serialize( $GLOBALS['_options'][ Aura_Worker_Elementor_Door::CREATING ] );
+		$GLOBALS['_sa_before_swap']                                  = static function () {
+			if ( false !== strpos( (string) $GLOBALS['wpdb']->last_query, Aura_Worker_Elementor_Door::CREATING ) ) {
+				throw new RuntimeException( 'the database went away' );
+			}
+		};
+
+		$out = $this->createPage( function () { return array( 'ok' => true ); } );
+
+		$this->assertSame( 'aura_governor_error', $out->get_error_code() );
+		$this->assertArrayNotHasKey( 'elementor/create-page', $this->ran );
+		$this->assertSame( 99, get_option( Aura_Worker_Elementor_Door::CREATING )['seq'], "the holder's mutex is still there" );
+		$this->assertSame( 'failed', $this->row( 1 )['result'] );
+	}
+
 }

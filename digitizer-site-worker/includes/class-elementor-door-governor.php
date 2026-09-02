@@ -578,7 +578,7 @@ class Aura_Worker_Elementor_Door {
 					'error'        => $e->getMessage(),
 					'may_have_run' => true,
 				);
-				if ( ! empty( self::$request['creating'] ) ) {
+				if ( ! empty( self::$request['creating'] ) && empty( self::$request['creation_done'] ) ) {
 					// The observer already put every inserted id on the row; the
 					// envelope (or the compensation) must still happen — a row
 					// settled here is one the reconciler will never revisit
@@ -591,9 +591,19 @@ class Aura_Worker_Elementor_Door {
 							$fields['reason'] = 'exception_then_compensated';
 						}
 					} catch ( \Throwable $creation_error ) {
-						delete_option( self::CREATING );
+						self::release_creation_mutex();
 						$fields['creation_error'] = $creation_error->getMessage();
 					}
+				} elseif ( ! empty( self::$request['creation_fields'] ) ) {
+					// A creation that ALREADY finished, and then something after
+					// it threw (round 1): it is not finished twice. A second
+					// finish_creation() would write a duplicate envelope and, if
+					// the store failed that time, TRASH the very posts the first
+					// envelope had just made restorable — with no mutex held,
+					// and ending in a delete_option() that would release another
+					// request's. The evidence the first one produced is carried
+					// onto this settle instead.
+					$fields = array_merge( $fields, self::$request['creation_fields'] );
 				}
 				Aura_Worker_Door_Log::settle( $seq, $fields );
 				self::$request = null;
@@ -750,7 +760,7 @@ class Aura_Worker_Elementor_Door {
 			if ( ! self::stamp_watermark( $seq ) ) {
 				// Without a durable watermark an interrupted creation could
 				// not be found; refuse before Elementor runs.
-				delete_option( self::CREATING );
+				self::release_creation_mutex();
 				Aura_Worker_Door_Log::settle(
 					$seq,
 					array(
@@ -780,10 +790,15 @@ class Aura_Worker_Elementor_Door {
 		}
 		if ( $creating ) {
 			$creation = self::finish_creation( $seq, $result, $failed ); // Task 7
+			// Finished — recorded BEFORE stamp_terminal_seq() or settle() can
+			// throw, because execute()'s catch keys on it to decide whether the
+			// creation still needs finishing (round 1).
+			self::$request['creation_done'] = true;
 			if ( is_wp_error( $creation ) ) {
 				return $creation; // compensated + settled inside
 			}
-			$terminal = array_merge( $terminal, $creation );
+			self::$request['creation_fields'] = $creation; // what a later throw settles with
+			$terminal                         = array_merge( $terminal, $creation );
 		}
 		if ( ! empty( self::$request['collateral'] ) ) {
 			$terminal['collateral_snapshot_ids'] = self::$request['collateral'];
@@ -1287,6 +1302,10 @@ class Aura_Worker_Elementor_Door {
 				'started_at' => gmdate( 'c' ),
 			)
 		);
+		if ( $taken ) {
+			// OWNERSHIP: only the request that inserted the row may delete it.
+			self::$request['mutex_held'] = true;
+		}
 		if ( ! $taken ) {
 			return new WP_Error(
 				'aura_creation_busy',
@@ -1429,7 +1448,22 @@ class Aura_Worker_Elementor_Door {
 			$fields['snapshot_id'] = (string) $env['snapshot']['id'];
 			return $fields;
 		} finally {
-			delete_option( self::CREATING );
+			self::release_creation_mutex();
 		}
+	}
+
+	/**
+	 * Release the creation mutex — but ONLY if this request is the one that
+	 * took it. A request whose mutex insert never landed (it lost the race, or
+	 * the statement threw) must not delete the row: that row is another
+	 * creation's, and deleting it would let a third call in beside it
+	 * (round 1).
+	 */
+	private static function release_creation_mutex() {
+		if ( null === self::$request || empty( self::$request['mutex_held'] ) ) {
+			return;
+		}
+		delete_option( self::CREATING );
+		self::$request['mutex_held'] = false;
 	}
 }
