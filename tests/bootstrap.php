@@ -1046,6 +1046,7 @@ $GLOBALS['_app_passwords_available'] = true;
 $GLOBALS['_app_passwords_delete_fail'] = false;
 $GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails (#434 Task 4).
 $GLOBALS['_sa_app_password_read_fail'] = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
+$GLOBALS['_sa_app_password_raw']       = array(); // user_id => raw meta_value string, returned verbatim as `v` instead of serialize($_app_passwords[user_id]) (2.15.0 decode test).
 $GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
 $GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's result SET outright — an array of rows (#434 Task 9).
 $GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).
@@ -1207,6 +1208,35 @@ if ( ! function_exists( 'add_filter' ) ) {
 if ( ! function_exists( 'add_action' ) ) {
 	function add_action( string $tag, $callback, int $priority = 10, int $accepted_args = 1 ): bool {
 		return add_filter( $tag, $callback, $priority, $accepted_args );
+	}
+}
+
+if ( ! function_exists( 'remove_filter' ) ) {
+	/**
+	 * Core's remove_filter(): drops the first registration on $tag matching
+	 * both $callback and $priority (core's own matching rule) — not every
+	 * registration of that callback, so two add_filter() calls at different
+	 * priorities are independent, same as in WordPress.
+	 */
+	function remove_filter( string $tag, $callback, int $priority = 10 ): bool {
+		if ( empty( $GLOBALS['_filters'][ $tag ] ) ) {
+			return false;
+		}
+		foreach ( $GLOBALS['_filters'][ $tag ] as $i => $entry ) {
+			$cb        = ( is_array( $entry ) && array_key_exists( 'callback', $entry ) ) ? $entry['callback'] : $entry;
+			$entry_pri = ( is_array( $entry ) && isset( $entry['priority'] ) ) ? (int) $entry['priority'] : 10;
+			if ( $cb === $callback && $entry_pri === $priority ) {
+				unset( $GLOBALS['_filters'][ $tag ][ $i ] );
+				return true;
+			}
+		}
+		return false;
+	}
+}
+
+if ( ! function_exists( 'remove_action' ) ) {
+	function remove_action( string $tag, $callback, int $priority = 10 ): bool {
+		return remove_filter( $tag, $callback, $priority );
 	}
 }
 
@@ -1753,6 +1783,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public string $prefix     = 'wp_';
 		public string $options    = 'wp_options';
 		public string $usermeta   = 'wp_usermeta';
+		public string $users      = 'wp_users';
 		// Core's wpdb sets a property per core table; the tools that read the
 		// media library name these two.
 		public string $posts      = 'wp_posts';
@@ -1777,6 +1808,8 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * dangerous shape there is — rather than some unrelated statement's.
 		 */
 		private $sa_last_row = null;
+		/** @var array what get_results() answered last — the stale answer a filtered-out statement meets */
+		private $sa_last_results = array();
 
 		/** Used only by get_status()'s health report — a fixed stand-in, not modelled state. */
 		public function db_version(): string {
@@ -1789,6 +1822,19 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * that only run one query.
 		 */
 		public function get_results( $query, $output = OBJECT ) {
+			// Same two early returns as get_var()/get_row(): wpdb::query()
+			// returns before flush() when the `query` filter blanks the SQL,
+			// and get_results() answers the previous statement's last_result
+			// with last_error untouched (Codex round-10 P2 on #84).
+			if ( ! $this->ready || ! empty( $GLOBALS['_sa_wpdb_query_filtered_out'] ) ) {
+				return $this->sa_last_results; // another statement's answer
+			}
+			$this->sa_last_results = $this->sa_get_results_ran( $query, $output );
+			return $this->sa_last_results;
+		}
+
+		/** get_results()'s body for the case where the statement really is issued. */
+		private function sa_get_results_ran( $query, $output = OBJECT ) {
 			$this->last_query = (string) $query;
 			// The one shape the value-parsed sweep issues: names AND values for
 			// a prefix, read against the "database" ($_rows, else $_options).
@@ -1846,11 +1892,78 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					? $GLOBALS['_sa_app_password_scan_answer']
 					: $rows;
 			}
+			// The Elementor-door candidate scan (2.15.0): distinct owners whose
+			// serialised list contains the prefix, ordered, bounded. Modelled
+			// over $GLOBALS['_app_passwords'] the way MySQL runs the LIKE.
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, 0 AS user_id UNION ALL SELECT '([^']*)' AS probe, c\.user_id FROM \(SELECT DISTINCT user_id FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%' AND user_id > 0 ORDER BY user_id ASC LIMIT (\d+)\) AS c$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$probe = $m[1];
+				$m     = array( $m[0], $m[3], $m[4] ); // keep the body below reading needle/limit as before
+				if ( ! empty( $GLOBALS['_sa_app_password_scan_fail'] ) ) {
+					// Real MySQL/wpdb: get_results() answers its CLEARED
+					// $last_result — an empty array, not null — when the
+					// statement fails; last_error is the only tell. array()
+					// here (not null) is deliberate: it is the shape that
+					// let a bare is_array() check read a broken table as
+					// "no candidates" (Codex round-2 P2).
+					$this->last_error = 'scan failed';
+					return array();
+				}
+				$needle = str_replace( array( '\\_', '\\%', '\\\\' ), array( '_', '%', '\\' ), stripslashes( $m[1] ) );
+				$ids    = array();
+				foreach ( $GLOBALS['_app_passwords'] as $user => $list ) {
+					// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+					if ( false !== strpos( serialize( $list ), $needle ) ) {
+						$ids[] = (int) $user;
+					}
+				}
+				sort( $ids );
+				$rows = array( (object) array( 'probe' => $probe, 'user_id' => 0 ) ); // the sentinel
+				foreach ( array_slice( $ids, 0, (int) $m[2] ) as $id ) {
+					$rows[] = (object) array( 'probe' => $probe, 'user_id' => $id );
+				}
+				return $rows;
+			}
+			// The Elementor-door consent scan (2.15.0), probe/sentinel shaped
+			// since Codex round-10 on #84: the queued/_db_rows result set a
+			// test placed is answered as MySQL would — every row stamped with
+			// THIS statement's nonce, behind the user-0 sentinel row — unless
+			// _sa_wpdb_results_error models a driver failure (cleared
+			// last_result, last_error set).
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, 0 AS user_id, NULL AS user_login, NULL AS len, NULL AS v, NULL AS umeta_id UNION ALL SELECT '([^']*)' AS probe, c\.user_id, c\.user_login, c\.len, c\.v, c\.umeta_id FROM \(SELECT .+ WHERE m\.meta_key = 'elementor_mcp_consent' .+\) AS c$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				if ( ! empty( $GLOBALS['_sa_wpdb_results_error'] ) ) {
+					$this->last_error = (string) $GLOBALS['_sa_wpdb_results_error'];
+					return array();
+				}
+				$placed = ! empty( $GLOBALS['_db_results_queue'] ) ? array_shift( $GLOBALS['_db_results_queue'] ) : $GLOBALS['_db_rows'];
+				$rows   = array( (object) array( 'probe' => $m[1], 'user_id' => 0, 'user_login' => null, 'len' => null, 'v' => null, 'umeta_id' => null ) );
+				$i      = 0;
+				foreach ( (array) $placed as $row ) {
+					++$i;
+					$row        = is_object( $row ) ? clone $row : (object) $row;
+					$row->probe = $m[2];
+					if ( ! isset( $row->umeta_id ) ) {
+						$row->umeta_id = $i; // placed order IS umeta_id order
+					}
+					$rows[] = $row;
+				}
+				return $rows;
+			}
 			// Reformatting the site-wide holder statement would otherwise
 			// unhook every test that depends on it silently — they would fall
 			// through to $_db_rows and go on passing while proving nothing.
 			if ( false !== strpos( (string) $query, '_application_passwords' ) ) {
 				throw new RuntimeException( 'wpdb stub: unrecognised _application_passwords query shape — usermeta_holders() was reformatted and its tests would prove nothing: ' . (string) $query );
+			}
+			// A driver-level failure on a get_results() shape this stub does not
+			// model specially (the elementor_mcp_consent scan is the one that
+			// reaches here today). Mirrors real wpdb::get_results(): the CLEARED
+			// $last_result — an empty array, never null — plus last_error, the
+			// only tell a broken statement leaves behind (Codex round-2 P2).
+			if ( ! empty( $GLOBALS['_sa_wpdb_results_error'] ) ) {
+				$this->last_error = (string) $GLOBALS['_sa_wpdb_results_error'];
+				return array();
 			}
 			if ( ! empty( $GLOBALS['_db_results_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_results_queue'] );
@@ -2002,10 +2115,34 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return (object) array(
 					'probe' => $m[1],
-					'v'     => isset( $GLOBALS['_app_passwords'][ $user ] )
-						? serialize( $GLOBALS['_app_passwords'][ $user ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
-						: null, // no row at all
+					'v'     => isset( $GLOBALS['_sa_app_password_raw'][ $user ] )
+						? (string) $GLOBALS['_sa_app_password_raw'][ $user ] // a raw string a stub can't serialize its way to (2.15.0 decode test)
+						: ( isset( $GLOBALS['_app_passwords'][ $user ] )
+							? serialize( $GLOBALS['_app_passwords'][ $user ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+							: null ), // no row at all
 				);
+			}
+			// The BOUNDED per-user read (2.15.0, the Elementor door): the same
+			// nonce proof, with the byte bound folded into the statement so the
+			// value decoded is the value measured. LEFT JOIN over a one-row
+			// derived table keeps the probe row coming back when the user has
+			// no meta row at all (len NULL, v NULL).
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, m\.len, m\.v FROM \(SELECT 1 AS one\) AS o LEFT JOIN \(SELECT LENGTH\(meta_value\) AS len, IF\(LENGTH\(meta_value\) <= (\d+), meta_value, NULL\) AS v FROM \S+ WHERE user_id = (\d+) AND meta_key = '_application_passwords' LIMIT 1\) AS m ON 1 = 1$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$max  = (int) $m[2];
+				$user = (int) $m[3];
+				if ( ! empty( $GLOBALS['_sa_app_password_read_fail'][ $user ] ) ) {
+					$this->last_error = 'read failed';
+					return null;
+				}
+				if ( ! isset( $GLOBALS['_app_passwords'][ $user ] ) && ! isset( $GLOBALS['_sa_app_password_raw'][ $user ] ) ) {
+					return (object) array( 'probe' => $m[1], 'len' => null, 'v' => null );
+				}
+				$raw = isset( $GLOBALS['_sa_app_password_raw'][ $user ] )
+					? (string) $GLOBALS['_sa_app_password_raw'][ $user ] // a raw string a stub can't serialize its way to (2.15.0 decode test)
+					: serialize( $GLOBALS['_app_passwords'][ $user ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+				$len = strlen( $raw );
+				return (object) array( 'probe' => $m[1], 'len' => $len, 'v' => $len <= $max ? $raw : null );
 			}
 			// Reformatting the production probe would otherwise unhook every
 			// I5/M12/N1 test silently — they would fall through to $_db_row,
@@ -2021,8 +2158,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * can never be the stale answer another test's probe meets.
 		 */
 		public function sa_forget_last_result(): void {
-			$this->sa_last_var = null;
-			$this->sa_last_row = null;
+			$this->sa_last_var     = null;
+			$this->sa_last_row     = null;
+			$this->sa_last_results = array();
 		}
 
 		/**
@@ -2374,6 +2512,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
+	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -2577,6 +2716,19 @@ $GLOBALS['_users_total']  = 0;
 $GLOBALS['_admin_total']  = 0;
 $GLOBALS['_user_queries'] = array();
 $GLOBALS['_post_counts']  = array();
+// Set to a message to make WP_User_Query model a database failure: the
+// underlying wpdb statement sets last_error and WordPress still answers an
+// empty result / zero total, never a throw — mirrors the direct-SQL seams'
+// $GLOBALS['_sa_wpdb_results_error'] knob for the same shape (Codex round-3 P2).
+$GLOBALS['_sa_user_query_error'] = null;
+// When true AND _sa_user_query_error is set: models the main query failing
+// and THEN a count_total query's own SELECT FOUND_ROWS() succeeding and
+// flushing $wpdb->last_error clean — the shape that made get_total() alone
+// answer 0 with no trace of the failure (Codex round-7 P2). The
+// found_users_query filter (applied below, matching WP_User_Query::query()'s
+// real timing: after the main query, before FOUND_ROWS) is the one seam that
+// still sees the error in that case.
+$GLOBALS['_sa_user_query_error_cleared_by_found_rows'] = false;
 
 if ( ! class_exists( 'WP_User_Query' ) ) {
 	class WP_User_Query {
@@ -2586,14 +2738,35 @@ if ( ! class_exists( 'WP_User_Query' ) ) {
 		public function __construct( $args = array() ) {
 			$this->query_vars           = is_array( $args ) ? $args : array();
 			$GLOBALS['_user_queries'][] = $this->query_vars;
+			if ( ! empty( $GLOBALS['_sa_user_query_error'] ) && isset( $GLOBALS['wpdb'] ) ) {
+				$GLOBALS['wpdb']->last_error = (string) $GLOBALS['_sa_user_query_error'];
+			}
+			// Real WP_User_Query::query() applies this filter, with the SQL of
+			// the about-to-run SELECT FOUND_ROWS(), whenever count_total is
+			// requested — AFTER the main query has run and BEFORE FOUND_ROWS
+			// does, regardless of whether the main query succeeded. Fired here,
+			// at construction, since this stub (like core) resolves the whole
+			// query — main statement and total — inside the constructor.
+			if ( ! empty( $this->query_vars['count_total'] ) ) {
+				apply_filters( 'found_users_query', 'SELECT FOUND_ROWS()', $this );
+				if ( ! empty( $GLOBALS['_sa_user_query_error_cleared_by_found_rows'] ) && isset( $GLOBALS['wpdb'] ) ) {
+					$GLOBALS['wpdb']->last_error = '';
+				}
+			}
 		}
 
 		public function get_results() {
+			if ( ! empty( $GLOBALS['_sa_user_query_error'] ) ) {
+				return array();
+			}
 			// The admin-count query asks only for IDs — it never reads results.
 			return $GLOBALS['_users'];
 		}
 
 		public function get_total() {
+			if ( ! empty( $GLOBALS['_sa_user_query_error'] ) ) {
+				return 0;
+			}
 			$is_admin_count = ( isset( $this->query_vars['role'] ) && 'administrator' === $this->query_vars['role'] )
 				&& ( isset( $this->query_vars['fields'] ) && 'ID' === $this->query_vars['fields'] );
 			return $is_admin_count ? (int) $GLOBALS['_admin_total'] : (int) $GLOBALS['_users_total'];
@@ -3377,6 +3550,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails; see the stub above.
 	$GLOBALS['_sa_app_password_read_fail']  = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
+	$GLOBALS['_sa_app_password_raw']        = array(); // user_id => raw meta_value string, returned verbatim as `v` instead of serialize($_app_passwords[user_id]) (2.15.0 decode test).
 	$GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
 	$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's result SET outright — an array of rows (#434 Task 9).
 	$GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).
@@ -3417,6 +3591,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
+	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -3435,6 +3610,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_admin_total']  = 0;
 	$GLOBALS['_user_queries'] = array();
 	$GLOBALS['_post_counts']  = array();
+	$GLOBALS['_sa_user_query_error'] = null;
+	$GLOBALS['_sa_user_query_error_cleared_by_found_rows'] = false;
 	$GLOBALS['_home_url']       = 'https://example.com';
 	$GLOBALS['_site_url']       = 'https://example.com';
 	$GLOBALS['_wp_query_posts'] = array();

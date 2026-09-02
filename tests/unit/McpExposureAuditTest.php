@@ -213,10 +213,10 @@ final class McpExposureAuditTest extends TestCase {
 		// presence as a live second door would be a finding the operator cannot
 		// act on, and one they would eventually learn to ignore.
 		$tool = new class() extends Aura_Tool_Audit_Mcp_Exposure {
-			protected function angie_state() {
+			protected function angie_state( array $servers ) {
 				// Mirror the real method with the plugin present and no server.
 				$server = false;
-				foreach ( $this->servers() as $entry ) {
+				foreach ( $servers as $entry ) {
 					if ( 'angie' === ( $entry['id'] ?? '' ) ) {
 						$server = true;
 					}

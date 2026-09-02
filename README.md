@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.14.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.15.0-green" alt="Stable" />
 </p>
 
 ---
@@ -226,6 +226,11 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.15.0
+
+- audit_mcp_exposure reports an `elementor` block: Elementor >= 4.3's official MCP module state, every `elementor_mcp_consent` row, every `Elementor MCP…` Application Password across all users (full detail), and the other Application Passwords of edit_posts users as counts. Every list is bounded (50 / 50 / 200) with a truncation flag beside it; no usermeta value over 256 KB is decoded; a scan that fails is reported as `{ error }` in its place, never as an empty list. Read-only.
+- aura_worker_app_password_list() accepts an optional byte bound, enforced in the same statement that returns the value.
 
 ### 2.14.0
 

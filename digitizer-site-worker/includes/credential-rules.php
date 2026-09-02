@@ -121,6 +121,65 @@ if ( ! function_exists( 'aura_worker_credential_owner' ) ) {
 	}
 }
 
+if ( ! function_exists( 'aura_worker_unserialize_array' ) ) {
+	/**
+	 * Decode a serialized value into an array, or prove it cannot be — without
+	 * ever letting `unserialize()` warn.
+	 *
+	 * `is_serialized()` is a SHAPE check, not a correctness one: a payload like
+	 * `a:2:{s:7:"allowed";b:1;}` declares two elements and holds one, passes
+	 * the shape check, and makes `unserialize()` emit an `E_WARNING` — which on
+	 * a site configured to display errors corrupts the REST JSON this plugin
+	 * answers with, and under any handler that turns warnings into exceptions
+	 * (PHPUnit's own default, a site's own error handler) throws OUT of a
+	 * single-row decode and takes down whatever larger structure was being
+	 * built around it (Codex round-7 P2). A caller that decodes one row out of
+	 * many — consent, an Application Password list — must be able to treat
+	 * THAT row as unproven and keep going; it cannot do that if the decode
+	 * itself can end the request.
+	 *
+	 * The warning is suppressed with `set_error_handler()`, restored in a
+	 * `finally` so a throw from elsewhere cannot leave the handler in place —
+	 * never with `@`, which silences every notice a warning-to-exception
+	 * handler might otherwise still want to see from code this doesn't own.
+	 *
+	 * `allowed_classes => false`: this decodes untrusted, database-sourced
+	 * bytes (a usermeta row, a LIKE-selected candidate), so a plain
+	 * `unserialize()` would let a crafted payload instantiate arbitrary
+	 * classes and fire `__wakeup()`/`__destruct()` gadgets. A serialised
+	 * object becomes `__PHP_Incomplete_Class` instead — not an array, so it
+	 * falls through to `false` here exactly like every other non-array shape.
+	 *
+	 * @since 2.15.0
+	 *
+	 * @param mixed $raw Whatever the stored value holds.
+	 * @return array|false The decoded array, or false when it is not a
+	 *                      serialized array, or the decode itself warned.
+	 */
+	function aura_worker_unserialize_array( $raw ) {
+		if ( ! is_string( $raw ) || ! is_serialized( $raw, true ) ) {
+			return false;
+		}
+		$warned = false;
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		set_error_handler(
+			static function () use ( &$warned ) {
+				$warned = true;
+				return true; // suppress: never let the warning propagate
+			}
+		);
+		try {
+			$value = unserialize( $raw, array( 'allowed_classes' => false ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
+		} finally {
+			restore_error_handler();
+		}
+		if ( $warned || ! is_array( $value ) ) {
+			return false;
+		}
+		return $value;
+	}
+}
+
 if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 	/**
 	 * That user's Application Password list, PROVEN to have been read.
@@ -151,22 +210,53 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 	 * must have is FRESHNESS, not unpredictability.
 	 *
 	 * @since 2.13.0
+	 * @since 2.15.0 the $max_bytes bound.
+	 * @since 2.15.0 the $notify parameter.
 	 *
-	 * @param int $owner Owner user ID.
+	 * @param int  $owner     Owner user ID.
+	 * @param int  $max_bytes Optional. When > 0, a row whose serialised value
+	 *                        exceeds it answers null (oversized, never
+	 *                        decoded); 0 = unbounded, the 2.13.0 behaviour.
+	 * @param bool $notify    Optional, default true. When false, NEITHER
+	 *                        do_action() call below fires — not the oversized
+	 *                        one, not the unproven-read one. The return
+	 *                        values are unchanged either way. Used by the
+	 *                        audit_mcp_exposure tool (a `read_only: true` MCP
+	 *                        tool that reads up to ~250 users' lists): firing
+	 *                        the action there would write the #434 unbind
+	 *                        breadcrumb from a read-only tool, and could
+	 *                        overwrite it with an unrelated user.
 	 * @return array|null The list — empty for a user with no row, or a row that
 	 *                    does not hold an array, exactly as core reads both —
 	 *                    or NULL for a read that proved nothing, which no
 	 *                    caller may treat as an absence.
 	 */
-	function aura_worker_app_password_list( $owner ) {
+	function aura_worker_app_password_list( $owner, $max_bytes = 0, $notify = true ) {
 		global $wpdb;
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
 			return null; // no way to confirm: never a proof of absence
 		}
 		static $seq = 0;
 		++$seq;
-		$nonce = $seq . '-' . wp_generate_uuid4();
-		$sql   = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, (int) $owner, '_application_passwords' );
+		$nonce     = $seq . '-' . wp_generate_uuid4();
+		$max_bytes = (int) $max_bytes;
+		if ( $max_bytes > 0 ) {
+			// The byte bound lives IN the statement that returns the value: a
+			// probe-then-fetch would let a concurrent usermeta write swap an
+			// oversized value in between, and the fetch would decode it. The
+			// LEFT JOIN over a one-row derived table keeps the probe row coming
+			// back when the user has no meta row (len NULL) — the nonce proof
+			// must not depend on the row existing.
+			$sql = $wpdb->prepare(
+				"SELECT %s AS probe, m.len, m.v FROM (SELECT 1 AS one) AS o LEFT JOIN (SELECT LENGTH(meta_value) AS len, IF(LENGTH(meta_value) <= %d, meta_value, NULL) AS v FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS m ON 1 = 1",
+				$nonce,
+				$max_bytes,
+				(int) $owner,
+				'_application_passwords'
+			);
+		} else {
+			$sql = $wpdb->prepare( "SELECT %s AS probe, (SELECT meta_value FROM {$wpdb->usermeta} WHERE user_id = %d AND meta_key = %s LIMIT 1) AS v", $nonce, (int) $owner, '_application_passwords' );
+		}
 		// core's prepare() answers null when it refuses the call: the earlier,
 		// cheaper refusal, and it keeps "we never asked" from being reported as
 		// "we asked and were told nothing".
@@ -179,14 +269,41 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 			// No row, or somebody else's row: this call proved nothing, and an
 			// unprovable probe owes app_passwords forever, so leave a
 			// breadcrumb rather than a tombstone that never explains itself.
-			do_action( 'aura_worker_app_password_probe_unproven', (int) $owner );
+			if ( $notify ) {
+				do_action( 'aura_worker_app_password_probe_unproven', (int) $owner );
+			}
 			return null;
+		}
+		if ( $max_bytes > 0 ) {
+			if ( ! isset( $row->len ) ) {
+				return array(); // no row at all: that user holds no Application Passwords
+			}
+			if ( ! isset( $row->v ) ) {
+				// The row exists and exceeds the bound: the value was never
+				// returned, so it was never decoded. Not an absence.
+				if ( $notify ) {
+					do_action( 'aura_worker_app_password_probe_unproven', (int) $owner, 'oversized' );
+				}
+				return null;
+			}
 		}
 		$raw = isset( $row->v ) ? $row->v : null;
 		if ( null === $raw ) {
 			return array(); // no row at all: that user holds no Application Passwords
 		}
-		$list = maybe_unserialize( $raw );
+		// aura_worker_unserialize_array(): this helper now also serves rows
+		// selected by a LIKE over the value itself (the Elementor-door
+		// candidate scan), so the value must be treated as untrusted the
+		// same way the consent decode (class-tool-audit-mcp-exposure.php)
+		// and the snapshot payload decode (class-aura-worker-snapshots.php)
+		// already do — allowed_classes => false keeps a crafted payload
+		// from instantiating arbitrary classes and firing
+		// __wakeup()/__destruct() gadgets, and the shared helper's warning
+		// suppression keeps a shape that passes is_serialized() but does
+		// not actually unserialize cleanly from throwing under a
+		// warnings-to-exceptions handler instead of just failing this one
+		// row (#434 Codex round-7 P2).
+		$list = aura_worker_unserialize_array( $raw );
 		return is_array( $list ) ? $list : array();
 	}
 }
