@@ -48,6 +48,16 @@ final class ElementorReplayTest extends TestCase {
 		);
 	}
 
+	protected function tearDown(): void {
+		$dir = WP_CONTENT_DIR . '/aura-backups/snapshots';
+		if ( is_dir( $dir ) ) {
+			@chmod( $dir, 0777 );
+			foreach ( (array) glob( $dir . '/*' ) as $file ) {
+				@unlink( $file );
+			}
+		}
+	}
+
 	// -----------------------------------------------------------------------
 	// Fixtures
 	// -----------------------------------------------------------------------
@@ -111,6 +121,34 @@ final class ElementorReplayTest extends TestCase {
 		$out = wp_get_ability( $slug )->execute( $input );
 		$this->assertSame( 'aura_held_for_approval', $out->get_error_code(), 'the fixture must actually hold' );
 		return (string) $out->get_error_data()['ref'];
+	}
+
+	/**
+	 * Task 7's compensation seam: the envelope store cannot be written, so
+	 * finish_creation() has to compensate. Nothing is faked — the real
+	 * Aura_Worker_Snapshots writes to a directory it cannot write to.
+	 *
+	 * @param callable $fn What to run.
+	 * @return mixed
+	 */
+	private function withUnwritableSnapshots( callable $fn ) {
+		$dir = WP_CONTENT_DIR . '/aura-backups/snapshots';
+		if ( ! is_dir( $dir ) ) {
+			new Aura_Worker_Snapshots(); // the constructor creates it
+		}
+		chmod( $dir, 0555 );
+		if ( false !== @file_put_contents( $dir . '/probe', 'x' ) ) {
+			@unlink( $dir . '/probe' );
+			chmod( $dir, 0777 );
+			$this->markTestSkipped( 'filesystem does not enforce the mode (running as root?)' );
+		}
+		set_error_handler( static function () { return true; }, E_WARNING );
+		try {
+			return $fn();
+		} finally {
+			restore_error_handler();
+			chmod( $dir, 0777 );
+		}
 	}
 
 	/** A warn rule on page 7. */
@@ -535,26 +573,189 @@ final class ElementorReplayTest extends TestCase {
 	// The answer comes from the terminal entry, or it is `interrupted`
 	// -----------------------------------------------------------------------
 
-	public function test_a_lost_terminal_stamp_answers_interrupted_and_releases_nothing(): void {
+	public function test_a_stamp_that_cannot_be_written_refuses_before_the_write(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );
 		$ref = $this->holdCall();
-		// The stamp's compare-and-swap refused at the driver: the claimed row
-		// survives, but nothing links it to the entry the write produced.
+		// The stamp's compare-and-swap is refused at the driver. It happens at
+		// ADMISSION now, so the call is refused before it can run: a claimed
+		// row with no seq would otherwise be indistinguishable afterwards from
+		// a call that never started.
 		$GLOBALS['_sa_option_cas_fail'][ 'aura_worker_door_claimed_' . $ref ] = true;
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertSame( 'aura_log_failed', $out['code'] );
+		$this->assertSame( array(), $this->ran, 'nothing ran' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the approval is not spent' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertSame( 'terminal_seq_unstamped', $log[1]['reason'] );
+	}
+
+	public function test_an_entry_that_cannot_be_read_answers_interrupted_and_retains_the_claim(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		$this->register(
+			'elementor/publish-document',
+			static function ( $input ) {
+				// The row this call would be judged by disappears mid-write.
+				unset( $GLOBALS['_options']['aura_worker_door_log_2'], $GLOBALS['_rows']['aura_worker_door_log_2'] );
+				return array(
+					'ok'    => true,
+					'input' => $input,
+				);
+			}
+		);
 
 		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
 
 		$this->assertFalse( $out['ok'], 'a return value is not evidence' );
 		$this->assertSame( 'interrupted', $out['reason'] );
 		$this->assertSame( $ref, $out['ref'] );
-		$this->assertArrayNotHasKey( 'snapshot_id', $out );
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row is left for the reconciler' );
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+	}
+
+	public function test_a_closed_log_gives_the_hold_back(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref    = $this->holdCall();
+		$before = Aura_Worker_Door_Holds::get_held( $ref );
+		Aura_Worker_Door_Log::close(); // Aura stopped acknowledging while the call waited
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertSame( 'aura_log_full', $out['code'] );
+		$this->assertSame( array(), $this->ran );
+		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+	}
+
+	public function test_a_target_that_stopped_being_attributable_is_refused_for_good(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		// The component post was re-typed while the call waited: no retry can
+		// make it snapshottable again.
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array(
+					'success' => false,
+					'error'   => 'post 7 is not a component',
+					'code'    => 'aura_target_unattributed',
+				);
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'refused', $out['reason'], 'not `interrupted` — the site provably did not run it' );
+		$this->assertSame( 'aura_target_unattributed', $out['code'] );
+		$this->assertSame( array(), $this->ran );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is spent, not parked for the reconciler' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
 		$log = Aura_Worker_Door_Log::log_after( 0 );
-		$this->assertSame( 'ok', $log[1]['result'], 'the write itself is recorded as it happened' );
-		$this->assertTrue( $log[1]['terminal_seq_unstamped'], 'and the row says its back-reference was lost' );
-		$this->assertSame( $ref, $log[1]['ref'], 'which is how Aura still finds this outcome' );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertSame( 'aura_target_unattributed', $log[1]['code'] );
+	}
+
+	// -----------------------------------------------------------------------
+	// The `ran` witness
+	// -----------------------------------------------------------------------
+
+	public function test_a_ran_witness_that_cannot_be_written_refuses_before_the_callback(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		// Only the `ran` patch fails; the admission, the stamp and the settle
+		// after it still land.
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_2'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 's:3:"ran";b:1;' );
+		};
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertSame( array(), $this->ran, 'a write whose witness is not durable does not run' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertSame( 'ran_witness_failed', $log[1]['reason'] );
+	}
+
+	public function test_the_stamp_and_the_ran_witness_are_on_the_row_before_the_callback(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref  = $this->holdCall();
+		$seen = array();
+		$this->register(
+			'elementor/publish-document',
+			static function () use ( $ref, &$seen ) {
+				$seen['stamp'] = Aura_Worker_Door_Holds::get_claimed( $ref )['terminal_seq'] ?? null;
+				$seen['ran']   = Aura_Worker_Door_Log::get( 2 )['ran'] ?? null;
+				throw new RuntimeException( 'elementor died mid-write' );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 2, $seen['stamp'], 'the claimed row knew its entry before the write' );
+		$this->assertTrue( $seen['ran'], 'and the row knew the callback was about to run' );
+		$this->assertSame( 'failed', $out['reason'], 'a call that may have run is never retried' );
+		$entry = Aura_Worker_Door_Log::get( 2 );
+		$this->assertSame( 'failed', $entry['result'] );
+		$this->assertTrue( $entry['may_have_run'] );
+		$this->assertTrue( $entry['ran'], 'the witness survives the settle' );
+	}
+
+	// -----------------------------------------------------------------------
+	// The Critical case: a creation whose envelope could not be stored
+	// -----------------------------------------------------------------------
+
+	public function test_a_creation_whose_envelope_fails_is_failed_and_never_replayed_again(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref  = $this->holdCall( 'elementor/create-page', array() );
+		$made = 0;
+		$this->register(
+			'elementor/create-page',
+			static function () use ( &$made ) {
+				$made = wp_insert_post(
+					array(
+						'post_type'   => 'page',
+						'post_title'  => 'made',
+						'post_author' => 3,
+					)
+				);
+				return array( 'id' => $made );
+			}
+		);
+
+		$out = $this->withUnwritableSnapshots(
+			static function () use ( $ref ) {
+				return Aura_Worker_Elementor_Door::replay( $ref, null );
+			}
+		);
+
+		// The page WAS created. `retry_later` here would create a second one.
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'failed', $out['reason'] );
+		$this->assertSame( 'aura_snapshot_failed', $out['code'], 'the same retryable code — and it is NOT retried' );
+		$this->assertSame( array( $made ), $out['created_post_ids'] );
+		$this->assertSame( array( $made ), $out['compensated'] );
+		$entry = Aura_Worker_Door_Log::get( 2 );
+		$this->assertSame( 'failed', $entry['result'] );
+		$this->assertTrue( $entry['ran'] );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the approval is spent' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+		$this->assertSame( 'not_held', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'] );
+		$this->assertSame( 1, $this->ran['elementor/create-page'], 'exactly one creation' );
 	}
 
 	// -----------------------------------------------------------------------

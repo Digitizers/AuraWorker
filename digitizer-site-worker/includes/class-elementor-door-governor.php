@@ -32,7 +32,7 @@ class Aura_Worker_Elementor_Door {
 	 * snapshot that failed, a log row that could not be written, a creation
 	 * mutex another request holds, a hold queue that is busy.
 	 */
-	const RETRYABLE_CODES = array( 'aura_snapshot_failed', 'aura_log_failed', 'aura_creation_busy', 'aura_hold_busy' );
+	const RETRYABLE_CODES = array( 'aura_snapshot_failed', 'aura_log_failed', 'aura_log_full', 'aura_creation_busy', 'aura_hold_busy' );
 
 	const CPT_GLOBAL_CLASS  = 'e_global_class';
 	const CPT_DEFAULT_STYLE = 'e_default_style';
@@ -701,6 +701,31 @@ class Aura_Worker_Elementor_Door {
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
 			return new WP_Error( 'aura_log_failed', 'The door log could not record this call; it was not run.', array( 'status' => 503 ) );
 		}
+		if ( null !== self::$replay_ack ) {
+			// The LINK between the claimed row and this entry, written BEFORE
+			// the snapshot and before the callback (Ruling P8). It used to be
+			// stamped after the write, which made an unstamped row ambiguous:
+			// `nothing ran` and `the creation ran and its envelope failed`
+			// looked identical, and the second was replayed — creating the
+			// page twice. Stamped here, `no terminal_seq` means exactly one
+			// thing: this call was never admitted to the write path.
+			//
+			// A stamp that FAILS refuses the call rather than running it
+			// unlinked: the claimed row would carry no seq, and the only
+			// honest reading of that afterwards is "nothing ran" — which a
+			// write that DID run would turn into a second run. `aura_log_failed`
+			// is retryable and nothing has happened yet, so the hold goes back.
+			if ( ! Aura_Worker_Door_Holds::stamp_terminal_seq( self::$replay_ack['ref'], $seq ) ) {
+				Aura_Worker_Door_Log::settle(
+					$seq,
+					array(
+						'result' => 'refused',
+						'reason' => 'terminal_seq_unstamped',
+					)
+				);
+				return new WP_Error( 'aura_log_failed', 'The door log could not link this approval to its entry; it was not run.', array( 'status' => 503 ) );
+			}
+		}
 		$kind = isset( self::WRITE_TABLE[ $slug ] ) ? self::WRITE_TABLE[ $slug ] : null;
 		// `create-page` always creates; a `manage-component` naming no id is
 		// creating one too, and takes the same path — mutex, watermark, and a
@@ -728,10 +753,16 @@ class Aura_Worker_Elementor_Door {
 			if ( empty( $snap['success'] ) ) {
 				Aura_Worker_Door_Log::settle(
 					$seq,
-					array(
-						'result' => 'refused',
-						'reason' => 'snapshot_failed',
-						'error'  => (string) ( isset( $snap['error'] ) ? $snap['error'] : '' ),
+					array_merge(
+						array(
+							'result' => 'refused',
+							'reason' => 'snapshot_failed',
+							'error'  => (string) ( isset( $snap['error'] ) ? $snap['error'] : '' ),
+						),
+						// A DESIGNATED refusal carries its code ON THE ROW: a
+						// replay answers from the entry, never from the return
+						// value, so the code has to be there to be answered with.
+						empty( $snap['code'] ) ? array() : array( 'code' => (string) $snap['code'] )
 					)
 				);
 				self::$request = null;
@@ -791,6 +822,26 @@ class Aura_Worker_Elementor_Door {
 			Aura_Worker_Rules::record_warn( $slug, $verdict['rule'] );
 		}
 
+		if ( null !== self::$replay_ack && ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'ran' => true ) ) ) {
+			// The witness a replay is judged by (Ruling P8): whether the
+			// callback ran is a fact about the SITE, and the row has to hold
+			// it before the callback can, or a refusal afterwards is
+			// indistinguishable from one before. Not durable, not run — the
+			// same rule the creation watermark follows a few lines above.
+			if ( $creating ) {
+				self::release_creation_mutex();
+			}
+			Aura_Worker_Door_Log::settle(
+				$seq,
+				array(
+					'result' => 'refused',
+					'reason' => 'ran_witness_failed',
+				)
+			);
+			self::$request = null;
+			return new WP_Error( 'aura_log_failed', 'The door log could not record that this call was about to run; it was not run.', array( 'status' => 503 ) );
+		}
+
 		$result = is_callable( $inner ) ? call_user_func( $inner, $input ) : new WP_Error( 'ability_invalid_execute_callback', 'no callback' );
 		do_action( 'sa_test_inner_ran', $slug ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- test seam only (ordering: snapshot before the write); no listener in production.
 
@@ -816,20 +867,6 @@ class Aura_Worker_Elementor_Door {
 		}
 		if ( ! empty( self::$request['collateral'] ) ) {
 			$terminal['collateral_snapshot_ids'] = self::$request['collateral'];
-		}
-		if ( null !== self::$replay_ack ) {
-			// The stamp is the LINK between the claimed row and this entry, and
-			// it can be lost — the claimed row swept away, or the CAS lost to a
-			// concurrent writer. A lost witness is recorded ON THE ROW, the way
-			// the wrapper already records `may_have_run` and `creation_error`
-			// there, rather than in a counter: the counters say a call went
-			// UNGOVERNED, and this one was governed, logged and settled — only
-			// its back-reference is missing. The row carries `ref`, so Aura can
-			// still find this outcome by the hold it ran for, which a counter
-			// could never tell it.
-			if ( ! Aura_Worker_Door_Holds::stamp_terminal_seq( self::$replay_ack['ref'], $seq ) ) {
-				$terminal['terminal_seq_unstamped'] = true;
-			}
 		}
 		Aura_Worker_Door_Log::settle( $seq, $terminal );
 		self::$request = null;
@@ -1083,70 +1120,145 @@ class Aura_Worker_Elementor_Door {
 			$stamp  = Aura_Worker_Door_Holds::get_claimed( $ref );
 			$seq    = (int) ( isset( $stamp['terminal_seq'] ) ? $stamp['terminal_seq'] : 0 );
 			$entry  = $seq > 0 ? Aura_Worker_Door_Log::get( $seq ) : null;
+			$code   = is_wp_error( $result ) ? $result->get_error_code() : '';
 
-			// A refusal the wrapper made BEFORE the callback, under a code
-			// that says "try again" (Ruling P7): the write never happened, so
-			// the operator's approval is not spent on it. The row goes BACK to
-			// held and the same ref can be approved again — an unstamped
-			// terminal_seq is what proves the run never reached the callback,
-			// because the wrapper stamps only on its way past it.
-			if ( 0 === $seq && is_wp_error( $result ) && in_array( $result->get_error_code(), self::RETRYABLE_CODES, true ) ) {
-				$out = array(
-					'ok'     => false,
-					'reason' => 'retry_later',
-					'code'   => $result->get_error_code(),
-					'error'  => $result->get_error_message(),
-				);
-				if ( ! Aura_Worker_Door_Holds::unclaim( $ref ) && null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
-					// The hold could not be put back and the claimed row still
-					// stands: it is the only record of this attempt, and the
-					// reconciler owns it from here. Say so — Aura must not
-					// expect this ref to answer a second approval.
-					$out['claim_retained'] = true;
+			// THE DISCRIMINATOR IS NEVER THE ERROR CODE — it is whether the
+			// callback ran, and the row says so (Ruling P8). `terminal_seq` is
+			// stamped at admission, so `no seq` means the write path was never
+			// entered; `ran` is patched immediately before the callback, so an
+			// entry without it is a call the site provably did not perform.
+			// The code decides only whether a call that did NOT run is worth
+			// retrying.
+			if ( 0 === $seq ) {
+				// Never admitted: a closed log, a log row that could not be
+				// written, a target that stopped being attributable while the
+				// call waited. Nothing ran, so nothing needs a rollback.
+				if ( is_wp_error( $result ) ) {
+					return in_array( $code, self::RETRYABLE_CODES, true )
+						? self::give_back( $ref, $code, $result->get_error_message() )
+						: self::spend_refusal( $ref, $code, $result->get_error_message() );
 				}
-				return $out;
-			}
-
-			// From here the answer comes from the TERMINAL LOG ENTRY and
-			// NOTHING else. No entry to read — no stamp, a row that is gone,
-			// or one still pending — means this request cannot say what
-			// happened, and a return value is not evidence: the callback may
-			// have run. Answer `interrupted` and leave the claimed row alone;
-			// it is the only witness that a write may be out there, and the
-			// reconciler settles it.
-			$terminal = is_array( $entry ) ? (string) ( isset( $entry['result'] ) ? $entry['result'] : '' ) : '';
-			if ( 0 === $seq || ! in_array( $terminal, Aura_Worker_Door_Log::TERMINAL, true ) ) {
+				// A result with no admission cannot happen — unless the claimed
+				// row itself was taken from under this request, in which case
+				// the seq is not missing, it is unreadable, and the write may
+				// well have happened.
 				return array(
 					'ok'     => false,
 					'reason' => 'interrupted',
 					'ref'    => $ref,
 				);
 			}
-			Aura_Worker_Door_Holds::release( $ref );
-			// The wrapper already classified an error-shaped array result as
-			// `failed`, and this answer must not say `ok` where the log says
-			// otherwise — Aura marks the action from this answer.
-			if ( is_wp_error( $result ) || 'ok' !== $terminal ) {
-				$logged = isset( $entry['error'] ) ? (string) $entry['error'] : 'ability reported an error';
+
+			// From here the answer comes from the ENTRY and nothing else. One
+			// that is missing or still pending is not an answer: the callback
+			// may have run, a return value is not evidence, and the claimed
+			// row is the only witness left — leave it for the reconciler.
+			$outcome = is_array( $entry ) ? (string) ( isset( $entry['result'] ) ? $entry['result'] : '' ) : '';
+			if ( ! in_array( $outcome, Aura_Worker_Door_Log::TERMINAL, true ) ) {
 				return array(
 					'ok'     => false,
-					'reason' => 'failed',
-					'error'  => is_wp_error( $result ) ? $result->get_error_message() : $logged,
-					'code'   => is_wp_error( $result ) ? $result->get_error_code() : 'ability_error',
+					'reason' => 'interrupted',
+					'ref'    => $ref,
 				);
 			}
-			return array(
-				'ok'               => true,
-				'result'           => $result,
-				'snapshot_id'      => isset( $entry['snapshot_id'] ) ? $entry['snapshot_id'] : null,
-				'created_post_ids' => isset( $entry['created_post_ids'] ) ? $entry['created_post_ids'] : array(),
+			$ran = ! empty( $entry['ran'] );
+			if ( ! $ran && in_array( $code, self::RETRYABLE_CODES, true ) ) {
+				// Admitted, refused before the callback, and worth retrying —
+				// the snapshot that failed, the creation mutex, the watermark.
+				// The approval is not spent on a site that could not act.
+				return self::give_back( $ref, $code, $result->get_error_message() );
+			}
+			if ( 'ok' === $outcome ) {
+				Aura_Worker_Door_Holds::release( $ref );
+				return array(
+					'ok'               => true,
+					'result'           => $result,
+					'snapshot_id'      => isset( $entry['snapshot_id'] ) ? $entry['snapshot_id'] : null,
+					'created_post_ids' => isset( $entry['created_post_ids'] ) ? $entry['created_post_ids'] : array(),
+				);
+			}
+			if ( 'refused' === $outcome ) {
+				$why = (string) ( isset( $entry['code'] ) ? $entry['code'] : ( isset( $entry['reason'] ) ? $entry['reason'] : '' ) );
+				if ( 'block' === ( isset( $entry['verdict'] ) ? $entry['verdict'] : '' ) || 'refused_by_current_rule' === $why ) {
+					Aura_Worker_Door_Holds::reject( $ref );
+					return array(
+						'ok'       => false,
+						'reason'   => 'refused_by_current_rule',
+						'rule_key' => (string) ( isset( $entry['rule_key'] ) ? $entry['rule_key'] : '' ),
+					);
+				}
+				return self::spend_refusal( $ref, $why, (string) ( isset( $entry['error'] ) ? $entry['error'] : '' ) );
+			}
+			// `failed`: it ran (or it was refused under a code no retry can
+			// help), and the entry says what came of it — including what a
+			// creation left behind.
+			Aura_Worker_Door_Holds::release( $ref );
+			$out = array(
+				'ok'     => false,
+				'reason' => 'failed',
+				'error'  => (string) ( isset( $entry['error'] ) ? $entry['error'] : ( is_wp_error( $result ) ? $result->get_error_message() : 'ability reported an error' ) ),
+				'code'   => '' === $code ? 'ability_error' : $code,
 			);
+			foreach ( array( 'snapshot_id', 'created_post_ids', 'compensated', 'uncompensated' ) as $field ) {
+				if ( isset( $entry[ $field ] ) ) {
+					$out[ $field ] = $entry[ $field ];
+				}
+			}
+			return $out;
 		} finally {
 			self::$replay_ack     = null;
 			self::$pinned_ruleset = null;
 			self::$memo           = array();
 			wp_set_current_user( (int) $prev_user );
 		}
+	}
+
+	/**
+	 * The approval is NOT spent: put the row back where it came from and tell
+	 * Aura to try again (Ruling P7/P8). Only ever called for a call the log
+	 * shows did not run.
+	 *
+	 * @param string $ref     Ref.
+	 * @param string $code    The refusal's code.
+	 * @param string $message The refusal's message.
+	 * @return array
+	 */
+	private static function give_back( $ref, $code, $message ) {
+		$out = array(
+			'ok'     => false,
+			'reason' => 'retry_later',
+			'code'   => $code,
+			'error'  => $message,
+		);
+		if ( ! Aura_Worker_Door_Holds::unclaim( $ref ) && null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
+			// The hold could not be put back and the claimed row still stands:
+			// it is the only record of this attempt, and the reconciler owns
+			// it from here. Say so — Aura must not expect this ref to answer a
+			// second approval.
+			$out['claim_retained'] = true;
+		}
+		return $out;
+	}
+
+	/**
+	 * A DEFINITIVE refusal of a call that never ran: retrying it changes
+	 * nothing (the ability is unmapped, the target stopped being one Aura can
+	 * snapshot), so the hold is spent rather than parked for a reconciler that
+	 * would only write a second, false `interrupted`.
+	 *
+	 * @param string $ref     Ref.
+	 * @param string $code    The refusal's code.
+	 * @param string $message The refusal's message.
+	 * @return array
+	 */
+	private static function spend_refusal( $ref, $code, $message ) {
+		Aura_Worker_Door_Holds::release( $ref );
+		return array(
+			'ok'     => false,
+			'reason' => 'refused',
+			'code'   => $code,
+			'error'  => $message,
+		);
 	}
 
 	/**
