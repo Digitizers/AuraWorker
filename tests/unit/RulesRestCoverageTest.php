@@ -26,6 +26,16 @@ final class RulesRestCoverageTest extends TestCase {
 	const EXEMPT = array(
 		// Captures state, changes nothing; a freeze must not block the safety net.
 		'wp.snapshot.create',
+		// Refuses a held write outright; can only PREVENT a mutation, never
+		// cause one, so a freeze blocking it would strand exactly the calls an
+		// operator most wants to clear while frozen.
+		'door.reject',
+		// Governance-plane bookkeeping on Aura's own log (raises the ack
+		// floor, lets acked rows be dropped); not a site mutation, and a
+		// freeze blocking it could starve the log toward its MAX_UNACKED
+		// bound and close the door during exactly the window an operator
+		// most wants visibility into it.
+		'door.ack',
 	);
 
 	protected function setUp(): void {

@@ -362,6 +362,78 @@ class Aura_Worker_API {
 			),
 		) );
 
+		// v1: reject a held Elementor-door write outright — the operator's "no"
+		// (spec §3.6-3.7). The site's own approval channel for the "yes" is
+		// elementor_replay_ability; this is its refusal counterpart.
+		register_rest_route( self::NAMESPACE, '/door/reject', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'reject_door_holds' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'refs' => array(
+					'required'          => true,
+					'type'              => 'array',
+					'items'             => array( 'type' => 'string' ),
+					'sanitize_callback' => array( __CLASS__, 'sanitize_door_refs' ),
+					'description'       => __( 'Hold references (door_…) to reject.', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
+		// v1: Aura's ack of the door log (spec §3.8, §3.10) — raises the site's
+		// ack floor and lets it drop everything at or under it.
+		register_rest_route( self::NAMESPACE, '/door/ack', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'ack_door_log' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'epoch' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( "The log epoch Aura is acking; ignored (acks nothing) when it does not match the site's current one.", 'digitizer-site-worker' ),
+				),
+				'seq' => array(
+					'required'          => true,
+					'type'              => 'integer',
+					'sanitize_callback' => 'absint',
+					'description'       => __( "Highest seq of Aura's contiguous committed prefix.", 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
+	}
+
+	/**
+	 * The `refs` sanitize_callback for POST /aura/v1/door/reject, and the same
+	 * pass the handler re-applies to whatever it reads off the request — one
+	 * source of truth for both the registered pipeline and a direct call that
+	 * bypasses it (the pattern is_allowed_self_update_url() already uses).
+	 * Non-string entries are dropped (no result entry is owed for a value that
+	 * was never a ref); survivors are sanitize_text_field()d and the list is
+	 * capped at 50. A survivor that sanitizes to something no hold ever used —
+	 * garbage characters, or simply unknown — is not special-cased here: it is
+	 * answered `not_held` downstream by Aura_Worker_Door_Holds::reject() itself,
+	 * exactly like any other ref nothing is held under.
+	 *
+	 * @param mixed $value Raw `refs` value.
+	 * @return string[]
+	 */
+	public static function sanitize_door_refs( $value ) {
+		if ( ! is_array( $value ) ) {
+			return array();
+		}
+		$out = array();
+		foreach ( $value as $item ) {
+			if ( ! is_string( $item ) ) {
+				continue;
+			}
+			$out[] = sanitize_text_field( $item );
+			if ( count( $out ) >= 50 ) {
+				break;
+			}
+		}
+		return $out;
 	}
 
 	/**
@@ -1239,6 +1311,73 @@ class Aura_Worker_API {
 			'snapshots' => $list,
 			'count'     => count( $list ),
 		) );
+	}
+
+	/**
+	 * POST /aura/v1/door/reject
+	 *
+	 * The operator's refusal of a held Elementor-door write (spec §3.6-3.7):
+	 * removes the held row so the call can never be replayed. Not itself a
+	 * site mutation — deliberately EXEMPT from the rule-guard invariant
+	 * (RulesRestCoverageTest): it can only PREVENT a write from ever running,
+	 * never cause one, so a freeze refusing it would strand exactly the calls
+	 * an operator most wants to clear while frozen.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
+	 */
+	public function reject_door_holds( $request ) {
+		$refs = self::sanitize_door_refs( $request->get_param( 'refs' ) );
+
+		$guard = Aura_Worker_Grant::require_for( $request, 'door.reject', array( 'refs' => $refs ) );
+		if ( is_wp_error( $guard ) ) {
+			return $guard;
+		}
+
+		$results = array();
+		foreach ( $refs as $ref ) {
+			$results[ $ref ] = Aura_Worker_Door_Holds::reject( $ref );
+		}
+
+		return new WP_REST_Response( array( 'results' => $results ), 200 );
+	}
+
+	/**
+	 * POST /aura/v1/door/ack
+	 *
+	 * Aura's ack of the door log (spec §3.8, §3.10): raises the site's ack
+	 * floor so it can drop everything at or under it. Transport only — every
+	 * rule (epoch match, floor-only-rises, reopen-under-the-bound) lives in
+	 * Aura_Worker_Door_Log::ack(). Deliberately EXEMPT from the rule-guard
+	 * invariant (RulesRestCoverageTest): this is governance-plane bookkeeping
+	 * on Aura's OWN log, not a site mutation, and a freeze blocking it could
+	 * starve the log toward its MAX_UNACKED bound and close the door — during
+	 * exactly the window an operator most wants visibility into it.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
+	 */
+	public function ack_door_log( $request ) {
+		$epoch = (string) $request->get_param( 'epoch' );
+		$seq   = (int) $request->get_param( 'seq' );
+
+		$guard = Aura_Worker_Grant::require_for( $request, 'door.ack', array( 'epoch' => $epoch, 'seq' => $seq ) );
+		if ( is_wp_error( $guard ) ) {
+			return $guard;
+		}
+
+		$result = Aura_Worker_Door_Log::ack( $epoch, $seq );
+
+		return new WP_REST_Response(
+			array(
+				'acked'   => (int) $result['acked'],
+				'floor'   => (int) $result['floor'],
+				'epoch'   => Aura_Worker_Door_Log::epoch(),
+				'unacked' => Aura_Worker_Door_Log::count_unacked(),
+				'door'    => Aura_Worker_Door_Log::is_closed() ? 'closed' : 'open',
+			),
+			200
+		);
 	}
 
 	/**
