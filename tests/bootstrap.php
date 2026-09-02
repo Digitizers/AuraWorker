@@ -1040,8 +1040,17 @@ if ( ! function_exists( 'is_user_logged_in' ) ) {
 }
 
 if ( ! function_exists( 'wp_set_current_user' ) ) {
+	/**
+	 * Core replaces the current user, so get_current_user_id() answers the new
+	 * id from the next statement on — which is the whole point wherever
+	 * production switches user and runs something as them (the door's replay
+	 * runs a held write as its stored actor). Both globals move together:
+	 * $_current_user is what tests assert the switch itself on,
+	 * $_current_user_id is what get_current_user_id() reads.
+	 */
 	function wp_set_current_user( int $id, string $name = '' ) {
-		$GLOBALS['_current_user'] = $id;
+		$GLOBALS['_current_user']    = $id;
+		$GLOBALS['_current_user_id'] = $id;
 		return $id;
 	}
 }

@@ -662,11 +662,16 @@ class Aura_Worker_Elementor_Door {
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}
+		// A replay's verdict is what the OPERATOR decided, not what the rules
+		// said: `none` / `rules_unavailable` reached the write because Aura
+		// approved it, and the entry says `approved` rather than repeating a
+		// judgement that by itself would have held the call. A warn is still
+		// a warn — it was acknowledged, not overridden.
 		$entry = array(
 			'ability'  => $slug,
 			'actor'    => $actor,
 			'touches'  => $touches,
-			'verdict'  => $verdict['verdict'],
+			'verdict'  => null !== self::$replay_ack ? ( 'warn' === $verdict['verdict'] ? 'warn' : 'approved' ) : $verdict['verdict'],
 			'rule_key' => isset( $verdict['rule']['key'] ) ? (string) $verdict['rule']['key'] : null,
 		);
 		if ( null !== self::$replay_ack ) {
@@ -913,6 +918,164 @@ class Aura_Worker_Elementor_Door {
 		}
 		Aura_Worker_Door_Log::admit( $seq );
 		Aura_Worker_Door_Log::settle( $seq, array_merge( array( 'result' => $result ), $extra ) );
+	}
+	/* ------------------------------------------------------------------ */
+	/* Replay: Aura's approval of a held call                              */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Run a held write now that Aura has approved it (spec §3.7).
+	 *
+	 * The ORDER is the guarantee, and every step of it is load-bearing:
+	 *
+	 * 1. The hold is read first; a ref with no held row — or one whose
+	 *    claimed twin exists (in flight, or interrupted and waiting for the
+	 *    reconciler) — is `not_held`, never a second run.
+	 * 2. The ruleset is read ONCE and pinned. Everything after this judges
+	 *    and records against that one copy, so a push landing mid-write
+	 *    cannot make the entry describe a policy the call was never judged
+	 *    on.
+	 * 3. The call is RE-JUDGED before anything is claimed: a `block`
+	 *    delivered while the call sat in the queue refuses it and rejects
+	 *    the hold, and a `warn` must be acknowledged by (key, ruleHash) —
+	 *    an approver who saw a different rule has not approved this one.
+	 * 4. The ability's own permission callback is re-checked AS THE STORED
+	 *    ACTOR: a user demoted or deleted during the hold's seven days must
+	 *    not get a mutation through somebody else's approval.
+	 * 5. Only then is the hold claimed, by moving it — and the answer comes
+	 *    from the TERMINAL LOG ENTRY, not from the fact that the callback
+	 *    returned. Aura marks the action from this answer.
+	 *
+	 * @param string     $ref Hold ref.
+	 * @param array|null $ack { key, ruleHash } the approver acknowledged.
+	 * @return array
+	 */
+	public static function replay( $ref, $ack ) {
+		$held = Aura_Worker_Door_Holds::get_held( $ref );
+		if ( null === $held || null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
+			return array(
+				'ok'     => false,
+				'reason' => 'not_held',
+			);
+		}
+		$slug                 = (string) $held['ability'];
+		$input                = (array) $held['input'];
+		$rec                  = Aura_Worker_Rules::current();
+		self::$pinned_ruleset = $rec;
+		self::$memo           = array();
+		$prev_user            = get_current_user_id();
+		try {
+			$verdict = self::govern( $slug, (array) $held['touches'], $input );
+			if ( 'block' === $verdict['effect'] ) {
+				Aura_Worker_Rules::record_block( $slug, $verdict['rule'] );
+				self::record_terminal_only(
+					$slug,
+					(array) $held['actor'],
+					(array) $held['touches'],
+					'refused',
+					array(
+						'ref'      => $ref,
+						'reason'   => 'refused_by_current_rule',
+						'rule_key' => isset( $verdict['rule']['key'] ) ? (string) $verdict['rule']['key'] : '',
+					)
+				);
+				Aura_Worker_Door_Holds::reject( $ref );
+				return array(
+					'ok'       => false,
+					'reason'   => 'refused_by_current_rule',
+					'rule_key' => isset( $verdict['rule']['key'] ) ? (string) $verdict['rule']['key'] : '',
+				);
+			}
+			if ( 'warn' === $verdict['verdict'] ) {
+				$ev = self::rule_evidence( $verdict['rule'] );
+				if ( null === $ack || ! isset( $ack['key'], $ack['ruleHash'] ) || $ack['key'] !== $ev['key'] || $ack['ruleHash'] !== $ev['ruleHash'] ) {
+					// The hold carries the rule the operator must acknowledge
+					// NEXT — refreshed in place, so a stale approval cannot be
+					// replayed against a rule nobody has seen.
+					Aura_Worker_Door_Holds::refresh_rule( $ref, $ev );
+					return array(
+						'ok'     => false,
+						'reason' => 'warn_changed',
+						'rule'   => $ev,
+					);
+				}
+			}
+			$claimed = Aura_Worker_Door_Holds::claim( $ref );
+			if ( is_wp_error( $claimed ) ) {
+				// `not_held` from claim() is a LOST RACE (a reject or the
+				// sweep took the row), not a rejection of this replay: Aura
+				// retries it, and finds out what happened from the hold list.
+				return array(
+					'ok'     => false,
+					'reason' => 'not_held',
+				);
+			}
+			wp_set_current_user( (int) $held['actor']['user_id'] );
+			$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $slug ) : null;
+			if ( ! $ability ) {
+				Aura_Worker_Door_Holds::release( $ref );
+				return array(
+					'ok'     => false,
+					'reason' => 'not_held',
+				);
+			}
+			// The ability's OWN permission callback, as the stored actor,
+			// before anything runs. `WP_Ability::check_permissions()` is
+			// public on WP 7.1's class.
+			$allowed = method_exists( $ability, 'check_permissions' ) ? $ability->check_permissions( $input ) : false;
+			if ( true !== $allowed ) {
+				self::record_terminal_only(
+					$slug,
+					(array) $held['actor'],
+					(array) $held['touches'],
+					'refused',
+					array(
+						'ref'    => $ref,
+						'reason' => 'refused_by_permission',
+						'error'  => is_wp_error( $allowed ) ? $allowed->get_error_message() : 'the actor no longer has permission for this ability',
+					)
+				);
+				Aura_Worker_Door_Holds::release( $ref );
+				return array(
+					'ok'     => false,
+					'reason' => 'refused_by_permission',
+				);
+			}
+			self::$replay_ack = array(
+				'ref' => $ref,
+				'ack' => $ack,
+			);
+			$result = $ability->execute( $input );
+			$stamp  = Aura_Worker_Door_Holds::get_claimed( $ref );
+			$seq    = (int) ( isset( $stamp['terminal_seq'] ) ? $stamp['terminal_seq'] : 0 );
+			$entry  = $seq > 0 ? Aura_Worker_Door_Log::get( $seq ) : null;
+			Aura_Worker_Door_Holds::release( $ref );
+			// The terminal entry is the verdict on the run: the wrapper
+			// already classified an error-shaped array result as `failed`,
+			// and this answer must not say `ok` where the log says otherwise
+			// — Aura marks the action from this answer.
+			$entry_failed = is_array( $entry ) && 'ok' !== ( isset( $entry['result'] ) ? $entry['result'] : 'failed' );
+			if ( is_wp_error( $result ) || $entry_failed ) {
+				$logged = is_array( $entry ) && isset( $entry['error'] ) ? (string) $entry['error'] : 'ability reported an error';
+				return array(
+					'ok'     => false,
+					'reason' => 'failed',
+					'error'  => is_wp_error( $result ) ? $result->get_error_message() : $logged,
+					'code'   => is_wp_error( $result ) ? $result->get_error_code() : 'ability_error',
+				);
+			}
+			return array(
+				'ok'               => true,
+				'result'           => $result,
+				'snapshot_id'      => is_array( $entry ) && isset( $entry['snapshot_id'] ) ? $entry['snapshot_id'] : null,
+				'created_post_ids' => is_array( $entry ) && isset( $entry['created_post_ids'] ) ? $entry['created_post_ids'] : array(),
+			);
+		} finally {
+			self::$replay_ack     = null;
+			self::$pinned_ruleset = null;
+			self::$memo           = array();
+			wp_set_current_user( (int) $prev_user );
+		}
 	}
 
 	/**
