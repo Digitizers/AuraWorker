@@ -46,6 +46,33 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 */
 	const VERSION_CONSTANTS = array( 'WP_MCP_ADAPTER_VERSION', 'WP_MCP_VERSION' );
 
+	/** Every list the `elementor` block returns is capped at this many rows (spec §3). */
+	const ELEMENTOR_LIST_CAP = 50;
+
+	/** `edit_posts` users inspected for the app-password context, at most. */
+	const ELEMENTOR_CONTEXT_CAP = 200;
+
+	/** Page size of the context enumeration. */
+	const ELEMENTOR_CONTEXT_PAGE = 50;
+
+	/** Every string the block returns is clipped to this many characters. */
+	const ELEMENTOR_STRING_MAX = 200;
+
+	/** "Used recently" horizon for the context counts, in days. */
+	const ELEMENTOR_RECENT_DAYS = 30;
+
+	/**
+	 * Raw serialized usermeta length considered parse-safe. MUST equal
+	 * Aura_Tool_Audit_Admin_Accounts::MAX_APP_PASSWORD_BYTES (a test pins it):
+	 * one bound for one kind of row, whichever tool reads it.
+	 */
+	const MAX_APP_PASSWORD_BYTES = 262144; // 256 KB.
+
+	const ELEMENTOR_PASSWORD_PREFIX = 'Elementor MCP';
+	const ELEMENTOR_SERVER_ID       = 'elementor-mcp-server';
+	const ELEMENTOR_CONSENT_META    = 'elementor_mcp_consent';
+	const ELEMENTOR_MODULE_CLASS    = '\\Elementor\\Modules\\Mcp\\Module';
+
 	public function get_name() {
 		return 'audit_mcp_exposure';
 	}
@@ -66,6 +93,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			'angie'                => 'object — { active, version, mcp_server_present } (the known second door; absence of Angie does not mean absence of a second server)',
 			'abilities'            => 'object — { total, discoverable_by_type_rule, discoverable_and_mutating, discoverable_mutating_names }. These count abilities that PASS the discovery rule co-installed servers apply (no meta.mcp.type, or "tool") — a property of the abilities, NOT proof that anything currently serves them. Reachability additionally requires a server that resolves targets from the site-wide registry; a server with an explicit tool list reaches only what it lists. Read together with `servers`: with none registered, these counts describe a door that does not exist yet.',
 			'coverage'             => 'object — { total_seen, returned, truncated, cap } bounded-coverage contract',
+			'elementor'            => 'object — Elementor >= 4.3\'s official MCP door (2.15.0). { installed, version, mcp_module: { class_present, active, abilities_registered, server_id }, consent: [{ user_id, login, allowed, timestamp }], consent_unproven: [user_id], consent_truncated, app_passwords: { elementor: [{ user_id, login, name, created, last_used, last_ip }], elementor_entries_truncated, elementor_unproven: [user_id], candidates_read, elementor_truncated, other: { users_checked, count, recently_used, unproven: [user_id] } }, coverage: { users_total, users_checked, truncated, cap } }. consent rows and Elementor-named Application Passwords are found across ALL users (two bounded usermeta queries, 50 rows each); every other Application Password of edit_posts users is counted (200 users). No usermeta value over 256 KB is decoded — such a row is listed in the subtree\'s *_unproven. A scan that failed is { error } in its place (mcp_module / consent / app_passwords.elementor / app_passwords.other + coverage), never an empty list. Shape: Digitizers/Aura docs/superpowers/specs/2026-09-02-elementor-mcp-door-detection-design.md §3.',
 		);
 	}
 
@@ -89,6 +117,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			'mcp_adapter'          => $this->adapter_state(),
 			'servers'              => $this->servers(),
 			'angie'                => $this->angie_state(),
+			'elementor'            => $this->elementor_state(),
 		) + $this->ability_exposure( $abilities_active );
 	}
 
@@ -212,6 +241,152 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			'version'            => defined( 'ANGIE_VERSION' ) ? (string) ANGIE_VERSION : '',
 			'mcp_server_present' => $server,
 		);
+	}
+
+	/**
+	 * Clip a string to the block's per-string bound.
+	 *
+	 * @param mixed $s Value.
+	 * @return string
+	 */
+	protected function clip( $s ) {
+		$s = (string) $s;
+		return function_exists( 'mb_substr' ) ? mb_substr( $s, 0, static::ELEMENTOR_STRING_MAX ) : substr( $s, 0, static::ELEMENTOR_STRING_MAX );
+	}
+
+	/**
+	 * The error subtree for a scan that threw.
+	 *
+	 * @param \Throwable $e The throw.
+	 * @return array { error }
+	 */
+	protected function subtree_error( $e ) {
+		$msg = $e->getMessage();
+		return array( 'error' => $this->clip( '' === $msg ? get_class( $e ) : $msg ) );
+	}
+
+	/**
+	 * Elementor's presence and module state, read from the live site.
+	 * A seam: tests override it, since a suite cannot define-then-undefine
+	 * ELEMENTOR_VERSION or unload a class.
+	 *
+	 * @return array { installed, version, class_present, active }
+	 */
+	protected function elementor_env() {
+		$class         = static::ELEMENTOR_MODULE_CLASS;
+		$class_present = class_exists( $class );
+		$active        = null;
+		if ( $class_present && is_callable( array( $class, 'is_active' ) ) ) {
+			$active = (bool) call_user_func( array( $class, 'is_active' ) );
+		}
+		return array(
+			'installed'     => defined( 'ELEMENTOR_VERSION' ) || class_exists( '\\Elementor\\Plugin' ),
+			'version'       => defined( 'ELEMENTOR_VERSION' ) ? (string) ELEMENTOR_VERSION : null,
+			'class_present' => $class_present,
+			'active'        => $active,
+		);
+	}
+
+	/**
+	 * Names of every registered ability, or null when the Abilities API is absent.
+	 *
+	 * @return string[]|null
+	 */
+	protected function elementor_ability_names() {
+		if ( ! function_exists( 'wp_get_abilities' ) ) {
+			return null;
+		}
+		$names = array();
+		foreach ( (array) wp_get_abilities() as $ability ) {
+			if ( is_object( $ability ) && method_exists( $ability, 'get_name' ) ) {
+				$names[] = (string) $ability->get_name();
+			}
+		}
+		return $names;
+	}
+
+	/**
+	 * The module subtree from its inputs — pure, so tests reach every branch.
+	 *
+	 * @param array      $env           From elementor_env().
+	 * @param array|null $ability_names From elementor_ability_names().
+	 * @param array      $servers       From servers().
+	 * @return array { class_present, active, abilities_registered, server_id }
+	 */
+	public static function elementor_module_from( array $env, $ability_names, array $servers ) {
+		$class_present = ! empty( $env['class_present'] );
+		// Same rule elementor_state() applies to the outer `installed`: the class
+		// cannot exist without Elementor, so either signal counts. A server_id is
+		// attributed to Elementor only when Elementor is believed present at all —
+		// otherwise a same-named server registered by something else would be
+		// misreported as Elementor's own door.
+		$installed = ! empty( $env['installed'] ) || $class_present;
+		// class absent ⇒ active null, whatever was read: the gate belongs to the class.
+		$active = $class_present && array_key_exists( 'active', $env ) && is_bool( $env['active'] ) ? $env['active'] : null;
+		$count  = null;
+		if ( is_array( $ability_names ) ) {
+			$count = 0;
+			foreach ( $ability_names as $name ) {
+				if ( is_string( $name ) && 0 === strpos( $name, 'elementor/' ) ) {
+					++$count;
+				}
+			}
+		}
+		$server_id = null;
+		if ( $installed ) {
+			foreach ( $servers as $entry ) {
+				if ( isset( $entry['id'] ) && static::ELEMENTOR_SERVER_ID === $entry['id'] ) {
+					$server_id = static::ELEMENTOR_SERVER_ID;
+					break;
+				}
+			}
+		}
+		return array(
+			'class_present'        => $class_present,
+			'active'               => $active,
+			'abilities_registered' => $count,
+			'server_id'            => $server_id,
+		);
+	}
+
+	/**
+	 * The `elementor` block: four scans, each failing on its own.
+	 *
+	 * @return array
+	 */
+	protected function elementor_state() {
+		$out = array(
+			'installed' => false,
+			'version'   => null,
+		);
+		try {
+			$env = $this->elementor_env();
+			$mod = static::elementor_module_from( $env, $this->elementor_ability_names(), $this->servers() );
+			// The class cannot exist without Elementor: installed follows it.
+			$installed        = ! empty( $env['installed'] ) || $mod['class_present'];
+			$out['installed'] = $installed;
+			$out['version']   = $installed && isset( $env['version'] ) && is_string( $env['version'] ) && '' !== $env['version'] ? $this->clip( $env['version'] ) : null;
+			$out['mcp_module'] = $mod;
+		} catch ( \Throwable $e ) {
+			$out['installed']  = false;
+			$out['version']    = null;
+			$out['mcp_module'] = $this->subtree_error( $e );
+		}
+
+		// Tasks 3–5 add consent, Elementor passwords, context here.
+		$out['consent']           = array();
+		$out['consent_unproven']  = array();
+		$out['consent_truncated'] = false;
+		$out['app_passwords']     = array(
+			'elementor'                   => array(),
+			'elementor_entries_truncated' => false,
+			'elementor_unproven'          => array(),
+			'candidates_read'             => 0,
+			'elementor_truncated'         => false,
+			'other'                       => array( 'users_checked' => 0, 'count' => 0, 'recently_used' => 0, 'unproven' => array() ),
+		);
+		$out['coverage']          = array( 'users_total' => 0, 'users_checked' => 0, 'truncated' => false, 'cap' => static::ELEMENTOR_CONTEXT_CAP );
+		return $out;
 	}
 
 	/**
