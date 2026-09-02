@@ -1808,6 +1808,8 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * dangerous shape there is — rather than some unrelated statement's.
 		 */
 		private $sa_last_row = null;
+		/** @var array what get_results() answered last — the stale answer a filtered-out statement meets */
+		private $sa_last_results = array();
 
 		/** Used only by get_status()'s health report — a fixed stand-in, not modelled state. */
 		public function db_version(): string {
@@ -1820,6 +1822,19 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * that only run one query.
 		 */
 		public function get_results( $query, $output = OBJECT ) {
+			// Same two early returns as get_var()/get_row(): wpdb::query()
+			// returns before flush() when the `query` filter blanks the SQL,
+			// and get_results() answers the previous statement's last_result
+			// with last_error untouched (Codex round-10 P2 on #84).
+			if ( ! $this->ready || ! empty( $GLOBALS['_sa_wpdb_query_filtered_out'] ) ) {
+				return $this->sa_last_results; // another statement's answer
+			}
+			$this->sa_last_results = $this->sa_get_results_ran( $query, $output );
+			return $this->sa_last_results;
+		}
+
+		/** get_results()'s body for the case where the statement really is issued. */
+		private function sa_get_results_ran( $query, $output = OBJECT ) {
 			$this->last_query = (string) $query;
 			// The one shape the value-parsed sweep issues: names AND values for
 			// a prefix, read against the "database" ($_rows, else $_options).
@@ -1880,8 +1895,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// The Elementor-door candidate scan (2.15.0): distinct owners whose
 			// serialised list contains the prefix, ordered, bounded. Modelled
 			// over $GLOBALS['_app_passwords'] the way MySQL runs the LIKE.
-			if ( preg_match( "/^SELECT DISTINCT user_id FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%' AND user_id > 0 ORDER BY user_id ASC LIMIT (\d+)$/", (string) $query, $m ) ) {
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, 0 AS user_id UNION ALL SELECT '([^']*)' AS probe, c\.user_id FROM \(SELECT DISTINCT user_id FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%' AND user_id > 0 ORDER BY user_id ASC LIMIT (\d+)\) AS c$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				$probe = $m[1];
+				$m     = array( $m[0], $m[3], $m[4] ); // keep the body below reading needle/limit as before
 				if ( ! empty( $GLOBALS['_sa_app_password_scan_fail'] ) ) {
 					// Real MySQL/wpdb: get_results() answers its CLEARED
 					// $last_result — an empty array, not null — when the
@@ -1901,9 +1918,35 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					}
 				}
 				sort( $ids );
-				$rows = array();
+				$rows = array( (object) array( 'probe' => $probe, 'user_id' => 0 ) ); // the sentinel
 				foreach ( array_slice( $ids, 0, (int) $m[2] ) as $id ) {
-					$rows[] = (object) array( 'user_id' => $id );
+					$rows[] = (object) array( 'probe' => $probe, 'user_id' => $id );
+				}
+				return $rows;
+			}
+			// The Elementor-door consent scan (2.15.0), probe/sentinel shaped
+			// since Codex round-10 on #84: the queued/_db_rows result set a
+			// test placed is answered as MySQL would — every row stamped with
+			// THIS statement's nonce, behind the user-0 sentinel row — unless
+			// _sa_wpdb_results_error models a driver failure (cleared
+			// last_result, last_error set).
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, 0 AS user_id, NULL AS user_login, NULL AS len, NULL AS v, NULL AS umeta_id UNION ALL SELECT '([^']*)' AS probe, c\.user_id, c\.user_login, c\.len, c\.v, c\.umeta_id FROM \(SELECT .+ WHERE m\.meta_key = 'elementor_mcp_consent' .+\) AS c$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				if ( ! empty( $GLOBALS['_sa_wpdb_results_error'] ) ) {
+					$this->last_error = (string) $GLOBALS['_sa_wpdb_results_error'];
+					return array();
+				}
+				$placed = ! empty( $GLOBALS['_db_results_queue'] ) ? array_shift( $GLOBALS['_db_results_queue'] ) : $GLOBALS['_db_rows'];
+				$rows   = array( (object) array( 'probe' => $m[1], 'user_id' => 0, 'user_login' => null, 'len' => null, 'v' => null, 'umeta_id' => null ) );
+				$i      = 0;
+				foreach ( (array) $placed as $row ) {
+					++$i;
+					$row        = is_object( $row ) ? clone $row : (object) $row;
+					$row->probe = $m[2];
+					if ( ! isset( $row->umeta_id ) ) {
+						$row->umeta_id = $i; // placed order IS umeta_id order
+					}
+					$rows[] = $row;
 				}
 				return $rows;
 			}
@@ -2115,8 +2158,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * can never be the stale answer another test's probe meets.
 		 */
 		public function sa_forget_last_result(): void {
-			$this->sa_last_var = null;
-			$this->sa_last_row = null;
+			$this->sa_last_var     = null;
+			$this->sa_last_row     = null;
+			$this->sa_last_results = array();
 		}
 
 		/**

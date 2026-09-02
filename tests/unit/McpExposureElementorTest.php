@@ -620,13 +620,73 @@ final class McpExposureElementorTest extends TestCase {
 		// round-4 P2 (#85), where 51 raw rows could dedupe to <= 50 distinct
 		// users and read consent_truncated as false while a later user's row
 		// was never fetched.
+		// Codex round-10 P2: the statement is probe/sentinel shaped (the
+		// #434 usermeta_holders() pattern) so its result set proves it ran;
+		// the inner SELECT is the round-4 statement verbatim.
 		$this->assertSame(
-			"SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM wp_usermeta m LEFT JOIN wp_users u ON u.ID = m.user_id WHERE m.meta_key = %s AND m.user_id > 0 AND m.umeta_id IN (SELECT MIN(umeta_id) FROM wp_usermeta WHERE meta_key = %s GROUP BY user_id) ORDER BY m.umeta_id ASC LIMIT %d",
+			"SELECT %s AS probe, 0 AS user_id, NULL AS user_login, NULL AS len, NULL AS v, NULL AS umeta_id UNION ALL SELECT %s AS probe, c.user_id, c.user_login, c.len, c.v, c.umeta_id FROM (SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v, m.umeta_id FROM wp_usermeta m LEFT JOIN wp_users u ON u.ID = m.user_id WHERE m.meta_key = %s AND m.user_id > 0 AND m.umeta_id IN (SELECT MIN(umeta_id) FROM wp_usermeta WHERE meta_key = %s GROUP BY user_id) ORDER BY m.umeta_id ASC LIMIT %d) AS c",
 			$prepared[0]['query']
 		);
 		$this->assertStringContainsString( 'MIN(umeta_id)', $prepared[0]['query'] );
 		$this->assertStringContainsString( 'm.user_id > 0', $prepared[0]['query'] );
-		$this->assertSame( array( 262144, 'elementor_mcp_consent', 'elementor_mcp_consent', 51 ), $prepared[0]['args'] );
+		$args = $prepared[0]['args'];
+		$this->assertCount( 6, $args );
+		$this->assertIsString( $args[0] );
+		$this->assertNotSame( '', $args[0] );
+		$this->assertSame( $args[0], $args[1], 'sentinel and rows carry the SAME nonce' );
+		$this->assertSame( array( 262144, 'elementor_mcp_consent', 'elementor_mcp_consent', 51 ), array_slice( $args, 2 ) );
+	}
+
+	public function test_a_consent_statement_the_query_filter_blanked_is_an_error_not_a_stale_inventory(): void {
+		// Codex round-10 P2: a `query` filter returning '' makes wpdb::query()
+		// return before flush(), and get_results() then answers the PREVIOUS
+		// statement's rows with last_error untouched. Run once for real (a
+		// proven row set with nonce A), then blank the next statement: the
+		// stale set carries nonce A, not this call's, and must be { error }.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$GLOBALS['_db_rows'] = array( self::consent_row( 4, array( 'allowed' => true, 'timestamp' => 7 ), 'ben' ) );
+		$first = $real->execute( array() )['elementor'];
+		$this->assertSame( 4, $first['consent'][0]['user_id'] );
+
+		$GLOBALS['_sa_wpdb_query_filtered_out'] = true;
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame( array( 'error' => 'consent statement did not run: result set is not this statement\'s' ), $b['consent'] );
+		$this->assertArrayNotHasKey( 'consent_unproven', $b );
+	}
+
+	public function test_a_consent_statement_answered_with_nothing_at_all_is_an_error_not_an_empty_inventory(): void {
+		// The other stale shape: no previous statement, so the filtered-out
+		// call meets an EMPTY last_result — no sentinel, nothing proved.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$GLOBALS['_sa_wpdb_query_filtered_out'] = true;
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame( array( 'error' => 'consent statement did not run: no sentinel row' ), $b['consent'] );
 	}
 
 	public function test_a_failed_consent_statement_is_an_error_not_an_empty_inventory(): void {
@@ -815,8 +875,13 @@ final class McpExposureElementorTest extends TestCase {
 			return false !== strpos( $p['query'], 'SELECT DISTINCT user_id' );
 		} ) );
 		$this->assertCount( 1, $prepared );
-		$this->assertSame( 'SELECT DISTINCT user_id FROM wp_usermeta WHERE meta_key = %s AND meta_value LIKE %s AND user_id > 0 ORDER BY user_id ASC LIMIT %d', $prepared[0]['query'] );
-		$this->assertSame( array( '_application_passwords', '%Elementor MCP%', 51 ), $prepared[0]['args'] );
+		// Codex round-10 P2: probe/sentinel shaped, the inner SELECT verbatim.
+		$this->assertSame( 'SELECT %s AS probe, 0 AS user_id UNION ALL SELECT %s AS probe, c.user_id FROM (SELECT DISTINCT user_id FROM wp_usermeta WHERE meta_key = %s AND meta_value LIKE %s AND user_id > 0 ORDER BY user_id ASC LIMIT %d) AS c', $prepared[0]['query'] );
+		$args = $prepared[0]['args'];
+		$this->assertCount( 5, $args );
+		$this->assertNotSame( '', $args[0] );
+		$this->assertSame( $args[0], $args[1], 'sentinel and rows carry the SAME nonce' );
+		$this->assertSame( array( '_application_passwords', '%Elementor MCP%', 51 ), array_slice( $args, 2 ) );
 		// And each candidate was read through the BOUNDED helper.
 		$bounded = array_filter( $GLOBALS['_db_queries'], static function ( $q ) {
 			return false !== strpos( $q, 'IF(LENGTH(meta_value) <= 262144' );
@@ -849,6 +914,34 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( array( 'error' => 'candidate statement failed: scan failed' ), $p['elementor'] );
 		$this->assertArrayNotHasKey( 'candidates_read', $p );
 		$this->assertArrayNotHasKey( 'elementor_truncated', $p );
+	}
+
+	public function test_a_candidate_statement_the_query_filter_blanked_is_an_error_not_a_stale_inventory(): void {
+		// Codex round-10 P2, the candidate scan: same probe/sentinel proof
+		// as consent_rows(). A real run first (proven, nonce A), then a
+		// blanked statement meeting that stale set.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$GLOBALS['_app_passwords'][7] = array( array( 'uuid' => 'u-7', 'name' => 'Elementor MCP (cursor)', 'created' => 1, 'last_used' => null, 'last_ip' => null ) );
+		$first = $real->execute( array() )['elementor']['app_passwords'];
+		$this->assertSame( 1, $first['candidates_read'] );
+
+		$GLOBALS['_sa_wpdb_query_filtered_out'] = true;
+		$p = $real->execute( array() )['elementor']['app_passwords'];
+		$this->assertSame( array( 'error' => 'candidate statement did not run: result set is not this statement\'s' ), $p['elementor'] );
+		$this->assertArrayNotHasKey( 'candidates_read', $p );
 	}
 
 	public function test_a_read_only_tool_fires_no_unproven_action_even_when_oversized(): void {

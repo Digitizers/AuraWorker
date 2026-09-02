@@ -541,8 +541,21 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta, $wpdb->users ) ) {
 			throw new \RuntimeException( 'database unavailable' );
 		}
+		$nonce = static::statement_nonce();
+		// The probe/sentinel shape of aura_worker_usermeta_holders() (#434):
+		// every row carries this call's nonce and a user-0 sentinel row comes
+		// back even from an empty table, so the result set proves it came
+		// from THIS statement. wpdb::query() returns before flush() when the
+		// `query` filter blanks the SQL, and get_results() then answers the
+		// previous statement's last_result with last_error untouched — a
+		// bare last_error check read that stale (or empty) set as a clean
+		// inventory (Codex round-10 P2). The inner SELECT is unchanged: one
+		// valid-user row per user, ordered, bounded, before the sentinel is
+		// added.
 		$sql = $wpdb->prepare(
-			"SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM {$wpdb->usermeta} m LEFT JOIN {$wpdb->users} u ON u.ID = m.user_id WHERE m.meta_key = %s AND m.user_id > 0 AND m.umeta_id IN (SELECT MIN(umeta_id) FROM {$wpdb->usermeta} WHERE meta_key = %s GROUP BY user_id) ORDER BY m.umeta_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			"SELECT %s AS probe, 0 AS user_id, NULL AS user_login, NULL AS len, NULL AS v, NULL AS umeta_id UNION ALL SELECT %s AS probe, c.user_id, c.user_login, c.len, c.v, c.umeta_id FROM (SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v, m.umeta_id FROM {$wpdb->usermeta} m LEFT JOIN {$wpdb->users} u ON u.ID = m.user_id WHERE m.meta_key = %s AND m.user_id > 0 AND m.umeta_id IN (SELECT MIN(umeta_id) FROM {$wpdb->usermeta} WHERE meta_key = %s GROUP BY user_id) ORDER BY m.umeta_id ASC LIMIT %d) AS c", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$nonce,
+			$nonce,
 			static::MAX_APP_PASSWORD_BYTES,
 			static::ELEMENTOR_CONSENT_META,
 			static::ELEMENTOR_CONSENT_META,
@@ -557,7 +570,62 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		if ( static::results_failed( $wpdb, $rows ) ) {
 			throw new \RuntimeException( 'consent statement failed' . ( ! empty( $wpdb->last_error ) ? ': ' . esc_html( $wpdb->last_error ) : '' ) );
 		}
+		$rows = static::proven_rows( $rows, $nonce, 'consent' );
+		// UNION ALL promises no order; the inner SELECT's umeta_id order is
+		// what the truncation invariant and the first-row-per-user dedupe
+		// rely on, so it is restored here.
+		usort(
+			$rows,
+			static function ( $a, $b ) {
+				return ( isset( $a->umeta_id ) ? (int) $a->umeta_id : 0 ) - ( isset( $b->umeta_id ) ? (int) $b->umeta_id : 0 );
+			}
+		);
 		return $rows;
+	}
+
+	/**
+	 * A per-statement nonce, the same construction aura_worker_app_password_list()
+	 * uses: a process-local sequence keeps two nonces from ever colliding in one
+	 * request, the uuid keeps a stale last_result from another request from
+	 * matching.
+	 *
+	 * @return string
+	 */
+	private static function statement_nonce() {
+		static $seq = 0;
+		++$seq;
+		return $seq . '-' . wp_generate_uuid4();
+	}
+
+	/**
+	 * The rows a probe/sentinel statement returned, PROVEN to be this call's:
+	 * every row carries the nonce, and the user-0 sentinel row — the one row
+	 * the statement cannot fail to return — is among them. Anything else is a
+	 * result set that did not come from this statement, and is thrown, never
+	 * read as an inventory.
+	 *
+	 * @param array  $rows  From get_results().
+	 * @param string $nonce This call's nonce.
+	 * @param string $what  Statement name for the message.
+	 * @return array The rows minus the sentinel.
+	 */
+	private static function proven_rows( array $rows, $nonce, $what ) {
+		$sentinel = false;
+		$out      = array();
+		foreach ( $rows as $row ) {
+			if ( ! is_object( $row ) || ! isset( $row->probe ) || $nonce !== (string) $row->probe ) {
+				throw new \RuntimeException( esc_html( $what ) . ' statement did not run: result set is not this statement\'s' );
+			}
+			if ( isset( $row->user_id ) && 0 === (int) $row->user_id ) {
+				$sentinel = true; // WordPress never issues user id 0
+				continue;
+			}
+			$out[] = $row;
+		}
+		if ( ! $sentinel ) {
+			throw new \RuntimeException( esc_html( $what ) . ' statement did not run: no sentinel row' );
+		}
+		return $out;
 	}
 
 	/**
@@ -659,8 +727,13 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
 			throw new \RuntimeException( 'database unavailable' );
 		}
+		$nonce = static::statement_nonce();
+		// Probe/sentinel shape — see consent_rows() (Codex round-10 P2). The
+		// inner SELECT is the 2.15.0 candidate scan unchanged.
 		$sql = $wpdb->prepare(
-			"SELECT DISTINCT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s AND user_id > 0 ORDER BY user_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			"SELECT %s AS probe, 0 AS user_id UNION ALL SELECT %s AS probe, c.user_id FROM (SELECT DISTINCT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s AND user_id > 0 ORDER BY user_id ASC LIMIT %d) AS c", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$nonce,
+			$nonce,
 			'_application_passwords',
 			'%' . $wpdb->esc_like( static::ELEMENTOR_PASSWORD_PREFIX ) . '%',
 			static::ELEMENTOR_LIST_CAP + 1
@@ -675,11 +748,12 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			throw new \RuntimeException( 'candidate statement failed' . ( ! empty( $wpdb->last_error ) ? ': ' . esc_html( $wpdb->last_error ) : '' ) );
 		}
 		$ids = array();
-		foreach ( $rows as $row ) {
+		foreach ( static::proven_rows( $rows, $nonce, 'candidate' ) as $row ) {
 			if ( isset( $row->user_id ) && (int) $row->user_id > 0 ) {
 				$ids[] = (int) $row->user_id;
 			}
 		}
+		sort( $ids ); // UNION ALL promises no order; the cap logic reads ids ascending
 		return $ids;
 	}
 
