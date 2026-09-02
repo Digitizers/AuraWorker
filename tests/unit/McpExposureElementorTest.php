@@ -313,6 +313,42 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( true, $b['installed'] ); // the module subtree survived
 	}
 
+	public function test_a_serialised_object_in_a_consent_row_is_never_instantiated(): void {
+		// A crafted meta_value must never become a live object: allowed_classes
+		// must be false, or a gadget's __wakeup()/__destruct() could run.
+		$obj_row = (object) array(
+			'user_id'    => 9,
+			'user_login' => 'attacker',
+			'len'        => 60,
+			'v'          => 'O:8:"stdClass":2:{s:7:"allowed";b:1;s:9:"timestamp";i:5;}',
+		);
+		$this->tool->consent_rows = array(
+			$obj_row,
+			self::consent_row( 3, array( 'allowed' => true, 'timestamp' => 5 ), 'ben' ),
+		);
+		$b = $this->block();
+		$this->assertSame( array( 9 ), $b['consent_unproven'] );
+		$this->assertCount( 1, $b['consent'] );
+		$this->assertSame( 3, $b['consent'][0]['user_id'] );
+		$this->assertTrue( $b['consent'][0]['allowed'] );
+	}
+
+	public function test_invalid_user_ids_are_filtered_before_the_cap(): void {
+		// A user_id <= 0 row must not consume one of the 50 slots — the
+		// truncation invariant (consent + consent_unproven == 50) must hold
+		// by construction, not merely when every row happens to be valid.
+		$rows = array();
+		for ( $i = 1; $i <= 52; $i++ ) {
+			$rows[] = 3 === $i
+				? (object) array( 'user_id' => 0, 'user_login' => 'nobody', 'len' => 10, 'v' => serialize( array( 'allowed' => true, 'timestamp' => $i ) ) ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+				: self::consent_row( $i, array( 'allowed' => true, 'timestamp' => $i ) );
+		}
+		$this->tool->consent_rows = $rows;
+		$b = $this->block();
+		$this->assertTrue( $b['consent_truncated'] );
+		$this->assertSame( 50, count( $b['consent'] ) + count( $b['consent_unproven'] ) );
+	}
+
 	public function test_the_consent_statement_is_bounded_in_rows_and_bytes(): void {
 		// The REAL seam against the bootstrap's $wpdb: pins the SQL shape.
 		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {

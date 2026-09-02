@@ -422,21 +422,43 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 * @return array { consent, consent_unproven, consent_truncated }
 	 */
 	protected function elementor_consent() {
-		$rows      = $this->consent_rows();
+		$rows = $this->consent_rows();
+		// Filter out non-user rows BEFORE the cap: the parser invariant
+		// (consent_truncated ⇒ count(consent) + count(consent_unproven) == 50)
+		// must hold by construction, and a row this scan will never attribute
+		// to anyone must not consume one of the 50 slots.
+		$rows = array_values(
+			array_filter(
+				$rows,
+				static function ( $row ) {
+					return isset( $row->user_id ) && (int) $row->user_id > 0;
+				}
+			)
+		);
 		$truncated = count( $rows ) > static::ELEMENTOR_LIST_CAP;
 		$rows      = array_slice( $rows, 0, static::ELEMENTOR_LIST_CAP );
 		$consent   = array();
 		$unproven  = array();
 		foreach ( $rows as $row ) {
-			$uid = isset( $row->user_id ) ? (int) $row->user_id : 0;
-			if ( $uid <= 0 ) {
-				continue; // not a user row; nothing to attribute it to
-			}
+			$uid = (int) $row->user_id;
 			if ( ! isset( $row->v ) || ! is_string( $row->v ) ) {
 				$unproven[] = $uid; // over the byte bound: never decoded
 				continue;
 			}
-			$data = maybe_unserialize( $row->v );
+			// is_serialized() first, the same gate maybe_unserialize() applies,
+			// so a plain non-serialized string (not the documented shape) is
+			// unproven without ever handing unserialize() bytes it will warn
+			// on. allowed_classes => false on the actual decode: this
+			// meta_value comes from a usermeta scan with no capability
+			// filter, so it must be treated as untrusted — a plain
+			// unserialize()/maybe_unserialize() would let a crafted payload
+			// instantiate arbitrary classes and fire __wakeup()/__destruct()
+			// gadgets. Forcing classes off turns any serialized object into
+			// __PHP_Incomplete_Class instead, which is not an array and lands
+			// the row in consent_unproven below — never decoded as consent.
+			$data = is_serialized( $row->v, true )
+				? unserialize( (string) $row->v, array( 'allowed_classes' => false ) )
+				: false;
 			if ( ! is_array( $data ) || ! array_key_exists( 'allowed', $data ) ) {
 				$unproven[] = $uid; // a row that is not the documented shape
 				continue;
