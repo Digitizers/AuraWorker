@@ -469,9 +469,16 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	}
 
 	/**
-	 * Every `elementor_mcp_consent` row, across ALL users, bounded in rows
-	 * (cap + 1, the extra only sets the flag) and in bytes (the value comes
-	 * back NULL past the bound, in the same statement). A seam.
+	 * Every `elementor_mcp_consent` row, ONE PER USER, valid ids only, across
+	 * ALL users, bounded in rows (cap + 1, the extra only sets the flag) and
+	 * in bytes (the value comes back NULL past the bound, in the same
+	 * statement). The dedupe (MIN(umeta_id), "first row per user wins") and
+	 * the `user_id > 0` filter run in SQL, BEFORE the LIMIT — so 51 raw rows
+	 * always means 51 distinct valid users, and `consent_truncated` cannot
+	 * read false while a later user's row was never fetched (Codex round-4
+	 * P2, #85: the old statement capped raw rows before dedupe/filtering, so
+	 * a duplicate or invalid row inside the window silently hid a real user
+	 * past it). A seam.
 	 *
 	 * @return object[] { user_id, user_login, len, v }
 	 */
@@ -481,8 +488,9 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			throw new \RuntimeException( 'database unavailable' );
 		}
 		$sql = $wpdb->prepare(
-			"SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM {$wpdb->usermeta} m LEFT JOIN {$wpdb->users} u ON u.ID = m.user_id WHERE m.meta_key = %s ORDER BY m.umeta_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			"SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM {$wpdb->usermeta} m LEFT JOIN {$wpdb->users} u ON u.ID = m.user_id WHERE m.meta_key = %s AND m.user_id > 0 AND m.umeta_id IN (SELECT MIN(umeta_id) FROM {$wpdb->usermeta} WHERE meta_key = %s GROUP BY user_id) ORDER BY m.umeta_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			static::MAX_APP_PASSWORD_BYTES,
+			static::ELEMENTOR_CONSENT_META,
 			static::ELEMENTOR_CONSENT_META,
 			static::ELEMENTOR_LIST_CAP + 1
 		);
@@ -505,6 +513,13 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 */
 	protected function elementor_consent() {
 		$rows = $this->consent_rows();
+		// The SQL itself now guarantees one valid-user row per user, in order,
+		// before the LIMIT (see consent_rows()) — that is the PRIMARY
+		// guarantee behind the truncation invariant. The filter and dedupe
+		// below are belt-and-braces: no-ops against a healthy database, kept
+		// so a row reaching here from any other seam (a test fake, a future
+		// caller) still cannot break the invariant.
+		//
 		// Filter out non-user rows BEFORE the cap: the parser invariant
 		// (consent_truncated ⇒ count(consent) + count(consent_unproven) == 50)
 		// must hold by construction, and a row this scan will never attribute

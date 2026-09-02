@@ -562,11 +562,19 @@ final class McpExposureElementorTest extends TestCase {
 			return false !== strpos( $p['query'], 'elementor_mcp_consent' ) || in_array( 'elementor_mcp_consent', $p['args'], true );
 		} ) );
 		$this->assertCount( 1, $prepared );
+		// Exact-string pin: proves the statement returns one row per user
+		// (MIN(umeta_id), the dedupe subquery) and excludes invalid ids
+		// (m.user_id > 0) BEFORE the LIMIT is applied — the fix for Codex
+		// round-4 P2 (#85), where 51 raw rows could dedupe to <= 50 distinct
+		// users and read consent_truncated as false while a later user's row
+		// was never fetched.
 		$this->assertSame(
-			'SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM wp_usermeta m LEFT JOIN wp_users u ON u.ID = m.user_id WHERE m.meta_key = %s ORDER BY m.umeta_id ASC LIMIT %d',
+			"SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM wp_usermeta m LEFT JOIN wp_users u ON u.ID = m.user_id WHERE m.meta_key = %s AND m.user_id > 0 AND m.umeta_id IN (SELECT MIN(umeta_id) FROM wp_usermeta WHERE meta_key = %s GROUP BY user_id) ORDER BY m.umeta_id ASC LIMIT %d",
 			$prepared[0]['query']
 		);
-		$this->assertSame( array( 262144, 'elementor_mcp_consent', 51 ), $prepared[0]['args'] );
+		$this->assertStringContainsString( 'MIN(umeta_id)', $prepared[0]['query'] );
+		$this->assertStringContainsString( 'm.user_id > 0', $prepared[0]['query'] );
+		$this->assertSame( array( 262144, 'elementor_mcp_consent', 'elementor_mcp_consent', 51 ), $prepared[0]['args'] );
 	}
 
 	public function test_a_failed_consent_statement_is_an_error_not_an_empty_inventory(): void {
