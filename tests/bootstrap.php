@@ -1753,6 +1753,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public string $prefix     = 'wp_';
 		public string $options    = 'wp_options';
 		public string $usermeta   = 'wp_usermeta';
+		public string $users      = 'wp_users';
 		// Core's wpdb sets a property per core table; the tools that read the
 		// media library name these two.
 		public string $posts      = 'wp_posts';

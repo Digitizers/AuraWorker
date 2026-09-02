@@ -350,6 +350,112 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	}
 
 	/**
+	 * Storage → bool for a consent's `allowed`: Elementor writes a bool; a
+	 * legacy or hand-edited row may hold 1 / '1'. Nothing else is consent.
+	 *
+	 * @param mixed $v Stored value.
+	 * @return bool
+	 */
+	public static function as_bool( $v ) {
+		return true === $v || 1 === $v || '1' === $v;
+	}
+
+	/**
+	 * A user's login for the block. A seam — used where a row carries no
+	 * login of its own (no JOIN available) and one must be looked up.
+	 *
+	 * @param int $uid User id.
+	 * @return string|null
+	 */
+	protected function user_login( $uid ) {
+		$u = get_userdata( (int) $uid );
+		return is_object( $u ) && isset( $u->user_login ) && '' !== (string) $u->user_login ? (string) $u->user_login : null;
+	}
+
+	/**
+	 * Login for a row already carrying one (the consent query's JOIN) —
+	 * clipped, with the id as the fallback name when the JOIN found no user.
+	 * Deliberately does NOT fall through to user_login(): the consent scan's
+	 * one bounded query is the point, and a per-row lookup for every departed
+	 * user would turn it into up to 50 more.
+	 *
+	 * @param int         $uid   User id.
+	 * @param string|null $login A login already read from the row.
+	 * @return string
+	 */
+	protected function login_for( $uid, $login = null ) {
+		return is_string( $login ) && '' !== $login ? $this->clip( $login ) : 'user:' . (int) $uid;
+	}
+
+	/**
+	 * Every `elementor_mcp_consent` row, across ALL users, bounded in rows
+	 * (cap + 1, the extra only sets the flag) and in bytes (the value comes
+	 * back NULL past the bound, in the same statement). A seam.
+	 *
+	 * @return object[] { user_id, user_login, len, v }
+	 */
+	protected function consent_rows() {
+		global $wpdb;
+		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta, $wpdb->users ) ) {
+			throw new \RuntimeException( 'database unavailable' );
+		}
+		$sql = $wpdb->prepare(
+			"SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM {$wpdb->usermeta} m LEFT JOIN {$wpdb->users} u ON u.ID = m.user_id WHERE m.meta_key = %s ORDER BY m.umeta_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			static::MAX_APP_PASSWORD_BYTES,
+			static::ELEMENTOR_CONSENT_META,
+			static::ELEMENTOR_LIST_CAP + 1
+		);
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			throw new \RuntimeException( 'consent statement could not be prepared' );
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_results( $sql );
+		if ( ! is_array( $rows ) ) {
+			throw new \RuntimeException( 'consent statement failed' . ( ! empty( $wpdb->last_error ) ? ': ' . esc_html( $wpdb->last_error ) : '' ) );
+		}
+		return $rows;
+	}
+
+	/**
+	 * The consent subtree.
+	 *
+	 * @return array { consent, consent_unproven, consent_truncated }
+	 */
+	protected function elementor_consent() {
+		$rows      = $this->consent_rows();
+		$truncated = count( $rows ) > static::ELEMENTOR_LIST_CAP;
+		$rows      = array_slice( $rows, 0, static::ELEMENTOR_LIST_CAP );
+		$consent   = array();
+		$unproven  = array();
+		foreach ( $rows as $row ) {
+			$uid = isset( $row->user_id ) ? (int) $row->user_id : 0;
+			if ( $uid <= 0 ) {
+				continue; // not a user row; nothing to attribute it to
+			}
+			if ( ! isset( $row->v ) || ! is_string( $row->v ) ) {
+				$unproven[] = $uid; // over the byte bound: never decoded
+				continue;
+			}
+			$data = maybe_unserialize( $row->v );
+			if ( ! is_array( $data ) || ! array_key_exists( 'allowed', $data ) ) {
+				$unproven[] = $uid; // a row that is not the documented shape
+				continue;
+			}
+			$consent[] = array(
+				'user_id'   => $uid,
+				'login'     => $this->login_for( $uid, isset( $row->user_login ) ? $row->user_login : null ),
+				'allowed'   => static::as_bool( $data['allowed'] ),
+				'timestamp' => isset( $data['timestamp'] ) && is_numeric( $data['timestamp'] ) ? (int) $data['timestamp'] : null,
+			);
+		}
+		return array(
+			'consent'           => $consent,
+			'consent_unproven'  => $unproven,
+			'consent_truncated' => $truncated,
+		);
+	}
+
+	/**
 	 * The `elementor` block: four scans, each failing on its own.
 	 *
 	 * @return array
@@ -373,10 +479,12 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			$out['mcp_module'] = $this->subtree_error( $e );
 		}
 
-		// Tasks 3–5 add consent, Elementor passwords, context here.
-		$out['consent']           = array();
-		$out['consent_unproven']  = array();
-		$out['consent_truncated'] = false;
+		// Tasks 4–5 add Elementor passwords, context here.
+		try {
+			$out += $this->elementor_consent();
+		} catch ( \Throwable $e ) {
+			$out['consent'] = $this->subtree_error( $e );
+		}
 		$out['app_passwords']     = array(
 			'elementor'                   => array(),
 			'elementor_entries_truncated' => false,

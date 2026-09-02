@@ -198,4 +198,148 @@ final class McpExposureElementorTest extends TestCase {
 		);
 		$this->assertSame( array( 'class_present' => true, 'active' => false, 'abilities_registered' => 2, 'server_id' => null ), $m );
 	}
+
+	// --- Task 3: consent ----------------------------------------------------
+
+	private static function consent_row( int $uid, $data, ?string $login = null ): object {
+		$raw = is_string( $data ) ? $data : serialize( $data ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+		return (object) array( 'user_id' => $uid, 'user_login' => $login ?? 'user' . $uid, 'len' => strlen( $raw ), 'v' => $raw );
+	}
+
+	public function test_a_consent_row_is_reported_with_its_owner_and_time(): void {
+		$this->tool->consent_rows = array( self::consent_row( 3, array( 'allowed' => true, 'timestamp' => 1788000000 ), 'ben' ) );
+		$b = $this->block();
+		$this->assertSame( array( array( 'user_id' => 3, 'login' => 'ben', 'allowed' => true, 'timestamp' => 1788000000 ) ), $b['consent'] );
+		$this->assertSame( array(), $b['consent_unproven'] );
+		$this->assertFalse( $b['consent_truncated'] );
+	}
+
+	public function test_consent_is_read_for_every_user_not_only_edit_posts(): void {
+		// The seam is a usermeta query with no capability filter; a demoted
+		// user's consent row still comes back. Modelled: no context pages at all.
+		$this->tool->context_pages = array();
+		$this->tool->consent_rows  = array( self::consent_row( 42, array( 'allowed' => true, 'timestamp' => 1 ) ) );
+		$this->assertSame( 42, $this->block()['consent'][0]['user_id'] );
+	}
+
+	public function test_allowed_false_is_reported_as_false(): void {
+		$this->tool->consent_rows = array( self::consent_row( 3, array( 'allowed' => false, 'timestamp' => 5 ) ) );
+		$this->assertFalse( $this->block()['consent'][0]['allowed'] );
+	}
+
+	public function test_allowed_is_a_strict_bool_from_storage(): void {
+		// Elementor stores a bool; a legacy or edited row may hold 1 / '1'.
+		// Anything else — 'yes', 'true', 2 — is NOT consent.
+		$rows = array();
+		foreach ( array( true, 1, '1', 'yes', 'true', 2, null ) as $i => $v ) {
+			$rows[] = self::consent_row( $i + 1, array( 'allowed' => $v, 'timestamp' => 5 ) );
+		}
+		$this->tool->consent_rows = $rows;
+		$got = array_map( static function ( $r ) { return $r['allowed']; }, $this->block()['consent'] );
+		$this->assertSame( array( true, true, true, false, false, false, false ), $got );
+	}
+
+	public function test_a_missing_or_non_numeric_timestamp_is_null(): void {
+		$this->tool->consent_rows = array(
+			self::consent_row( 1, array( 'allowed' => true ) ),
+			self::consent_row( 2, array( 'allowed' => true, 'timestamp' => 'soon' ) ),
+			self::consent_row( 3, array( 'allowed' => true, 'timestamp' => '1788000000' ) ),
+		);
+		$got = array_map( static function ( $r ) { return $r['timestamp']; }, $this->block()['consent'] );
+		$this->assertSame( array( null, null, 1788000000 ), $got );
+	}
+
+	public function test_an_oversized_consent_row_is_unproven_and_never_decoded(): void {
+		// The seam returns v NULL when LENGTH exceeded the bound in the
+		// statement; nothing here may try to read it.
+		$this->tool->consent_rows = array( (object) array( 'user_id' => 9, 'user_login' => 'big', 'len' => 999999, 'v' => null ) );
+		$b = $this->block();
+		$this->assertSame( array(), $b['consent'] );
+		$this->assertSame( array( 9 ), $b['consent_unproven'] );
+	}
+
+	public function test_a_row_that_is_not_the_documented_shape_is_unproven(): void {
+		$this->tool->consent_rows = array(
+			self::consent_row( 5, 'not-serialized-garbage' ),
+			self::consent_row( 6, array( 'no_allowed_key' => 1 ) ),
+		);
+		$b = $this->block();
+		$this->assertSame( array(), $b['consent'] );
+		$this->assertSame( array( 5, 6 ), $b['consent_unproven'] );
+	}
+
+	public function test_fifty_one_consent_rows_are_fifty_and_truncated(): void {
+		$rows = array();
+		for ( $i = 1; $i <= 51; $i++ ) {
+			$rows[] = self::consent_row( $i, array( 'allowed' => true, 'timestamp' => $i ) );
+		}
+		$this->tool->consent_rows = $rows;
+		$b = $this->block();
+		$this->assertCount( 50, $b['consent'] );
+		$this->assertSame( 50, $b['consent'][49]['user_id'] );
+		$this->assertTrue( $b['consent_truncated'] );
+	}
+
+	public function test_truncation_counts_unproven_rows_toward_the_fifty(): void {
+		// Parser invariant: consent_truncated ⇒ count(consent) + count(unproven) == 50.
+		$rows = array();
+		for ( $i = 1; $i <= 51; $i++ ) {
+			$rows[] = 25 === $i
+				? (object) array( 'user_id' => $i, 'user_login' => 'x', 'len' => 999999, 'v' => null )
+				: self::consent_row( $i, array( 'allowed' => true, 'timestamp' => $i ) );
+		}
+		$this->tool->consent_rows = $rows;
+		$b = $this->block();
+		$this->assertTrue( $b['consent_truncated'] );
+		$this->assertSame( 50, count( $b['consent'] ) + count( $b['consent_unproven'] ) );
+	}
+
+	public function test_a_login_is_clipped_and_a_missing_login_falls_back_to_the_id(): void {
+		$this->tool->consent_rows = array(
+			self::consent_row( 1, array( 'allowed' => true, 'timestamp' => 1 ), str_repeat( 'l', 300 ) ),
+			(object) array( 'user_id' => 2, 'user_login' => null, 'len' => 10, 'v' => serialize( array( 'allowed' => true, 'timestamp' => 1 ) ) ), // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+		);
+		$c = $this->block()['consent'];
+		$this->assertSame( 200, strlen( $c[0]['login'] ) );
+		$this->assertSame( 'user:2', $c[1]['login'] );
+	}
+
+	public function test_a_throw_in_the_consent_scan_replaces_only_consent(): void {
+		$this->tool->throw_in = array( 'consent' );
+		$b = $this->block();
+		$this->assertSame( array( 'error' => 'consent exploded' ), $b['consent'] );
+		$this->assertArrayNotHasKey( 'consent_truncated', $b );
+		$this->assertArrayNotHasKey( 'consent_unproven', $b );
+		$this->assertSame( true, $b['installed'] ); // the module subtree survived
+	}
+
+	public function test_the_consent_statement_is_bounded_in_rows_and_bytes(): void {
+		// The REAL seam against the bootstrap's $wpdb: pins the SQL shape.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$GLOBALS['_db_rows'] = array( self::consent_row( 4, array( 'allowed' => true, 'timestamp' => 7 ), 'ben' ) );
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame( 4, $b['consent'][0]['user_id'] );
+		$prepared = array_values( array_filter( $GLOBALS['_db_prepared'], static function ( $p ) {
+			return false !== strpos( $p['query'], 'elementor_mcp_consent' ) || in_array( 'elementor_mcp_consent', $p['args'], true );
+		} ) );
+		$this->assertCount( 1, $prepared );
+		$this->assertSame(
+			'SELECT m.user_id, u.user_login, LENGTH(m.meta_value) AS len, IF(LENGTH(m.meta_value) <= %d, m.meta_value, NULL) AS v FROM wp_usermeta m LEFT JOIN wp_users u ON u.ID = m.user_id WHERE m.meta_key = %s ORDER BY m.umeta_id ASC LIMIT %d',
+			$prepared[0]['query']
+		);
+		$this->assertSame( array( 262144, 'elementor_mcp_consent', 51 ), $prepared[0]['args'] );
+	}
 }
