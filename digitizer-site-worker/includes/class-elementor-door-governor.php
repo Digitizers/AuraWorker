@@ -238,23 +238,324 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * What `/status` says about the door (Task 9 fills the rest of it).
+	 * What `/status` says about the door (spec §3.10) — and what Aura drains.
 	 *
 	 * ABSENT on a site with no door: Aura keys on the fragment's presence to
 	 * decide whether this site is governed at all, so a site without
 	 * Elementor must not report a door — open or closed.
 	 *
-	 * @return array|null { epoch, seam, door }
+	 * `$after` is Aura's cursor and `$epoch` the epoch that cursor belongs to.
+	 * A cursor from ANOTHER epoch says nothing about this log, so it is
+	 * ignored outright and the log is served from 0 (Codex round-7 P1) —
+	 * which is also what an absent `door_epoch` gets.
+	 *
+	 * A cursor from THIS epoch that is above every row AND above the ack
+	 * floor is the one thing that cannot happen while the site's option store
+	 * is intact: a failed ack leaves the rows, a successful one raises the
+	 * floor. It means the options table was restored from a backup under the
+	 * same epoch, so the epoch is ROTATED (Codex round-6 P1 on #499) and the
+	 * NEW one answered — Aura's own epoch check then re-fetches from 0 and
+	 * re-ingests whatever the backup holds.
+	 *
+	 * @param int    $after Aura's cursor.
+	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
+	 * @return array|null { epoch, seam, door, held, interrupted, log, log_floor, log_unacked, log_full }
 	 */
-	public static function status_fragment() {
+	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::active() ) {
 			return null;
 		}
+		$after = (int) $after;
+		$site  = Aura_Worker_Door_Log::epoch();
+		if ( (string) $epoch !== $site ) {
+			$after = 0;
+		} elseif ( $after > max( Aura_Worker_Door_Log::highest_row_seq(), Aura_Worker_Door_Log::floor() ) ) {
+			$site  = Aura_Worker_Door_Log::rotate_epoch();
+			$after = 0;
+		}
+		$interrupted = array();
+		foreach ( Aura_Worker_Door_Holds::stale_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
+			// Whatever reconcile() could not settle a moment ago — a claim
+			// whose `interrupted` entry could not be written is reported here
+			// every poll until it can be.
+			$interrupted[] = array(
+				'ref'        => (string) $ref,
+				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
+			);
+		}
 		return array(
-			'epoch' => Aura_Worker_Door_Log::epoch(),
-			'seam'  => self::$seam,
-			'door'  => 'ok' === self::$seam ? 'open' : 'closed',
+			'epoch'       => $site,
+			'seam'        => self::$seam,
+			'door'        => 'ok' === self::$seam ? 'open' : 'closed',
+			'held'        => Aura_Worker_Door_Holds::listing(),
+			'interrupted' => $interrupted,
+			'log'         => Aura_Worker_Door_Log::log_after( $after ),
+			'log_floor'   => Aura_Worker_Door_Log::floor(),
+			'log_unacked' => Aura_Worker_Door_Log::count_unacked(),
+			'log_full'    => Aura_Worker_Door_Log::full_report(),
 		);
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* The reconciler                                                      */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Settle what a died request left behind, at the head of every `/status`
+	 * (spec §3.10). PHP requests die — a timeout, a fatal, a pool recycle —
+	 * and every one of them can leave the door mid-transaction: a pending log
+	 * row, a claimed hold nobody will release, the creation mutex, an
+	 * envelope nothing points at.
+	 *
+	 * The ORDER is the guarantee:
+	 *
+	 * 1. The hold sweep first (TTL, and a held row whose claimed twin exists).
+	 * 2. Stale CLAIMS, before stale rows — a claim's own `terminal_seq` is
+	 *    better evidence about its row than the row's age is, and settling
+	 *    the row first would leave the claim to be settled from an entry it
+	 *    no longer explains.
+	 * 3. Stale pending ROWS: the requests that never held anything.
+	 * 4. The creation mutex, by age alone.
+	 * 5. Retention: door envelopes older than 30 days (Ruling R6).
+	 *
+	 * A claim is released ONLY once its evidence is durable. Anything else
+	 * loses the one record that a replay may have mutated the site.
+	 *
+	 * @param int|null $now Unix time; defaults to now.
+	 * @return array{ interrupted: int, discarded: int, settled_claims: int, swept: int, pruned: int }
+	 */
+	public static function reconcile( $now = null ) {
+		$now = null === $now ? time() : (int) $now;
+		$out = array(
+			'interrupted'    => 0,
+			'discarded'      => 0,
+			'settled_claims' => 0,
+			'swept'          => 0,
+			'pruned'         => 0,
+		);
+
+		$out['swept'] = (int) Aura_Worker_Door_Holds::sweep( $now );
+
+		foreach ( Aura_Worker_Door_Holds::stale_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
+			self::settle_stale_claim( (string) $ref, (array) $claim, $out );
+		}
+
+		foreach ( Aura_Worker_Door_Log::stale_pending( self::CLAIM_STALE_MS ) as $row ) {
+			$seq = (int) ( isset( $row['seq'] ) ? $row['seq'] : 0 );
+			if ( $seq <= 0 ) {
+				continue;
+			}
+			if ( empty( $row['admitted'] ) ) {
+				// Never admitted: the request died between open_pending() and
+				// admit(), so nothing was ever run under this number. It keeps
+				// its seq — Aura's cursor is contiguous — and is served as
+				// `discarded`.
+				if ( Aura_Worker_Door_Log::discard( $seq ) ) {
+					$out['discarded']++;
+				}
+				continue;
+			}
+			if ( self::settle_interrupted( $row ) ) {
+				$out['interrupted']++;
+			}
+		}
+
+		self::clear_stale_creation_mutex( $now );
+
+		$out['pruned'] = (int) ( new Aura_Worker_Snapshots() )->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+
+		return $out;
+	}
+
+	/**
+	 * One stale claim, settled from its own evidence.
+	 *
+	 * `terminal_seq` is stamped AT ADMISSION, before the snapshot and before
+	 * the callback (Ruling P8), so what it names says exactly what happened:
+	 *
+	 * - a TERMINAL entry, or a seq at or below the ack floor (the entry was
+	 *   acked and its row deleted) ⇒ the run finished and only the release
+	 *   was lost. Release; write nothing.
+	 * - a PENDING entry ⇒ the run died mid-way. Settle that entry
+	 *   `interrupted` — finishing its creation if it had one — and release
+	 *   only if that settle landed.
+	 * - no `terminal_seq` at all ⇒ the request died before admission (or the
+	 *   stamp itself failed). Write one `interrupted` entry naming the ref,
+	 *   through the same admission every entry gets, and release only if it
+	 *   was durably recorded.
+	 *
+	 * @param string $ref   Hold ref.
+	 * @param array  $claim The claimed row.
+	 * @param array  $out   Counters, by reference.
+	 */
+	private static function settle_stale_claim( $ref, array $claim, array &$out ) {
+		$seq = (int) ( isset( $claim['terminal_seq'] ) ? $claim['terminal_seq'] : 0 );
+		if ( $seq > 0 ) {
+			if ( $seq <= Aura_Worker_Door_Log::floor() ) {
+				Aura_Worker_Door_Holds::release( $ref );
+				$out['settled_claims']++;
+				return;
+			}
+			$row = Aura_Worker_Door_Log::get( $seq );
+			if ( null !== $row && 'pending' !== ( isset( $row['result'] ) ? $row['result'] : 'pending' ) ) {
+				Aura_Worker_Door_Holds::release( $ref );
+				$out['settled_claims']++;
+				return;
+			}
+			if ( null !== $row ) {
+				if ( self::settle_interrupted( $row ) ) {
+					$out['interrupted']++;
+					Aura_Worker_Door_Holds::release( $ref );
+					$out['settled_claims']++;
+				}
+				return;
+			}
+			// A seq above the floor with no row cannot happen by construction
+			// (only an ack deletes a row, and it raises the floor first), so
+			// this claim's evidence is not readable. Fall through and write
+			// one, rather than release on the strength of a number nothing
+			// backs.
+		}
+		if ( self::record_terminal_only(
+			(string) ( isset( $claim['ability'] ) ? $claim['ability'] : '' ),
+			isset( $claim['actor'] ) && is_array( $claim['actor'] ) ? $claim['actor'] : array(),
+			isset( $claim['touches'] ) && is_array( $claim['touches'] ) ? $claim['touches'] : array(),
+			'interrupted',
+			array( 'ref' => $ref )
+		) ) {
+			$out['interrupted']++;
+			Aura_Worker_Door_Holds::release( $ref );
+			$out['settled_claims']++;
+		}
+		// Not written — a closed log, a failed insert. The claim STAYS: it is
+		// the only evidence a replay may have mutated the site, and
+		// status_fragment() reports it in `interrupted[]` every poll until the
+		// entry can be written (Codex round-7 P1).
+	}
+
+	/**
+	 * Settle one admitted, pending row `interrupted`.
+	 *
+	 * Whatever the dead request already patched onto the row — the snapshot
+	 * id, the collateral ids — is carried by settle()'s own merge; only a
+	 * CREATION needs finishing here, and it is finished from the ROW's own
+	 * fields (`post_watermark`, `expected_types`, the stored actor), never
+	 * from `self::$request`, which belongs to whatever request is running now.
+	 *
+	 * @param array $row The log row.
+	 * @return bool The row settled.
+	 */
+	private static function settle_interrupted( array $row ) {
+		$seq    = (int) ( isset( $row['seq'] ) ? $row['seq'] : 0 );
+		$fields = array( 'result' => 'interrupted' );
+		if ( isset( $row['post_watermark'] ) ) {
+			// A watermark is only ever stamped by a creation that got past the
+			// mutex, so its presence IS "this row was creating".
+			$fields = array_merge( $fields, self::finish_stale_creation( $seq, $row ) );
+		}
+		return Aura_Worker_Door_Log::settle( $seq, $fields );
+	}
+
+	/**
+	 * The creation half of an interrupted row: union the two witnesses (the
+	 * ids the insert hook recorded, and the watermark diff), store the
+	 * `creation` envelope, and compensate when it cannot be stored — the
+	 * posts exist either way, and one that cannot be made restorable is
+	 * undone instead.
+	 *
+	 * The result stays `interrupted`: what the compensation says is HOW the
+	 * site was left, not what happened to the call.
+	 *
+	 * @param int   $seq Log seq.
+	 * @param array $row The log row.
+	 * @return array Fields to settle with.
+	 */
+	private static function finish_stale_creation( $seq, array $row ) {
+		$types = array();
+		foreach ( (array) ( isset( $row['expected_types'] ) ? $row['expected_types'] : array() ) as $type ) {
+			if ( is_string( $type ) && '' !== $type ) {
+				$types[] = $type;
+			}
+		}
+		$actor    = isset( $row['actor'] ) && is_array( $row['actor'] ) ? $row['actor'] : array();
+		$actor_id = (int) ( isset( $actor['user_id'] ) ? $actor['user_id'] : 0 );
+		$diff     = empty( $types ) ? array() : self::watermark_diff( (int) $row['post_watermark'], $types, $actor_id );
+		$hooked   = array_map( 'intval', (array) ( isset( $row['created_post_ids'] ) ? $row['created_post_ids'] : array() ) );
+		$missed   = array_values( array_diff( $diff, $hooked ) );
+		$created  = array_values( array_unique( array_merge( $hooked, $missed ) ) );
+		$fields   = array( 'created_post_ids' => $created );
+		if ( ! empty( $missed ) ) {
+			$fields['observed_by_watermark'] = $missed;
+			$fields['hook_missed']           = count( $missed );
+			self::bump_counter( 'hook_missed' );
+		}
+		if ( empty( $created ) ) {
+			return $fields; // nothing was inserted: nothing to undo
+		}
+		$snaps = new Aura_Worker_Snapshots();
+		$env   = $snaps->snapshot_creation(
+			$created,
+			(string) ( isset( $types[0] ) ? $types[0] : '' ),
+			array(
+				'seq'         => $seq,
+				'ability'     => (string) ( isset( $row['ability'] ) ? $row['ability'] : '' ),
+				'interrupted' => true,
+			)
+		);
+		if ( ! empty( $env['success'] ) ) {
+			$fields['snapshot_id'] = (string) $env['snapshot']['id'];
+			return $fields;
+		}
+		return array_merge( $fields, array( 'reason' => 'snapshot_failed' ), self::compensate( $created ) );
+	}
+
+	/**
+	 * Undo what a creation left behind when its envelope could not be stored.
+	 *
+	 * VERIFIED per id — wp_trash_post() can return a truthy value on a hook
+	 * or database failure, so a post that stayed live is reported as
+	 * uncompensated, never as undone.
+	 *
+	 * @param int[] $created Post ids.
+	 * @return array{ compensated: int[], uncompensated: int[], compensated_by: string }
+	 */
+	private static function compensate( array $created ) {
+		$how  = ( defined( 'EMPTY_TRASH_DAYS' ) && 0 === (int) EMPTY_TRASH_DAYS ) ? 'delete' : 'trash';
+		$done = array();
+		$left = array();
+		foreach ( $created as $pid ) {
+			wp_trash_post( $pid );
+			$post = get_post( $pid );
+			if ( ! $post || 'trash' === $post->post_status ) {
+				$done[] = $pid;
+			} else {
+				$left[] = $pid;
+			}
+		}
+		return array(
+			'compensated'    => $done,
+			'uncompensated'  => $left,
+			'compensated_by' => $how,
+		);
+	}
+
+	/**
+	 * The creation mutex is one row per SITE, released by its owner alone —
+	 * so a request that died holding it would close creations for ever. It is
+	 * cleared by AGE, which is what `started_at` is for, and a stamp that
+	 * cannot be read is not evidence of freshness either.
+	 *
+	 * @param int $now Unix time.
+	 */
+	private static function clear_stale_creation_mutex( $now ) {
+		$mutex = get_option( self::CREATING, null );
+		if ( ! is_array( $mutex ) ) {
+			return;
+		}
+		$started = strtotime( (string) ( isset( $mutex['started_at'] ) ? $mutex['started_at'] : '' ) );
+		if ( false === $started || $started <= $now - (int) floor( self::CLAIM_STALE_MS / 1000 ) ) {
+			delete_option( self::CREATING );
+		}
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -939,8 +1240,11 @@ class Aura_Worker_Elementor_Door {
 	 * @param string $slug    Ability.
 	 * @param array  $actor   Actor.
 	 * @param array  $touches Touches.
-	 * @param string $result  held|refused.
+	 * @param string $result  held|refused|interrupted.
 	 * @param array  $extra   Extra fields.
+	 * @return bool The entry is DURABLY recorded. The reconciler keeps a stale
+	 *              claim when it is not; every other caller's refusal already
+	 *              stands whatever this answers.
 	 */
 	private static function record_terminal_only( $slug, array $actor, array $touches, $result, array $extra ) {
 		// The same admission as a write (Codex round-2 P2): a closed log takes
@@ -951,7 +1255,7 @@ class Aura_Worker_Elementor_Door {
 		if ( Aura_Worker_Door_Log::is_closed() ) {
 			Aura_Worker_Door_Log::bump_refused();
 			self::bump_counter( 'log_ungoverned' );
-			return;
+			return false;
 		}
 		$seq = Aura_Worker_Door_Log::open_pending(
 			array_merge(
@@ -965,16 +1269,18 @@ class Aura_Worker_Elementor_Door {
 		);
 		if ( is_wp_error( $seq ) ) {
 			self::bump_counter( 'log_ungoverned' );
-			return;
+			return false;
 		}
 		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
 			Aura_Worker_Door_Log::discard( $seq );
 			Aura_Worker_Door_Log::close();
 			self::bump_counter( 'log_ungoverned' );
-			return;
+			return false;
 		}
 		Aura_Worker_Door_Log::admit( $seq );
-		Aura_Worker_Door_Log::settle( $seq, array_merge( array( 'result' => $result ), $extra ) );
+		// settle() admits too, so the entry is served whether or not the
+		// admit above landed; its own answer is the whole of "durable".
+		return Aura_Worker_Door_Log::settle( $seq, array_merge( array( 'result' => $result ), $extra ) );
 	}
 	/* ------------------------------------------------------------------ */
 	/* Replay: Aura's approval of a held call                              */
@@ -1690,6 +1996,29 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * WITNESS 2, read: every post above the mark, of an expected type,
+	 * authored by the actor. Both filters are load-bearing — a post of
+	 * another type, or another author's, is not this call's.
+	 *
+	 * Shared by finish_creation() (which diffs against the mark on
+	 * `self::$request`) and the reconciler (which diffs against the mark on
+	 * the ROW, minutes or hours later, in a request that never made it).
+	 *
+	 * @param int      $mark     The watermark: the highest post id before the write.
+	 * @param string[] $types    Post types the creation may legitimately have inserted.
+	 * @param int      $actor_id The actor the creation ran as.
+	 * @return int[]
+	 */
+	private static function watermark_diff( $mark, array $types, $actor_id ) {
+		global $wpdb;
+		if ( empty( $types ) ) {
+			return array();
+		}
+		$in = implode( ',', array_fill( 0, count( $types ), '%s' ) );
+		return array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE ID > %d AND post_type IN ($in) AND post_author = %d", array_merge( array( (int) $mark ), $types, array( (int) $actor_id ) ) ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	}
+
+	/**
 	 * After the inner callback of a creating ability: union the two witnesses,
 	 * store the `creation` envelope, and — when it cannot be stored —
 	 * compensate, because the write already happened.
@@ -1700,10 +2029,8 @@ class Aura_Worker_Elementor_Door {
 	 * @return array|WP_Error terminal fields, or aura_snapshot_failed (compensated).
 	 */
 	private static function finish_creation( $seq, $result, $failed ) {
-		global $wpdb;
 		$types    = (array) self::$request['expected'];
 		$actor_id = (int) ( self::$request['actor_id'] ?? 0 );
-		$in       = implode( ',', array_fill( 0, count( $types ), '%s' ) );
 		// NO watermark means this request never reached the write — the mutex
 		// or the stamp itself failed, and execute()'s catch still finishes the
 		// creation. There is no mark to diff against, and treating that as
@@ -1713,8 +2040,7 @@ class Aura_Worker_Elementor_Door {
 		// diff; only its ABSENCE means "nothing to compare".
 		$diff   = array();
 		if ( isset( self::$request['watermark'] ) ) {
-			$mark = (int) self::$request['watermark'];
-			$diff = array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE ID > %d AND post_type IN ($in) AND post_author = %d", array_merge( array( $mark ), $types, array( $actor_id ) ) ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$diff = self::watermark_diff( (int) self::$request['watermark'], $types, $actor_id );
 		}
 		$hooked   = array_map( 'intval', (array) self::$request['created'] );
 		$missed   = array_values( array_diff( $diff, $hooked ) );
@@ -1751,32 +2077,17 @@ class Aura_Worker_Elementor_Door {
 			);
 			if ( empty( $env['success'] ) ) {
 				// Compensate: the write happened and cannot be made restorable.
-				// VERIFIED per id — wp_trash_post() can return false on a hook
-				// or database failure, and a post that stayed live is reported
-				// as uncompensated, never as undone.
-				$how  = ( defined( 'EMPTY_TRASH_DAYS' ) && 0 === (int) EMPTY_TRASH_DAYS ) ? 'delete' : 'trash';
-				$done = array();
-				$left = array();
-				foreach ( $created as $pid ) {
-					wp_trash_post( $pid );
-					$post = get_post( $pid );
-					if ( ! $post || 'trash' === $post->post_status ) {
-						$done[] = $pid;
-					} else {
-						$left[] = $pid;
-					}
-				}
+				$comp = self::compensate( $created );
+				$left = $comp['uncompensated'];
 				Aura_Worker_Door_Log::settle(
 					$seq,
 					array_merge(
 						$fields,
 						array(
-							'result'         => 'failed',
-							'reason'         => 'snapshot_failed',
-							'compensated'    => $done,
-							'uncompensated'  => $left,
-							'compensated_by' => $how,
-						)
+							'result' => 'failed',
+							'reason' => 'snapshot_failed',
+						),
+						$comp
 					)
 				);
 				$msg = empty( $left )

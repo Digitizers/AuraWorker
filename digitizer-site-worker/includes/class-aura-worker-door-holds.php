@@ -314,17 +314,22 @@ class Aura_Worker_Door_Holds {
 	 * Expire holds; remove a held row whose claimed twin exists (§3.7).
 	 *
 	 * @param int $now Unix time.
+	 * @return int How many held rows were removed — the reconciler reports it.
 	 */
 	public static function sweep( $now ) {
+		$gone = 0;
 		foreach ( self::rows( self::HELD ) as $ref => $row ) {
 			if ( null !== self::get_claimed( $ref ) ) {
 				delete_option( self::HELD . $ref ); // the replay's own delete, retried
+				$gone++;
 				continue;
 			}
 			if ( strtotime( (string) ( $row['expires_at'] ?? '' ) ) <= (int) $now ) {
 				delete_option( self::HELD . $ref );
+				$gone++;
 			}
 		}
+		return $gone;
 	}
 
 	/**

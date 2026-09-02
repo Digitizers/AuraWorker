@@ -452,6 +452,20 @@ class Aura_Worker_API {
 			$status['app_password_probe_unproven'] = (object) $probe;
 		}
 
+		// The Elementor door (2.16.0, spec §3.10). The reconciler runs FIRST,
+		// so what a died request left behind is settled in the very response
+		// that reports it: `/status` is the only clock this site has. An
+		// OBJECT on the wire, like `unbound` above, and ABSENT on a site with
+		// no door — Aura keys on its presence to decide whether this site is
+		// governed at all.
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) && Aura_Worker_Elementor_Door::active() ) {
+			Aura_Worker_Elementor_Door::reconcile();
+			$status['door'] = (object) Aura_Worker_Elementor_Door::status_fragment(
+				(int) $request->get_param( 'door_after' ),
+				(string) $request->get_param( 'door_epoch' ) // the epoch the cursor belongs to; '' ⇒ served from 0
+			);
+		}
+
 		return rest_ensure_response( $status );
 	}
 
