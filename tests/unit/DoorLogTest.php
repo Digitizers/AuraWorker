@@ -39,16 +39,30 @@ final class DoorLogTest extends TestCase {
 	}
 
 	public function test_a_collision_on_insert_retries_with_the_next_number(): void {
-		// Another writer took seq 1 between the read and the insert.
+		// Another writer took seq 1 before this call even started.
 		$GLOBALS['_options']['aura_worker_door_log_1'] = array( 'seq' => 1, 'result' => 'ok', 'admitted' => true );
+		// A second writer takes seq 2 in the window between this call's own
+		// existence check (there is none — insert_unique() is a real
+		// conditional INSERT, `INSERT ... WHERE NOT EXISTS`) and its
+		// statement actually running: the same seam
+		// ConnectProvisionTest::test_two_claims_for_one_magic_link_admit_exactly_one
+		// uses to race claim_magic_link(), which issues the identical SQL shape.
 		$GLOBALS['_sa_before_swap'] = static function () {
-			// Fires inside add_option(): simulate the concurrent writer landing seq 2 first, once.
 			if ( ! isset( $GLOBALS['_options']['aura_worker_door_log_2'] ) && empty( $GLOBALS['_collided'] ) ) {
-				$GLOBALS['_collided']                       = true;
-				$GLOBALS['_options']['aura_worker_door_log_2'] = array( 'seq' => 2, 'result' => 'ok', 'admitted' => true );
+				$GLOBALS['_collided']                           = true;
+				$racer                                          = array( 'seq' => 2, 'result' => 'ok', 'admitted' => true );
+				$GLOBALS['_options']['aura_worker_door_log_2']  = $racer;
+				$GLOBALS['_rows']['aura_worker_door_log_2']     = maybe_serialize( $racer );
 			}
 		};
 		$this->assertSame( 3, Aura_Worker_Door_Log::open_pending( $this->entry() ) );
+	}
+
+	public function test_insert_unique_is_a_real_mutex_true_once_then_false(): void {
+		$this->assertTrue( Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_test_row', array( 'v' => 1 ) ) );
+		$this->assertSame( array( 'v' => 1 ), get_option( 'aura_worker_door_test_row' ), 'the value landed and the cache was evicted' );
+		$this->assertFalse( Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_test_row', array( 'v' => 2 ) ), 'a second insert of the same name never overwrites' );
+		$this->assertSame( array( 'v' => 1 ), get_option( 'aura_worker_door_test_row' ), 'the first value survives the refused second insert' );
 	}
 
 	public function test_an_ack_never_deletes_the_floor_marker_or_counter_rows(): void {

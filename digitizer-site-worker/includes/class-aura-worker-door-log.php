@@ -34,6 +34,38 @@ class Aura_Worker_Door_Log {
 	const TERMINAL = array( 'ok', 'refused', 'failed', 'interrupted', 'discarded', 'held' );
 
 	/**
+	 * Creates an option row only when none exists — a real mutex, unlike
+	 * add_option(), whose INSERT … ON DUPLICATE KEY UPDATE lets a racer that
+	 * passed the cached existence check overwrite and still return true.
+	 * The shape is the one Aura_Worker_Magic_Link::claim_magic_link() uses
+	 * (class-aura-worker-magic-link.php), and every door-side "INSERT" goes
+	 * through this one primitive so seq allocation, the epoch and the
+	 * closure marker cannot lose a race to a silent overwrite.
+	 *
+	 * @param string $name  Option name.
+	 * @param mixed  $value Value; serialized like an option.
+	 * @return bool True only when exactly one row was inserted.
+	 */
+	public static function insert_unique( $name, $value ) {
+		global $wpdb;
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+				$name,
+				maybe_serialize( $value ),
+				'no',
+				$name
+			)
+		);
+		if ( 1 === (int) $rows && '' === (string) $wpdb->last_error ) {
+			wp_cache_delete( $name, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			return true;
+		}
+		return false;
+	}
+
+	/**
 	 * The site's log epoch — minted once, new only when the option store is
 	 * gone (a reinstall). A credential re-save or a reconnect never moves it.
 	 *
@@ -44,7 +76,7 @@ class Aura_Worker_Door_Log {
 		if ( is_string( $cur ) && '' !== $cur ) {
 			return $cur;
 		}
-		add_option( self::EPOCH, wp_generate_uuid4(), '', 'no' ); // a concurrent mint loses the INSERT and reads the winner's
+		self::insert_unique( self::EPOCH, wp_generate_uuid4() ); // a concurrent mint loses the INSERT and reads the winner's
 		$cur = get_option( self::EPOCH, '' );
 		return is_string( $cur ) ? $cur : '';
 	}
@@ -67,7 +99,7 @@ class Aura_Worker_Door_Log {
 					'admitted' => false,
 				)
 			);
-			if ( add_option( self::PREFIX . $seq, $row, '', 'no' ) ) {
+			if ( self::insert_unique( self::PREFIX . $seq, $row ) ) {
 				return $seq;
 			}
 			// Unique-name collision: a concurrent writer took this number.
@@ -245,7 +277,7 @@ class Aura_Worker_Door_Log {
 
 	/** One owner: the INSERT. */
 	public static function close() {
-		add_option( self::FULL_MARKER, gmdate( 'c' ), '', 'no' );
+		self::insert_unique( self::FULL_MARKER, gmdate( 'c' ) );
 	}
 
 	/** Atomic increment, no row per refusal. */
@@ -291,7 +323,7 @@ class Aura_Worker_Door_Log {
 		// stood BEFORE the raise bounds the cache invalidation below to the
 		// newly acked range — never 1..seq on a site with a long history
 		// (Codex round-5 P2).
-		add_option( self::FLOOR, 0, '', 'no' );
+		self::insert_unique( self::FLOOR, 0 );
 		$prev_floor_before_raise = self::floor();
 		$wpdb->query(
 			$wpdb->prepare(

@@ -654,16 +654,13 @@ if ( ! function_exists( 'add_option' ) ) {
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return false;
 		}
-		// core's check and its write are TWO statements — the window
-		// sa_before_swap() models. A caller relying on plain add_option() for
-		// a real mutex (the door log's seq allocation, #499) needs that window
-		// to be honest: a racer landing in it must be seen, so this re-checks
-		// existence right before the write rather than trusting the first
-		// (now stale) check. Inert when the seam is unset, exactly as before.
+		// …but core's check and its write are TWO statements, and the write is
+		// `INSERT … ON DUPLICATE KEY UPDATE` (option.php): a second caller that
+		// passed the same check in between also "succeeds", and its value
+		// overwrites the first one's. Anything that needs a real mutex must use
+		// a conditional INSERT instead — this seam is how a test shows the
+		// difference (inert when unset).
 		sa_before_swap();
-		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
-			return false; // a racer's row landed in the window just opened
-		}
 		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ]       = $value;
 		$GLOBALS['_rows'][ $option ]          = maybe_serialize( $value );
@@ -2422,27 +2419,32 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
 				list( , $name, $value, ) = array_map( 'stripslashes', $m );
 				// This exact SQL shape is also Aura_Worker_Magic_Link::claim_magic_link()'s
-				// statement (the site-wide claim, per-link claims) — and, since
-				// #434, accept() takes the site claim before it ever touches
-				// the ruleset row. A seam armed to fail/race/inspect "the
-				// ruleset's first insert" must not instead fire on an
-				// unrelated claim row that happens to be the FIRST matching
-				// statement of the request; every seam below is therefore
-				// scoped to the ruleset option specifically.
-				$is_ruleset_insert = ( Aura_Worker_Rules::OPTION === $name );
+				// statement (the site-wide claim, per-link claims) and — since
+				// 2.16.0 — Aura_Worker_Door_Log::insert_unique()'s (seq rows,
+				// the epoch, the closure marker, all sharing the
+				// 'aura_worker_door_' namespace). A seam armed to fail/race/
+				// inspect "the ruleset's first insert" must not instead fire
+				// on an unrelated claim or door-log row that happens to be
+				// the FIRST matching statement of the request; every seam
+				// below is therefore scoped by name.
+				$is_ruleset_insert  = ( Aura_Worker_Rules::OPTION === $name );
+				$is_door_log_insert = ( 0 === strpos( $name, 'aura_worker_door_' ) );
 				if ( $is_ruleset_insert && true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
-				if ( $is_ruleset_insert ) {
-					sa_before_swap();
+				if ( $is_ruleset_insert || $is_door_log_insert ) {
 					// A second request inserting between this caller's own
 					// existence check (there is none — that's the point of a
 					// real conditional INSERT) and this statement running.
-					if ( ! empty( $GLOBALS['_insert_racer'] ) ) {
-						$racer                    = $GLOBALS['_insert_racer'];
-						$GLOBALS['_insert_racer'] = null;
-						Aura_Worker_Rules::accept( $racer );
-					}
+					sa_before_swap();
+				}
+				// The ruleset's own nested-racer injection: door log callers
+				// have no equivalent (there is no Aura_Worker_Rules::accept()
+				// analogue to re-enter), so this stays ruleset-only.
+				if ( $is_ruleset_insert && ! empty( $GLOBALS['_insert_racer'] ) ) {
+					$racer                    = $GLOBALS['_insert_racer'];
+					$GLOBALS['_insert_racer'] = null;
+					Aura_Worker_Rules::accept( $racer );
 				}
 				// The row as the DATABASE holds it — $_rows, else an $_options
 				// value a test seeded directly (sa_read_option_uncached()).
