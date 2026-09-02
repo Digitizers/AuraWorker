@@ -672,6 +672,16 @@ class Aura_Worker_Snapshots {
 		if ( ! is_array( $captured ) || $this->contains_stripped_object( $captured ) ) {
 			return array( 'success' => false, 'error' => 'Snapshot payload corrupt.' );
 		}
+		// An EMPTY capture is not a record of an empty set — snapshot_posts()
+		// refuses an empty id list and writes one entry per id, so a payload
+		// that deserializes to nothing is truncated or partly written. Refusing
+		// is the only honest verdict: reporting success would answer 200 and
+		// settle the door entry `ok` having rolled nothing back, and for a
+		// set-typed capture it would additionally read as "every class and
+		// style on the site was added by the write".
+		if ( empty( $captured ) ) {
+			return array( 'success' => false, 'error' => 'Snapshot payload corrupt.' );
+		}
 		foreach ( $captured as $pid => $info ) {
 			$pid    = (int) $pid;
 			$exists = (bool) get_post( $pid );
@@ -727,12 +737,7 @@ class Aura_Worker_Snapshots {
 		// A SET-typed capture (design_system): a post of those types that was
 		// NOT in the capture was ADDED by the write — remove it, or the restored
 		// order meta points at rows that should not exist.
-		// An EMPTY capture is never evidence that everything is an addition —
-		// snapshot_posts() refuses an empty id list, so an envelope that reaches
-		// here with nothing captured is truncated, not a record of an empty set.
-		// Without this guard such a payload would wipe every class and style on
-		// the site.
-		if ( ! empty( $captured ) && ! empty( $record['cpts'] ) && is_array( $record['cpts'] ) ) {
+		if ( ! empty( $record['cpts'] ) && is_array( $record['cpts'] ) ) {
 			$keep = array_map( 'intval', array_keys( $captured ) );
 			$all  = get_posts(
 				array(

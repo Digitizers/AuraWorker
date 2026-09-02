@@ -706,7 +706,20 @@ class Aura_Worker_Elementor_Door {
 					)
 				);
 				self::$request = null;
-				return new WP_Error( 'aura_snapshot_failed', 'Aura could not snapshot this target before the write; it was not run. ' . (string) ( isset( $snap['error'] ) ? $snap['error'] : '' ), array( 'status' => 503 ) );
+				$why = (string) ( isset( $snap['error'] ) ? $snap['error'] : '' );
+				if ( ! empty( $snap['code'] ) ) {
+					// A DESIGNATED refusal (today: `aura_target_unattributed`, a
+					// component write naming a post that is not a component). The
+					// target can never become snapshottable, so this is not the
+					// 503 a caller should retry — it is a 403 under its own code,
+					// the same answer touches_for() gives an unattributable page.
+					return new WP_Error(
+						(string) $snap['code'],
+						'This write names no target Aura can snapshot; it was not run. ' . $why,
+						array( 'status' => 403 )
+					);
+				}
+				return new WP_Error( 'aura_snapshot_failed', 'Aura could not snapshot this target before the write; it was not run. ' . $why, array( 'status' => 503 ) );
 			}
 			$snapshot_id = (string) $snap['snapshot']['id'];
 			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'snapshot_id' => $snapshot_id ) ) ) { // the id lands on the row BEFORE the write, durably

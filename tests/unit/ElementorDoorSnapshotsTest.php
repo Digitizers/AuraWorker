@@ -15,15 +15,20 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 	/** @var Aura_Worker_API */
 	private $api;
 
+	/** @var array<string,int> how many times each inner callback ran */
+	private $ran = array();
+
 	protected function setUp(): void {
 		sa_reset_state();
 		$this->rrmdir( WP_CONTENT_DIR );
 		mkdir( WP_CONTENT_DIR, 0755, true );
 		Aura_Worker_Elementor_Door::reset_for_tests();
+		Aura_Worker_Elementor_Door::init();
 		$GLOBALS['_current_user_id'] = 3;
 		$GLOBALS['_user_logins'][3]  = 'bot';
 		$GLOBALS['_options']['aura_worker_site_token'] = Aura_Worker_Security::hash_token( 'tok' );
 		$this->api = new Aura_Worker_API( new Aura_Worker_Security() );
+		$this->ran = array();
 	}
 
 	protected function tearDown(): void {
@@ -84,6 +89,32 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 			$m->setAccessible( true );
 		}
 		return $m->invoke( null, $slug, $touches, $input );
+	}
+
+	/** Register one governed ability with a counting inner callback. */
+	private function registerAbility( string $slug ): void {
+		$ran         = &$this->ran;
+		sa_register_ability(
+			$slug,
+			array(
+				'execute_callback'    => static function ( $input ) use ( &$ran, $slug ) {
+					$ran[ $slug ] = ( $ran[ $slug ] ?? 0 ) + 1;
+					return array( 'ok' => true, 'input' => $input );
+				},
+				'permission_callback' => '__return_true',
+			)
+		);
+	}
+
+	/** The stored ruleset record, written straight to the option. */
+	private function installRuleset( array $rules ): void {
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = array(
+			'envelope'    => 'x.y',
+			'seq'         => 5,
+			'issued_at'   => '2026-09-02T00:00:00Z',
+			'received_at' => time(),
+			'rules'       => $rules,
+		);
 	}
 
 	private function request( array $params ): WP_REST_Request {
@@ -177,19 +208,35 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertNotNull( get_post( 301 ), 'a default style of a captured type is not collateral damage' );
 	}
 
-	public function test_a_truncated_set_capture_never_wipes_the_design_system(): void {
+	public function test_a_truncated_set_capture_refuses_and_never_wipes_the_design_system(): void {
 		$this->seedDesignSystem();
 		$snaps = new Aura_Worker_Snapshots();
 		$snap  = $this->snapshotFor( 'elementor/manage-classes', array( array( 'type' => 'design_system', 'id' => '*' ) ), array() );
 
 		// The payload is truncated to an empty (still well-formed) capture. An
-		// empty set must NOT read as "every class on the site was added".
+		// empty set is not a record of an empty design system: it must refuse,
+		// and it must NOT read as "every class on the site was added".
 		file_put_contents( $snap['snapshot']['payload_path'], serialize( array() ) );
 
-		$snaps->restore( $snap['snapshot']['id'] );
+		$out = $snaps->restore( $snap['snapshot']['id'] );
+		$this->assertFalse( $out['success'], 'an empty capture is a corrupt payload, not a done restore' );
+		$this->assertSame( 'Snapshot payload corrupt.', $out['error'] );
 		$this->assertNotNull( get_post( 201 ) );
 		$this->assertNotNull( get_post( 202 ) );
 		$this->assertNotNull( get_post( 301 ) );
+	}
+
+	public function test_a_truncated_set_capture_settles_the_door_entry_failed(): void {
+		$this->seedDesignSystem();
+		$snaps = new Aura_Worker_Snapshots();
+		$snap  = $this->snapshotFor( 'elementor/manage-classes', array( array( 'type' => 'design_system', 'id' => '*' ) ), array() );
+		file_put_contents( $snap['snapshot']['payload_path'], serialize( array() ) );
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $snap['snapshot']['id'] ) ) );
+		$this->assertSame( 500, $res->get_status(), 'never 200 for a restore that rolled nothing back' );
+		$this->assertFalse( $res->data['success'] );
+		$this->assertSame( 'failed', Aura_Worker_Door_Log::get( 1 )['result'] );
+		$this->assertNotNull( get_post( 202 ) );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -237,6 +284,40 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertFalse( $out['success'] );
 		$this->assertSame( 'aura_target_unattributed', $out['code'] );
 		$this->assertSame( 0, $this->envelopeCount(), 'nothing was written' );
+	}
+
+	/**
+	 * End to end: the designated code reaches the CALLER, as a 403. An
+	 * unattributable target can never become snapshottable, so answering the
+	 * generic retryable 503 `aura_snapshot_failed` would tell an agent to try
+	 * again forever.
+	 */
+	public function test_an_unattributable_component_target_answers_403_through_the_door(): void {
+		$this->seedPost( 55, 'page' );
+		$this->registerAbility( 'elementor/manage-component' );
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'design_system' ), 'reason' => 'ok' ) ) );
+
+		$out = wp_get_ability( 'elementor/manage-component' )->execute( array( 'id' => 55 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_target_unattributed', $out->get_error_code() );
+		$this->assertSame( 403, $out->get_error_data()['status'] );
+		$this->assertArrayNotHasKey( 'elementor/manage-component', $this->ran, 'the write never ran' );
+		$this->assertSame( 'refused', Aura_Worker_Door_Log::log_after( 0 )[0]['result'] );
+		$this->assertSame( 0, $this->envelopeCount(), 'nothing was written' );
+	}
+
+	public function test_a_capture_that_fails_for_any_other_reason_is_still_a_retryable_503(): void {
+		$this->seedPost( 7, 'page', 'draft' );
+		$this->registerAbility( 'elementor/manage-elements' );
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests( static function () { return array( 'success' => false, 'error' => 'disk full' ); } );
+
+		$out = wp_get_ability( 'elementor/manage-elements' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_snapshot_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertSame( 'refused', Aura_Worker_Door_Log::log_after( 0 )[0]['result'] );
 	}
 
 	public function test_a_component_write_on_a_component_post_captures_it(): void {
