@@ -518,4 +518,126 @@ final class McpExposureElementorTest extends TestCase {
 		} );
 		$this->assertCount( 2, $bounded );
 	}
+
+	// --- Task 5: context ------------------------------------------------------
+
+	public function test_context_counts_other_passwords_and_recent_use(): void {
+		$now = time();
+		$this->tool->context_pages = array( array( 1, 2, 3 ) );
+		$this->tool->context_total = 3;
+		$this->tool->lists         = array(
+			1 => array( self::pw( array( 'name' => 'Aura SiteAgent', 'last_used' => $now - 86400 ) ), self::pw( array( 'name' => 'Aura Fleet', 'last_used' => $now - 40 * 86400 ) ) ),
+			2 => array(),
+			3 => array( self::pw( array( 'name' => 'Zapier', 'last_used' => null ) ) ),
+		);
+		$b = $this->block();
+		$this->assertSame( array( 'users_checked' => 3, 'count' => 3, 'recently_used' => 1, 'unproven' => array() ), $b['app_passwords']['other'] );
+		$this->assertSame( array( 'users_total' => 3, 'users_checked' => 3, 'truncated' => false, 'cap' => 200 ), $b['coverage'] );
+	}
+
+	public function test_an_elementor_named_password_met_in_context_is_not_counted_twice(): void {
+		$this->tool->candidates    = array( 1 );
+		$this->tool->context_pages = array( array( 1 ) );
+		$this->tool->context_total = 1;
+		$this->tool->lists         = array( 1 => array( self::pw(), self::pw( array( 'name' => 'Aura SiteAgent' ) ) ) );
+		$b = $this->block();
+		$this->assertCount( 1, $b['app_passwords']['elementor'] );
+		$this->assertSame( 1, $b['app_passwords']['other']['count'] );
+	}
+
+	public function test_an_unreadable_context_list_is_unproven_never_zero(): void {
+		$this->tool->context_pages = array( array( 1, 2 ) );
+		$this->tool->context_total = 2;
+		$this->tool->lists         = array( 1 => null, 2 => array( self::pw( array( 'name' => 'X' ) ) ) );
+		$o = $this->block()['app_passwords']['other'];
+		$this->assertSame( array( 1 ), $o['unproven'] );
+		$this->assertSame( 1, $o['count'] );
+		$this->assertSame( 2, $o['users_checked'] );
+	}
+
+	public function test_context_pages_through_fifty_at_a_time(): void {
+		$this->tool->context_pages = array( range( 1, 50 ), range( 51, 100 ), range( 101, 120 ) );
+		$this->tool->context_total = 120;
+		$c = $this->block()['coverage'];
+		$this->assertSame( array( 'users_total' => 120, 'users_checked' => 120, 'truncated' => false, 'cap' => 200 ), $c );
+	}
+
+	public function test_more_than_the_cap_is_truncated_at_two_hundred(): void {
+		$this->tool->context_pages = array( range( 1, 50 ), range( 51, 100 ), range( 101, 150 ), range( 151, 200 ), range( 201, 250 ) );
+		$this->tool->context_total = 250;
+		$b = $this->block();
+		$this->assertSame( array( 'users_total' => 250, 'users_checked' => 200, 'truncated' => true, 'cap' => 200 ), $b['coverage'] );
+		$this->assertSame( 200, $b['app_passwords']['other']['users_checked'] );
+		$this->assertSame( 200, count( array_unique( $this->tool->reads ) ) );
+	}
+
+	public function test_a_total_that_lags_the_pages_is_reconciled_so_the_invariant_holds(): void {
+		// Parser invariant: truncated:false ⇒ users_checked == users_total, and
+		// users_checked <= users_total. A count query that raced a user
+		// creation must not produce a payload the parser refuses.
+		$this->tool->context_pages = array( array( 1, 2, 3, 4 ) );
+		$this->tool->context_total = 3;
+		$c = $this->block()['coverage'];
+		$this->assertSame( 4, $c['users_total'] );
+		$this->assertSame( 4, $c['users_checked'] );
+		$this->assertFalse( $c['truncated'] );
+	}
+
+	public function test_a_total_above_the_pages_is_reported_as_truncated(): void {
+		// The pages ran dry before the count said they should: incomplete, honestly.
+		$this->tool->context_pages = array( array( 1, 2 ) );
+		$this->tool->context_total = 5;
+		$c = $this->block()['coverage'];
+		$this->assertSame( array( 'users_total' => 5, 'users_checked' => 2, 'truncated' => true, 'cap' => 200 ), $c );
+	}
+
+	public function test_a_duplicate_id_across_pages_is_checked_once(): void {
+		// Pages must be FULL for the next one to be fetched (a short page ends
+		// the scan), so the duplicate sits at the seam of two 50-id pages.
+		$this->tool->context_pages = array( range( 1, 50 ), array( 50, 51 ) );
+		$this->tool->context_total = 51;
+		$this->assertSame( 51, $this->block()['coverage']['users_checked'] );
+	}
+
+	public function test_a_throw_in_the_context_scan_replaces_other_and_coverage_together(): void {
+		$this->tool->throw_in      = array( 'context' );
+		$this->tool->candidates    = array( 1 );
+		$this->tool->lists         = array( 1 => array( self::pw( array( 'last_used' => 5 ) ) ) );
+		$b = $this->block();
+		$this->assertSame( array( 'error' => 'context exploded' ), $b['app_passwords']['other'] );
+		$this->assertSame( array( 'error' => 'context exploded' ), $b['coverage'] );
+		$this->assertCount( 1, $b['app_passwords']['elementor'] ); // the used credential survived
+	}
+
+	public function test_a_throw_counting_users_is_a_context_error_too(): void {
+		$this->tool->throw_in = array( 'total' );
+		$this->assertSame( array( 'error' => 'total exploded' ), $this->block()['coverage'] );
+	}
+
+	public function test_the_context_query_asks_for_edit_posts_ids_in_order(): void {
+		// The REAL seams against the bootstrap's WP_User_Query stub, which
+		// records every query's vars.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function password_list( $uid ) {
+				return array();
+			}
+		};
+		$GLOBALS['_users']        = array( 3, 4 );
+		$GLOBALS['_users_total']  = 2;
+		$GLOBALS['_user_queries'] = array();
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame( array( 'users_total' => 2, 'users_checked' => 2, 'truncated' => false, 'cap' => 200 ), $b['coverage'] );
+		$vars = $GLOBALS['_user_queries'];
+		$this->assertSame( array( 'capability' => 'edit_posts', 'fields' => 'ID', 'number' => 1, 'count_total' => true ), $vars[0] );
+		$this->assertSame( array( 'capability' => 'edit_posts', 'fields' => 'ID', 'number' => 50, 'offset' => 0, 'orderby' => 'ID', 'order' => 'ASC', 'count_total' => false ), $vars[1] );
+	}
 }

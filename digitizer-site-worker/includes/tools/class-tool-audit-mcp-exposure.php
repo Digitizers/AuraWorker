@@ -590,6 +590,128 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	}
 
 	/**
+	 * One page of edit_posts user ids. A seam.
+	 *
+	 * @param int $offset Offset.
+	 * @param int $number Page size.
+	 * @return int[]
+	 */
+	protected function context_user_ids( $offset, $number ) {
+		$q = new \WP_User_Query(
+			array(
+				'capability'  => 'edit_posts',
+				'fields'      => 'ID',
+				'number'      => (int) $number,
+				'offset'      => (int) $offset,
+				'orderby'     => 'ID',
+				'order'       => 'ASC',
+				'count_total' => false,
+			)
+		);
+		$ids = array();
+		foreach ( (array) $q->get_results() as $id ) {
+			$ids[] = (int) ( is_object( $id ) && isset( $id->ID ) ? $id->ID : $id );
+		}
+		return $ids;
+	}
+
+	/**
+	 * How many edit_posts users the site has. A seam.
+	 *
+	 * @return int
+	 */
+	protected function context_users_total() {
+		$q = new \WP_User_Query(
+			array(
+				'capability'  => 'edit_posts',
+				'fields'      => 'ID',
+				'number'      => 1,
+				'count_total' => true,
+			)
+		);
+		return (int) $q->get_total();
+	}
+
+	/**
+	 * The context subtree: every OTHER Application Password of edit_posts
+	 * users, as counts. An Elementor-named one met here is already reported
+	 * in `elementor` and is not counted again.
+	 *
+	 * @return array { other: { users_checked, count, recently_used, unproven }, coverage: { users_total, users_checked, truncated, cap } }
+	 */
+	protected function elementor_context() {
+		$total     = $this->context_users_total();
+		$checked   = 0;
+		$count     = 0;
+		$recent    = 0;
+		$unproven  = array();
+		$truncated = false;
+		$seen      = array();
+		$offset    = 0;
+		$horizon   = time() - static::ELEMENTOR_RECENT_DAYS * 86400;
+		while ( $checked < static::ELEMENTOR_CONTEXT_CAP ) {
+			$ids = $this->context_user_ids( $offset, static::ELEMENTOR_CONTEXT_PAGE );
+			if ( empty( $ids ) ) {
+				break;
+			}
+			foreach ( $ids as $uid ) {
+				$uid = (int) $uid;
+				if ( $uid <= 0 || isset( $seen[ $uid ] ) ) {
+					continue;
+				}
+				if ( $checked >= static::ELEMENTOR_CONTEXT_CAP ) {
+					$truncated = true;
+					break 2;
+				}
+				$seen[ $uid ] = true;
+				++$checked;
+				$list = $this->password_list( $uid );
+				if ( null === $list ) {
+					$unproven[] = $uid;
+					continue;
+				}
+				foreach ( $list as $item ) {
+					if ( ! is_array( $item ) || static::is_elementor_named( $item ) ) {
+						continue;
+					}
+					++$count;
+					if ( isset( $item['last_used'] ) && is_numeric( $item['last_used'] ) && (int) $item['last_used'] >= $horizon ) {
+						++$recent;
+					}
+				}
+			}
+			if ( count( $ids ) < static::ELEMENTOR_CONTEXT_PAGE ) {
+				break;
+			}
+			$offset += static::ELEMENTOR_CONTEXT_PAGE;
+		}
+		// The parser refuses users_checked > users_total, and truncated:false
+		// with users_checked != users_total. A count that raced the pages is
+		// reconciled: more checked than counted → the pages are the truth;
+		// fewer checked than counted with the pages exhausted → incomplete.
+		if ( $checked > $total ) {
+			$total = $checked;
+		}
+		if ( $total > $checked ) {
+			$truncated = true;
+		}
+		return array(
+			'other'    => array(
+				'users_checked' => $checked,
+				'count'         => $count,
+				'recently_used' => $recent,
+				'unproven'      => $unproven,
+			),
+			'coverage' => array(
+				'users_total'   => $total,
+				'users_checked' => $checked,
+				'truncated'     => $truncated,
+				'cap'           => static::ELEMENTOR_CONTEXT_CAP,
+			),
+		);
+	}
+
+	/**
 	 * The `elementor` block: four scans, each failing on its own.
 	 *
 	 * @return array
@@ -613,7 +735,6 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			$out['mcp_module'] = $this->subtree_error( $e );
 		}
 
-		// Task 5 adds context here.
 		try {
 			$out += $this->elementor_consent();
 		} catch ( \Throwable $e ) {
@@ -624,10 +745,16 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		} catch ( \Throwable $e ) {
 			$passwords = array( 'elementor' => $this->subtree_error( $e ) );
 		}
-		// Task 5 adds 'other' and coverage here.
-		$passwords['other']   = array( 'users_checked' => 0, 'count' => 0, 'recently_used' => 0, 'unproven' => array() );
-		$out['app_passwords'] = $passwords;
-		$out['coverage']      = array( 'users_total' => 0, 'users_checked' => 0, 'truncated' => false, 'cap' => static::ELEMENTOR_CONTEXT_CAP );
+		try {
+			$ctx                  = $this->elementor_context();
+			$passwords['other']   = $ctx['other'];
+			$out['app_passwords'] = $passwords;
+			$out['coverage']      = $ctx['coverage'];
+		} catch ( \Throwable $e ) {
+			$passwords['other']   = $this->subtree_error( $e );
+			$out['app_passwords'] = $passwords;
+			$out['coverage']      = $this->subtree_error( $e );
+		}
 		return $out;
 	}
 
