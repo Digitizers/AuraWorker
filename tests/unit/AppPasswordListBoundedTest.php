@@ -60,4 +60,47 @@ final class AppPasswordListBoundedTest extends TestCase {
 		$this->assertNull( aura_worker_app_password_list( 7, 262144 ) );
 		$this->assertSame( array( array( 7, '' ) ), $GLOBALS['_sa_unproven_calls'] );
 	}
+
+	// --- $notify = false: a read-only caller must fire no action (finding 3) ---
+
+	public function test_notify_false_suppresses_the_oversized_action(): void {
+		$GLOBALS['_app_passwords'][7] = array( array( 'uuid' => 'u-1', 'name' => str_repeat( 'x', 300 ) ) );
+		$this->assertNull( aura_worker_app_password_list( 7, 100, false ) );
+		$this->assertSame( array(), $GLOBALS['_sa_unproven_calls'] );
+	}
+
+	public function test_notify_false_suppresses_the_failed_statement_action(): void {
+		$GLOBALS['_sa_app_password_read_fail'][7] = true;
+		$this->assertNull( aura_worker_app_password_list( 7, 262144, false ) );
+		$this->assertSame( array(), $GLOBALS['_sa_unproven_calls'] );
+	}
+
+	public function test_notify_defaults_true_so_existing_callers_are_unaffected(): void {
+		// Omitting the third argument must behave exactly as before it existed.
+		$GLOBALS['_app_passwords'][7] = array( array( 'uuid' => 'u-1', 'name' => str_repeat( 'x', 300 ) ) );
+		$this->assertNull( aura_worker_app_password_list( 7, 100 ) );
+		$this->assertSame( array( array( 7, 'oversized' ) ), $GLOBALS['_sa_unproven_calls'] );
+	}
+
+	// --- allowed_classes => false decode (finding 4) ---------------------------
+
+	public function test_a_serialised_object_row_decodes_to_an_empty_array_unbounded(): void {
+		// The stub can only serialize $_app_passwords entries (always arrays),
+		// so a raw serialized-object row is injected directly — the shape a
+		// crafted/corrupted usermeta row would take.
+		$GLOBALS['_sa_app_password_raw'][7] = 'O:8:"stdClass":1:{s:4:"uuid";s:3:"u-1";}';
+		$this->assertSame( array(), aura_worker_app_password_list( 7 ) );
+	}
+
+	public function test_a_serialised_object_row_decodes_to_an_empty_array_bounded(): void {
+		$GLOBALS['_sa_app_password_raw'][7] = 'O:8:"stdClass":1:{s:4:"uuid";s:3:"u-1";}';
+		$this->assertSame( array(), aura_worker_app_password_list( 7, 262144 ) );
+	}
+
+	public function test_a_non_serialized_plain_string_row_is_an_empty_array(): void {
+		// is_serialized() gates the decode: a plain string never reaches
+		// unserialize() at all, and is never a valid Application Password list.
+		$GLOBALS['_sa_app_password_raw'][7] = 'not-serialized-garbage';
+		$this->assertSame( array(), aura_worker_app_password_list( 7, 262144 ) );
+	}
 }

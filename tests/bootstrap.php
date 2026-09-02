@@ -1046,6 +1046,7 @@ $GLOBALS['_app_passwords_available'] = true;
 $GLOBALS['_app_passwords_delete_fail'] = false;
 $GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails (#434 Task 4).
 $GLOBALS['_sa_app_password_read_fail'] = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
+$GLOBALS['_sa_app_password_raw']       = array(); // user_id => raw meta_value string, returned verbatim as `v` instead of serialize($_app_passwords[user_id]) (2.15.0 decode test).
 $GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
 $GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's result SET outright — an array of rows (#434 Task 9).
 $GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).
@@ -2027,9 +2028,11 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return (object) array(
 					'probe' => $m[1],
-					'v'     => isset( $GLOBALS['_app_passwords'][ $user ] )
-						? serialize( $GLOBALS['_app_passwords'][ $user ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
-						: null, // no row at all
+					'v'     => isset( $GLOBALS['_sa_app_password_raw'][ $user ] )
+						? (string) $GLOBALS['_sa_app_password_raw'][ $user ] // a raw string a stub can't serialize its way to (2.15.0 decode test)
+						: ( isset( $GLOBALS['_app_passwords'][ $user ] )
+							? serialize( $GLOBALS['_app_passwords'][ $user ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+							: null ), // no row at all
 				);
 			}
 			// The BOUNDED per-user read (2.15.0, the Elementor door): the same
@@ -2045,10 +2048,12 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					$this->last_error = 'read failed';
 					return null;
 				}
-				if ( ! isset( $GLOBALS['_app_passwords'][ $user ] ) ) {
+				if ( ! isset( $GLOBALS['_app_passwords'][ $user ] ) && ! isset( $GLOBALS['_sa_app_password_raw'][ $user ] ) ) {
 					return (object) array( 'probe' => $m[1], 'len' => null, 'v' => null );
 				}
-				$raw = serialize( $GLOBALS['_app_passwords'][ $user ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+				$raw = isset( $GLOBALS['_sa_app_password_raw'][ $user ] )
+					? (string) $GLOBALS['_sa_app_password_raw'][ $user ] // a raw string a stub can't serialize its way to (2.15.0 decode test)
+					: serialize( $GLOBALS['_app_passwords'][ $user ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
 				$len = strlen( $raw );
 				return (object) array( 'probe' => $m[1], 'len' => $len, 'v' => $len <= $max ? $raw : null );
 			}
@@ -3422,6 +3427,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_app_passwords_delete_fail'] = false;
 	$GLOBALS['_fail_delete_app_password']  = null; // ONE uuid whose delete fails; see the stub above.
 	$GLOBALS['_sa_app_password_read_fail']  = array(); // user_id => true: that user's app-password meta row cannot be read (#434 I5).
+	$GLOBALS['_sa_app_password_raw']        = array(); // user_id => raw meta_value string, returned verbatim as `v` instead of serialize($_app_passwords[user_id]) (2.15.0 decode test).
 	$GLOBALS['_sa_app_password_scan_fail']  = false; // the site-wide holder statement itself fails (#434 Task 9).
 	$GLOBALS['_sa_app_password_scan_answer'] = null; // replaces that statement's result SET outright — an array of rows (#434 Task 9).
 	$GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).

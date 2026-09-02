@@ -152,17 +152,27 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 	 *
 	 * @since 2.13.0
 	 * @since 2.15.0 the $max_bytes bound.
+	 * @since 2.15.0 the $notify parameter.
 	 *
-	 * @param int $owner     Owner user ID.
-	 * @param int $max_bytes Optional. When > 0, a row whose serialised value
-	 *                       exceeds it answers null (oversized, never
-	 *                       decoded); 0 = unbounded, the 2.13.0 behaviour.
+	 * @param int  $owner     Owner user ID.
+	 * @param int  $max_bytes Optional. When > 0, a row whose serialised value
+	 *                        exceeds it answers null (oversized, never
+	 *                        decoded); 0 = unbounded, the 2.13.0 behaviour.
+	 * @param bool $notify    Optional, default true. When false, NEITHER
+	 *                        do_action() call below fires — not the oversized
+	 *                        one, not the unproven-read one. The return
+	 *                        values are unchanged either way. Used by the
+	 *                        audit_mcp_exposure tool (a `read_only: true` MCP
+	 *                        tool that reads up to ~250 users' lists): firing
+	 *                        the action there would write the #434 unbind
+	 *                        breadcrumb from a read-only tool, and could
+	 *                        overwrite it with an unrelated user.
 	 * @return array|null The list — empty for a user with no row, or a row that
 	 *                    does not hold an array, exactly as core reads both —
 	 *                    or NULL for a read that proved nothing, which no
 	 *                    caller may treat as an absence.
 	 */
-	function aura_worker_app_password_list( $owner, $max_bytes = 0 ) {
+	function aura_worker_app_password_list( $owner, $max_bytes = 0, $notify = true ) {
 		global $wpdb;
 		if ( ! is_object( $wpdb ) || ! isset( $wpdb->usermeta ) ) {
 			return null; // no way to confirm: never a proof of absence
@@ -200,7 +210,9 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 			// No row, or somebody else's row: this call proved nothing, and an
 			// unprovable probe owes app_passwords forever, so leave a
 			// breadcrumb rather than a tombstone that never explains itself.
-			do_action( 'aura_worker_app_password_probe_unproven', (int) $owner );
+			if ( $notify ) {
+				do_action( 'aura_worker_app_password_probe_unproven', (int) $owner );
+			}
 			return null;
 		}
 		if ( $max_bytes > 0 ) {
@@ -210,7 +222,9 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 			if ( ! isset( $row->v ) ) {
 				// The row exists and exceeds the bound: the value was never
 				// returned, so it was never decoded. Not an absence.
-				do_action( 'aura_worker_app_password_probe_unproven', (int) $owner, 'oversized' );
+				if ( $notify ) {
+					do_action( 'aura_worker_app_password_probe_unproven', (int) $owner, 'oversized' );
+				}
 				return null;
 			}
 		}
@@ -218,7 +232,21 @@ if ( ! function_exists( 'aura_worker_app_password_list' ) ) {
 		if ( null === $raw ) {
 			return array(); // no row at all: that user holds no Application Passwords
 		}
-		$list = maybe_unserialize( $raw );
+		// allowed_classes => false: this helper now also serves rows selected
+		// by a LIKE over the value itself (the Elementor-door candidate scan),
+		// so the value must be treated as untrusted the same way the consent
+		// decode (class-tool-audit-mcp-exposure.php) and the snapshot payload
+		// decode (class-aura-worker-snapshots.php) already do — a plain
+		// maybe_unserialize()/unserialize() would let a crafted payload
+		// instantiate arbitrary classes and fire __wakeup()/__destruct()
+		// gadgets. is_serialized() first is the same gate maybe_unserialize()
+		// applies, so a plain non-serialized string never reaches unserialize()
+		// at all. A serialised object becomes __PHP_Incomplete_Class, which is
+		// not an array and falls through to array() below — behaviour-identical
+		// to maybe_unserialize() for every array this ever legitimately held.
+		$list = is_serialized( $raw, true )
+			? unserialize( (string) $raw, array( 'allowed_classes' => false ) ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
+			: false;
 		return is_array( $list ) ? $list : array();
 	}
 }
