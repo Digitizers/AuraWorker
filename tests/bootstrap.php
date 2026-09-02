@@ -418,6 +418,34 @@ function sa_like_to_regex( string $like ): string {
 }
 
 /**
+ * Option names matching a MySQL LIKE prefix pattern AND a REGEXP pattern —
+ * the door log's SELECT/DELETE filter (2.16.0). Read against the merged
+ * "database" view get_results()'s LIKE branch and get_col() already use
+ * ($GLOBALS['_rows'] ∪ $GLOBALS['_options']), so a row a test seeded
+ * directly into either global is as visible here as a real column scan
+ * would make it — never the floor, closure marker or refusal counter
+ * options, which share the prefix but fail the numeric REGEXP.
+ *
+ * @param string $like_raw   The LIKE pattern, still SQL/LIKE-escaped.
+ * @param string $regexp_raw The REGEXP pattern, raw (a PCRE body with no
+ *                            unescaped '/').
+ * @return string[]
+ */
+function sa_door_log_rows_matching( string $like_raw, string $regexp_raw ): array {
+	$like_re = sa_like_to_regex( stripslashes( $like_raw ) );
+	$row_re  = '/' . stripslashes( $regexp_raw ) . '/';
+	$names   = array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) );
+	return array_values(
+		array_filter(
+			$names,
+			static function ( $name ) use ( $like_re, $row_re ) {
+				return 1 === preg_match( $like_re, (string) $name ) && 1 === preg_match( $row_re, (string) $name );
+			}
+		)
+	);
+}
+
+/**
  * Does the claim row named $claim exist with a value matching the LIKE pattern
  * the caller built from its fence? Mirrors MySQL's LIKE for the one shape the
  * plugin issues: an esc_like()'d prefix followed by '%'.
@@ -626,13 +654,16 @@ if ( ! function_exists( 'add_option' ) ) {
 		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
 			return false;
 		}
-		// …but core's check and its write are TWO statements, and the write is
-		// `INSERT … ON DUPLICATE KEY UPDATE` (option.php): a second caller that
-		// passed the same check in between also "succeeds", and its value
-		// overwrites the first one's. Anything that needs a real mutex must use
-		// a conditional INSERT instead — this seam is how a test shows the
-		// difference (inert when unset).
+		// core's check and its write are TWO statements — the window
+		// sa_before_swap() models. A caller relying on plain add_option() for
+		// a real mutex (the door log's seq allocation, #499) needs that window
+		// to be honest: a racer landing in it must be seen, so this re-checks
+		// existence right before the write rather than trusting the first
+		// (now stale) check. Inert when the seam is unset, exactly as before.
 		sa_before_swap();
+		if ( array_key_exists( $option, $GLOBALS['_options'] ) ) {
+			return false; // a racer's row landed in the window just opened
+		}
 		unset( $GLOBALS['_notoptions'][ $option ] );
 		$GLOBALS['_options'][ $option ]       = $value;
 		$GLOBALS['_rows'][ $option ]          = maybe_serialize( $value );
@@ -2041,6 +2072,33 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				sa_after_option_read( $name );
 				return $answer;
 			}
+			// Aura_Worker_Door_Log::highest_row_seq() (2.16.0): the max numeric
+			// suffix among rows sharing the prefix — never the floor, closure
+			// marker or refusal counter, which share the prefix but fail the
+			// REGEXP. Read against the merged "database" view (sa_door_log_rows_matching()),
+			// the same one get_results()'s LIKE branch and get_col() already read.
+			if ( preg_match( "/^SELECT MAX\(CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\)\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$max = 0;
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) ) {
+						$max = max( $max, (int) $mm[1] );
+					}
+				}
+				return $max;
+			}
+			// Aura_Worker_Door_Log::count_unacked(): rows above the ack floor.
+			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\) > (\d+)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$floor = (int) $m[3];
+				$n     = 0;
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) && (int) $mm[1] > $floor ) {
+						++$n;
+					}
+				}
+				return $n;
+			}
 			// app_password_row_state()'s confirming read is a get_row() now
 			// (#434 N1), so NO get_var() shape may touch this meta key except
 			// the admin-accounts audit's size pre-check. Anything else means
@@ -2440,6 +2498,39 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					$after( $name );
 				}
 				return 1;
+			}
+
+			// Aura_Worker_Door_Log::ack()'s floor raise: upward-only, via a
+			// numeric-cast predicate rather than a byte-exact one (the floor's
+			// stored value is compared as a number, not matched verbatim).
+			if ( preg_match( "/^UPDATE \S+ SET option_value = '([^']*)' WHERE option_name = '([^']+)' AND CAST\(option_value AS UNSIGNED\) < (\d+)$/s", $query, $m ) ) {
+				list( , $new, $name, $bound ) = array_map( 'stripslashes', $m );
+				$bound = (int) $bound;
+				$cur   = sa_read_option_uncached( $name );
+				if ( null === $cur || (int) $cur >= $bound ) {
+					return 0; // absent, or already at/above the bound — not lower.
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
+
+			// Aura_Worker_Door_Log::ack()'s row purge: every numeric row at or
+			// below the newly raised floor — never the floor/marker/counter
+			// options themselves, which the REGEXP excludes.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\) <= (\d+)$/s", $query, $m ) ) {
+				$bound = (int) $m[3];
+				$n     = 0;
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) && (int) $mm[1] <= $bound ) {
+						unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+						$GLOBALS['_notoptions'][ $name ] = true;
+						$GLOBALS['_option_writes'][]     = array( 'delete', $name );
+						++$n;
+					}
+				}
+				return $n;
 			}
 
 			// Emulate the counters' atomic create-or-increment: one statement,
