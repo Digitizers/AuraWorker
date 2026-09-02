@@ -194,6 +194,51 @@ class Aura_Worker_Door_Holds {
 		return $claimed;
 	}
 
+	/**
+	 * The inverse of claim(): move the row BACK to held.
+	 *
+	 * A replay claims before it runs, and the wrapper can still refuse the
+	 * call AFTER that — a snapshot it could not take, a log row it could not
+	 * write, a creation mutex another request holds. Those refusals are
+	 * retryable and the callback never ran, so the operator's approval must
+	 * not be spent on them (Ruling P7): the row goes back where it came from
+	 * and the same ref can be approved again.
+	 *
+	 * Symmetrical with claim(), and for the same reasons: INSERT the held row
+	 * first (a real conditional INSERT — a held row already there means
+	 * somebody else owns this ref now, and the claimed row stays put), then
+	 * DELETE the claimed twin and require exactly one row. `claimed_at` and
+	 * `terminal_seq` are dropped, so what comes back is byte-identical to the
+	 * row the hold was stored as.
+	 *
+	 * The lost-delete case does NOT back the insert out, which is where this
+	 * differs from claim(): claim() backs out because a held row deleted
+	 * underneath it means a reject decided the call must not run, while here
+	 * the target state (held present, claimed absent) is exactly what a
+	 * vanished claimed row leaves behind. It answers false regardless — the
+	 * caller reports what it can actually see rather than what it intended.
+	 *
+	 * @param string $ref Ref.
+	 * @return bool The row is held again, by this call.
+	 */
+	public static function unclaim( $ref ) {
+		global $wpdb;
+		$ref     = self::clean( $ref );
+		$claimed = self::from_db( self::CLAIMED . $ref );
+		if ( null === $claimed ) {
+			return false;
+		}
+		$held = $claimed;
+		unset( $held['claimed_at'], $held['terminal_seq'] );
+		if ( ! Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $held ) ) {
+			return false; // a held row is already there — the claimed row stands
+		}
+		$wpdb->last_error = '';
+		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::CLAIMED . $ref ) );
+		wp_cache_delete( self::CLAIMED . $ref, 'options' );
+		return 1 === (int) $gone;
+	}
+
 	/** @param string $ref Ref. @param int $seq Seq. @return bool */
 	public static function stamp_terminal_seq( $ref, $seq ) {
 		$option = self::CLAIMED . self::clean( $ref );

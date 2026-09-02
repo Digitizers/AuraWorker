@@ -462,6 +462,148 @@ final class ElementorReplayTest extends TestCase {
 	}
 
 	// -----------------------------------------------------------------------
+	// Ruling P7: a transient refusal never spends the approval
+	// -----------------------------------------------------------------------
+
+	public function test_a_snapshot_failure_after_the_claim_puts_the_hold_back(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref    = $this->holdCall();
+		$before = Aura_Worker_Door_Holds::get_held( $ref );
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array(
+					'success' => false,
+					'error'   => 'disk full',
+				);
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertSame( 'aura_snapshot_failed', $out['code'] );
+		$this->assertStringContainsString( 'disk full', $out['error'] );
+		$this->assertArrayNotHasKey( 'claim_retained', $out );
+		$this->assertSame( array(), $this->ran, 'the write never happened' );
+		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is back, byte for byte' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertSame( 'snapshot_failed', $log[1]['reason'] );
+
+		// …and the same approval works once the site can snapshot again.
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array(
+					'success'  => true,
+					'snapshot' => array( 'id' => 'snap_test' ),
+				);
+			}
+		);
+		$second = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$this->assertTrue( $second['ok'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+	}
+
+	public function test_a_move_back_that_cannot_insert_keeps_the_claimed_row_and_says_so(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				// The refusal, and — on the way out — a database that refuses
+				// the move-back's conditional INSERT too.
+				$GLOBALS['_sa_insert_unique_fail'] = true;
+				return array(
+					'success' => false,
+					'error'   => 'disk full',
+				);
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertTrue( $out['claim_retained'], 'Aura is told the ref will not answer a second approval' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row is the only record left' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+	}
+
+	// -----------------------------------------------------------------------
+	// The answer comes from the terminal entry, or it is `interrupted`
+	// -----------------------------------------------------------------------
+
+	public function test_a_lost_terminal_stamp_answers_interrupted_and_releases_nothing(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		// The stamp's compare-and-swap refused at the driver: the claimed row
+		// survives, but nothing links it to the entry the write produced.
+		$GLOBALS['_sa_option_cas_fail'][ 'aura_worker_door_claimed_' . $ref ] = true;
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'], 'a return value is not evidence' );
+		$this->assertSame( 'interrupted', $out['reason'] );
+		$this->assertSame( $ref, $out['ref'] );
+		$this->assertArrayNotHasKey( 'snapshot_id', $out );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row is left for the reconciler' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'ok', $log[1]['result'], 'the write itself is recorded as it happened' );
+		$this->assertTrue( $log[1]['terminal_seq_unstamped'], 'and the row says its back-reference was lost' );
+		$this->assertSame( $ref, $log[1]['ref'], 'which is how Aura still finds this outcome' );
+	}
+
+	// -----------------------------------------------------------------------
+	// The ability is gone
+	// -----------------------------------------------------------------------
+
+	public function test_an_ability_gone_since_the_hold_is_refused_and_logged(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		unset( $GLOBALS['_abilities']['elementor/publish-document'] ); // Elementor deactivated
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'refused_by_missing_ability', $out['reason'], 'not `not_held` — that would mean retry' );
+		$this->assertSame( array(), $this->ran );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertSame( 'ability_missing', $log[1]['reason'] );
+		$this->assertSame( $ref, $log[1]['ref'] );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+	}
+
+	// -----------------------------------------------------------------------
+	// The permission re-check is the ACTOR's
+	// -----------------------------------------------------------------------
+
+	public function test_the_permission_check_runs_as_the_actor_not_the_approver(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref  = $this->holdCall();
+		$seen = null;
+		$this->register(
+			'elementor/publish-document',
+			null,
+			static function () use ( &$seen ) {
+				$seen = get_current_user_id();
+				return true;
+			}
+		);
+		$GLOBALS['_current_user_id'] = 9;
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::replay( $ref, null )['ok'] );
+		$this->assertSame( 3, $seen, 'the ability was asked about the user who wanted the write' );
+	}
+
+	// -----------------------------------------------------------------------
 	// The tool
 	// -----------------------------------------------------------------------
 

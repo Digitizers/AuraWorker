@@ -25,6 +25,15 @@ class Aura_Worker_Elementor_Door {
 	const MODULE_CLASS   = '\Elementor\Modules\Mcp\Module';
 	const CLAIM_STALE_MS = 600000;
 
+	/**
+	 * Wrapper refusals a replay must not spend the approval on (Ruling P7).
+	 * Every one of them is issued BEFORE the inner callback runs and says
+	 * "this site could not do it just now", never "this call is refused": a
+	 * snapshot that failed, a log row that could not be written, a creation
+	 * mutex another request holds, a hold queue that is busy.
+	 */
+	const RETRYABLE_CODES = array( 'aura_snapshot_failed', 'aura_log_failed', 'aura_creation_busy', 'aura_hold_busy' );
+
 	const CPT_GLOBAL_CLASS  = 'e_global_class';
 	const CPT_DEFAULT_STYLE = 'e_default_style';
 	const CPT_COMPONENT     = 'elementor_component';
@@ -809,7 +818,18 @@ class Aura_Worker_Elementor_Door {
 			$terminal['collateral_snapshot_ids'] = self::$request['collateral'];
 		}
 		if ( null !== self::$replay_ack ) {
-			Aura_Worker_Door_Holds::stamp_terminal_seq( self::$replay_ack['ref'], $seq );
+			// The stamp is the LINK between the claimed row and this entry, and
+			// it can be lost — the claimed row swept away, or the CAS lost to a
+			// concurrent writer. A lost witness is recorded ON THE ROW, the way
+			// the wrapper already records `may_have_run` and `creation_error`
+			// there, rather than in a counter: the counters say a call went
+			// UNGOVERNED, and this one was governed, logged and settled — only
+			// its back-reference is missing. The row carries `ref`, so Aura can
+			// still find this outcome by the hold it ran for, which a counter
+			// could never tell it.
+			if ( ! Aura_Worker_Door_Holds::stamp_terminal_seq( self::$replay_ack['ref'], $seq ) ) {
+				$terminal['terminal_seq_unstamped'] = true;
+			}
 		}
 		Aura_Worker_Door_Log::settle( $seq, $terminal );
 		self::$request = null;
@@ -1013,10 +1033,24 @@ class Aura_Worker_Elementor_Door {
 			wp_set_current_user( (int) $held['actor']['user_id'] );
 			$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $slug ) : null;
 			if ( ! $ability ) {
+				// Elementor was deactivated (or the ability renamed) during the
+				// hold's seven days. That is a REFUSAL with a record, not
+				// `not_held` — which means "retry", and this one never will
+				// succeed until the plugin comes back.
+				self::record_terminal_only(
+					$slug,
+					(array) $held['actor'],
+					(array) $held['touches'],
+					'refused',
+					array(
+						'ref'    => $ref,
+						'reason' => 'ability_missing',
+					)
+				);
 				Aura_Worker_Door_Holds::release( $ref );
 				return array(
 					'ok'     => false,
-					'reason' => 'not_held',
+					'reason' => 'refused_by_missing_ability',
 				);
 			}
 			// The ability's OWN permission callback, as the stored actor,
@@ -1049,14 +1083,51 @@ class Aura_Worker_Elementor_Door {
 			$stamp  = Aura_Worker_Door_Holds::get_claimed( $ref );
 			$seq    = (int) ( isset( $stamp['terminal_seq'] ) ? $stamp['terminal_seq'] : 0 );
 			$entry  = $seq > 0 ? Aura_Worker_Door_Log::get( $seq ) : null;
+
+			// A refusal the wrapper made BEFORE the callback, under a code
+			// that says "try again" (Ruling P7): the write never happened, so
+			// the operator's approval is not spent on it. The row goes BACK to
+			// held and the same ref can be approved again — an unstamped
+			// terminal_seq is what proves the run never reached the callback,
+			// because the wrapper stamps only on its way past it.
+			if ( 0 === $seq && is_wp_error( $result ) && in_array( $result->get_error_code(), self::RETRYABLE_CODES, true ) ) {
+				$out = array(
+					'ok'     => false,
+					'reason' => 'retry_later',
+					'code'   => $result->get_error_code(),
+					'error'  => $result->get_error_message(),
+				);
+				if ( ! Aura_Worker_Door_Holds::unclaim( $ref ) && null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
+					// The hold could not be put back and the claimed row still
+					// stands: it is the only record of this attempt, and the
+					// reconciler owns it from here. Say so — Aura must not
+					// expect this ref to answer a second approval.
+					$out['claim_retained'] = true;
+				}
+				return $out;
+			}
+
+			// From here the answer comes from the TERMINAL LOG ENTRY and
+			// NOTHING else. No entry to read — no stamp, a row that is gone,
+			// or one still pending — means this request cannot say what
+			// happened, and a return value is not evidence: the callback may
+			// have run. Answer `interrupted` and leave the claimed row alone;
+			// it is the only witness that a write may be out there, and the
+			// reconciler settles it.
+			$terminal = is_array( $entry ) ? (string) ( isset( $entry['result'] ) ? $entry['result'] : '' ) : '';
+			if ( 0 === $seq || ! in_array( $terminal, Aura_Worker_Door_Log::TERMINAL, true ) ) {
+				return array(
+					'ok'     => false,
+					'reason' => 'interrupted',
+					'ref'    => $ref,
+				);
+			}
 			Aura_Worker_Door_Holds::release( $ref );
-			// The terminal entry is the verdict on the run: the wrapper
-			// already classified an error-shaped array result as `failed`,
-			// and this answer must not say `ok` where the log says otherwise
-			// — Aura marks the action from this answer.
-			$entry_failed = is_array( $entry ) && 'ok' !== ( isset( $entry['result'] ) ? $entry['result'] : 'failed' );
-			if ( is_wp_error( $result ) || $entry_failed ) {
-				$logged = is_array( $entry ) && isset( $entry['error'] ) ? (string) $entry['error'] : 'ability reported an error';
+			// The wrapper already classified an error-shaped array result as
+			// `failed`, and this answer must not say `ok` where the log says
+			// otherwise — Aura marks the action from this answer.
+			if ( is_wp_error( $result ) || 'ok' !== $terminal ) {
+				$logged = isset( $entry['error'] ) ? (string) $entry['error'] : 'ability reported an error';
 				return array(
 					'ok'     => false,
 					'reason' => 'failed',
@@ -1067,8 +1138,8 @@ class Aura_Worker_Elementor_Door {
 			return array(
 				'ok'               => true,
 				'result'           => $result,
-				'snapshot_id'      => is_array( $entry ) && isset( $entry['snapshot_id'] ) ? $entry['snapshot_id'] : null,
-				'created_post_ids' => is_array( $entry ) && isset( $entry['created_post_ids'] ) ? $entry['created_post_ids'] : array(),
+				'snapshot_id'      => isset( $entry['snapshot_id'] ) ? $entry['snapshot_id'] : null,
+				'created_post_ids' => isset( $entry['created_post_ids'] ) ? $entry['created_post_ids'] : array(),
 			);
 		} finally {
 			self::$replay_ack     = null;

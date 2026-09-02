@@ -144,6 +144,41 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayNotHasKey( 'aura_worker_door_claimed_' . $ref, $GLOBALS['_options'], 'the claim backed out' );
 	}
 
+	public function test_unclaim_moves_the_row_back_to_held_with_its_original_fields(): void {
+		$ref    = Aura_Worker_Door_Holds::hold( $this->call() );
+		$before = $GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ];
+		Aura_Worker_Door_Holds::claim( $ref );
+		Aura_Worker_Door_Holds::stamp_terminal_seq( $ref, 12 );
+
+		$this->assertTrue( Aura_Worker_Door_Holds::unclaim( $ref ) );
+
+		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ), 'the row that comes back is the row that was held' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and the twin is gone' );
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count() );
+		// The approval was not spent: the ref can be claimed again.
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+	}
+
+	public function test_unclaim_keeps_the_claimed_row_when_the_held_name_is_taken(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Holds::claim( $ref );
+		// Something already put a row back under this ref (or the insert
+		// simply fails): the claimed row must stand, because it is the only
+		// record of the attempt.
+		$GLOBALS['_sa_insert_unique_fail'] = true;
+
+		$this->assertFalse( Aura_Worker_Door_Holds::unclaim( $ref ) );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+	}
+
+	public function test_unclaim_of_a_ref_with_no_claimed_row_is_false(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertFalse( Aura_Worker_Door_Holds::unclaim( $ref ) );
+		$this->assertFalse( Aura_Worker_Door_Holds::unclaim( 'door_nope' ) );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the held row is untouched' );
+	}
+
 	public function test_reject_refuses_to_delete_a_held_row_that_has_a_claimed_twin(): void {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
 		$GLOBALS['_options'][ 'aura_worker_door_claimed_' . $ref ] = $GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ]; // an orphaned pair
