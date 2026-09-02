@@ -2432,6 +2432,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( $is_ruleset_insert && true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
+				// Aura_Worker_Door_Holds::hold()'s row-insert failure seam: the
+				// database refusing ONE statement inside the hold-queue mutex — a
+				// held row or a claimed twin — but never the lock itself, so a
+				// test can prove the lock is still released on this path
+				// (Aura_Worker_Door_Holds uses insert_unique() for the lock too,
+				// since add_option()'s ON DUPLICATE KEY UPDATE is not a mutex).
+				if ( ! empty( $GLOBALS['_sa_insert_unique_fail'] ) && 'aura_worker_door_hold_lock' !== $name ) {
+					return 0;
+				}
 				if ( $is_ruleset_insert || $is_door_log_insert ) {
 					// A second request inserting between this caller's own
 					// existence check (there is none — that's the point of a
@@ -2535,6 +2544,24 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return $n;
 			}
 
+			// The bare delete Aura_Worker_Door_Holds::claim() and ::reject() issue
+			// on a held row's exact name: no fence, no LIKE — just "does this row
+			// still exist", and the row count answers it. claim() moves a hold by
+			// inserting the claimed twin FIRST and then requiring this delete to
+			// remove exactly one row; a reject or the TTL sweep that already took
+			// the row leaves this reporting 0, and the caller backs out rather
+			// than trust the twin it just wrote.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)'$/", $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				if ( null === sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+				$GLOBALS['_notoptions'][ $name ]   = true;
+				$GLOBALS['_option_writes'][]       = array( 'delete', $name );
+				return 1;
+			}
+
 			// Emulate the counters' atomic create-or-increment: one statement,
 			// no read, so a first bump inserts '1' and every later bump in the
 			// same hour adds one to whatever is there — never the two-step
@@ -2610,6 +2637,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
@@ -3790,6 +3818,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
