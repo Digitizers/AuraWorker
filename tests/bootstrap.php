@@ -2294,19 +2294,31 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// filters: a post of another type, or another author's, is not this
 			// call's, and a fake that ignored either would let the production
 			// code claim posts it never made.
-			if ( preg_match( "/^SELECT ID FROM \S+ WHERE ID > (\d+) AND post_type IN \(([^)]*)\) AND post_author = (\d+)$/", (string) $query, $m ) ) {
+			if ( preg_match( "/^SELECT ID FROM \S+ WHERE ID > (\d+) AND post_type IN \(([^)]*)\) AND post_author = (\d+)(?: AND post_date_gmt <= '([^']*)')?$/", (string) $query, $m ) ) {
 				$mark   = (int) $m[1];
 				$types  = array();
 				if ( preg_match_all( "/'([^']*)'/", $m[2], $tm ) ) {
 					$types = array_map( 'stripslashes', $tm[1] );
 				}
 				$author = (int) $m[3];
+				// The reconciler's TIME bound (2.16.0, Ruling P9(b)): the live
+				// path diffs across ONE request and sends no bound; the stale
+				// path sends `started_at + CLAIM_STALE_MS`. Compared the way
+				// MySQL compares a DATETIME string — lexicographically, which
+				// for 'Y-m-d H:i:s' is chronological — so a post the same user
+				// made by hand after the window is not this call's, and a fake
+				// that ignored the clause would let the production code
+				// attribute (and trash) it.
+				$until  = isset( $m[4] ) ? stripslashes( $m[4] ) : null;
 				$out    = array();
 				foreach ( $GLOBALS['_posts'] as $id => $p ) {
 					if ( (int) $id <= $mark || ! in_array( (string) ( $p->post_type ?? '' ), $types, true ) ) {
 						continue;
 					}
 					if ( (int) ( $p->post_author ?? 0 ) !== $author ) {
+						continue;
+					}
+					if ( null !== $until && strcmp( (string) ( $p->post_date_gmt ?? '' ), $until ) > 0 ) {
 						continue;
 					}
 					$out[] = (string) (int) $id;

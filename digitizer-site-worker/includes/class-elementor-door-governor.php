@@ -26,6 +26,21 @@ class Aura_Worker_Elementor_Door {
 	const CLAIM_STALE_MS = 600000;
 
 	/**
+	 * Envelope retention runs at most this often (Ruling P9(a)). The sweep
+	 * reads every snapshot record on disk, and `/status` is the hottest
+	 * endpoint this site has: on a fleet polled every minute that is the same
+	 * directory decoded 1,440 times a day to delete nothing.
+	 */
+	const PRUNE_INTERVAL_S = 21600;
+
+	/**
+	 * When retention last ran. A STAMP, not a mutex: two overlapping prunes
+	 * delete the same already-expired envelopes and are harmless, so this is
+	 * an ordinary update_option() rather than an insert_unique().
+	 */
+	const PRUNED_AT = 'aura_worker_door_pruned_at';
+
+	/**
 	 * Wrapper refusals a replay must not spend the approval on (Ruling P7).
 	 * Every one of them is issued BEFORE the inner callback runs and says
 	 * "this site could not do it just now", never "this call is refused": a
@@ -316,7 +331,9 @@ class Aura_Worker_Elementor_Door {
 	 *    no longer explains.
 	 * 3. Stale pending ROWS: the requests that never held anything.
 	 * 4. The creation mutex, by age alone.
-	 * 5. Retention: door envelopes older than 30 days (Ruling R6).
+	 * 5. Retention: door envelopes older than 30 days (Ruling R6) — at most
+	 *    once every PRUNE_INTERVAL_S, because the sweep reads every envelope
+	 *    on disk and this runs on the site's hottest endpoint (Ruling P9(a)).
 	 *
 	 * A claim is released ONLY once its evidence is durable. Anything else
 	 * loses the one record that a replay may have mutated the site.
@@ -362,7 +379,14 @@ class Aura_Worker_Elementor_Door {
 
 		self::clear_stale_creation_mutex( $now );
 
-		$out['pruned'] = (int) ( new Aura_Worker_Snapshots() )->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+		// Retention, at most every PRUNE_INTERVAL_S (Ruling P9(a)). `pruned`
+		// is 0 when the gate skips — nothing was swept, and saying otherwise
+		// would make the counter a lie.
+		$last = strtotime( (string) get_option( self::PRUNED_AT, '' ) );
+		if ( false === $last || $last <= $now - self::PRUNE_INTERVAL_S ) {
+			$out['pruned'] = (int) ( new Aura_Worker_Snapshots() )->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+			update_option( self::PRUNED_AT, gmdate( 'c', $now ), false );
+		}
 
 		return $out;
 	}
@@ -479,7 +503,17 @@ class Aura_Worker_Elementor_Door {
 		}
 		$actor    = isset( $row['actor'] ) && is_array( $row['actor'] ) ? $row['actor'] : array();
 		$actor_id = (int) ( isset( $actor['user_id'] ) ? $actor['user_id'] : 0 );
-		$diff     = empty( $types ) ? array() : self::watermark_diff( (int) $row['post_watermark'], $types, $actor_id );
+		// The window this call could possibly have written in: from its
+		// watermark until the moment it was already stale (Ruling P9(b)).
+		// `started_at` is stamped with the watermark; `at` is the row's own
+		// birth and is always there. Neither readable ⇒ NO diff: an unbounded
+		// one would claim posts made by hand hours later.
+		$from  = strtotime( (string) ( isset( $row['started_at'] ) ? $row['started_at'] : '' ) );
+		if ( false === $from ) {
+			$from = strtotime( (string) ( isset( $row['at'] ) ? $row['at'] : '' ) );
+		}
+		$until = false === $from ? null : gmdate( 'Y-m-d H:i:s', $from + (int) floor( self::CLAIM_STALE_MS / 1000 ) );
+		$diff     = ( empty( $types ) || null === $until ) ? array() : self::watermark_diff( (int) $row['post_watermark'], $types, $actor_id, $until );
 		$hooked   = array_map( 'intval', (array) ( isset( $row['created_post_ids'] ) ? $row['created_post_ids'] : array() ) );
 		$missed   = array_values( array_diff( $diff, $hooked ) );
 		$created  = array_values( array_unique( array_merge( $hooked, $missed ) ) );
@@ -506,7 +540,17 @@ class Aura_Worker_Elementor_Door {
 			$fields['snapshot_id'] = (string) $env['snapshot']['id'];
 			return $fields;
 		}
-		return array_merge( $fields, array( 'reason' => 'snapshot_failed' ), self::compensate( $created ) );
+		// Compensate only what the INSERT HOOK witnessed (Ruling P9(b)). A
+		// diff-only id is the watermark's suspicion, not a witnessed creation
+		// — good enough to record and to put in an envelope, nowhere near
+		// good enough to trash somebody's page on. They are listed under
+		// their own key, never folded into `uncompensated`, which means
+		// "this call made it and it could not be undone".
+		$fields = array_merge( $fields, array( 'reason' => 'snapshot_failed' ), self::compensate( $hooked ) );
+		if ( ! empty( $missed ) ) {
+			$fields['unproven'] = $missed;
+		}
+		return $fields;
 	}
 
 	/**
@@ -2004,18 +2048,33 @@ class Aura_Worker_Elementor_Door {
 	 * `self::$request`) and the reconciler (which diffs against the mark on
 	 * the ROW, minutes or hours later, in a request that never made it).
 	 *
-	 * @param int      $mark     The watermark: the highest post id before the write.
-	 * @param string[] $types    Post types the creation may legitimately have inserted.
-	 * @param int      $actor_id The actor the creation ran as.
+	 * `$until` bounds it in TIME, and only the reconciler passes it (Ruling
+	 * P9(b)). The live path diffs across ONE request, so id and author are
+	 * enough; the stale path diffs across everything between the watermark
+	 * and the first `/status` poll that noticed — ten minutes at best, days on
+	 * an unpolled site — and without an upper bound every page the same
+	 * WordPress user made by hand in that window is attributed to a call that
+	 * never made them.
+	 *
+	 * @param int         $mark     The watermark: the highest post id before the write.
+	 * @param string[]    $types    Post types the creation may legitimately have inserted.
+	 * @param int         $actor_id The actor the creation ran as.
+	 * @param string|null $until    GMT datetime; ids created after it are not this call's.
 	 * @return int[]
 	 */
-	private static function watermark_diff( $mark, array $types, $actor_id ) {
+	private static function watermark_diff( $mark, array $types, $actor_id, $until = null ) {
 		global $wpdb;
 		if ( empty( $types ) ) {
 			return array();
 		}
-		$in = implode( ',', array_fill( 0, count( $types ), '%s' ) );
-		return array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE ID > %d AND post_type IN ($in) AND post_author = %d", array_merge( array( (int) $mark ), $types, array( (int) $actor_id ) ) ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$in   = implode( ',', array_fill( 0, count( $types ), '%s' ) );
+		$sql  = "SELECT ID FROM {$wpdb->posts} WHERE ID > %d AND post_type IN ($in) AND post_author = %d";
+		$args = array_merge( array( (int) $mark ), $types, array( (int) $actor_id ) );
+		if ( null !== $until ) {
+			$sql   .= ' AND post_date_gmt <= %s';
+			$args[] = (string) $until;
+		}
+		return array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( $sql, $args ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 	}
 
 	/**

@@ -126,8 +126,12 @@ final class DoorReconcilerTest extends TestCase {
 		return $row;
 	}
 
-	/** A post that was already there, with every field a capture reads. */
-	private function seedPost( int $id, string $type = 'page', int $author = 3 ): void {
+	/**
+	 * A post that was already there, with every field a capture reads — and a
+	 * `post_date_gmt` the watermark diff's time bound is compared against.
+	 */
+	private function seedPost( int $id, string $type = 'page', int $author = 3, ?string $gmt = null ): void {
+		$gmt                      = null === $gmt ? gmdate( 'Y-m-d H:i:s', time() - 1200 ) : $gmt;
 		$GLOBALS['_posts'][ $id ] = (object) array(
 			'ID'             => $id,
 			'post_type'      => $type,
@@ -139,8 +143,8 @@ final class DoorReconcilerTest extends TestCase {
 			'post_excerpt'   => '',
 			'menu_order'     => 0,
 			'post_author'    => $author,
-			'post_date'      => '2026-01-02 03:04:05',
-			'post_date_gmt'  => '2026-01-02 03:04:05',
+			'post_date'      => $gmt,
+			'post_date_gmt'  => $gmt,
 			'comment_status' => 'closed',
 			'ping_status'    => 'closed',
 		);
@@ -340,12 +344,38 @@ final class DoorReconcilerTest extends TestCase {
 		$row = $this->row( $seq );
 		$this->assertSame( 'interrupted', $row['result'] );
 		$this->assertSame( 'snapshot_failed', $row['reason'] );
-		$this->assertSame( array( 11, 12 ), $row['compensated'] );
+		$this->assertSame( array( 11, 12 ), $row['created_post_ids'], 'both are recorded — recording is not undoing' );
+		$this->assertSame( array( 11 ), $row['compensated'], 'only what the insert hook witnessed is trashed' );
 		$this->assertSame( array(), $row['uncompensated'] );
+		$this->assertSame( array( 12 ), $row['unproven'], 'a diff-only id is the watermark\'s suspicion, and is left alone' );
 		$this->assertSame( 'trash', $row['compensated_by'] );
 		$this->assertArrayNotHasKey( 'snapshot_id', $row );
 		$this->assertSame( 'trash', get_post( 11 )->post_status );
-		$this->assertSame( 'trash', get_post( 12 )->post_status );
+		$this->assertSame( 'publish', get_post( 12 )->post_status, 'a page the same user may have made by hand survives' );
+	}
+
+	public function test_a_post_created_after_the_stale_window_is_not_attributed_at_all(): void {
+		$this->seedPost( 10 );
+		$this->seedPost( 11 );
+		// The same actor, the same type, above the mark — but made an hour
+		// after this creation was already stale. It is not this call's.
+		$this->seedPost( 13, 'page', 3, gmdate( 'Y-m-d H:i:s', time() + 3600 ) );
+		$seq = $this->entry(
+			array(
+				'ability'          => 'elementor/create-page',
+				'post_watermark'   => 10,
+				'expected_types'   => array( 'page' ),
+				'created_post_ids' => array( 11 ),
+				'started_at'       => $this->longAgo(),
+			)
+		);
+
+		Aura_Worker_Elementor_Door::reconcile();
+
+		$row = $this->row( $seq );
+		$this->assertSame( array( 11 ), $row['created_post_ids'] );
+		$this->assertArrayNotHasKey( 'observed_by_watermark', $row );
+		$this->assertSame( 'publish', get_post( 13 )->post_status );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -549,6 +579,33 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( 1, $out['pruned'] );
 		$this->assertNull( $snaps->get( $old['snapshot']['id'] ) );
 		$this->assertIsArray( $snaps->get( $new['snapshot']['id'] ) );
+		$this->assertNotSame( '', (string) get_option( Aura_Worker_Elementor_Door::PRUNED_AT, '' ), 'the run is stamped' );
+	}
+
+	public function test_retention_runs_at_most_once_every_six_hours(): void {
+		$snaps = new Aura_Worker_Snapshots();
+		$this->seedPost( 21 );
+		$first = $snaps->snapshot_creation( array( 21 ), 'page', array( 'seq' => 1 ) );
+		$this->ageSnapshot( $first['snapshot']['id'], 40 );
+
+		$this->assertSame( 1, Aura_Worker_Elementor_Door::reconcile()['pruned'] );
+		$stamp = (string) get_option( Aura_Worker_Elementor_Door::PRUNED_AT, '' );
+
+		// A second envelope, just as expired, and another poll a minute later:
+		// `/status` is the hottest endpoint this site has, and the sweep reads
+		// every envelope on disk.
+		$second = $snaps->snapshot_creation( array( 21 ), 'page', array( 'seq' => 2 ) );
+		$this->ageSnapshot( $second['snapshot']['id'], 40 );
+
+		$this->assertSame( 0, Aura_Worker_Elementor_Door::reconcile()['pruned'], 'the gate skipped, so nothing was swept and the counter says so' );
+		$this->assertIsArray( $snaps->get( $second['snapshot']['id'] ), 'the sweep did not run' );
+		$this->assertSame( $stamp, (string) get_option( Aura_Worker_Elementor_Door::PRUNED_AT, '' ), 'a skipped run does not re-stamp' );
+
+		// Six hours on.
+		update_option( Aura_Worker_Elementor_Door::PRUNED_AT, gmdate( 'c', time() - Aura_Worker_Elementor_Door::PRUNE_INTERVAL_S - 60 ) );
+
+		$this->assertSame( 1, Aura_Worker_Elementor_Door::reconcile()['pruned'] );
+		$this->assertNull( $snaps->get( $second['snapshot']['id'] ) );
 	}
 
 	/** Rewrite an envelope's stamp $days into the past, on disk. */
