@@ -266,6 +266,40 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	}
 
 	/**
+	 * Clears `$wpdb->last_error` before a statement this class is about to
+	 * judge by it, guarded so a foreign `$wpdb` lacking the property cannot
+	 * fatal.
+	 *
+	 * @param mixed $wpdb A wpdb-like object.
+	 * @return void
+	 */
+	private static function clear_last_error( $wpdb ) {
+		if ( is_object( $wpdb ) && property_exists( $wpdb, 'last_error' ) ) {
+			$wpdb->last_error = '';
+		}
+	}
+
+	/**
+	 * Whether a `get_results()` call failed: not-an-array (a database or
+	 * driver outage never reaching a result set), OR an array with
+	 * `last_error` set. `get_results()` answers its CLEARED `$last_result` —
+	 * an empty array — when the statement itself fails, so an array alone is
+	 * never proof of success; only `last_error`, read right after the same
+	 * call, tells a broken table apart from a clean "no rows" (Codex round-2
+	 * P2).
+	 *
+	 * @param mixed $wpdb A wpdb-like object.
+	 * @param mixed $rows Whatever `get_results()` returned.
+	 * @return bool
+	 */
+	private static function results_failed( $wpdb, $rows ) {
+		if ( ! is_array( $rows ) ) {
+			return true;
+		}
+		return is_object( $wpdb ) && isset( $wpdb->last_error ) && '' !== (string) $wpdb->last_error;
+	}
+
+	/**
 	 * Elementor's presence and module state, read from the live site.
 	 * A seam: tests override it, since a suite cannot define-then-undefine
 	 * ELEMENTOR_VERSION or unload a class.
@@ -455,9 +489,10 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		if ( ! is_string( $sql ) || '' === $sql ) {
 			throw new \RuntimeException( 'consent statement could not be prepared' );
 		}
+		static::clear_last_error( $wpdb );
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
 		$rows = $wpdb->get_results( $sql );
-		if ( ! is_array( $rows ) ) {
+		if ( static::results_failed( $wpdb, $rows ) ) {
 			throw new \RuntimeException( 'consent statement failed' . ( ! empty( $wpdb->last_error ) ? ': ' . esc_html( $wpdb->last_error ) : '' ) );
 		}
 		return $rows;
@@ -563,9 +598,10 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		if ( ! is_string( $sql ) || '' === $sql ) {
 			throw new \RuntimeException( 'candidate statement could not be prepared' );
 		}
+		static::clear_last_error( $wpdb );
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
 		$rows = $wpdb->get_results( $sql );
-		if ( ! is_array( $rows ) ) {
+		if ( static::results_failed( $wpdb, $rows ) ) {
 			throw new \RuntimeException( 'candidate statement failed' . ( ! empty( $wpdb->last_error ) ? ': ' . esc_html( $wpdb->last_error ) : '' ) );
 		}
 		$ids = array();
@@ -823,18 +859,30 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			'installed' => false,
 			'version'   => null,
 		);
+		// Two tries, not one: elementor_env() alone decides installed/version
+		// (its own `class_present` already carries the "class implies
+		// installed" rule — see elementor_module_from()'s identical formula).
+		// A throw counting abilities or listing servers is a DISCOVERY
+		// failure, not an installation one, and must not erase an environment
+		// that was read fine (Codex round-2 P2).
+		$env = null;
 		try {
 			$env = $this->elementor_env();
-			$mod = static::elementor_module_from( $env, $this->elementor_ability_names(), $this->servers() );
-			// The class cannot exist without Elementor: installed follows it.
-			$installed        = ! empty( $env['installed'] ) || $mod['class_present'];
+		} catch ( \Throwable $e ) {
+			$out['mcp_module'] = $this->subtree_error( $e );
+		}
+
+		if ( null !== $env ) {
+			$installed        = ! empty( $env['installed'] ) || ! empty( $env['class_present'] );
 			$out['installed'] = $installed;
 			$out['version']   = $installed && isset( $env['version'] ) && is_string( $env['version'] ) && '' !== $env['version'] ? $this->clip( $env['version'] ) : null;
-			$out['mcp_module'] = $mod;
-		} catch ( \Throwable $e ) {
-			$out['installed']  = false;
-			$out['version']    = null;
-			$out['mcp_module'] = $this->subtree_error( $e );
+			try {
+				$out['mcp_module'] = static::elementor_module_from( $env, $this->elementor_ability_names(), $this->servers() );
+			} catch ( \Throwable $e ) {
+				// installed/version already derived from $env alone, above —
+				// left untouched here.
+				$out['mcp_module'] = $this->subtree_error( $e );
+			}
 		}
 
 		try {

@@ -57,7 +57,19 @@ class SA_Elementor_Fake_Tool extends Aura_Tool_Audit_Mcp_Exposure {
 		return $this->abilities;
 	}
 	protected function servers() {
+		$this->maybe_throw( 'servers' );
 		return $this->server_list;
+	}
+
+	/**
+	 * A public seam onto the protected elementor_state() — used by the
+	 * `servers` throw test so it can prove that throw stays inside the
+	 * elementor block, without going through execute()'s own top-level
+	 * `servers()`/`angie()` calls (which reuse this same override and would
+	 * otherwise throw first, before `elementor` is even reached).
+	 */
+	public function state(): array {
+		return $this->elementor_state();
 	}
 	protected function consent_rows() {
 		$this->maybe_throw( 'consent' );
@@ -186,8 +198,27 @@ final class McpExposureElementorTest extends TestCase {
 	}
 
 	public function test_a_throw_counting_abilities_is_a_module_error_too(): void {
+		// Codex round-2 P2: a throw counting abilities is a DISCOVERY failure,
+		// not an installation one — installed/version, already read from
+		// elementor_env() alone, must survive it.
 		$this->tool->throw_in = array( 'abilities' );
-		$this->assertSame( array( 'error' => 'abilities exploded' ), $this->block()['mcp_module'] );
+		$b = $this->block();
+		$this->assertSame( array( 'error' => 'abilities exploded' ), $b['mcp_module'] );
+		$this->assertTrue( $b['installed'] );
+		$this->assertSame( '4.3.0-beta1', $b['version'] );
+	}
+
+	public function test_a_throw_listing_servers_is_a_module_error_too(): void {
+		// Same rule, the other discovery input: elementor_module_from() also
+		// reads servers() to attribute server_id. Uses the state() seam
+		// (not block()/execute()) because this fake's servers() override is
+		// shared with execute()'s own top-level `servers` and `angie` keys,
+		// which would throw first and never reach `elementor` at all.
+		$this->tool->throw_in = array( 'servers' );
+		$b = $this->tool->state();
+		$this->assertSame( array( 'error' => 'servers exploded' ), $b['mcp_module'] );
+		$this->assertTrue( $b['installed'] );
+		$this->assertSame( '4.3.0-beta1', $b['version'] );
 	}
 
 	public function test_strings_are_clipped_at_200(): void {
@@ -498,6 +529,39 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( array( 262144, 'elementor_mcp_consent', 51 ), $prepared[0]['args'] );
 	}
 
+	public function test_a_failed_consent_statement_is_an_error_not_an_empty_inventory(): void {
+		// Codex round-2 P2: wpdb::get_results() answers its CLEARED
+		// $last_result — an empty array — when the statement itself fails,
+		// not false. The REAL seam against the bootstrap's $wpdb: an empty
+		// row set together with a set last_error must still be reported as
+		// { error }, never as "no consent rows".
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$GLOBALS['_db_rows']               = array();
+		$GLOBALS['_sa_wpdb_results_error'] = 'Table wp_usermeta doesnt exist';
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame(
+			array( 'error' => 'consent statement failed: Table wp_usermeta doesnt exist' ),
+			$b['consent']
+		);
+		$this->assertArrayNotHasKey( 'consent_unproven', $b );
+		$this->assertArrayNotHasKey( 'consent_truncated', $b );
+		// The module subtree, read independently, is untouched.
+		$this->assertFalse( $b['installed'] );
+	}
+
 	// --- Task 4: Elementor passwords -----------------------------------------
 
 	private static function pw( array $over = array() ): array {
@@ -658,6 +722,33 @@ final class McpExposureElementorTest extends TestCase {
 			return false !== strpos( $q, 'IF(LENGTH(meta_value) <= 262144' );
 		} );
 		$this->assertCount( 2, $bounded );
+	}
+
+	public function test_a_failed_candidate_statement_is_an_error_not_an_empty_inventory(): void {
+		// Codex round-2 P2: the same empty-array-on-failure shape as
+		// consent, for the candidate scan. `_sa_app_password_scan_fail`
+		// already models real wpdb behaviour here (last_error set, an
+		// empty array returned) -- this pins that a table/driver error
+		// reads as { error }, never as "no Elementor passwords".
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		$GLOBALS['_sa_app_password_scan_fail'] = true;
+		$p = $real->execute( array() )['elementor']['app_passwords'];
+		$this->assertSame( array( 'error' => 'candidate statement failed: scan failed' ), $p['elementor'] );
+		$this->assertArrayNotHasKey( 'candidates_read', $p );
+		$this->assertArrayNotHasKey( 'elementor_truncated', $p );
 	}
 
 	public function test_a_read_only_tool_fires_no_unproven_action_even_when_oversized(): void {

@@ -1854,8 +1854,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( preg_match( "/^SELECT DISTINCT user_id FROM \S+ WHERE meta_key = '_application_passwords' AND meta_value LIKE '%([^']*)%' ORDER BY user_id ASC LIMIT (\d+)$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				if ( ! empty( $GLOBALS['_sa_app_password_scan_fail'] ) ) {
+					// Real MySQL/wpdb: get_results() answers its CLEARED
+					// $last_result — an empty array, not null — when the
+					// statement fails; last_error is the only tell. array()
+					// here (not null) is deliberate: it is the shape that
+					// let a bare is_array() check read a broken table as
+					// "no candidates" (Codex round-2 P2).
 					$this->last_error = 'scan failed';
-					return null;
+					return array();
 				}
 				$needle = str_replace( array( '\\_', '\\%', '\\\\' ), array( '_', '%', '\\' ), stripslashes( $m[1] ) );
 				$ids    = array();
@@ -1877,6 +1883,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// through to $_db_rows and go on passing while proving nothing.
 			if ( false !== strpos( (string) $query, '_application_passwords' ) ) {
 				throw new RuntimeException( 'wpdb stub: unrecognised _application_passwords query shape — usermeta_holders() was reformatted and its tests would prove nothing: ' . (string) $query );
+			}
+			// A driver-level failure on a get_results() shape this stub does not
+			// model specially (the elementor_mcp_consent scan is the one that
+			// reaches here today). Mirrors real wpdb::get_results(): the CLEARED
+			// $last_result — an empty array, never null — plus last_error, the
+			// only tell a broken statement leaves behind (Codex round-2 P2).
+			if ( ! empty( $GLOBALS['_sa_wpdb_results_error'] ) ) {
+				$this->last_error = (string) $GLOBALS['_sa_wpdb_results_error'];
+				return array();
 			}
 			if ( ! empty( $GLOBALS['_db_results_queue'] ) ) {
 				return array_shift( $GLOBALS['_db_results_queue'] );
@@ -2424,6 +2439,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
+	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
@@ -3468,6 +3484,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
+	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
