@@ -39,6 +39,8 @@ class SA_Elementor_Fake_Tool extends Aura_Tool_Audit_Mcp_Exposure {
 	public $throw_in = array();
 	/** @var int[] user ids whose list was read, in order */
 	public $reads = array();
+	/** @var int how many times consent_rows() was invoked — the manage_options gate test proves this stays 0 */
+	public $consent_rows_calls = 0;
 
 	private function maybe_throw( $seam ) {
 		if ( in_array( $seam, $this->throw_in, true ) ) {
@@ -72,6 +74,7 @@ class SA_Elementor_Fake_Tool extends Aura_Tool_Audit_Mcp_Exposure {
 		return $this->elementor_state();
 	}
 	protected function consent_rows() {
+		++$this->consent_rows_calls;
 		$this->maybe_throw( 'consent' );
 		return $this->consent_rows;
 	}
@@ -125,6 +128,43 @@ final class McpExposureElementorTest extends TestCase {
 		foreach ( array( 'abilities_api_active', 'mcp_adapter', 'servers', 'angie', 'abilities', 'coverage' ) as $key ) {
 			$this->assertArrayHasKey( $key, $result );
 		}
+	}
+
+	// --- Codex round-3 P2: the block requires manage_options -----------------
+	// `POST /aura/mcp/tools/execute` is gated by check_update_plugins_permission,
+	// not manage_options — a caller holding update_plugins without manage_options
+	// must get the { error } shape on every subtree, with NOTHING read.
+
+	public function test_without_manage_options_every_subtree_is_the_error_shape_and_nothing_is_read(): void {
+		$GLOBALS['_caps'] = array( 'update_plugins' ); // held, but NOT manage_options
+		$b = $this->block();
+		$this->assertSame(
+			array(
+				'installed'     => false,
+				'version'       => null,
+				'mcp_module'    => array( 'error' => 'manage_options required' ),
+				'consent'       => array( 'error' => 'manage_options required' ),
+				'app_passwords' => array(
+					'elementor' => array( 'error' => 'manage_options required' ),
+					'other'     => array( 'error' => 'manage_options required' ),
+				),
+				'coverage'      => array( 'error' => 'manage_options required' ),
+			),
+			$b
+		);
+		$this->assertSame( array(), $this->tool->reads );
+		$this->assertSame( 0, $this->tool->consent_rows_calls );
+	}
+
+	public function test_with_manage_options_the_block_is_read(): void {
+		// sa_reset_state()'s default ($GLOBALS['_caps'] = null) already allows
+		// everything; asserted explicitly here as the gate's other branch.
+		$GLOBALS['_caps'] = null;
+		$this->tool->abilities = array( 'elementor/create-page' );
+		$b = $this->block();
+		$this->assertTrue( $b['installed'] );
+		$this->assertArrayHasKey( 'class_present', $b['mcp_module'] );
+		$this->assertSame( 1, $b['mcp_module']['abilities_registered'] );
 	}
 
 	public function test_a_clean_4_3_site_is_built_with_the_official_server_id(): void {
@@ -911,6 +951,56 @@ final class McpExposureElementorTest extends TestCase {
 		$vars = $GLOBALS['_user_queries'];
 		$this->assertSame( array( 'capability' => 'edit_posts', 'fields' => 'ID', 'number' => 1, 'count_total' => true ), $vars[0] );
 		$this->assertSame( array( 'capability' => 'edit_posts', 'fields' => 'ID', 'number' => 50, 'offset' => 0, 'orderby' => 'ID', 'order' => 'ASC', 'count_total' => false ), $vars[1] );
+	}
+
+	public function test_a_failed_user_count_query_is_a_context_error_not_an_empty_inventory(): void {
+		// Codex round-3 P2: WP_User_Query wraps a wpdb statement that can fail
+		// the same way the direct SQL scans (consent, candidates) can —
+		// WordPress answers an empty result / zero total on a database
+		// failure, never a throw. The REAL seam against the bootstrap's
+		// WP_User_Query stub, via its _sa_user_query_error knob.
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+		};
+		$GLOBALS['_sa_user_query_error'] = 'Table wp_users doesnt exist';
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['coverage'] );
+		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['app_passwords']['other'] );
+		// mcp_module and consent, read independently, are untouched.
+		$this->assertFalse( $b['installed'] );
+		$this->assertArrayNotHasKey( 'error', $b['mcp_module'] );
+		$this->assertSame( array(), $b['consent'] );
+	}
+
+	public function test_a_failed_paging_query_is_also_a_context_error(): void {
+		// Isolates context_user_ids()'s own failure path (context_users_total()
+		// is overridden to succeed, so the scan reaches the paging query).
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_users_total() {
+				return 5;
+			}
+		};
+		$GLOBALS['_sa_user_query_error'] = 'Table wp_users doesnt exist';
+		$b = $real->execute( array() )['elementor'];
+		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['coverage'] );
+		$this->assertSame( array( 'error' => 'user query failed: Table wp_users doesnt exist' ), $b['app_passwords']['other'] );
 	}
 
 	public function test_a_page_that_never_advances_terminates_and_is_bounded(): void {

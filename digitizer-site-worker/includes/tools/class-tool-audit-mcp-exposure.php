@@ -93,7 +93,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			'angie'                => 'object — { active, version, mcp_server_present } (the known second door; absence of Angie does not mean absence of a second server)',
 			'abilities'            => 'object — { total, discoverable_by_type_rule, discoverable_and_mutating, discoverable_mutating_names }. These count abilities that PASS the discovery rule co-installed servers apply (no meta.mcp.type, or "tool") — a property of the abilities, NOT proof that anything currently serves them. Reachability additionally requires a server that resolves targets from the site-wide registry; a server with an explicit tool list reaches only what it lists. Read together with `servers`: with none registered, these counts describe a door that does not exist yet.',
 			'coverage'             => 'object — { total_seen, returned, truncated, cap } bounded-coverage contract',
-			'elementor'            => 'object — Elementor >= 4.3\'s official MCP door (2.15.0). { installed, version, mcp_module: { class_present, active, abilities_registered, server_id }, consent: [{ user_id, login, allowed, timestamp }], consent_unproven: [user_id], consent_truncated, app_passwords: { elementor: [{ user_id, login, name, created, last_used, last_ip }], elementor_entries_truncated, elementor_unproven: [user_id], candidates_read, elementor_truncated, other: { users_checked, count, recently_used, unproven: [user_id] } }, coverage: { users_total, users_checked, truncated, cap } }. consent rows and Elementor-named Application Passwords are found across ALL users (two bounded usermeta queries, 50 rows each); every other Application Password of edit_posts users is counted (200 users). No usermeta value over 256 KB is decoded — such a row is listed in the subtree\'s *_unproven. A scan that failed is { error } in its place (mcp_module / consent / app_passwords.elementor / app_passwords.other + coverage), never an empty list. Shape: Digitizers/Aura docs/superpowers/specs/2026-09-02-elementor-mcp-door-detection-design.md §3.',
+			'elementor'            => 'object — Elementor >= 4.3\'s official MCP door (2.15.0). { installed, version, mcp_module: { class_present, active, abilities_registered, server_id }, consent: [{ user_id, login, allowed, timestamp }], consent_unproven: [user_id], consent_truncated, app_passwords: { elementor: [{ user_id, login, name, created, last_used, last_ip }], elementor_entries_truncated, elementor_unproven: [user_id], candidates_read, elementor_truncated, other: { users_checked, count, recently_used, unproven: [user_id] } }, coverage: { users_total, users_checked, truncated, cap } }. consent rows and Elementor-named Application Passwords are found across ALL users (two bounded usermeta queries, 50 rows each); every other Application Password of edit_posts users is counted (200 users). No usermeta value over 256 KB is decoded — such a row is listed in the subtree\'s *_unproven. A scan that failed is { error } in its place (mcp_module / consent / app_passwords.elementor / app_passwords.other + coverage), never an empty list. Requires manage_options; every subtree is { error: \'manage_options required\' } otherwise. Shape: Digitizers/Aura docs/superpowers/specs/2026-09-02-elementor-mcp-door-detection-design.md §3.',
 		);
 	}
 
@@ -713,6 +713,8 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 * @return int[]
 	 */
 	protected function context_user_ids( $offset, $number ) {
+		global $wpdb;
+		static::clear_last_error( $wpdb );
 		$q = new \WP_User_Query(
 			array(
 				'capability'  => 'edit_posts',
@@ -724,8 +726,17 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 				'count_total' => false,
 			)
 		);
+		$rows = $q->get_results();
+		// WP_User_Query wraps a wpdb statement that can fail the same way the
+		// direct SQL in consent_rows()/elementor_candidate_ids() can: WordPress
+		// answers an empty array on a database failure, never a throw, so an
+		// empty result is indistinguishable from "no edit_posts users" unless
+		// last_error is consulted right after the call (Codex round-3 P2).
+		if ( static::results_failed( $wpdb, $rows ) ) {
+			throw new \RuntimeException( 'user query failed' . ( is_object( $wpdb ) && ! empty( $wpdb->last_error ) ? ': ' . esc_html( $wpdb->last_error ) : '' ) );
+		}
 		$ids = array();
-		foreach ( (array) $q->get_results() as $id ) {
+		foreach ( (array) $rows as $id ) {
 			$ids[] = (int) ( is_object( $id ) && isset( $id->ID ) ? $id->ID : $id );
 		}
 		return $ids;
@@ -737,6 +748,8 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 * @return int
 	 */
 	protected function context_users_total() {
+		global $wpdb;
+		static::clear_last_error( $wpdb );
 		$q = new \WP_User_Query(
 			array(
 				'capability'  => 'edit_posts',
@@ -745,7 +758,11 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 				'count_total' => true,
 			)
 		);
-		return (int) $q->get_total();
+		$total = $q->get_total();
+		if ( is_object( $wpdb ) && ! empty( $wpdb->last_error ) ) {
+			throw new \RuntimeException( 'user query failed: ' . esc_html( $wpdb->last_error ) );
+		}
+		return (int) $total;
 	}
 
 	/**
@@ -855,6 +872,32 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 * @return array
 	 */
 	protected function elementor_state() {
+		// `POST /aura/mcp/tools/execute` is gated by check_update_plugins_permission
+		// (class-aura-worker-mcp.php), not manage_options — an authenticated user
+		// holding update_plugins (a custom role, an Application Password) but not
+		// manage_options can otherwise reach this block and read every user's
+		// Elementor-issued password names, last_ip, and consent rows. The
+		// Abilities path already gates on manage_options
+		// (Aura_Worker_Abilities::make_permission()); this closes the same door
+		// on the REST execute path. Aura's own calls run as a stored administrator
+		// (class-aura-worker-security.php), so this never affects the gateway.
+		// Every subtree the block promises is replaced with the SAME shape a
+		// throw in that subtree already produces — a consumer that treats
+		// `{ error }` as unknown needs no new case — and NOTHING is read: no
+		// env, no ability count, no consent/candidate/context statement.
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return array(
+				'installed'     => false,
+				'version'       => null,
+				'mcp_module'    => array( 'error' => 'manage_options required' ),
+				'consent'       => array( 'error' => 'manage_options required' ),
+				'app_passwords' => array(
+					'elementor' => array( 'error' => 'manage_options required' ),
+					'other'     => array( 'error' => 'manage_options required' ),
+				),
+				'coverage'      => array( 'error' => 'manage_options required' ),
+			);
+		}
 		$out = array(
 			'installed' => false,
 			'version'   => null,

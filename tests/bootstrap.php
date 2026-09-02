@@ -2643,6 +2643,11 @@ $GLOBALS['_users_total']  = 0;
 $GLOBALS['_admin_total']  = 0;
 $GLOBALS['_user_queries'] = array();
 $GLOBALS['_post_counts']  = array();
+// Set to a message to make WP_User_Query model a database failure: the
+// underlying wpdb statement sets last_error and WordPress still answers an
+// empty result / zero total, never a throw — mirrors the direct-SQL seams'
+// $GLOBALS['_sa_wpdb_results_error'] knob for the same shape (Codex round-3 P2).
+$GLOBALS['_sa_user_query_error'] = null;
 
 if ( ! class_exists( 'WP_User_Query' ) ) {
 	class WP_User_Query {
@@ -2652,14 +2657,23 @@ if ( ! class_exists( 'WP_User_Query' ) ) {
 		public function __construct( $args = array() ) {
 			$this->query_vars           = is_array( $args ) ? $args : array();
 			$GLOBALS['_user_queries'][] = $this->query_vars;
+			if ( ! empty( $GLOBALS['_sa_user_query_error'] ) && isset( $GLOBALS['wpdb'] ) ) {
+				$GLOBALS['wpdb']->last_error = (string) $GLOBALS['_sa_user_query_error'];
+			}
 		}
 
 		public function get_results() {
+			if ( ! empty( $GLOBALS['_sa_user_query_error'] ) ) {
+				return array();
+			}
 			// The admin-count query asks only for IDs — it never reads results.
 			return $GLOBALS['_users'];
 		}
 
 		public function get_total() {
+			if ( ! empty( $GLOBALS['_sa_user_query_error'] ) ) {
+				return 0;
+			}
 			$is_admin_count = ( isset( $this->query_vars['role'] ) && 'administrator' === $this->query_vars['role'] )
 				&& ( isset( $this->query_vars['fields'] ) && 'ID' === $this->query_vars['fields'] );
 			return $is_admin_count ? (int) $GLOBALS['_admin_total'] : (int) $GLOBALS['_users_total'];
@@ -3503,6 +3517,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_admin_total']  = 0;
 	$GLOBALS['_user_queries'] = array();
 	$GLOBALS['_post_counts']  = array();
+	$GLOBALS['_sa_user_query_error'] = null;
 	$GLOBALS['_home_url']       = 'https://example.com';
 	$GLOBALS['_site_url']       = 'https://example.com';
 	$GLOBALS['_wp_query_posts'] = array();
