@@ -2554,11 +2554,21 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// want its own seam rather than borrowing this one.
 			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
 				list( , $name, $expected ) = array_map( 'stripslashes', $m );
-				if ( 'aura_worker_door_hold_lock' === $name ) {
-					// A racer replacing the lock's value in the window between
-					// this caller's own read and this delete — the window
-					// round-1's fix exists to close.
-					sa_before_swap();
+				// A racer replacing the lock's value in the window between
+				// this caller's own read and this delete — the window
+				// round-1's fix exists to close. This is its OWN seam, never
+				// _sa_before_swap: that one already fires inside
+				// insert_unique()'s NOT EXISTS branch for any
+				// 'aura_worker_door_' name, including the lock, so arming it
+				// here would fire on take_lock()'s very first insert attempt
+				// (before staleness is even judged) rather than in the window
+				// this fence protects — round-2 finding: a test built on the
+				// shared seam passed identically against the pre-round-1,
+				// unconditional-delete take_lock(), proving nothing.
+				if ( 'aura_worker_door_hold_lock' === $name && isset( $GLOBALS['_sa_before_lock_delete'] ) && is_callable( $GLOBALS['_sa_before_lock_delete'] ) ) {
+					$racer                             = $GLOBALS['_sa_before_lock_delete'];
+					$GLOBALS['_sa_before_lock_delete'] = null; // fires once
+					$racer();
 				}
 				if ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $expected ) {
 					return 0; // Someone else wrote (or already deleted) first.
@@ -2665,6 +2675,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
@@ -3846,6 +3857,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).

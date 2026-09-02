@@ -69,20 +69,22 @@ final class DoorHoldsTest extends TestCase {
 	public function test_two_racers_on_a_stale_lock_only_one_of_them_takes_it(): void {
 		$stale = time() - Aura_Worker_Door_Holds::LOCK_S - 1;
 		add_option( Aura_Worker_Door_Holds::LOCK, $stale, '', 'no' );
-		// Racer B replaces the crashed holder's lock with its OWN fresh one
-		// in the exact window between this call's read of the stale bytes
-		// and its fenced delete keyed on them — the race round-1's fix
-		// closes. A distinguishable timestamp (far in the future) so the
-		// assertion below cannot be satisfied by A's own writes.
-		$racers_lock = time() + 100000;
-		$GLOBALS['_sa_before_swap'] = static function () use ( $racers_lock ) {
-			$GLOBALS['_sa_before_swap']                       = null; // fires once
+		// Racer B wins the SAME window A's own fenced delete is about to
+		// close: it fires INSIDE that delete's own SQL branch (never
+		// _sa_before_swap, which also fires on take_lock()'s very first
+		// insert_unique() attempt — before staleness is even judged — and so
+		// cannot tell a fenced delete from an unconditional one; round-2
+		// finding). B deletes the stale row and installs its OWN fresh lock,
+		// exactly as a real racer's insert_unique() would leave things.
+		$racers_lock = time();
+		$GLOBALS['_sa_before_lock_delete'] = static function () use ( $racers_lock ) {
+			unset( $GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ], $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] );
 			$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $racers_lock;
 			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = (string) $racers_lock;
 		};
 		$err = Aura_Worker_Door_Holds::hold( $this->call() );
 		$this->assertInstanceOf( WP_Error::class, $err );
-		$this->assertSame( 'aura_hold_busy', $err->get_error_code(), 'A never got past the fenced delete: its own insert_unique() keeps meeting a lock it does not own' );
+		$this->assertSame( 'aura_hold_busy', $err->get_error_code(), 'A never gets past the fenced delete: its own insert_unique() keeps meeting a lock it does not own' );
 		$this->assertSame( $racers_lock, $GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ], "the racer's lock was never overwritten by A" );
 		$this->assertSame( 0, Aura_Worker_Door_Holds::count(), 'no held row leaked while the lock could not be taken' );
 	}
@@ -96,8 +98,7 @@ final class DoorHoldsTest extends TestCase {
 		// exercised directly against the fenced-DELETE SQL shape itself
 		// rather than through take_lock()'s retry loop.
 		$fresh = time();
-		$GLOBALS['_sa_before_swap'] = static function () use ( $fresh ) {
-			$GLOBALS['_sa_before_swap']                       = null;
+		$GLOBALS['_sa_before_lock_delete'] = static function () use ( $fresh ) {
 			$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $fresh;
 			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = (string) $fresh;
 		};
