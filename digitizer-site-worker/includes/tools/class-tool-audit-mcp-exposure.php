@@ -605,7 +605,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			throw new \RuntimeException( 'database unavailable' );
 		}
 		$sql = $wpdb->prepare(
-			"SELECT DISTINCT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s ORDER BY user_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			"SELECT DISTINCT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value LIKE %s AND user_id > 0 ORDER BY user_id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			'_application_passwords',
 			'%' . $wpdb->esc_like( static::ELEMENTOR_PASSWORD_PREFIX ) . '%',
 			static::ELEMENTOR_LIST_CAP + 1

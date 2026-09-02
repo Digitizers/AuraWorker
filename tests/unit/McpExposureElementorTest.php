@@ -763,7 +763,7 @@ final class McpExposureElementorTest extends TestCase {
 			return false !== strpos( $p['query'], 'SELECT DISTINCT user_id' );
 		} ) );
 		$this->assertCount( 1, $prepared );
-		$this->assertSame( 'SELECT DISTINCT user_id FROM wp_usermeta WHERE meta_key = %s AND meta_value LIKE %s ORDER BY user_id ASC LIMIT %d', $prepared[0]['query'] );
+		$this->assertSame( 'SELECT DISTINCT user_id FROM wp_usermeta WHERE meta_key = %s AND meta_value LIKE %s AND user_id > 0 ORDER BY user_id ASC LIMIT %d', $prepared[0]['query'] );
 		$this->assertSame( array( '_application_passwords', '%Elementor MCP%', 51 ), $prepared[0]['args'] );
 		// And each candidate was read through the BOUNDED helper.
 		$bounded = array_filter( $GLOBALS['_db_queries'], static function ( $q ) {
