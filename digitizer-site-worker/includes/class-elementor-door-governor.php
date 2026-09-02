@@ -1699,18 +1699,19 @@ class Aura_Worker_Elementor_Door {
 			return array( 'active' => false );
 		}
 		$epoch = Aura_Worker_Door_Log::epoch();
+		$held  = Aura_Worker_Door_Holds::count(); // read once — held_count and queue_full are the same fact
 		return array(
 			'active'              => true,
 			'epoch'               => '' === $epoch ? null : $epoch,
 			'seam'                => self::$seam,
 			'door'                => Aura_Worker_Door_Log::is_closed() ? 'closed' : 'open',
-			'held_count'          => Aura_Worker_Door_Holds::count(),
+			'held_count'          => $held,
 			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(),
 			'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),
 			'unobserved_30d'      => self::count_30d( 'unobserved' ),
 			'hook_missed_30d'     => self::count_30d( 'hook_missed' ),
 			'unknown_ability_30d' => self::count_30d( 'unknown_ability' ),
-			'queue_full'          => Aura_Worker_Door_Holds::count() >= Aura_Worker_Door_Holds::CAP,
+			'queue_full'          => $held >= Aura_Worker_Door_Holds::CAP,
 			'log_full'            => Aura_Worker_Door_Log::full_report(),
 		);
 	}
