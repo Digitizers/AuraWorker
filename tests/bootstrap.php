@@ -132,6 +132,15 @@ if ( ! function_exists( 'sanitize_text_field' ) ) {
 	}
 }
 
+if ( ! function_exists( 'sanitize_key' ) ) {
+	// Core's rule exactly: lowercase, then everything outside [a-z0-9_-] gone.
+	// The door's expected_types() runs an ability's `post_type` input through
+	// it before either creation witness compares anything against it.
+	function sanitize_key( $key ): string {
+		return preg_replace( '/[^a-z0-9_\-]/', '', strtolower( (string) $key ) );
+	}
+}
+
 if ( ! function_exists( 'sanitize_textarea_field' ) ) {
 	function sanitize_textarea_field( $str ): string {
 		return trim( strip_tags( (string) $str ) );
@@ -2099,6 +2108,16 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return $max;
 			}
+			// The Elementor door's creation watermark (2.16.0): the highest post
+			// id before the write, so an insert core's hook never fired for can
+			// still be found afterwards. Read against $GLOBALS['_posts'] — the
+			// "posts table" — the way MySQL would; an empty table answers NULL,
+			// which is what the production (int) cast is written against.
+			if ( preg_match( '/^SELECT MAX\(ID\) FROM \S+$/', trim( (string) $query ) ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$ids                      = array_map( 'intval', array_keys( $GLOBALS['_posts'] ) );
+				return empty( $ids ) ? null : (string) max( $ids );
+			}
 			// Aura_Worker_Door_Log::count_unacked(): rows above the ack floor.
 			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\) > (\d+)$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
@@ -2257,6 +2276,34 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 						}
 					)
 				);
+			}
+			// The Elementor door's watermark DIFF (2.16.0): every post above the
+			// mark, of an expected type, authored by the actor — the second
+			// witness to a creation, which is how an insert the wp_insert_post
+			// hook never saw is still attributed. Modelled over
+			// $GLOBALS['_posts'] the way MySQL would run it, honouring BOTH
+			// filters: a post of another type, or another author's, is not this
+			// call's, and a fake that ignored either would let the production
+			// code claim posts it never made.
+			if ( preg_match( "/^SELECT ID FROM \S+ WHERE ID > (\d+) AND post_type IN \(([^)]*)\) AND post_author = (\d+)$/", (string) $query, $m ) ) {
+				$mark   = (int) $m[1];
+				$types  = array();
+				if ( preg_match_all( "/'([^']*)'/", $m[2], $tm ) ) {
+					$types = array_map( 'stripslashes', $tm[1] );
+				}
+				$author = (int) $m[3];
+				$out    = array();
+				foreach ( $GLOBALS['_posts'] as $id => $p ) {
+					if ( (int) $id <= $mark || ! in_array( (string) ( $p->post_type ?? '' ), $types, true ) ) {
+						continue;
+					}
+					if ( (int) ( $p->post_author ?? 0 ) !== $author ) {
+						continue;
+					}
+					$out[] = (string) (int) $id;
+				}
+				sort( $out, SORT_NUMERIC );
+				return $out;
 			}
 			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", (string) $query, $m ) ) {
 				$re     = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
@@ -2494,6 +2541,20 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
+				// One named row's compare-and-swap refused at the driver —
+				// NOT a lost race, and not the same thing as
+				// _sa_option_write_fail, which scopes update_option() and the
+				// claim-conditional writes. Kept apart deliberately: a test
+				// arming one of those must not silently start failing every
+				// door-log patch too. `true` fails every swap of that row; a
+				// CALLABLE receives the value being written and returns true
+				// to refuse it, which is how ONE patch of a sequence (the
+				// creation watermark, say) can fail while the admission
+				// before it and the settle after it still land.
+				$cas_fail = $GLOBALS['_sa_option_cas_fail'][ stripslashes( $m[2] ) ] ?? null;
+				if ( null !== $cas_fail && ( ! is_callable( $cas_fail ) || $cas_fail( stripslashes( $m[1] ) ) ) ) {
+					return false;
+				}
 				if ( ! empty( $GLOBALS['_cas_always_lose'] ) ) {
 					return 0; // Contention that never resolves.
 				}
@@ -2687,6 +2748,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
@@ -3441,6 +3503,13 @@ if ( ! function_exists( 'wp_trash_post' ) ) {
 		if ( defined( 'EMPTY_TRASH_DAYS' ) && 0 === (int) EMPTY_TRASH_DAYS ) {
 			return wp_delete_post( $id, true );
 		}
+		// The same shape as wp_delete_post's noop seam above: a pre_trash_post
+		// short-circuit (or a failing UPDATE) that returns a TRUTHY value while
+		// the post stays live — so a caller must verify by re-reading the
+		// status, never by the return value.
+		if ( ! empty( $GLOBALS['_sa_state']['wp_trash_post_noop'][ $id ] ) ) {
+			return $GLOBALS['_posts'][ $id ];
+		}
 		if ( 'trash' === ( $GLOBALS['_posts'][ $id ]->post_status ?? '' ) ) {
 			return false; // core: already trashed
 		}
@@ -3881,6 +3950,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.

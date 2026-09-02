@@ -687,6 +687,11 @@ class Aura_Worker_Elementor_Door {
 			'slug'       => $slug,
 			'kind'       => $kind,
 			'creating'   => $creating,
+			// The witnesses' shared frame: which types this creation may
+			// insert, and whose inserts they are. Both are read by the hook
+			// observer and by the watermark diff after it.
+			'expected'   => self::expected_types( $slug, $input ),
+			'actor_id'   => (int) $actor['user_id'],
 			'created'    => array(),
 			'suspected'  => array(),
 			'collateral' => array(),
@@ -1043,6 +1048,23 @@ class Aura_Worker_Elementor_Door {
 		return 'component' === $kind && ! ( isset( $input['id'] ) && is_numeric( $input['id'] ) && (int) $input['id'] > 0 );
 	}
 
+	/**
+	 * The post types a creation may legitimately insert — the set both
+	 * witnesses judge against: the insert hook files anything else under
+	 * `other_inserts`, and the watermark diff never looks outside it.
+	 *
+	 * @param string $slug  Ability.
+	 * @param array  $input Input.
+	 * @return string[]
+	 */
+	private static function expected_types( $slug, array $input ) {
+		if ( 'elementor/manage-component' === $slug ) {
+			return array( self::CPT_COMPONENT );
+		}
+		$t = isset( $input['post_type'] ) && is_string( $input['post_type'] ) && '' !== $input['post_type'] ? sanitize_key( $input['post_type'] ) : 'page';
+		return array( '' === $t ? 'page' : $t );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* A restore is itself a governed write                                */
 	/* ------------------------------------------------------------------ */
@@ -1159,49 +1181,255 @@ class Aura_Worker_Elementor_Door {
 		);
 	}
 
+	/* ------------------------------------------------------------------ */
+	/* Creation: the two witnesses, the mutex, and compensation            */
+	/* ------------------------------------------------------------------ */
+
 	/**
-	 * Task 7.
+	 * WITNESS 1 — core's own insert hook, at priority 1.
+	 *
+	 * Every id is written to the pending row AS IT HAPPENS, one write per
+	 * insert, before the callback that made it can return: a request that dies
+	 * mid-write still leaves Aura the ids it has to undo. An `$update` is not a
+	 * creation, and an insert outside the expected set is recorded apart, in
+	 * `other_inserts` — never handed to a `creation` envelope, whose restore
+	 * would trash it.
 	 *
 	 * @param int    $post_id Post id.
 	 * @param object $post    Post.
 	 * @param bool   $update  Whether this was an update.
 	 */
-	public static function observe_insert( $post_id, $post, $update ) {}
+	public static function observe_insert( $post_id, $post, $update ) {
+		if ( null === self::$request || empty( self::$request['creating'] ) || $update ) {
+			return;
+		}
+		$id   = (int) $post_id;
+		$type = is_object( $post ) ? (string) ( $post->post_type ?? '' ) : (string) get_post_type( $id );
+		$seq  = (int) self::$request['seq'];
+		$row  = Aura_Worker_Door_Log::get( $seq );
+		if ( null === $row ) {
+			return;
+		}
+		if ( in_array( $type, (array) self::$request['expected'], true ) ) {
+			self::$request['created'][] = $id;
+			$ids                        = array_values( array_unique( array_merge( (array) ( $row['created_post_ids'] ?? array() ), array( $id ) ) ) );
+			Aura_Worker_Door_Log::patch_pending( $seq, array( 'created_post_ids' => $ids ) );
+		} else {
+			$others = array_values( array_unique( array_merge( (array) ( $row['other_inserts'] ?? array() ), array( $id ) ) ) );
+			Aura_Worker_Door_Log::patch_pending( $seq, array( 'other_inserts' => $others ) );
+		}
+	}
 
 	/**
-	 * Task 7.
+	 * Elementor deleting a global class REWRITES every page that used it, and
+	 * those pages are not this call's target — they are its collateral. They
+	 * are captured HERE, at priority 1, so the envelope exists (and its id is
+	 * on the row) before Elementor's own handler at priority 10 touches them.
+	 *
+	 * A capture that fails THROWS: the governor's catch turns that into
+	 * `aura_governor_error`, which refuses the whole call before the rewrite —
+	 * the class posts themselves are still restorable from the design_system
+	 * envelope taken before the write.
 	 *
 	 * @param array $deleted_class_ids Class ids removed.
 	 * @param array $affected_post_ids Posts they were on.
+	 * @throws RuntimeException When the capture, or the record of it, fails.
 	 */
-	public static function capture_class_cleanup( $deleted_class_ids, $affected_post_ids ) {}
+	public static function capture_class_cleanup( $deleted_class_ids, $affected_post_ids ) {
+		if ( null === self::$request || 'design_system' !== ( self::$request['kind'] ?? '' ) ) {
+			return;
+		}
+		$ids = array_values( array_filter( array_map( 'intval', (array) $affected_post_ids ) ) );
+		if ( empty( $ids ) ) {
+			return;
+		}
+		$snaps = new Aura_Worker_Snapshots();
+		$env   = $snaps->snapshot_posts(
+			$ids,
+			array( '_elementor_data' ),
+			array(
+				'kind_label' => 'page',
+				'door'       => array(
+					'seq'           => self::$request['seq'],
+					'collateral_of' => self::$request['seq'],
+				),
+			)
+		);
+		if ( empty( $env['success'] ) ) {
+			throw new RuntimeException( esc_html( 'collateral capture failed: ' . (string) ( $env['error'] ?? '' ) ) ); // the wrapper's catch refuses the call before Elementor's cleanup runs
+		}
+		self::$request['collateral'][] = (string) $env['snapshot']['id'];
+		// Durable BEFORE Elementor's cleanup handler (priority 10) rewrites the
+		// pages: an interrupted request must still name the envelope that can
+		// undo them.
+		if ( ! Aura_Worker_Door_Log::patch_pending( (int) self::$request['seq'], array( 'collateral_snapshot_ids' => self::$request['collateral'] ) ) ) {
+			throw new RuntimeException( 'collateral id could not be recorded' );
+		}
+	}
 
 	/**
-	 * Task 7.
+	 * One creation at a time per site — because the watermark diff cannot tell
+	 * two concurrent creations' posts apart.
+	 *
+	 * Taken with insert_unique(), NOT add_option(): core's add_option() ends in
+	 * an `INSERT … ON DUPLICATE KEY UPDATE`, which is an upsert, so both racers
+	 * would "take" it (Ruling P5). The reconciler clears a mutex older than
+	 * CLAIM_STALE_MS, which is what `started_at` is for.
 	 *
 	 * @param int $seq Log seq.
-	 * @return true|WP_Error
+	 * @return true|WP_Error `aura_creation_busy` (503) when another creation holds it.
 	 */
 	private static function take_creation_mutex( $seq ) {
+		$taken = Aura_Worker_Door_Log::insert_unique(
+			self::CREATING,
+			array(
+				'seq'        => (int) $seq,
+				'started_at' => gmdate( 'c' ),
+			)
+		);
+		if ( ! $taken ) {
+			return new WP_Error(
+				'aura_creation_busy',
+				'Another creation is in progress on this site; retry in 30 seconds.',
+				array(
+					'status'      => 503,
+					'retry_after' => 30,
+				)
+			);
+		}
 		return true;
 	}
 
 	/**
-	 * Task 7.
+	 * WITNESS 2 — the high-water mark of wp_posts before the write, so an
+	 * insert core's hook never fired for can still be found afterwards.
 	 *
 	 * @param int $seq Log seq.
+	 * @return bool the watermark is on the row; false ⇒ the caller refuses the
+	 *              write: a creation whose watermark is not durable could not
+	 *              be reconstructed by anyone.
 	 */
-	private static function stamp_watermark( $seq ) {}
+	private static function stamp_watermark( $seq ) {
+		global $wpdb;
+		$max = (int) $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		self::$request['watermark'] = $max;
+		return Aura_Worker_Door_Log::patch_pending(
+			$seq,
+			array(
+				'post_watermark'   => $max,
+				'started_at'       => gmdate( 'c' ),
+				'created_post_ids' => array(),
+				'expected_types'   => self::$request['expected'],
+			)
+		);
+	}
 
 	/**
-	 * Task 7.
+	 * After the inner callback of a creating ability: union the two witnesses,
+	 * store the `creation` envelope, and — when it cannot be stored —
+	 * compensate, because the write already happened.
 	 *
 	 * @param int   $seq    Log seq.
 	 * @param mixed $result Inner result.
-	 * @param bool  $failed Whether it failed.
-	 * @return array|WP_Error
+	 * @param bool  $failed Whether the ability reported failure.
+	 * @return array|WP_Error terminal fields, or aura_snapshot_failed (compensated).
 	 */
 	private static function finish_creation( $seq, $result, $failed ) {
-		return array();
+		global $wpdb;
+		$types    = (array) self::$request['expected'];
+		$actor_id = (int) ( self::$request['actor_id'] ?? 0 );
+		$in       = implode( ',', array_fill( 0, count( $types ), '%s' ) );
+		// NO watermark means this request never reached the write — the mutex
+		// or the stamp itself failed, and execute()'s catch still finishes the
+		// creation. There is no mark to diff against, and treating that as
+		// "everything above id 0" would attribute every page this user ever
+		// made to the call — and then TRASH them if the envelope could not be
+		// stored. A stamped 0 (an empty posts table) is a real mark and does
+		// diff; only its ABSENCE means "nothing to compare".
+		$diff   = array();
+		if ( isset( self::$request['watermark'] ) ) {
+			$mark = (int) self::$request['watermark'];
+			$diff = array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE ID > %d AND post_type IN ($in) AND post_author = %d", array_merge( array( $mark ), $types, array( $actor_id ) ) ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		}
+		$hooked   = array_map( 'intval', (array) self::$request['created'] );
+		$missed   = array_values( array_diff( $diff, $hooked ) );
+		$created  = array_values( array_unique( array_merge( $hooked, $missed ) ) );
+		$fields   = array( 'created_post_ids' => $created );
+		if ( ! empty( $missed ) ) {
+			$fields['observed_by_watermark'] = $missed;
+			$fields['hook_missed']           = count( $missed );
+			self::bump_counter( 'hook_missed' );
+		}
+		if ( empty( $created ) && ! $failed ) {
+			self::bump_counter( 'unobserved' ); // a success that inserted nothing the witnesses could see
+		}
+		$named = is_array( $result ) && isset( $result['id'] ) && is_numeric( $result['id'] ) ? (int) $result['id'] : 0;
+		if ( $named > 0 && ! in_array( $named, $created, true ) ) {
+			$fields['unattributed_result'] = $named;
+		}
+		try {
+			if ( empty( $created ) ) {
+				return $fields; // nothing was inserted: nothing to undo; the mutex is released in the finally
+			}
+			// A callback that inserted and THEN reported failure still left
+			// posts behind: they get an envelope like any creation, or are
+			// compensated when the envelope cannot be stored — `$failed`
+			// decides the entry's result, never whether the rollback exists.
+			$snaps = new Aura_Worker_Snapshots();
+			$env   = $snaps->snapshot_creation(
+				$created,
+				(string) $types[0],
+				array(
+					'seq'     => $seq,
+					'ability' => self::$request['slug'],
+				)
+			);
+			if ( empty( $env['success'] ) ) {
+				// Compensate: the write happened and cannot be made restorable.
+				// VERIFIED per id — wp_trash_post() can return false on a hook
+				// or database failure, and a post that stayed live is reported
+				// as uncompensated, never as undone.
+				$how  = ( defined( 'EMPTY_TRASH_DAYS' ) && 0 === (int) EMPTY_TRASH_DAYS ) ? 'delete' : 'trash';
+				$done = array();
+				$left = array();
+				foreach ( $created as $pid ) {
+					wp_trash_post( $pid );
+					$post = get_post( $pid );
+					if ( ! $post || 'trash' === $post->post_status ) {
+						$done[] = $pid;
+					} else {
+						$left[] = $pid;
+					}
+				}
+				Aura_Worker_Door_Log::settle(
+					$seq,
+					array_merge(
+						$fields,
+						array(
+							'result'         => 'failed',
+							'reason'         => 'snapshot_failed',
+							'compensated'    => $done,
+							'uncompensated'  => $left,
+							'compensated_by' => $how,
+						)
+					)
+				);
+				$msg = empty( $left )
+					? 'Aura could not record a rollback for what this call created; the creation was undone. '
+					: sprintf( 'Aura could not record a rollback for what this call created, and could not undo post(s) %s — check the site. ', implode( ', ', $left ) );
+				return new WP_Error(
+					'aura_snapshot_failed',
+					$msg . (string) ( $env['error'] ?? '' ),
+					array(
+						'status'        => 503,
+						'uncompensated' => $left,
+					)
+				);
+			}
+			$fields['snapshot_id'] = (string) $env['snapshot']['id'];
+			return $fields;
+		} finally {
+			delete_option( self::CREATING );
+		}
 	}
 }
