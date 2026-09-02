@@ -63,16 +63,6 @@ class SA_Elementor_Fake_Tool extends Aura_Tool_Audit_Mcp_Exposure {
 		return $this->server_list;
 	}
 
-	/**
-	 * A public seam onto the protected elementor_state() — used by the
-	 * `servers` throw test so it can prove that throw stays inside the
-	 * elementor block, without going through execute()'s own top-level
-	 * `servers()`/`angie()` calls (which reuse this same override and would
-	 * otherwise throw first, before `elementor` is even reached).
-	 */
-	public function state(): array {
-		return $this->elementor_state();
-	}
 	protected function consent_rows() {
 		++$this->consent_rows_calls;
 		$this->maybe_throw( 'consent' );
@@ -250,15 +240,31 @@ final class McpExposureElementorTest extends TestCase {
 
 	public function test_a_throw_listing_servers_is_a_module_error_too(): void {
 		// Same rule, the other discovery input: elementor_module_from() also
-		// reads servers() to attribute server_id. Uses the state() seam
-		// (not block()/execute()) because this fake's servers() override is
-		// shared with execute()'s own top-level `servers` and `angie` keys,
-		// which would throw first and never reach `elementor` at all.
+		// reads servers() to attribute server_id.
 		$this->tool->throw_in = array( 'servers' );
-		$b = $this->tool->state();
+		$b = $this->block();
 		$this->assertSame( array( 'error' => 'servers exploded' ), $b['mcp_module'] );
 		$this->assertTrue( $b['installed'] );
 		$this->assertSame( '4.3.0-beta1', $b['version'] );
+	}
+
+	public function test_a_throw_listing_servers_never_leaves_execute(): void {
+		// Codex round-8 P2: execute() builds `servers` and `angie` BEFORE
+		// `elementor`, from the same servers() read — so a throw there used to
+		// fail the whole tool and the module-subtree isolation above was never
+		// reached. Discovery is now read once in execute(); every reader gets
+		// { error } in its own place and the rest of the payload still lands.
+		$this->tool->throw_in = array( 'servers' );
+		$result = $this->tool->execute( array() );
+		$this->assertSame( array( 'error' => 'servers exploded' ), $result['servers'] );
+		$this->assertSame( array( 'error' => 'servers exploded' ), $result['angie'] );
+		$this->assertSame( array( 'error' => 'servers exploded' ), $result['elementor']['mcp_module'] );
+		$this->assertTrue( $result['elementor']['installed'] );
+		$this->assertSame( '4.3.0-beta1', $result['elementor']['version'] );
+		foreach ( array( 'abilities_api_active', 'mcp_adapter', 'abilities', 'coverage' ) as $key ) {
+			$this->assertArrayHasKey( $key, $result );
+		}
+		$this->assertIsArray( $result['elementor']['consent'] );
 	}
 
 	public function test_strings_are_clipped_at_200(): void {

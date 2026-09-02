@@ -112,12 +112,28 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	public function execute( $params ) {
 		$abilities_active = function_exists( 'wp_get_abilities' );
 
+		// Server discovery is read ONCE, here, and a throw in it never leaves
+		// execute(): the adapter's get_servers() (or one server's accessor)
+		// exploding used to fail the whole tool before `elementor` was even
+		// built, so the isolation elementor_state() promises for its module
+		// subtree was unreachable exactly when it was needed (Codex round-8
+		// P2). Every reader of the list gets the same answer in its own place:
+		// `servers` and `angie` become { error }, and elementor_state() turns
+		// the same throw into its `mcp_module` error while keeping the
+		// installed/version facts it read on its own.
+		try {
+			$servers = $this->servers();
+		} catch ( \Throwable $e ) {
+			$servers = $e;
+		}
+		$discovery_failed = $servers instanceof \Throwable;
+
 		return array(
 			'abilities_api_active' => $abilities_active,
 			'mcp_adapter'          => $this->adapter_state(),
-			'servers'              => $this->servers(),
-			'angie'                => $this->angie_state(),
-			'elementor'            => $this->elementor_state(),
+			'servers'              => $discovery_failed ? $this->subtree_error( $servers ) : $servers,
+			'angie'                => $discovery_failed ? $this->subtree_error( $servers ) : $this->angie_state( $servers ),
+			'elementor'            => $this->elementor_state( $servers ),
 		) + $this->ability_exposure( $abilities_active );
 	}
 
@@ -224,12 +240,13 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	 * `mcp_server_present` is the honest part: Angie being active is not the
 	 * same as Angie exposing an MCP server, and the module can be off.
 	 *
+	 * @param array $servers From servers(), read once by execute().
 	 * @return array
 	 */
-	protected function angie_state() {
+	protected function angie_state( array $servers ) {
 		$active = defined( 'ANGIE_VERSION' ) || class_exists( '\\Angie\\Plugin' );
 		$server = false;
-		foreach ( $this->servers() as $entry ) {
+		foreach ( $servers as $entry ) {
 			if ( isset( $entry['id'] ) && 'angie' === $entry['id'] ) {
 				$server = true;
 				break;
@@ -943,9 +960,12 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	/**
 	 * The `elementor` block: four scans, each failing on its own.
 	 *
+	 * @param array|\Throwable $servers From servers(), read once by execute() —
+	 *                                  the Throwable when that read failed, so
+	 *                                  the module scan fails the same way here.
 	 * @return array
 	 */
-	protected function elementor_state() {
+	protected function elementor_state( $servers ) {
 		// `POST /aura/mcp/tools/execute` is gated by check_update_plugins_permission
 		// (class-aura-worker-mcp.php), not manage_options — an authenticated user
 		// holding update_plugins (a custom role, an Application Password) but not
@@ -994,7 +1014,10 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			$out['installed'] = $installed;
 			$out['version']   = $installed && isset( $env['version'] ) && is_string( $env['version'] ) && '' !== $env['version'] ? $this->clip( $env['version'] ) : null;
 			try {
-				$out['mcp_module'] = static::elementor_module_from( $env, $this->elementor_ability_names(), $this->servers() );
+				if ( $servers instanceof \Throwable ) {
+					throw $servers;
+				}
+				$out['mcp_module'] = static::elementor_module_from( $env, $this->elementor_ability_names(), $servers );
 			} catch ( \Throwable $e ) {
 				// installed/version already derived from $env alone, above —
 				// left untouched here.
