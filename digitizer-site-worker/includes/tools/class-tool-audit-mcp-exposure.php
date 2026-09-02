@@ -435,6 +435,25 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 				}
 			)
 		);
+		// Dedupe by user_id BEFORE the cap too — two rows for the same user
+		// (a duplicate meta row) must not land the user in both `consent` and
+		// `consent_unproven`, which would break the invariant
+		// consent_unproven ∩ consent[].user_id = ∅. Rows are already ordered
+		// by umeta_id ASC, so the first occurrence per user is the one kept.
+		$seen = array();
+		$rows = array_values(
+			array_filter(
+				$rows,
+				static function ( $row ) use ( &$seen ) {
+					$uid = (int) $row->user_id;
+					if ( isset( $seen[ $uid ] ) ) {
+						return false;
+					}
+					$seen[ $uid ] = true;
+					return true;
+				}
+			)
+		);
 		$truncated = count( $rows ) > static::ELEMENTOR_LIST_CAP;
 		$rows      = array_slice( $rows, 0, static::ELEMENTOR_LIST_CAP );
 		$consent   = array();
@@ -514,11 +533,17 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 	/**
 	 * One user's Application Password list, byte-bounded, PROVEN read or null. A seam.
 	 *
+	 * `$notify` is false: this audit is a `read_only: true` tool that can walk up
+	 * to ~250 users, so an oversized or failed read here must never fire the
+	 * #434 unbind breadcrumb (`aura_worker_app_password_probe_unproven`) — a
+	 * read-only tool overwriting that breadcrumb with an unrelated user is a
+	 * write this annotation promises never happens.
+	 *
 	 * @param int $uid User id.
 	 * @return array|null
 	 */
 	protected function password_list( $uid ) {
-		return aura_worker_app_password_list( (int) $uid, static::MAX_APP_PASSWORD_BYTES );
+		return aura_worker_app_password_list( (int) $uid, static::MAX_APP_PASSWORD_BYTES, false );
 	}
 
 	/**
@@ -574,8 +599,16 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 					continue;
 				}
 				if ( count( $entries ) >= static::ELEMENTOR_LIST_CAP ) {
+					// Only THIS candidate's remaining items stop being appended —
+					// the outer loop keeps walking the (<=50) candidates so every
+					// one is still read (or recorded unproven) and candidates_read
+					// reaches the number of candidates in the slice. A `break 2`
+					// here abandoned the rest of the slice unread the moment the
+					// entry cap tripped, so candidates_read could land far short
+					// of 50 while elementor_truncated was still true — breaking
+					// the spec invariant elementor_truncated ⇒ candidates_read == 50.
 					$entries_truncated = true;
-					break 2;
+					break;
 				}
 				$entries[] = $this->password_entry( $uid, $item );
 			}
@@ -649,11 +682,26 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 		$seen      = array();
 		$offset    = 0;
 		$horizon   = time() - static::ELEMENTOR_RECENT_DAYS * 86400;
-		while ( $checked < static::ELEMENTOR_CONTEXT_CAP ) {
+		// Bounded by construction, not only by the pages running dry: a
+		// context_user_ids() a pre_user_query filter has stripped $offset from
+		// can hand back the SAME full page forever. count($ids) === PAGE then
+		// keeps `if ( count( $ids ) < PAGE ) break;` from firing while $checked
+		// never advances, and the while() below would never exit on its own.
+		// Two independent guards close it: a hard ceiling on how many pages are
+		// EVER fetched — ceil(cap/page) pages of pure progress, plus one more,
+		// since the last page needed to reach the cap can straddle an earlier
+		// one (ids already seen at its head, new ones only at its tail) and
+		// still be required — and a break the moment one full page contributes
+		// zero ids not already seen, the tell that nothing is actually advancing.
+		$max_pages = (int) ceil( static::ELEMENTOR_CONTEXT_CAP / static::ELEMENTOR_CONTEXT_PAGE ) + 1;
+		$pages     = 0;
+		while ( $checked < static::ELEMENTOR_CONTEXT_CAP && $pages < $max_pages ) {
+			++$pages;
 			$ids = $this->context_user_ids( $offset, static::ELEMENTOR_CONTEXT_PAGE );
 			if ( empty( $ids ) ) {
 				break;
 			}
+			$new = 0;
 			foreach ( $ids as $uid ) {
 				$uid = (int) $uid;
 				if ( $uid <= 0 || isset( $seen[ $uid ] ) ) {
@@ -664,6 +712,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 					break 2;
 				}
 				$seen[ $uid ] = true;
+				++$new;
 				++$checked;
 				$list = $this->password_list( $uid );
 				if ( null === $list ) {
@@ -679,6 +728,12 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 						++$recent;
 					}
 				}
+			}
+			if ( 0 === $new ) {
+				// A full page that advanced nothing: the offset is not being
+				// honoured. Continuing would fetch the same page forever without
+				// ever reaching the cap.
+				break;
 			}
 			if ( count( $ids ) < static::ELEMENTOR_CONTEXT_PAGE ) {
 				break;

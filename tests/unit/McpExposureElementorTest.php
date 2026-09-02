@@ -349,6 +349,37 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( 50, count( $b['consent'] ) + count( $b['consent_unproven'] ) );
 	}
 
+	public function test_duplicate_rows_for_one_user_are_deduped_the_first_wins(): void {
+		// Two rows for uid 7 (the query orders by umeta_id ASC, so the first
+		// row IS the oversized one here) must not put 7 in both `consent` and
+		// `consent_unproven` — that would break the invariant
+		// consent_unproven ∩ consent[].user_id = ∅.
+		$this->tool->consent_rows = array(
+			(object) array( 'user_id' => 7, 'user_login' => 'dup', 'len' => 999999, 'v' => null ), // oversized, first
+			self::consent_row( 7, array( 'allowed' => true, 'timestamp' => 1 ) ), // valid, later — dropped
+			self::consent_row( 8, array( 'allowed' => true, 'timestamp' => 2 ) ),
+		);
+		$b = $this->block();
+		$this->assertSame( array( 7 ), $b['consent_unproven'] );
+		$this->assertSame( array( 8 ), array_map( static function ( $r ) { return $r['user_id']; }, $b['consent'] ) );
+	}
+
+	public function test_a_duplicate_among_fifty_two_rows_is_still_fifty_and_truncated(): void {
+		$rows = array();
+		for ( $i = 1; $i <= 51; $i++ ) {
+			$rows[] = self::consent_row( $i, array( 'allowed' => true, 'timestamp' => $i ) );
+		}
+		// A 52nd row duplicating uid 1: dropped by the dedupe, not counted
+		// toward the 50-row cap at all.
+		$rows[] = self::consent_row( 1, array( 'allowed' => false, 'timestamp' => 999 ) );
+		$this->tool->consent_rows = $rows;
+		$b = $this->block();
+		$this->assertTrue( $b['consent_truncated'] );
+		$this->assertSame( 50, count( $b['consent'] ) + count( $b['consent_unproven'] ) );
+		// The FIRST row for uid 1 (allowed:true) is the one kept.
+		$this->assertTrue( $b['consent'][0]['allowed'] );
+	}
+
 	public function test_the_consent_statement_is_bounded_in_rows_and_bytes(): void {
 		// The REAL seam against the bootstrap's $wpdb: pins the SQL shape.
 		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
@@ -437,6 +468,28 @@ final class McpExposureElementorTest extends TestCase {
 		$this->assertSame( range( 1, 50 ), $this->tool->reads );
 	}
 
+	public function test_the_entry_cap_does_not_abandon_the_rest_of_the_candidate_slice(): void {
+		// 51 candidates (sliced to 50), candidate 1 alone holds 60 Elementor-
+		// named passwords, candidate 2's list is unreadable. Before the fix a
+		// `break 2` on the entry cap stopped reading candidates the instant
+		// the 50th entry was appended (candidates_read: 1), breaking the spec
+		// invariant elementor_truncated ⇒ candidates_read == 50. The fix walks
+		// every candidate in the slice regardless — entries past 50 are
+		// simply not appended.
+		$this->tool->candidates = range( 1, 51 );
+		$this->tool->lists      = array(
+			1 => array_fill( 0, 60, self::pw() ),
+			2 => null,
+		);
+		$p = $this->passwords();
+		$this->assertCount( 50, $p['elementor'] );
+		$this->assertTrue( $p['elementor_entries_truncated'] );
+		$this->assertTrue( $p['elementor_truncated'] );
+		$this->assertSame( 50, $p['candidates_read'] );
+		$this->assertSame( array( 2 ), $p['elementor_unproven'] );
+		$this->assertSame( range( 1, 50 ), $this->tool->reads );
+	}
+
 	public function test_entries_are_capped_at_fifty_across_candidates(): void {
 		$this->tool->candidates = array( 1, 2 );
 		$this->tool->lists      = array(
@@ -517,6 +570,46 @@ final class McpExposureElementorTest extends TestCase {
 			return false !== strpos( $q, 'IF(LENGTH(meta_value) <= 262144' );
 		} );
 		$this->assertCount( 2, $bounded );
+	}
+
+	public function test_a_read_only_tool_fires_no_unproven_action_even_when_oversized(): void {
+		// `audit_mcp_exposure` is annotated read_only: true, and can read up to
+		// ~250 users' Application Password lists. The #434 breadcrumb listener
+		// (Aura_Worker_Magic_Link::record_probe_unproven, which update_option()s
+		// aura_worker_app_password_probe_unproven) is registered by
+		// Aura_Worker::init() in production — never run by this bootstrap — so
+		// it is registered here directly, against the REAL class the bootstrap
+		// already loads (tests/bootstrap.php requires class-aura-worker-magic-
+		// link.php unconditionally), proving the real boundary rather than a
+		// mirror of it.
+		require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-magic-link.php';
+		add_action( 'aura_worker_app_password_probe_unproven', array( 'Aura_Worker_Magic_Link', 'record_probe_unproven' ), 10, 1 );
+
+		$real = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				return array();
+			}
+			protected function context_users_total() {
+				return 0;
+			}
+		};
+		// One Elementor-named candidate whose list is oversized (300,000-char
+		// name) — a LIKE match the bounded read then cannot decode.
+		$GLOBALS['_app_passwords'] = array(
+			3 => array( self::pw( array( 'name' => 'Elementor MCP ' . str_repeat( 'n', 300000 ) ) ) ),
+		);
+		$before = get_option( 'aura_worker_app_password_probe_unproven', null );
+		$b      = $real->execute( array() )['elementor'];
+		$after  = get_option( 'aura_worker_app_password_probe_unproven', null );
+
+		$this->assertSame( $before, $after ); // the breadcrumb was never written
+		$this->assertSame( array( 3 ), $b['app_passwords']['elementor_unproven'] );
 	}
 
 	// --- Task 5: context ------------------------------------------------------
@@ -639,5 +732,80 @@ final class McpExposureElementorTest extends TestCase {
 		$vars = $GLOBALS['_user_queries'];
 		$this->assertSame( array( 'capability' => 'edit_posts', 'fields' => 'ID', 'number' => 1, 'count_total' => true ), $vars[0] );
 		$this->assertSame( array( 'capability' => 'edit_posts', 'fields' => 'ID', 'number' => 50, 'offset' => 0, 'orderby' => 'ID', 'order' => 'ASC', 'count_total' => false ), $vars[1] );
+	}
+
+	public function test_a_page_that_never_advances_terminates_and_is_bounded(): void {
+		// A context_user_ids() that ignores $offset (a pre_user_query filter
+		// dropping it) returns the SAME full page every time. Before the fix,
+		// count($ids) === PAGE kept `if ( count( $ids ) < PAGE ) break;` from
+		// firing while $checked never advanced, so the while() never exited
+		// on its own.
+		$seam = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			public $calls = 0;
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				++$this->calls;
+				return range( 1, 50 );
+			}
+			protected function context_users_total() {
+				return 120;
+			}
+			protected function password_list( $uid ) {
+				return array();
+			}
+		};
+		$b = $seam->execute( array() )['elementor'];
+		$this->assertSame( 50, $b['coverage']['users_checked'] );
+		$this->assertTrue( $b['coverage']['truncated'] );
+		$this->assertLessThanOrEqual( 6, $seam->calls );
+	}
+
+	public function test_a_mid_page_cap_reads_every_id_exactly_once(): void {
+		// The fixture the ledger deferred: page 4 overlaps page 3 by 25 ids,
+		// so the cap (200) is reached partway through it. Nothing here may be
+		// read twice, and the scan must still terminate cleanly.
+		$seam = new class() extends Aura_Tool_Audit_Mcp_Exposure {
+			public $pages = array();
+			public $reads = array();
+			protected function elementor_env() {
+				return array( 'installed' => false, 'version' => null, 'class_present' => false, 'active' => null );
+			}
+			protected function consent_rows() {
+				return array();
+			}
+			protected function elementor_candidate_ids() {
+				return array();
+			}
+			protected function context_user_ids( $offset, $number ) {
+				$page = (int) ( $offset / $number );
+				return isset( $this->pages[ $page ] ) ? $this->pages[ $page ] : array();
+			}
+			protected function context_users_total() {
+				return 250;
+			}
+			protected function password_list( $uid ) {
+				$this->reads[] = (int) $uid;
+				return array();
+			}
+		};
+		$seam->pages = array(
+			range( 1, 50 ),
+			range( 51, 100 ),
+			range( 101, 150 ),
+			range( 126, 175 ),
+			range( 176, 250 ),
+		);
+		$b = $seam->execute( array() )['elementor'];
+		$this->assertSame( 200, $b['coverage']['users_checked'] );
+		$this->assertTrue( $b['coverage']['truncated'] );
+		$this->assertSame( count( $seam->reads ), count( array_unique( $seam->reads ) ) );
 	}
 }
