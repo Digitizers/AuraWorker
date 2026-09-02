@@ -82,6 +82,12 @@ class Aura_Worker {
 		// app-password agent and a second MCP server actually write through.
 		Aura_Worker_Rules::init();
 
+		// The Elementor MCP door (2.16.0): wraps every non-read `elementor/*`
+		// ability, verifies after registration that the wrapper is what the
+		// registry finally holds, and closes both of Elementor's transports when
+		// it cannot. Returns immediately on a site without Elementor's MCP module.
+		Aura_Worker_Elementor_Door::init();
+
 		// Which Application Password authenticated this request (#434). Copied
 		// into the unbind marker by Phase A, before Phase B revokes it, so the
 		// core-REST seam can still recognise the departed binding. Registered

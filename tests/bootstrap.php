@@ -1121,6 +1121,21 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 			}
 			return $GLOBALS['_app_passwords'][ $user_id ] ?? array();
 		}
+		/**
+		 * Core's single-password lookup (class-wp-application-passwords.php):
+		 * the item for one uuid, or NULL when this user has no such password.
+		 * The door governor reads the authenticating credential's NAME through
+		 * it (§3.2), so the same read failure that empties the list above
+		 * answers null here — never an invented name.
+		 */
+		public static function get_user_application_password( int $user_id, string $uuid ) {
+			foreach ( self::get_user_application_passwords( $user_id ) as $item ) {
+				if ( isset( $item['uuid'] ) && (string) $item['uuid'] === $uuid ) {
+					return $item;
+				}
+			}
+			return null;
+		}
 		public static function delete_application_password( int $user_id, string $uuid ) {
 			if ( ! empty( $GLOBALS['_app_passwords_delete_fail'] ) ) {
 				return new WP_Error( 'db_update_error', 'user meta write failed' );
@@ -2676,6 +2691,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
+	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::init() runs without Elementor's MCP module present (2.16.0); reset_for_tests() arms it.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
@@ -3035,6 +3051,12 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-abilities.php';
 require_once SA_PLUGIN_DIR . '/includes/credential-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-unbind.php';
+// The Elementor door (2.16.0): Aura_Worker::init() wires the governor, so
+// the class has to be loaded here as the plugin bootstrap loads it — the
+// door tests require these three themselves too, harmlessly (require_once).
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-log.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-holds.php';
+require_once SA_PLUGIN_DIR . '/includes/class-elementor-door-governor.php';
 // The plugin's admin/settings class: registers settings and owns the token
 // regeneration handler (#67).
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker.php';
@@ -3858,6 +3880,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
+	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::init() runs without Elementor's MCP module present (2.16.0); reset_for_tests() arms it.
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).

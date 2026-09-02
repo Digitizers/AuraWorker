@@ -128,12 +128,18 @@ final class UninstallCoverageTest extends TestCase {
 	 *   one call site in source, counted once regardless of how many option
 	 *   names it is called with at runtime). All names fall under the swept
 	 *   'aura_worker_' prefix.
+	 * - includes/class-elementor-door-governor.php (1, 2.16.0) — the door's
+	 *   rolling 30-day counters, in the rule counters' shape:
+	 *   'aura_worker_door_c_<name>_h<hour>', an atomic
+	 *   INSERT … ON DUPLICATE KEY UPDATE no scan of function calls could see.
+	 *   Under the swept 'aura_worker_' prefix.
 	 */
 	private const ACKNOWLEDGED_RAW_OPTION_WRITES = array(
-		'includes/class-aura-worker-door-log.php'   => 4,
-		'includes/class-aura-worker-magic-link.php' => 3,
-		'includes/class-aura-worker-rules.php'      => 5,
-		'includes/class-aura-worker.php'            => 2,
+		'includes/class-aura-worker-door-log.php'    => 4,
+		'includes/class-aura-worker-magic-link.php'  => 3,
+		'includes/class-aura-worker-rules.php'       => 5,
+		'includes/class-aura-worker.php'             => 2,
+		'includes/class-elementor-door-governor.php' => 1,
 	);
 
 	protected function setUp(): void {
