@@ -247,12 +247,17 @@ Most issues from the initial code review were fixed in v1.2.0 and v2.0.0. Remain
 
 ## Testing
 
-There are currently no automated tests. When adding tests:
+PHPUnit, against hand-written WordPress stubs in `tests/bootstrap.php` (not WP_Mock — nothing
+from WordPress is loaded). `tests/unit/*Test.php`, one class per subject; `sa_reset_state()` in
+`setUp()`. Run `vendor/bin/phpunit --testdox` (CI: PHP 7.4 / 8.1 / 8.2), one class with
+`--filter <ClassName>`, lint with `composer lint`.
 
-- Use [WP_Mock](https://github.com/10up/wp_mock) or WordPress's `WP_UnitTestCase` for unit/integration tests
-- Test each updater method with mock return values (`true`, `false`, `null`, `WP_Error`)
-- Test security layers independently (IP check, token check, capability check)
-- Test REST endpoint registration and response shapes
+- Anything that reads a global constant or a class the suite cannot unload goes behind a
+  `protected` seam and an anonymous (or named) subclass overrides it — `pick_version()` /
+  `angie_state()` / `elementor_env()` in `class-tool-audit-mcp-exposure.php` are the pattern.
+- The `$wpdb` stub matches statements by regex and throws on an unrecognised
+  `_application_passwords` shape, so a reformatted production query fails loudly instead of
+  proving nothing. A new statement shape is taught to the stub in the same PR.
 
 ---
 

@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.14.0
+Stable tag: 2.15.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -249,6 +249,10 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 7. Connections: provider connections (Cloudways, Cloudflare, Bunny, Hostinger, Vultr, xCloud) with resource counts, status, and credential-rotation reminders.
 
 == Changelog ==
+
+= 2.15.0 =
+* audit_mcp_exposure reports an `elementor` block: Elementor >= 4.3's official MCP module state, every `elementor_mcp_consent` row, every `Elementor MCP…` Application Password across all users (full detail), and the other Application Passwords of edit_posts users as counts. Every list is bounded (50 / 50 / 200) with a truncation flag beside it; no usermeta value over 256 KB is decoded; a scan that fails is reported as `{ error }` in its place, never as an empty list. Read-only.
+* aura_worker_app_password_list() accepts an optional byte bound, enforced in the same statement that returns the value.
 
 = 2.14.0 =
 * Feature: **a self-update can now undo itself.** Before installing, SiteAgent
