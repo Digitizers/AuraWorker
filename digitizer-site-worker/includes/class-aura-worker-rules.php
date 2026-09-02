@@ -200,10 +200,16 @@ class Aura_Worker_Rules {
 	}
 
 	/** The only resource types a rule may name. Anything else never matches. */
-	const TYPES = array( 'site', 'page', 'post', 'plugin' );
+	const TYPES = array( 'site', 'page', 'post', 'plugin', 'design_system', 'page_create' );
+
+	/** Target types that carry no id — a rule on them names the whole category. */
+	const ID_LESS_TYPES = array( 'site', 'design_system', 'page_create' );
 
 	/** `page` and `post` are the same ID seen from two directions. */
 	const CONTENT_TYPES = array( 'page', 'post' );
+
+	/** Effects the matcher understands. `allow` is meaningful only at the Elementor door (2.16.0). */
+	const EFFECTS = array( 'block', 'warn', 'allow' );
 
 	/**
 	 * The base-class default: a tool that never said what it touches. Not a
@@ -219,9 +225,9 @@ class Aura_Worker_Rules {
 	/**
 	 * The rule that decides this call, or null.
 	 *
-	 * `block` beats `warn`. Expired rules never match. Unknown target types
-	 * never match — Aura refuses them at write time, and if one arrives anyway
-	 * the site does not guess.
+	 * `block` beats `warn` beats `allow` beats no match. Expired rules never
+	 * match. Unknown target types never match — Aura refuses them at write
+	 * time, and if one arrives anyway the site does not guess.
 	 *
 	 * @param array    $touches Resources the call declares: list of {type,id}.
 	 * @param array    $rules   Rules from the current ruleset.
@@ -326,7 +332,7 @@ class Aura_Worker_Rules {
 				continue;
 			}
 			$effect = isset( $rule['effect'] ) ? (string) $rule['effect'] : '';
-			if ( 'block' !== $effect && 'warn' !== $effect ) {
+			if ( ! in_array( $effect, self::EFFECTS, true ) ) {
 				continue;
 			}
 			// Site scoping (Aura spec §4, 2.12.0), through the shared predicate
@@ -341,7 +347,9 @@ class Aura_Worker_Rules {
 			if ( 'block' === $effect ) {
 				return $rule; // Nothing outranks a block.
 			}
-			if ( null === $winner ) {
+			// warn > allow: a caveat someone wrote wins over an opt-in someone
+			// else wrote (spec §3.4). First match wins within a rank.
+			if ( null === $winner || ( 'warn' === $effect && 'allow' === $winner['effect'] ) ) {
 				$winner = $rule;
 			}
 		}
@@ -426,8 +434,11 @@ class Aura_Worker_Rules {
 		if ( isset( $touched[ self::UNKNOWN . ':*' ] ) ) {
 			return true; // Undeclared: every live rule applies.
 		}
-		if ( 'site' === $type ) {
-			return ! empty( $touched );
+		if ( in_array( $type, self::ID_LESS_TYPES, true ) ) {
+			if ( 'site' === $type ) {
+				return ! empty( $touched ); // a freeze catches everything declared
+			}
+			return isset( $touched[ $type . ':*' ] ); // design_system / page_create: the category itself
 		}
 		$id = isset( $target['id'] ) ? (string) $target['id'] : '';
 		if ( '' === $id ) {
@@ -2224,7 +2235,7 @@ class Aura_Worker_Rules {
 	 * @param array    $touches   What the call declares it touches.
 	 * @param string   $tool_name For the hook and the message.
 	 * @param int|null $now       Unix time; injected for tests.
-	 * @return array {effect: null|'warn'|'block', rule?: array, recorded?: bool}
+	 * @return array {effect: null|'warn'|'block', rule?: array, recorded?: bool} `allow` is never returned here — it reads as no match.
 	 */
 	public static function enforce( array $touches, $tool_name, $now = null ) {
 		self::note_expired( $now );
@@ -2233,6 +2244,11 @@ class Aura_Worker_Rules {
 		// two can never disagree). The fork inherits this through enforce(),
 		// so its governance wrapper needs no change of its own.
 		$rule = self::match( $touches, self::rules(), $now, self::site_ref() );
+		if ( null !== $rule && 'allow' === $rule['effect'] ) {
+			// The tools path already defaults to the approval queue; `allow`
+			// speaks only at the Elementor door (class-elementor-door-governor.php).
+			$rule = null;
+		}
 		if ( null === $rule ) {
 			return array( 'effect' => null );
 		}

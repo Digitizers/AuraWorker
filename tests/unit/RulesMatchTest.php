@@ -311,4 +311,35 @@ final class RulesMatchTest extends TestCase {
 			);
 		}
 	}
+
+	public function test_allow_is_an_effect_the_matcher_returns_when_nothing_outranks_it(): void {
+		$rules = array(
+			array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'design_system' ), 'reason' => 'ok' ),
+		);
+		$hit = Aura_Worker_Rules::match( array( array( 'type' => 'design_system', 'id' => '*' ) ), $rules, 1000 );
+		$this->assertSame( 'rule/a', $hit['key'] );
+		$this->assertSame( 'allow', $hit['effect'] );
+	}
+
+	public function test_warn_outranks_allow_and_block_outranks_both(): void {
+		$touch = array( array( 'type' => 'page_create', 'id' => '*' ) );
+		$allow = array( 'key' => 'rule/allow', 'effect' => 'allow', 'target' => array( 'type' => 'page_create' ), 'reason' => 'a' );
+		$warn  = array( 'key' => 'rule/warn', 'effect' => 'warn', 'target' => array( 'type' => 'page_create' ), 'reason' => 'w' );
+		$block = array( 'key' => 'rule/block', 'effect' => 'block', 'target' => array( 'type' => 'page_create' ), 'reason' => 'b' );
+		$this->assertSame( 'rule/warn', Aura_Worker_Rules::match( $touch, array( $allow, $warn ), 1000 )['key'] );
+		$this->assertSame( 'rule/warn', Aura_Worker_Rules::match( $touch, array( $warn, $allow ), 1000 )['key'] );
+		$this->assertSame( 'rule/block', Aura_Worker_Rules::match( $touch, array( $allow, $warn, $block ), 1000 )['key'] );
+	}
+
+	public function test_design_system_and_page_create_are_id_less_targets(): void {
+		$rule = array( 'key' => 'rule/ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'x' );
+		$this->assertNotNull( Aura_Worker_Rules::match( array( array( 'type' => 'design_system', 'id' => '*' ) ), array( $rule ), 1000 ) );
+		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'page', 'id' => '7' ) ), array( $rule ), 1000 ), 'a design_system rule does not reach a page write' );
+		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'page_create', 'id' => '*' ) ), array( $rule ), 1000 ) );
+	}
+
+	public function test_an_unknown_effect_still_never_matches(): void {
+		$rule = array( 'key' => 'rule/x', 'effect' => 'permit', 'target' => array( 'type' => 'site' ), 'reason' => 'x' );
+		$this->assertNull( Aura_Worker_Rules::match( array( array( 'type' => 'site', 'id' => '*' ) ), array( $rule ), 1000 ) );
+	}
 }

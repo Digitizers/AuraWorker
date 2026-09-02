@@ -386,4 +386,10 @@ final class RulesEnforcementTest extends TestCase {
 		$this->assertSame( 403, $resp->status );
 		$this->assertSame( 'aura_rule_blocked', $resp->data['code'] );
 	}
+
+	public function test_enforce_reads_a_matched_allow_as_no_verdict_for_siteagent_tools(): void {
+		$this->install( array( $this->rule( 'rule/allow', 'allow', 'site' ) ) );
+		$v = Aura_Worker_Rules::enforce( array( array( 'type' => 'site', 'id' => '*' ) ), 'clear_caches' );
+		$this->assertNull( $v['effect'], 'allow has no meaning on the tools path — the approval queue is the default there already' );
+	}
 }
