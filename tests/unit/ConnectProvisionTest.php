@@ -428,6 +428,9 @@ final class ConnectProvisionTest extends TestCase {
 		if ( null !== $client ) {
 			Aura_Worker_Rules::bind( $client, $hash );
 		}
+		// The DOOR's own record of whose it is (Ruling P59) — what the next
+		// connect's rotation compares itself against.
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => $client, 'dashboard' => $dashboard ) );
 	}
 
 	/** A hold and a settled log row belonging to that binding. */
@@ -447,6 +450,87 @@ final class ConnectProvisionTest extends TestCase {
 		$seq = Aura_Worker_Door_Log::open_pending( $call );
 		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
 		return (string) $ref;
+	}
+
+	/**
+	 * Ruling P59 (F1): a rotation that could not be VERIFIED refuses the
+	 * connect, and the next one finishes the job.
+	 *
+	 * The old rotation deleted the option and read it back, so a transient
+	 * failure returned the unchanged generation and both callers ignored it —
+	 * a changed-client connect completed with the departed client's holds
+	 * still current and replayable by the replacement.
+	 */
+	public function test_a_rotation_that_cannot_be_verified_refuses_the_connect(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref = $this->seedDoorState();
+		$gen = Aura_Worker_Door_Log::binding();
+		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_door_failed', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), 'the generation did not move' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), "so the old client's hold is still THEIRS" );
+		// The TOKEN is installed — this is the connect's last step — so the
+		// next attempt with the same identity rotates and completes.
+		$GLOBALS['_sa_option_cas_fail'] = array();
+
+		$res2 = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res2->get_status() );
+		$this->assertNotSame( $gen, Aura_Worker_Door_Log::binding(), 'the retry rotated it' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+	}
+
+	/**
+	 * Ruling P59 (F3): a token write that fails verification leaves the
+	 * generation AND the epoch exactly where they were.
+	 *
+	 * Rotating first made the still-current client's pending holds invisible
+	 * and their log cursor invalid, for a rebind that never happened.
+	 */
+	public function test_a_failed_token_write_leaves_the_generation_and_epoch_alone(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref   = $this->seedDoorState();
+		$gen   = Aura_Worker_Door_Log::binding();
+		$epoch = Aura_Worker_Door_Log::epoch();
+		// The claim-conditional token write lands nowhere.
+		$GLOBALS['_sa_option_write_fail']['aura_worker_site_token'] = true;
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 500, $res->get_status() );
+		$this->assertSame( 'aura_connect_store_failed', $res->data['code'] );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), 'the generation is untouched' );
+		$this->assertSame( $epoch, Aura_Worker_Door_Log::epoch(), 'and so is the log cursor' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the still-current client keeps its queue' );
+	}
+
+	/**
+	 * Ruling P59 (F4): a handler that stalled past the takeover window and
+	 * lost the site claim never rotates the WINNER's generation.
+	 *
+	 * The rotation is the connect's last step, after the claim-conditional
+	 * token write — which is exactly what rejects a handler that no longer
+	 * owns the claim.
+	 */
+	public function test_a_connect_that_lost_the_site_claim_never_rotates_the_winners_generation(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$gen = Aura_Worker_Door_Log::binding();
+		// The winner took the claim while this handler was stalled: every
+		// claim-conditional write of ours now matches no row.
+		$GLOBALS['_sa_option_write_fail']['aura_worker_site_token'] = true;
+		Aura_Worker_Magic_Link::release_site( '' );
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertNotSame( 200, $res instanceof WP_REST_Response ? $res->get_status() : 500 );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), "the winner's generation is safe" );
 	}
 
 	/**

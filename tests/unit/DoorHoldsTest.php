@@ -99,7 +99,7 @@ final class DoorHoldsTest extends TestCase {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
 
-		Aura_Worker_Door_Log::rotate_binding(); // a changed-binding connect, or an unbind
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) ); // a changed-binding connect, or an unbind
 
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'not readable' );
 		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'not listed' );
@@ -112,7 +112,7 @@ final class DoorHoldsTest extends TestCase {
 	/** …and the sweep is what finally removes it. */
 	public function test_the_sweep_removes_a_hold_from_another_binding(): void {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
-		Aura_Worker_Door_Log::rotate_binding();
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) );
 
 		$this->assertSame( 1, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
 
@@ -138,20 +138,33 @@ final class DoorHoldsTest extends TestCase {
 		$GLOBALS['_options'][ $name ] = $row;
 		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
 
-		Aura_Worker_Door_Log::rotate_binding();
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) );
 
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'never strand an approval nobody can re-issue' );
 		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
 	}
 
-	/** rotate_binding() mints a value nothing older can match. */
-	public function test_rotate_binding_mints_a_new_generation(): void {
-		$before = Aura_Worker_Door_Log::binding();
-		$after  = Aura_Worker_Door_Log::rotate_binding();
+	/**
+	 * rotate_binding() mints a value nothing older can match — and is a NO-OP
+	 * when the record already names the identity being installed (Ruling P59).
+	 */
+	public function test_rotate_binding_mints_a_generation_and_is_idempotent_by_identity(): void {
+		$before   = Aura_Worker_Door_Log::binding();
+		$identity = array( 'client' => 'c1', 'dashboard' => 'https://dash.example' );
 
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( $identity ) );
+		$after = Aura_Worker_Door_Log::binding();
 		$this->assertMatchesRegularExpression( '/^[0-9a-f-]{36}$/', $after );
 		$this->assertNotSame( $before, $after );
-		$this->assertSame( $after, Aura_Worker_Door_Log::binding(), 'and it sticks' );
+
+		// The SAME identity again changes nothing — which is what lets a failed
+		// rotation simply be retried by the next connect.
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( $identity ) );
+		$this->assertSame( $after, Aura_Worker_Door_Log::binding() );
+
+		// A different one moves it.
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://dash.example' ) ) );
+		$this->assertNotSame( $after, Aura_Worker_Door_Log::binding() );
 	}
 
 	public function test_a_claimed_ref_still_holds_a_slot(): void {

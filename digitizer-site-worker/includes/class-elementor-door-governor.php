@@ -289,14 +289,16 @@ class Aura_Worker_Elementor_Door {
 	 * uses on a rewind: the new binding starts at cursor 0 rather than
 	 * inheriting one it never agreed to.
 	 *
-	 * NEVER busy, and nothing to undo — which is why the connect can call it
-	 * before its own writes and never has to answer a refusal for it.
+	 * VERIFIED and IDEMPOTENT (Ruling P59): the swap is a compare-and-swap
+	 * that must change exactly one row, and it is a no-op when the record
+	 * already names this identity — so a caller can answer a failure honestly
+	 * and the next connect simply does it again.
 	 *
-	 * @return string The new generation.
+	 * @param array $identity { client: string|null, dashboard: string|null }.
+	 * @return bool The door now belongs to that identity.
 	 */
-	public static function rebind() {
-		Aura_Worker_Door_Log::rotate_epoch( Aura_Worker_Door_Log::epoch() );
-		return Aura_Worker_Door_Log::rotate_binding();
+	public static function rebind( array $identity ) {
+		return Aura_Worker_Door_Log::rotate_binding( $identity );
 	}
 
 	/**
@@ -984,11 +986,10 @@ class Aura_Worker_Elementor_Door {
 		if ( '' === $claimed ) {
 			return true; // claimed before the fence existed
 		}
-		// RAW, and past this request's option cache: the writer that deleted
-		// the binding is another request, and binding() would mint a
+		// RAW, and past this request's option cache: the writer that rotated
+		// the generation is another request, and binding() would MINT a
 		// replacement rather than report the absence.
-		wp_cache_delete( Aura_Worker_Door_Log::BINDING, 'options' );
-		return $claimed === (string) get_option( Aura_Worker_Door_Log::BINDING, '' );
+		return $claimed === Aura_Worker_Door_Log::binding_raw();
 	}
 
 	/**

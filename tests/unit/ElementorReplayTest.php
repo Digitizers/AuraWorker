@@ -663,7 +663,7 @@ final class ElementorReplayTest extends TestCase {
 
 		$this->assertTrue( $out['ok'] );
 		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
-		$this->assertSame( $binding, (string) get_option( Aura_Worker_Door_Log::BINDING, '' ), 'and the binding never moved' );
+		$this->assertSame( $binding, Aura_Worker_Door_Log::binding(), 'and the binding never moved' );
 	}
 
 	/**
@@ -692,7 +692,7 @@ final class ElementorReplayTest extends TestCase {
 
 		$this->assertTrue( $out['ok'], 'a rotation is not a rebind' );
 		$this->assertSame( 1, $this->ran['elementor/publish-document'], 'the approved call ran' );
-		$this->assertSame( $binding, (string) get_option( Aura_Worker_Door_Log::BINDING, '' ), 'the binding never moved' );
+		$this->assertSame( $binding, Aura_Worker_Door_Log::binding(), 'the binding never moved' );
 	}
 
 	/** The claimed row vanishing outright is the same refusal. */

@@ -895,7 +895,7 @@ final class Aura_Worker_Unbind {
 	public static function leftovers(): array {
 		$m = self::read();
 		if ( is_wp_error( $m ) ) {
-			return array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
+			return array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' );
 		}
 		if ( null === $m ) {
 			return array(); // no marker: this site is not mid-unbind and owes nothing
@@ -930,6 +930,18 @@ final class Aura_Worker_Unbind {
 		}
 		if ( ! self::option_absent( 'aura_worker_grant_pubkey' ) ) {
 			$left[] = 'grant_pubkey';
+		}
+		// The door's binding GENERATION (Ruling P59). Asked the way every other
+		// kind is asked — is it done — not "did step (4a)'s call return true":
+		// an unbound site is bound to nobody, so a record still naming a client
+		// or a dashboard means the rotation has not landed and the departed
+		// client's holds are still current. Names ONLY that; the queue, the log
+		// and the epoch are not deleted by an unbind and are not owed.
+		if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+			$rec = Aura_Worker_Door_Log::binding_record();
+			if ( null !== ( isset( $rec['client'] ) ? $rec['client'] : null ) || null !== ( isset( $rec['dashboard'] ) ? $rec['dashboard'] : null ) ) {
+				$left[] = 'door';
+			}
 		}
 		return $left;
 	}
@@ -1045,15 +1057,22 @@ final class Aura_Worker_Unbind {
 		// `elementor_replay_ability`.
 		//
 		// A new binding GENERATION, not a wipe (Ruling P58). Nothing is
-		// deleted and nothing can refuse: from this moment every held, claimed
-		// and log row this binding wrote is stamped with a generation that is
-		// no longer current, so the queue's readers cannot see them, the cap
-		// does not charge for them, and the sweep removes the held ones in its
-		// own time. It cannot fail in a way that needs reporting, so `door` is
-		// NOT a leftover kind and never gates the token.
+		// deleted: from this moment every held, claimed and log row this
+		// binding wrote is stamped with a generation that is no longer
+		// current, so the queue's readers cannot see them, the cap does not
+		// charge for them, and the sweep removes the held ones in its own time.
+		//
+		// The identity it moves to is NOBODY (Ruling P59): an unbound site is
+		// bound to no client and no dashboard, so the next connect's own
+		// identity is necessarily a change and rotates again.
+		//
+		// VERIFIED (Ruling P59): the rotation is a compare-and-swap that must
+		// change exactly one row, and a failure is REPORTED — `door` is a
+		// leftovers() kind again, so the token stays and the drain's next
+		// Phase-B pass rotates for real.
 		do_action( 'aura_worker_unbind_step', 'door' );
 		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
-			Aura_Worker_Elementor_Door::rebind();
+			Aura_Worker_Elementor_Door::rebind( array( 'client' => null, 'dashboard' => null ) );
 		}
 
 		if ( array() !== self::leftovers() ) {

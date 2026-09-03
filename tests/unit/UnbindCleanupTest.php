@@ -194,7 +194,7 @@ final class UnbindCleanupTest extends TestCase {
 		$left = Aura_Worker_Unbind::leftovers();
 
 		$GLOBALS['_sa_option_read_fail'] = array();
-		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ), $left );
+		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' ), $left );
 	}
 
 	public function test_leftovers_names_every_pending_step_and_nothing_else(): void {
@@ -912,7 +912,9 @@ final class UnbindCleanupTest extends TestCase {
 		// throttle.
 		update_option( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 1, 'started_at' => gmdate( 'c' ) ) );
 		update_option( Aura_Worker_Elementor_Door::PRUNED_AT, gmdate( 'c' ) );
-		Aura_Worker_Door_Log::binding(); // the generation a replay is fenced to (Ruling P51)
+		// The door bound to the departing client, so the unbind's rotation to
+		// NOBODY is a real change (Ruling P59).
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
 		$bucket                       = 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS );
 		$GLOBALS['_options'][ $bucket ] = 4;
 		$GLOBALS['_rows'][ $bucket ]    = maybe_serialize( 4 );
@@ -975,7 +977,10 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
 
 		$this->assertNotSame( $before, Aura_Worker_Door_Log::binding(), 'a new generation' );
-		$this->assertNotContains( 'door', Aura_Worker_Unbind::leftovers(), 'and it can never be owed' );
+		$this->assertNotContains( 'door', Aura_Worker_Unbind::leftovers(), 'and nothing is owed once it lands' );
+		$rec = Aura_Worker_Door_Log::binding_record();
+		$this->assertNull( $rec['client'], 'an unbound site is bound to nobody' );
+		$this->assertNull( $rec['dashboard'] );
 		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'so the token still goes' );
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $door['held'] ), 'the departed queue is invisible' );
 		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );

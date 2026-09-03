@@ -479,13 +479,6 @@ class Aura_Worker_Magic_Link {
 				409
 			);
 		}
-		// WHO THIS SITE IS BOUND TO RIGHT NOW — read BEFORE the token write
-		// below, because bound_client() proves the stored record against the
-		// site's CURRENT token and the write about to happen would make the old
-		// record read as stale. Used only to decide whether the Elementor
-		// door's queue survives this connect (Ruling P44').
-		$prev_client    = class_exists( 'Aura_Worker_Rules' ) ? (string) Aura_Worker_Rules::bound_client() : '';
-		$prev_dashboard = (string) get_option( 'aura_worker_dashboard_url', '' );
 		$token_hash = Aura_Worker_Security::hash_token( $token );
 		// The token is the ONE write whose loss the dashboard cannot see: a
 		// handler resuming after its claim was released could otherwise
@@ -494,61 +487,9 @@ class Aura_Worker_Magic_Link {
 		// (round-9). So it is not merely preceded by a check — it is
 		// CONDITIONAL on the claim, in one statement, and a handler that no
 		// longer owns the claim writes nothing at all.
-		// THE DEPARTED BINDING'S DOOR STATE, taken BEFORE anything of this
-		// install is written (Rulings P44/P44'/P46). A connect does NOT require
-		// an unbind first: finish_before_rebind() above returns true
-		// immediately for a site with no unbind marker, so this callback can
-		// install a new binding straight over an old one — and the Elementor
-		// door's holds, claims and log rows would survive into it. A hold is a
-		// stored WordPress action with the actor to run it as; the NEW client
-		// would be served the old client's queue through `/status` and could
-		// approve one through `elementor_replay_ability`.
-		//
-		// ONLY WHEN THE BINDING CHANGES (Ruling P44'). A token rotation — the
-		// same site reconnecting to the same client — is not a new owner, and
-		// discarding that operator's pending approvals and unacked log because
-		// their credentials were refreshed would be a bug of its own. The
-		// binding is the pair (client id, dashboard URL): the signed `client`
-		// line this callback carries, against the client the ruleset store is
-		// bound to, and the new dashboard URL against the stored one.
-		//
-		// The comparison FAILS TOWARD THE WIPE. Either side missing a client
-		// line (an older dashboard, an unbound or unreadable store, a record
-		// whose token no longer matches) is a binding that cannot be PROVEN the
-		// same, and an unprovable binding is treated as replaced — the safe
-		// direction is always the departed client's approvals not surviving.
-		// An unbind rebinds unconditionally; this condition is the connect's
-		// alone.
-		//
-		// A NEW GENERATION, not a wipe (Ruling P58). Nothing is deleted: every
-		// held, claimed and log row the departed binding wrote keeps its own
-		// `binding`, and from this moment the queue's readers cannot see them
-		// — `listing()` omits them, `claim()` answers `not_held`, the cap does
-		// not charge for them, and the reconciler's sweep removes the held ones
-		// in its own time. The log stays and is still served: it is the SITE's
-		// audit trail, each entry carrying the binding that wrote it, and the
-		// new client drains it by acking.
-		//
-		// So this cannot refuse, cannot wait on a lock, and has nothing to undo
-		// if a later write in this handler fails — which is what six rounds of
-		// racing a delete against a live replay were trying and failing to buy.
-		$same_binding = '' !== $prev_client
-			&& '' !== $client
-			&& hash_equals( $prev_client, $client )
-			&& '' !== $prev_dashboard
-			&& $prev_dashboard === $dashboard_url;
-		if ( ! $same_binding && class_exists( 'Aura_Worker_Elementor_Door' ) ) {
-			Aura_Worker_Elementor_Door::rebind();
-		}
-		// THE CONNECT USER, after the rebind and not before it (Ruling P48). This
-		// used to be the handler's first persistent write, so the retryable
-		// refusal path above left the OLD token, dashboard and client active
-		// while token-only requests started running as the NEW administrator —
-		// and releasing the site claim restores nothing. Under Ruling P58 the
-		// rebind cannot refuse at all, so the ordering is no longer load
-		// bearing for that reason; it is kept because Phase B step (2) deletes
-		// exactly this option, which is why it comes after
-		// finish_before_rebind() above.
+		// THE CONNECT USER (Ruling P48). It comes after finish_before_rebind()
+		// above because Phase B step (2) deletes exactly this option, so
+		// settling afterwards would erase this install's own write.
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
 		}
@@ -572,6 +513,52 @@ class Aura_Worker_Magic_Link {
 				return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
 			}
 			return new WP_REST_Response( array( 'error' => 'Connect not completed: the site token could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
+		}
+		// THE DOOR'S BINDING GENERATION — the connect's LAST persistent step,
+		// and only now (Rulings P58/P59, findings F3 and F4).
+		//
+		// A connect does NOT require an unbind first: finish_before_rebind()
+		// above returns true immediately for a site with no unbind marker, so
+		// this callback can install a new binding straight over an old one —
+		// and the departed client's holds would otherwise stay current, be
+		// listed to the replacement client through `/status`, and be approved
+		// through `elementor_replay_ability`, running the old client's input as
+		// the old client's actor.
+		//
+		// AFTER the claim-conditional token write, not before it:
+		//   F3 — a token write that fails verification leaves the OLD token and
+		//        client active, and a generation already rotated would have made
+		//        THEIR pending holds invisible and THEIR log cursor invalid for
+		//        a rebind that never happened;
+		//   F4 — a handler that stalled past SITE_CLAIM_TAKEOVER_AFTER and lost
+		//        the site never reaches this line, because the token write
+		//        above rejected it first. The winner's generation is safe.
+		//
+		// Idempotent by identity: EVERY connect calls it, including a
+		// same-client token rotation, and rotate_binding() is a no-op when the
+		// record already names this (client, dashboard). That is what makes a
+		// FAILED rotation harmless to leave — the next connect does it again —
+		// and it is why the old pre-comparison is gone: the record IS the
+		// comparison now.
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			$rebound = Aura_Worker_Elementor_Door::rebind(
+				array(
+					'client'    => '' === (string) $client ? null : (string) $client,
+					'dashboard' => '' === (string) $dashboard_url ? null : (string) $dashboard_url,
+				)
+			);
+			if ( ! $rebound ) {
+				// The token IS installed, so this connect is otherwise done —
+				// but the door still belongs to the departed binding, and
+				// saying otherwise would hand its queue to the new client.
+				// Retryable: the next connect rotates.
+				$release();
+				return new WP_Error(
+					'aura_door_failed',
+					__( 'Connect not completed: the Elementor door could not be handed to the new binding; retry.', 'digitizer-site-worker' ),
+					array( 'status' => 503, 'retry_after' => 5 )
+				);
+			}
 		}
 		// The token is stored, so the credential minted beside the PREVIOUS one
 		// is now a credential without a token — revoke it here, before anything

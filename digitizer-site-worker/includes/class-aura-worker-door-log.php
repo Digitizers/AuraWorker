@@ -101,13 +101,42 @@ class Aura_Worker_Door_Log {
 	 * @return string
 	 */
 	public static function binding() {
-		$cur = get_option( self::BINDING, '' );
-		if ( is_string( $cur ) && '' !== $cur ) {
+		$rec = self::binding_record();
+		return (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' );
+	}
+
+	/**
+	 * The whole binding record — `{ gen, client, dashboard }` (Ruling P59).
+	 *
+	 * The generation carries the IDENTITY it belongs to, which is what makes
+	 * the rotation idempotent: a connect states the identity it is installing
+	 * and the rotation is a no-op when the record already names it. That, and
+	 * nothing else, is why a rotation that failed can simply be retried by the
+	 * next connect rather than needing to be undone.
+	 *
+	 * Minted lazily with a NULL identity, which reads as "rotate on the first
+	 * connect": a site that has never been connected under this rule has a
+	 * generation but no claim about whose it is.
+	 *
+	 * @return array{ gen: string, client: string|null, dashboard: string|null }
+	 */
+	public static function binding_record() {
+		$cur = get_option( self::BINDING, null );
+		if ( is_array( $cur ) && isset( $cur['gen'] ) && '' !== (string) $cur['gen'] ) {
 			return $cur;
 		}
-		self::insert_unique( self::BINDING, wp_generate_uuid4() ); // a concurrent mint loses the INSERT and reads the winner's
-		$cur = get_option( self::BINDING, '' );
-		return is_string( $cur ) ? $cur : '';
+		self::insert_unique(
+			self::BINDING,
+			array(
+				'gen'       => wp_generate_uuid4(),
+				'client'    => null,
+				'dashboard' => null,
+			)
+		); // a concurrent mint loses the INSERT and reads the winner's
+		$cur = get_option( self::BINDING, null );
+		return is_array( $cur ) && isset( $cur['gen'] )
+			? $cur
+			: array( 'gen' => '', 'client' => null, 'dashboard' => null );
 	}
 
 	/**
@@ -325,27 +354,115 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * Mint a NEW binding generation (Ruling P58).
+	 * The current generation, read RAW from the database and NEVER minted
+	 * (Rulings P51/P59).
 	 *
-	 * This is what a rebind does now, in place of deleting the door. Nothing
-	 * is removed: every held, claimed and log row keeps its own `binding`, and
-	 * from this moment the ones stamped with the old value are another
-	 * client's — invisible to the queue's readers, swept when the reconciler
-	 * next runs, and still readable in the log, which is the SITE's audit
-	 * trail rather than any one binding's.
+	 * `binding()` mints when the record is absent, which is right for a writer
+	 * stamping a row and wrong for a FENCE: on a site whose record had gone
+	 * missing it would quietly manufacture agreement. A fence wants the
+	 * database's answer or nothing.
 	 *
-	 * Delete-then-insert rather than a CAS: a concurrent minter loses the
-	 * conditional INSERT and reads the winner's value, which is the same
-	 * property epoch() relies on, and either winner is a generation nothing
-	 * older can match.
-	 *
-	 * @return string The new generation.
+	 * @return string '' when there is no record.
 	 */
-	public static function rotate_binding() {
-		delete_option( self::BINDING );
+	public static function binding_raw() {
+		$raw = self::raw_option( self::BINDING );
+		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		return is_array( $rec ) && isset( $rec['gen'] ) ? (string) $rec['gen'] : '';
+	}
+
+	/**
+	 * Move the binding to a new IDENTITY, minting a generation (Rulings
+	 * P58/P59).
+	 *
+	 * This is what a rebind does, in place of deleting the door. Nothing is
+	 * removed: every held, claimed and log row keeps its own `binding`, and
+	 * from this moment the ones stamped with the old generation are another
+	 * client's — invisible to the queue's readers, swept when the reconciler
+	 * next runs, and still readable in the log, which is the SITE's audit trail
+	 * rather than any one binding's.
+	 *
+	 * IDEMPOTENT and VERIFIED. Idempotent because the record names the identity
+	 * it belongs to, so a connect that changes nothing rotates nothing — which
+	 * is what lets a FAILED rotation simply be retried by the next connect
+	 * instead of needing to be undone. Verified because the swap is a
+	 * compare-and-swap on the bytes just read and exactly one row must change:
+	 * a transient failure used to be indistinguishable from a rotation that
+	 * happened, and a changed-client connect would complete with the departed
+	 * client's holds still current (F1).
+	 *
+	 * @param array $identity { client: string|null, dashboard: string|null }.
+	 * @return bool The record now names this identity.
+	 */
+	public static function rotate_binding( array $identity ) {
+		global $wpdb;
+		$client    = isset( $identity['client'] ) && '' !== (string) $identity['client'] ? (string) $identity['client'] : null;
+		$dashboard = isset( $identity['dashboard'] ) && '' !== (string) $identity['dashboard'] ? (string) $identity['dashboard'] : null;
+
+		$raw = self::raw_option( self::BINDING );
+		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		$rec = is_array( $rec ) && isset( $rec['gen'] ) ? $rec : null;
+
+		// ALREADY THIS IDENTITY ⇒ nothing to do (Ruling P59). This is what
+		// makes the rotation safe to retry: every connect calls it, and only a
+		// connect that actually CHANGES the binding moves the generation.
+		if ( null !== $rec
+			&& ( isset( $rec['client'] ) ? $rec['client'] : null ) === $client
+			&& ( isset( $rec['dashboard'] ) ? $rec['dashboard'] : null ) === $dashboard
+		) {
+			return true;
+		}
+
+		$was  = self::epoch(); // read BEFORE the swap, so the rotate below fences on it
+		$next = array(
+			'gen'       => wp_generate_uuid4(),
+			'client'    => $client,
+			'dashboard' => $dashboard,
+		);
+
+		if ( null === $rec ) {
+			// No record at all: a real conditional INSERT, so a concurrent
+			// minter cannot be overwritten blind.
+			$done = self::insert_unique( self::BINDING, $next );
+		} else {
+			// COMPARE-AND-SWAP on the bytes just read (F1): a transient failure
+			// must not read as a rotation that happened, or a changed-client
+			// connect would complete with the departed client's holds still
+			// current and replayable by the replacement.
+			$wpdb->last_error = '';
+			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+					maybe_serialize( $next ),
+					self::BINDING,
+					$raw
+				)
+			);
+			$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+		}
 		wp_cache_delete( self::BINDING, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
-		return self::binding();
+		wp_cache_delete( 'alloptions', 'options' );
+		if ( ! $done ) {
+			return false;
+		}
+		// The epoch follows, so the new binding starts at cursor 0. Its own
+		// fenced rotate answering 0 rows is a LOST RACE somebody else already
+		// settled — the epoch moved either way, which is all this needs.
+		self::rotate_epoch( $was );
+		return true;
+	}
+
+	/**
+	 * One option's raw, still-serialised bytes from the DATABASE — never this
+	 * request's cache. The predicate a compare-and-swap fences on.
+	 *
+	 * @param string $name Option name.
+	 * @return string|null
+	 */
+	private static function raw_option( $name ) {
+		global $wpdb;
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ) );
+		return null === $raw ? null : (string) $raw;
 	}
 
 	/** @param int $seq Seq. @return array|null */
