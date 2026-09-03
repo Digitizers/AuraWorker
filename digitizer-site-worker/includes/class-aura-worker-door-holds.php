@@ -270,6 +270,20 @@ class Aura_Worker_Door_Holds {
 		return 1 === (int) $gone ? $row : null;
 	}
 
+	/**
+	 * The epoch this ref was CLAIMED under, read from the database (Ruling
+	 * P47) — never this request's option cache, because the writer that could
+	 * have taken the row away is another request.
+	 *
+	 * @param string $ref Ref.
+	 * @return string|null null when the claimed row is gone; '' when it
+	 *                     carries no epoch (claimed before this rule existed).
+	 */
+	public static function claimed_epoch( $ref ) {
+		$row = self::from_db( self::CLAIMED . self::clean( $ref ) );
+		return null === $row ? null : (string) ( isset( $row['epoch'] ) ? $row['epoch'] : '' );
+	}
+
 	/** @param string $ref Ref. @return array|null */
 	public static function get_claimed( $ref ) {
 		$row = get_option( self::CLAIMED . self::clean( $ref ), null );
@@ -357,6 +371,27 @@ class Aura_Worker_Door_Holds {
 	 * @return array|WP_Error The claimed entry, or `not_held`.
 	 */
 	public static function claim( $ref ) {
+		// UNDER THE HOLD LOCK (Ruling P47). Only admission used to take this
+		// mutex, so a claim could complete its move in the window a
+		// changed-client connect's (or an unbind's) wipe was deleting rows in —
+		// and the replay it belongs to then ran on into the callback,
+		// recreating door state while executing the DEPARTED client's stored
+		// mutation under the replacement binding. A lock that cannot be taken
+		// answers the lost-race `not_held` this method already has: Aura
+		// retries, and finds out what happened from the hold list.
+		$token = self::take_lock();
+		if ( false === $token ) {
+			return self::not_held();
+		}
+		try {
+			return self::claim_locked( $ref );
+		} finally {
+			self::release_lock( $token );
+		}
+	}
+
+	/** The body of claim(), run only while the lock is held. */
+	private static function claim_locked( $ref ) {
 		global $wpdb;
 		$ref  = self::clean( $ref );
 		$held = self::from_db( self::HELD . $ref );
@@ -373,6 +408,12 @@ class Aura_Worker_Door_Holds {
 		}
 		$claimed               = $held;
 		$claimed['claimed_at'] = gmdate( 'c' );
+		// The BINDING this claim belongs to (Ruling P47). A wipe deletes the
+		// epoch, and the next binding mints a fresh one, so this value can
+		// never be equal across a rebind — which is exactly what the wrapper
+		// re-reads immediately before the callback to prove the site is still
+		// the one that approved this call.
+		$claimed['epoch']      = Aura_Worker_Door_Log::epoch();
 		if ( ! Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed ) ) {
 			return self::not_held(); // already claimed
 		}
@@ -432,6 +473,26 @@ class Aura_Worker_Door_Holds {
 	 * @return bool The row is held again, by this call.
 	 */
 	public static function unclaim( $ref ) {
+		// UNDER THE LOCK as well (Ruling P47), for symmetry with the wipe
+		// rather than with claim(): unclaim INSERTS a held row, and a wipe that
+		// has already run its held-prefix delete would otherwise find one
+		// afterwards — the same shape as the claim race, in the other
+		// direction. A lock it cannot take answers false, which give_back()
+		// already reads correctly: the hold is not back, so the approval is
+		// reported as not retryable rather than promised.
+		$token = self::take_lock();
+		if ( false === $token ) {
+			return false;
+		}
+		try {
+			return self::unclaim_locked( $ref );
+		} finally {
+			self::release_lock( $token );
+		}
+	}
+
+	/** The body of unclaim(), run only while the lock is held. */
+	private static function unclaim_locked( $ref ) {
 		global $wpdb;
 		$ref     = self::clean( $ref );
 		$claimed = self::from_db( self::CLAIMED . $ref );
@@ -439,7 +500,7 @@ class Aura_Worker_Door_Holds {
 			return false;
 		}
 		$held = $claimed;
-		unset( $held['claimed_at'], $held['terminal_seq'] );
+		unset( $held['claimed_at'], $held['terminal_seq'], $held['epoch'] );
 		// The witness the sweep reads to tell this move from claim()'s
 		// (Ruling P41). Stamped BEFORE the insert, so a row that exists always
 		// carries it.

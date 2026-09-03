@@ -931,6 +931,34 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Is the claimed row still ours, under the epoch it was claimed in
+	 * (Ruling P47)?
+	 *
+	 * FALSE when the claimed row is gone (a wipe took it) or when the site's
+	 * epoch has moved (a wipe deleted it and a new binding minted another).
+	 * A claimed row carrying NO epoch — claimed by a build before this rule —
+	 * is accepted: it predates the fence and refusing it would strand an
+	 * approval nobody can re-issue.
+	 *
+	 * @param string $ref Hold ref.
+	 * @return bool
+	 */
+	private static function replay_binding_unchanged( $ref ) {
+		$claimed = Aura_Worker_Door_Holds::claimed_epoch( $ref );
+		if ( null === $claimed ) {
+			return false; // the row this replay owns is gone
+		}
+		if ( '' === $claimed ) {
+			return true; // claimed before the fence existed
+		}
+		// RAW, and past this request's option cache: the writer that deleted
+		// the epoch is another request, and epoch() would mint a replacement
+		// rather than report the absence.
+		wp_cache_delete( Aura_Worker_Door_Log::EPOCH, 'options' );
+		return $claimed === (string) get_option( Aura_Worker_Door_Log::EPOCH, '' );
+	}
+
+	/**
 	 * @param string $route REST route.
 	 * @return bool
 	 */
@@ -1782,6 +1810,50 @@ class Aura_Worker_Elementor_Door {
 			return new WP_Error( 'aura_log_failed', 'The door log could not record that this call was about to run; it was not run.', array( 'status' => 503 ) );
 		}
 
+		// IS THIS STILL THE BINDING THAT APPROVED THE CALL (Ruling P47)?
+		//
+		// The last thing checked before the callback, because it is the last
+		// thing that can change: a changed-client connect (or an unbind) wipes
+		// the door while this replay is mid-flight, and everything it deletes —
+		// the claimed row, the log, the epoch — was the DEPARTED client's. The
+		// claim itself is now taken under the hold lock, so it cannot land
+		// inside the wipe's deletes; this catches the other order, where the
+		// claim was already ours and the wipe happened afterwards.
+		//
+		// The epoch is the witness: the wipe deletes it and the next binding
+		// mints a fresh one, so the value stamped on the claimed row can never
+		// survive a rebind. Read RAW — never epoch(), which MINTS one and would
+		// quietly manufacture agreement on a site whose epoch was just deleted.
+		//
+		// RESIDUAL WINDOW, stated rather than hidden: a wipe landing between
+		// this read and `call_user_func()` below is not caught. It is the same
+		// class of residual as the P37 allocation re-check — narrowed to two
+		// statements, not closed — and closing it would mean holding the hold
+		// lock across the ability's own execution, which is an arbitrary amount
+		// of third-party work.
+		if ( null !== self::$replay_ack ) {
+			$ours = self::replay_binding_unchanged( (string) self::$replay_ack['ref'] );
+			if ( ! $ours ) {
+				if ( $creating ) {
+					self::release_creation_mutex();
+				}
+				Aura_Worker_Door_Log::settle(
+					$seq,
+					array(
+						'result'       => 'refused',
+						'reason'       => 'binding_changed',
+						'may_have_run' => false,
+					)
+				);
+				self::$request = null;
+				return new WP_Error(
+					'aura_binding_changed',
+					'This site was rebound to another Aura client while the approval was running; it was not run.',
+					array( 'status' => 409 )
+				);
+			}
+		}
+
 		// THE CALLBACK IS ABOUT TO BE ENTERED (Ruling P33). The `ran` witness
 		// above is the DURABLE record, for a replay reading the row in a later
 		// request; this is the IN-MEMORY one, for the catch below in THIS
@@ -2268,6 +2340,18 @@ class Aura_Worker_Elementor_Door {
 			$seq    = (int) ( isset( $stamp['terminal_seq'] ) ? $stamp['terminal_seq'] : 0 );
 			$entry  = $seq > 0 ? Aura_Worker_Door_Log::get( $seq ) : null;
 			$code   = is_wp_error( $result ) ? $result->get_error_code() : '';
+
+			// The site was rebound under this replay (Ruling P47). The hold is
+			// NOT given back: it belonged to the departed binding, and whatever
+			// the wipe left of it is the wipe's to have left. Answered before
+			// every other rule below, because none of them applies to a call
+			// whose owner no longer exists.
+			if ( 'aura_binding_changed' === $code ) {
+				return array(
+					'ok'     => false,
+					'reason' => 'binding_changed',
+				);
+			}
 
 			// THE DISCRIMINATOR IS NEVER THE ERROR CODE — it is whether the
 			// callback ran, and the row says so (Ruling P8). `terminal_seq` is

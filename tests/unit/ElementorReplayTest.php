@@ -532,6 +532,101 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
 	}
 
+	/**
+	 * Fire $fn immediately after the CAS swap on one named option, re-arming
+	 * the shared one-shot seam until that option is the one that swapped.
+	 */
+	private function afterSwapOn( string $option, callable $fn ): void {
+		$arm = null;
+		$arm = static function ( $name ) use ( &$arm, $option, $fn ) {
+			if ( (string) $name === $option ) {
+				$fn();
+				return;
+			}
+			$GLOBALS['_sa_after_swap'] = $arm; // not this one: wait for the next
+		};
+		$GLOBALS['_sa_after_swap'] = $arm;
+	}
+
+	/**
+	 * Ruling P47: a replay whose site was REBOUND mid-flight does not run.
+	 *
+	 * The claim is now taken under the hold lock, so it cannot land inside a
+	 * wipe's deletes. This is the other order: the claim was already ours and
+	 * the wipe happened afterwards — a changed-client connect, or an unbind,
+	 * taking the departed binding's door away while the approval was running.
+	 * Without the fence the callback went on to execute the departed client's
+	 * stored mutation under the replacement binding, and recreated door state
+	 * doing it.
+	 */
+	public function test_a_replay_refuses_when_the_site_is_rebound_mid_flight(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref       = $this->holdCall();
+		$inner_ran = 0;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$inner_ran ) {
+				++$inner_ran;
+			}
+		);
+		// The wipe lands after the claim (its terminal_seq stamp is the first
+		// swap on the claimed row) and before the callback: the epoch and the
+		// claimed row are exactly what it takes.
+		$this->afterSwapOn(
+			Aura_Worker_Door_Holds::CLAIMED . $ref,
+			static function () {
+				delete_option( Aura_Worker_Door_Log::EPOCH );
+				unset( $GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ] );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'binding_changed', $out['reason'] );
+		$this->assertSame( 0, $inner_ran, 'the write path was never entered' );
+		$this->assertSame( array(), $this->ran, 'and the departed client\'s mutation never ran' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is NOT given back — it was the departed binding\'s' );
+		$entry = Aura_Worker_Door_Log::get( 2 );
+		$this->assertSame( 'refused', $entry['result'] );
+		$this->assertSame( 'binding_changed', $entry['reason'] );
+		$this->assertFalse( $entry['may_have_run'] );
+	}
+
+	/** A claimed row whose epoch still matches runs exactly as before. */
+	public function test_a_replay_under_an_unchanged_epoch_still_runs(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref   = $this->holdCall();
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertTrue( $out['ok'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+		$this->assertSame( $epoch, (string) get_option( Aura_Worker_Door_Log::EPOCH, '' ), 'and the epoch never moved' );
+	}
+
+	/** The claimed row vanishing outright is the same refusal. */
+	public function test_a_replay_whose_claimed_row_is_taken_away_refuses(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		$this->afterSwapOn(
+			Aura_Worker_Door_Holds::CLAIMED . $ref,
+			static function () use ( $ref ) {
+				delete_option( Aura_Worker_Door_Holds::CLAIMED . $ref );
+				unset( $GLOBALS['_rows'][ Aura_Worker_Door_Holds::CLAIMED . $ref ] );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 'binding_changed', $out['reason'] );
+		$this->assertSame( array(), $this->ran );
+	}
+
 	public function test_a_permission_callback_that_throws_refuses_and_releases_the_claim(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );
