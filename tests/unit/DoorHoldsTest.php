@@ -37,6 +37,56 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertEqualsWithDelta( time() + 7 * 86400, strtotime( $row['expires_at'] ), 5 );
 	}
 
+	/** The LIKE prefix the held read carries, as the statement escapes it. */
+	private function heldReadKey(): string {
+		return $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD );
+	}
+
+	/**
+	 * Ruling P57: an unreadable queue is not an empty one.
+	 *
+	 * `rows()` cast a failed `get_results()` to `array()`, so `count()` read
+	 * the queue as below capacity and `hold()` admitted past CAP — again and
+	 * again, for as long as the read kept failing. The bounded approval queue
+	 * was bounded only while the database was healthy.
+	 */
+	public function test_a_hold_refuses_retryably_when_the_queue_cannot_be_read(): void {
+		$GLOBALS['_sa_rows_read_error'][ $this->heldReadKey() ] = true;
+
+		$out = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$GLOBALS['_sa_rows_read_error'] = array();
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_failed', $out->get_error_code(), 'retryable, and NOT queue_full' );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nothing was inserted' );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::count() );
+	}
+
+	/** count() answers null rather than a false zero. */
+	public function test_an_unreadable_queue_counts_as_null_not_zero(): void {
+		Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count() );
+
+		$GLOBALS['_sa_rows_read_error'][ $this->heldReadKey() ] = true;
+		$this->assertNull( Aura_Worker_Door_Holds::count() );
+		$this->assertTrue( Aura_Worker_Door_Holds::queue_unreadable() );
+		$GLOBALS['_sa_rows_read_error'] = array();
+	}
+
+	/** A sweep with an unreadable read deletes nothing. */
+	public function test_a_sweep_with_an_unreadable_queue_deletes_nothing(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ]['expires_at'] = gmdate( 'c', time() - 10 );
+		$GLOBALS['_rows'][ 'aura_worker_door_held_' . $ref ] = maybe_serialize( $GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ] );
+		$GLOBALS['_sa_rows_read_error'][ $this->heldReadKey() ] = true;
+
+		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+
+		$GLOBALS['_sa_rows_read_error'] = array();
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'never delete on a guess' );
+	}
+
 	public function test_a_claimed_ref_still_holds_a_slot(): void {
 		for ( $i = 0; $i < 49; $i++ ) {
 			Aura_Worker_Door_Holds::hold( $this->call() );

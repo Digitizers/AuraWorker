@@ -257,6 +257,23 @@ final class McpExposureGovernorTest extends TestCase {
 		$this->assertSame( 1, $b['log_ungoverned_30d'] );
 	}
 
+	/**
+	 * Ruling P57: an unreadable queue is reported as unknown, not as empty.
+	 *
+	 * `held_count` and `queue_full` are the same fact, so they say "unknown"
+	 * together rather than one of them inventing a zero.
+	 */
+	public function test_an_unreadable_queue_reports_null_rather_than_zero(): void {
+		$this->bringUpTheDoor();
+		$GLOBALS['_sa_rows_read_error'][ $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD ) ] = true;
+
+		$b = $this->block();
+
+		$GLOBALS['_sa_rows_read_error'] = array();
+		$this->assertNull( $b['held_count'] );
+		$this->assertNull( $b['queue_full'] );
+	}
+
 	// --- a throw inside governor_block() is isolated ------------------------
 
 	public function test_a_throw_inside_governor_block_yields_error_for_governor_only(): void {

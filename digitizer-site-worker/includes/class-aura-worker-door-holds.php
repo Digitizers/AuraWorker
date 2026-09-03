@@ -150,7 +150,15 @@ class Aura_Worker_Door_Holds {
 		// answered `aura_hold_queue_full` to every new Elementor write while
 		// there was nothing live in the queue at all.
 		self::purge_expired();
-		if ( self::count() >= self::CAP ) {
+		$queued = self::count();
+		if ( null === $queued ) {
+			// CANNOT COUNT, CANNOT ADMIT (Ruling P57). Not `aura_hold_queue_full`
+			// — the queue may be empty, and saying it is full would send the
+			// operator looking for approvals that are not there. Retryable, and
+			// nothing is inserted.
+			return new WP_Error( 'aura_hold_failed', __( 'Aura could not read this site\'s approval queue; the call was not run — retry.', 'digitizer-site-worker' ), array( 'status' => 503 ) );
+		}
+		if ( $queued >= self::CAP ) {
 			return new WP_Error( 'aura_hold_queue_full', 'Aura\'s approval queue for this site is full (50 held calls); ask the operator to act on it.', array( 'status' => 503 ) );
 		}
 		$ref = 'door_' . wp_generate_uuid4();
@@ -577,9 +585,16 @@ class Aura_Worker_Door_Holds {
 	 * @return array[]
 	 */
 	public static function listing() {
-		$out = array();
-		$now = time();
-		foreach ( self::rows( self::HELD ) as $ref => $row ) {
+		$out  = array();
+		$now  = time();
+		$held = self::rows( self::HELD );
+		if ( null === $held ) {
+			// Nothing to LIST is not the same as nothing HELD (Ruling P57), and
+			// the caller must not read an empty list as an empty queue —
+			// status_fragment() carries `held_unreadable: true` beside it.
+			return array();
+		}
+		foreach ( $held as $ref => $row ) {
 			if ( null !== self::get_claimed( $ref ) ) {
 				continue;
 			}
@@ -628,7 +643,11 @@ class Aura_Worker_Door_Holds {
 	public static function sweep( $now, $claim_stale_ms ) {
 		$gone = 0;
 		$cut  = (int) $now - (int) floor( (int) $claim_stale_ms / 1000 );
-		foreach ( self::rows( self::HELD ) as $ref => $row ) {
+		$held = self::rows( self::HELD );
+		if ( null === $held ) {
+			return 0; // unreadable ⇒ nothing to sweep (Ruling P57); never delete on a guess
+		}
+		foreach ( $held as $ref => $row ) {
 			$claimed = self::get_claimed( $ref );
 			if ( null !== $claimed ) {
 				$at = strtotime( (string) ( isset( $claimed['claimed_at'] ) ? $claimed['claimed_at'] : '' ) );
@@ -889,7 +908,7 @@ class Aura_Worker_Door_Holds {
 		$cut              = time() - (int) floor( $ms / 1000 );
 		$wpdb->last_error = '';
 		$rows             = self::rows( self::CLAIMED );
-		if ( '' !== (string) $wpdb->last_error ) {
+		if ( null === $rows || '' !== (string) $wpdb->last_error ) {
 			// A READ THAT FAILED IS NOT AN EMPTY SET (Ruling P49'). The whole
 			// point of this check is to refuse while a replay MAY be running,
 			// and "may" is exactly what an unreadable answer leaves.
@@ -945,7 +964,7 @@ class Aura_Worker_Door_Holds {
 	public static function stale_claims( $ms ) {
 		$cut = time() - (int) floor( $ms / 1000 );
 		$out = array();
-		foreach ( self::rows( self::CLAIMED ) as $ref => $row ) {
+		foreach ( (array) self::rows( self::CLAIMED ) as $ref => $row ) { // null ⇒ nothing stale (Ruling P57)
 			if ( strtotime( (string) ( $row['claimed_at'] ?? '' ) ) <= $cut ) {
 				$out[ $ref ] = $row;
 			}
@@ -1000,7 +1019,7 @@ class Aura_Worker_Door_Holds {
 		$cut  = time() - (int) floor( (int) $ms / 1000 );
 		$cap  = time() - self::LEASE_HARD_CAP_S;
 		$out  = array( 'stale' => array(), 'running' => array() );
-		foreach ( self::rows( self::CLAIMED ) as $ref => $row ) {
+		foreach ( (array) self::rows( self::CLAIMED ) as $ref => $row ) { // null ⇒ nothing stale (Ruling P57)
 			if ( ! ( strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) ) <= $cut ) ) {
 				continue; // young: not stale, and not "running" either — just in progress
 			}
@@ -1054,7 +1073,11 @@ class Aura_Worker_Door_Holds {
 	private static function purge_expired() {
 		$gone = 0;
 		$now  = time();
-		foreach ( self::rows( self::HELD ) as $ref => $row ) {
+		$held = self::rows( self::HELD );
+		if ( null === $held ) {
+			return 0; // unreadable ⇒ nothing to purge (Ruling P57)
+		}
+		foreach ( $held as $ref => $row ) {
 			if ( self::is_expired( $row, $now ) && null === self::get_claimed( $ref ) ) {
 				delete_option( self::HELD . $ref );
 				$gone++;
@@ -1073,12 +1096,20 @@ class Aura_Worker_Door_Holds {
 	 * honours (Ruling P21). A claimed ref counts however old it is: the row
 	 * is a replay's, and only the sweep decides when it goes.
 	 *
-	 * @return int
+	 * NULL when either read failed (Ruling P57): a queue whose size cannot be
+	 * established is not a queue with room in it.
+	 *
+	 * @return int|null
 	 */
 	public static function count() {
-		$now  = time();
-		$refs = array_keys( self::rows( self::CLAIMED ) );
-		foreach ( self::rows( self::HELD ) as $ref => $row ) {
+		$now     = time();
+		$claimed = self::rows( self::CLAIMED );
+		$held    = self::rows( self::HELD );
+		if ( null === $claimed || null === $held ) {
+			return null;
+		}
+		$refs = array_keys( $claimed );
+		foreach ( $held as $ref => $row ) {
 			if ( ! self::is_expired( $row, $now ) || in_array( $ref, $refs, true ) ) {
 				$refs[] = $ref;
 			}
@@ -1087,10 +1118,25 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
-	 * Every row under a prefix, from the database, keyed by ref.
+	 * Could the held queue not be read on this request (Ruling P57)?
+	 *
+	 * `listing()` answers `[]` for an unreadable queue, which is the only
+	 * shape it can answer — but an empty list and an empty QUEUE are different
+	 * facts, so `/status` reports this beside it and Aura is never told the
+	 * queue is empty when nobody knows.
+	 *
+	 * @return bool
+	 */
+	public static function queue_unreadable() {
+		return null === self::rows( self::HELD );
+	}
+
+	/**
+	 * Every row under a prefix, from the database, keyed by ref — or NULL when
+	 * that could not be read (Ruling P57).
 	 *
 	 * @param string $prefix HELD or CLAIMED.
-	 * @return array<string,array>
+	 * @return array<string,array>|null
 	 */
 	private static function rows( $prefix ) {
 		global $wpdb;
@@ -1098,8 +1144,18 @@ class Aura_Worker_Door_Holds {
 		// ARRAY_A, matching Aura_Worker_Rules::sweep_options()'s identical
 		// SELECT — $wpdb::OBJECT is the default and would otherwise hand back
 		// stdClass rows this class never asks for.
-		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s", $like ), ARRAY_A );
-		$out  = array();
+		$wpdb->last_error = '';
+		$rows             = $wpdb->get_results( $wpdb->prepare( "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s", $like ), ARRAY_A );
+		// AN UNREADABLE SET IS NOT AN EMPTY ONE (Ruling P57). wpdb answers its
+		// CLEARED last_result — an empty array — for a statement that failed,
+		// so the error flag is the only tell, and casting it to `array()` read
+		// the whole queue as absent: count() saw a queue below capacity and
+		// hold() admitted past CAP, over and over, for as long as the read
+		// kept failing.
+		if ( null === $rows || false === $rows || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		$out = array();
 		foreach ( (array) $rows as $r ) {
 			$val = maybe_unserialize( $r['option_value'] );
 			if ( is_array( $val ) ) {

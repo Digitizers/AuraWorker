@@ -432,7 +432,7 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { active, epoch, seam, door, held, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
+	 * @return array|null { active, epoch, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::present() ) {
@@ -485,6 +485,10 @@ class Aura_Worker_Elementor_Door {
 			'seam'        => self::$seam,
 			'door'        => self::door_state(),
 			'held'        => Aura_Worker_Door_Holds::listing(),
+			// TRUE when `held` is empty because the queue could not be READ,
+			// not because it is empty (Ruling P57). Aura must never take an
+			// unreadable queue for an empty one.
+			'held_unreadable' => Aura_Worker_Door_Holds::queue_unreadable(),
 			'interrupted' => $interrupted,
 			// Claims past CLAIM_STALE_MS whose replay is demonstrably still
 			// running — an execution lease held by a live database connection
@@ -2842,7 +2846,10 @@ class Aura_Worker_Elementor_Door {
 			return array( 'active' => false );
 		}
 		$epoch = Aura_Worker_Door_Log::epoch();
-		$held  = Aura_Worker_Door_Holds::count(); // read once — held_count and queue_full are the same fact
+		// NULL when the queue could not be read (Ruling P57) — held_count and
+		// queue_full are the same fact, so both say "unknown" together rather
+		// than one of them inventing a zero.
+		$held  = Aura_Worker_Door_Holds::count(); // read once
 		return array(
 			'active'              => self::active(),
 			'epoch'               => '' === $epoch ? null : $epoch,
@@ -2854,7 +2861,7 @@ class Aura_Worker_Elementor_Door {
 			'unobserved_30d'      => self::count_30d( 'unobserved' ),
 			'hook_missed_30d'     => self::count_30d( 'hook_missed' ),
 			'unknown_ability_30d' => self::count_30d( 'unknown_ability' ),
-			'queue_full'          => $held >= Aura_Worker_Door_Holds::CAP,
+			'queue_full'          => null === $held ? null : ( $held >= Aura_Worker_Door_Holds::CAP ),
 			'log_full'            => Aura_Worker_Door_Log::full_report(),
 		);
 	}
