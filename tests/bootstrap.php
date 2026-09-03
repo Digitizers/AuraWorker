@@ -3295,6 +3295,12 @@ if ( ! function_exists( 'is_multisite' ) ) {
 	}
 }
 
+if ( ! function_exists( 'get_current_blog_id' ) ) {
+	function get_current_blog_id(): int {
+		return (int) ( $GLOBALS['_current_blog_id'] ?? 1 );
+	}
+}
+
 if ( ! function_exists( 'get_site_option' ) ) {
 	function get_site_option( string $option, $default = false ) {
 		return $GLOBALS['_site_options'][ $option ] ?? $default;
@@ -4049,6 +4055,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_state']     = array();
 	$GLOBALS['_is_admin']       = false; // is_admin() — see the stub above.
 	$GLOBALS['_is_multisite']   = false;
+	$GLOBALS['_current_blog_id'] = 1; // get_current_blog_id() — core's own default on a single site.
 	$GLOBALS['_site_options']   = array();
 	$GLOBALS['_user_meta']      = array();
 	$GLOBALS['_cron_array']     = array();

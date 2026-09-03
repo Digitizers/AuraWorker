@@ -1283,6 +1283,23 @@ class Aura_Worker_API {
 		$record    = $snapshots->get( $id );
 		$pre       = null;
 		$seq       = null;
+		if ( is_array( $record ) && ! Aura_Worker_Snapshots::belongs_to_current_blog( $record ) ) {
+			// Answered HERE, before the door branch opens an entry or captures
+			// anything: a foreign envelope is refused, not attempted, so this
+			// blog's state is never captured for a restore that cannot run
+			// (Ruling P15). restore() refuses it too — this is the early exit,
+			// not the only guard.
+			return new WP_REST_Response(
+				Aura_Worker_Rules::with_warnings(
+					array(
+						'success' => false,
+						'code'    => 'aura_foreign_blog',
+						'error'   => Aura_Worker_Snapshots::FOREIGN_BLOG_ERROR,
+					)
+				),
+				409
+			);
+		}
 		if ( is_array( $record ) && in_array( (string) ( $record['door_kind'] ?? '' ), Aura_Worker_Snapshots::DOOR_KINDS, true ) ) {
 			// A door restore is itself a governed write: RESERVE the log entry
 			// first (a closed or failing log refuses the restore, as it refuses

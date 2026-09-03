@@ -75,7 +75,8 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 			'record'    => 'object|null — the stored envelope (kind, target/targets, door metadata, …), never including payload_path; null when not found',
 			'payload'   => 'string|null — the raw payload, base64-encoded, when it is at most 2 MiB; null when the snapshot has no payload, could not be read, or was withheld',
 			'truncated' => 'bool — present and true only when the payload exceeds 2 MiB and was withheld',
-			'withheld'  => 'bool — present and true only when this envelope is not a door capture (its door_kind is not one of page|component|design_system|creation|creation_restore), in which case the record is described but its payload is never returned',
+			'withheld'  => 'bool — present and true only when the payload is deliberately not returned: this envelope is not a door capture (its door_kind is not one of page|component|design_system|creation|creation_restore), or it belongs to another blog (see foreign_blog). The record is still described',
+			'foreign_blog' => 'bool — present and true only when this envelope was captured by another blog of a multisite, or (on a multisite) carries no blog stamp at all and so cannot be placed. Its payload is never returned here; read it on the blog that took it',
 		);
 	}
 
@@ -111,6 +112,25 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 
 		$payload_path = isset( $record['payload_path'] ) ? (string) $record['payload_path'] : '';
 		unset( $record['payload_path'] );
+
+		// ANOTHER BLOG'S CAPTURE (Ruling P15). Every blog on a multisite
+		// shares one snapshots directory and the ids are listed, so without
+		// this one subsite's credentials read another subsite's captured
+		// Elementor content. Withheld when the stamp names another blog —
+		// and, on a multisite, when there is NO stamp: a legacy envelope
+		// cannot be placed, and unplaceable is not the same as ours. On a
+		// single site there is only one blog it can be, so a legacy record is
+		// served exactly as before.
+		if ( ! Aura_Worker_Snapshots::belongs_to_current_blog( $record )
+			|| ( ! isset( $record['blog_id'] ) && function_exists( 'is_multisite' ) && is_multisite() ) ) {
+			return array(
+				'found'        => true,
+				'record'       => $record,
+				'payload'      => null,
+				'withheld'     => true,
+				'foreign_blog' => true,
+			);
+		}
 
 		// The payload of a NON-DOOR envelope is never returned. This tool
 		// exists to read back what the Elementor door captured before a

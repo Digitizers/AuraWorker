@@ -313,6 +313,83 @@ final class DoorRestTest extends TestCase {
 		$this->assertArrayHasKey( 'withheld', $tool->get_returns(), 'and the shape declares it' );
 	}
 
+	/* ---- multisite: an envelope belongs to the blog that took it ---- */
+
+	/** Capture a page envelope AS blog $blog, then come back to blog 1. */
+	private function envelope_from_blog( int $blog, int $post_id = 7 ): array {
+		$this->fixture_page( $post_id );
+		$GLOBALS['_current_blog_id'] = $blog;
+		$captured                    = ( new Aura_Worker_Snapshots() )->snapshot_posts( array( $post_id ), array(), array( 'kind_label' => 'page' ) );
+		$GLOBALS['_current_blog_id'] = 1;
+		$this->assertTrue( $captured['success'] );
+		return $captured['snapshot'];
+	}
+
+	/** Rewrite an envelope's stored json — for forging a legacy record. */
+	private function rewrite_envelope( string $id, callable $fn ): void {
+		$path = WP_CONTENT_DIR . '/aura-backups/snapshots/' . $id . '.json';
+		$rec  = json_decode( file_get_contents( $path ), true );
+		file_put_contents( $path, wp_json_encode( $fn( $rec ) ) );
+	}
+
+	public function test_an_envelope_records_the_blog_that_took_it(): void {
+		$env = $this->envelope_from_blog( 2 );
+		$this->assertSame( 2, $env['blog_id'] );
+	}
+
+	/**
+	 * Every blog on a multisite shares one snapshots directory, and the ids
+	 * are listed. Without this, one subsite's credentials read another
+	 * subsite's captured Elementor content (Ruling P15).
+	 */
+	public function test_snapshot_get_withholds_the_payload_of_another_blogs_envelope(): void {
+		$env = $this->envelope_from_blog( 2 );
+
+		$out = ( new Aura_Tool_Snapshot_Get() )->execute( array( 'id' => $env['id'] ) );
+
+		$this->assertTrue( $out['found'] );
+		$this->assertSame( 'page', $out['record']['door_kind'], 'the record itself is still described' );
+		$this->assertNull( $out['payload'] );
+		$this->assertTrue( $out['withheld'] );
+		$this->assertTrue( $out['foreign_blog'] );
+		$this->assertArrayHasKey( 'foreign_blog', ( new Aura_Tool_Snapshot_Get() )->get_returns(), 'and the shape declares it' );
+	}
+
+	public function test_snapshot_get_serves_this_blogs_own_envelope(): void {
+		$env = $this->envelope_from_blog( 1 );
+
+		$out = ( new Aura_Tool_Snapshot_Get() )->execute( array( 'id' => $env['id'] ) );
+
+		$this->assertIsString( $out['payload'] );
+		$this->assertArrayNotHasKey( 'foreign_blog', $out );
+		$this->assertArrayNotHasKey( 'withheld', $out );
+	}
+
+	/**
+	 * A legacy envelope predates the stamp. On a single site it can only be
+	 * this site's, and is served as before; on a multisite it cannot be
+	 * placed, and unplaceable is not the same as ours.
+	 */
+	public function test_a_legacy_envelope_serves_on_a_single_site_and_is_withheld_on_a_multisite(): void {
+		$env = $this->envelope_from_blog( 1 );
+		$this->rewrite_envelope(
+			$env['id'],
+			static function ( array $rec ): array {
+				unset( $rec['blog_id'] );
+				return $rec;
+			}
+		);
+
+		$single = ( new Aura_Tool_Snapshot_Get() )->execute( array( 'id' => $env['id'] ) );
+		$this->assertIsString( $single['payload'], 'on a single site there is only one blog it can be' );
+
+		$GLOBALS['_is_multisite'] = true;
+		$multi                    = ( new Aura_Tool_Snapshot_Get() )->execute( array( 'id' => $env['id'] ) );
+		$this->assertNull( $multi['payload'] );
+		$this->assertTrue( $multi['withheld'] );
+		$this->assertTrue( $multi['foreign_blog'] );
+	}
+
 	public function test_snapshot_get_answers_found_false_for_an_unknown_id(): void {
 		$tool = new Aura_Tool_Snapshot_Get();
 		$out  = $tool->execute( array( 'id' => 'snap_does_not_exist_at_all' ) );

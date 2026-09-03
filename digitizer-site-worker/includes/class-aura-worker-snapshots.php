@@ -86,6 +86,12 @@ class Aura_Worker_Snapshots {
 		$id                  = $this->new_id();
 		$meta['id']          = $id;
 		$meta['created_gmt'] = gmdate( 'Y-m-d H:i:s' );
+		// WHICH BLOG TOOK IT (Ruling P15). Every blog on a multisite shares
+		// this one directory, and an envelope's ids — post ids, option names —
+		// mean nothing outside the blog they were read on. The stamp is what
+		// lets a read be withheld and a restore be refused; without it, one
+		// subsite's credentials read and overwrite another subsite's content.
+		$meta['blog_id']     = self::current_blog_id();
 
 		if ( null !== $payload ) {
 			$payload_path = $this->dir . $id . '.payload';
@@ -107,6 +113,37 @@ class Aura_Worker_Snapshots {
 
 		return $meta;
 	}
+
+	/**
+	 * This blog's id — 1 on a single site, where core's own default is 1 and
+	 * the function may not exist at all on very old cores.
+	 *
+	 * @return int
+	 */
+	private static function current_blog_id() {
+		return function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 1;
+	}
+
+	/**
+	 * Is this envelope this blog's to act on?
+	 *
+	 * FALSE only when the stamp is PRESENT and names another blog. A legacy
+	 * envelope carries no stamp and cannot be placed — and refusing to
+	 * restore every capture taken before the stamp existed would break the
+	 * undo of every write on the site. The READ path is stricter (see
+	 * Aura_Tool_Snapshot_Get): on a multisite an unplaceable envelope has its
+	 * payload withheld, because handing over content that may be another
+	 * blog's is a leak, while restoring your own old capture is not.
+	 *
+	 * @param array $record The envelope.
+	 * @return bool
+	 */
+	public static function belongs_to_current_blog( array $record ) {
+		return ! isset( $record['blog_id'] ) || (int) $record['blog_id'] === self::current_blog_id();
+	}
+
+	/** The one refusal both the API and restore() answer a foreign envelope with. */
+	const FOREIGN_BLOG_ERROR = 'Snapshot belongs to another site.';
 
 	/**
 	 * Capture a file's current contents before it is modified.
@@ -528,6 +565,17 @@ class Aura_Worker_Snapshots {
 		$record = $this->get( $id );
 		if ( null === $record ) {
 			return array( 'success' => false, 'error' => 'Snapshot not found.' );
+		}
+		if ( ! self::belongs_to_current_blog( $record ) ) {
+			// A DESIGNATED refusal, not a failure: the envelope is intact and
+			// restorable — on the blog that took it (Ruling P15). Its ids
+			// address that blog's tables, so writing it here would overwrite
+			// whatever happens to share those numbers.
+			return array(
+				'success' => false,
+				'code'    => 'aura_foreign_blog',
+				'error'   => self::FOREIGN_BLOG_ERROR,
+			);
 		}
 
 		switch ( $record['kind'] ) {

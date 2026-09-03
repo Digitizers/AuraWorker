@@ -823,6 +823,36 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
 	}
 
+	/**
+	 * The write half of Ruling P15: a foreign blog's envelope must not be
+	 * written over THIS blog either — its ids mean nothing here.
+	 */
+	public function test_a_restore_of_another_blogs_envelope_is_refused_before_anything_is_captured(): void {
+		$GLOBALS['_current_blog_id'] = 2;
+		$env                         = $this->pageEnvelope();
+		$GLOBALS['_current_blog_id'] = 1;
+		$before                      = $this->envelopeCount();
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertFalse( $res->data['success'] );
+		$this->assertSame( 'Snapshot belongs to another site.', $res->data['error'] );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
+		$this->assertSame( $before, $this->envelopeCount(), 'nothing was captured' );
+		$this->assertNull( Aura_Worker_Door_Log::get( 1 ), 'and no restore entry was opened' );
+	}
+
+	public function test_a_restore_of_this_blogs_envelope_is_unaffected(): void {
+		$env = $this->pageEnvelope();
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( '[{"v":1}]', get_post_meta( 7, '_elementor_data', true ) );
+	}
+
 	public function test_a_missing_envelope_is_404_and_an_execution_failure_is_500(): void {
 		$res = $this->api->restore_snapshot( $this->request( array( 'id' => 'snap_nope' ) ) );
 		$this->assertSame( 404, $res->get_status() );
