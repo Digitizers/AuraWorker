@@ -490,6 +490,111 @@ final class ElementorDoorCreationTest extends TestCase {
 	}
 
 	/* ------------------------------------------------------------------ */
+	/* (e2) a created id the ROW cannot witness (Ruling P26)               */
+	/* ------------------------------------------------------------------ */
+
+	/** Fail ONLY observe_insert()'s own patch of the created ids. */
+	private function failWitnessPatch(): void {
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			$v = (string) $value;
+			// Every write after the watermark stamp carries the field, so the
+			// discriminator is a NON-EMPTY list on a row that is still
+			// pending: the stamp writes `a:0:{}`, the terminal settle carries
+			// `settled_at`.
+			return false === strpos( $v, 's:16:"created_post_ids";a:0:{}' )
+				&& false !== strpos( $v, 'created_post_ids' )
+				&& false === strpos( $v, 'settled_at' );
+		};
+	}
+
+	/**
+	 * The post exists and the row cannot be told. Carrying on would leave the
+	 * id in request memory alone: a timeout or fatal before finish_creation()
+	 * then leaves the reconciler nothing but the watermark, which is UNPROVEN
+	 * — so the post would get neither an envelope nor compensation. The
+	 * creation is aborted HERE, while the hook still holds the id.
+	 */
+	public function test_a_created_id_the_row_cannot_witness_aborts_the_creation(): void {
+		$this->failWitnessPatch();
+
+		$out = $this->createPage(
+			function () {
+				$this->insertPage(); // throws inside the hook: nothing after this runs
+				return array( 'ok' => true );
+			}
+		);
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$data = $out->get_error_data();
+		$this->assertSame( 503, $data['status'] );
+		$this->assertTrue( $data['may_have_run'] );
+		$this->assertSame( 1, $data['seq'] );
+		$this->assertCount( 1, $data['created_post_ids'] );
+		$made = (int) $data['created_post_ids'][0];
+
+		$row = $this->row( 1 );
+		$this->assertSame( 'failed', $row['result'] );
+		$this->assertSame( 'witness_unrecorded', $row['reason'] );
+		$this->assertTrue( $row['may_have_run'] );
+		$this->assertSame( array( $made ), $row['created_post_ids'], 'from the hook witness, not the diff' );
+
+		$envelopes = $this->creationEnvelopes();
+		$this->assertCount( 1, $envelopes, 'exactly one creation envelope' );
+		$this->assertSame( array( $made ), $envelopes[0]['created_post_ids'] );
+		$this->assertSame( $envelopes[0]['id'], $data['snapshot_id'] );
+		$this->assertSame( 'draft', get_post( $made )->post_status, 'the post is left in place — it is restorable' );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the mutex is released' );
+	}
+
+	public function test_a_witness_that_cannot_be_recorded_compensates_when_the_envelope_cannot_be_stored_either(): void {
+		$out = $this->withUnwritableSnapshots(
+			function () {
+				$this->failWitnessPatch();
+				return $this->createPage(
+					function () {
+						$this->insertPage();
+						return array( 'ok' => true );
+					}
+				);
+			}
+		);
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertTrue( $out->get_error_data()['may_have_run'] );
+
+		$row  = $this->row( 1 );
+		$this->assertSame( 'failed', $row['result'] );
+		$this->assertCount( 1, $row['compensated'] );
+		$made = (int) $row['compensated'][0];
+		$this->assertSame( array(), $row['uncompensated'] );
+		$this->assertSame( 'trash', get_post( $made )->post_status, 'nothing could make it restorable, so it was undone' );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the mutex is released' );
+	}
+
+	/** An `other_inserts` patch is advisory — it records nothing a rollback needs. */
+	public function test_an_other_inserts_patch_that_fails_does_not_abort_the_creation(): void {
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'other_inserts' );
+		};
+
+		$made = 0;
+		$out  = $this->createPage(
+			function () use ( &$made ) {
+				wp_insert_post( array( 'post_type' => 'attachment', 'post_title' => 'side effect', 'post_author' => 3 ) );
+				$made = $this->insertPage();
+				return array( 'id' => $made );
+			}
+		);
+
+		$this->assertSame( array( 'id' => $made ), $out );
+		$row = $this->row( 1 );
+		$this->assertSame( 'ok', $row['result'] );
+		$this->assertSame( array( $made ), $row['created_post_ids'] );
+	}
+
+	/* ------------------------------------------------------------------ */
 	/* (f) compensation                                                    */
 	/* ------------------------------------------------------------------ */
 

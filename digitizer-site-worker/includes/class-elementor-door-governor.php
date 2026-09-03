@@ -956,6 +956,52 @@ class Aura_Worker_Elementor_Door {
 		$input = is_array( $input ) ? $input : array();
 		try {
 			return self::govern_and_run( $slug, $inner, $input );
+		} catch ( Aura_Worker_Door_Witness_Exception $e ) {
+			// A creation aborted BY the governor because the row could not
+			// witness what was just created (Ruling P26). Not a governor
+			// failure and not a rule refusal: the write happened, and the
+			// whole point of unwinding here is that the insert hook still
+			// holds the id finish_creation() needs. It runs from that
+			// witness — envelope stored ⇒ the post is restorable; store
+			// failed ⇒ compensation trashes it — and the entry says which.
+			$seq    = isset( self::$request['seq'] ) ? (int) self::$request['seq'] : 0;
+			$fields = array(
+				'result'       => 'failed',
+				'reason'       => 'witness_unrecorded',
+				'error'        => $e->getMessage(),
+				'may_have_run' => true,
+			);
+			if ( $seq > 0 ) {
+				if ( ! empty( self::$request['creating'] ) && empty( self::$request['creation_done'] ) ) {
+					try {
+						$creation = self::finish_creation( $seq, null, true );
+						if ( ! is_wp_error( $creation ) ) {
+							$fields = array_merge( $fields, $creation );
+						} else {
+							// finish_creation() settled its own compensation
+							// onto the row; settle() merges, so it survives.
+							$fields['reason'] = 'witness_unrecorded_then_compensated';
+						}
+					} catch ( \Throwable $creation_error ) {
+						self::release_creation_mutex();
+						$fields['creation_error'] = $creation_error->getMessage();
+					}
+				}
+				Aura_Worker_Door_Log::settle( $seq, $fields );
+				self::$request = null;
+				$row           = Aura_Worker_Door_Log::get( $seq );
+			}
+			return new WP_Error(
+				'aura_log_failed',
+				'A page was created and this site could not record which one; the creation was rolled back or made restorable — check the site before retrying. ' . $e->getMessage(),
+				array(
+					'status'           => 503,
+					'may_have_run'     => true,
+					'seq'              => $seq,
+					'created_post_ids' => isset( $row['created_post_ids'] ) ? $row['created_post_ids'] : array(),
+					'snapshot_id'      => isset( $row['snapshot_id'] ) ? $row['snapshot_id'] : null,
+				)
+			);
 		} catch ( Aura_Worker_Door_Blocked_Exception $e ) {
 			// A DELIBERATE refusal, not a governor failure (Ruling P22): a
 			// rule that only became applicable once the write was underway —
@@ -2380,7 +2426,19 @@ class Aura_Worker_Elementor_Door {
 		if ( in_array( $type, (array) self::$request['expected'], true ) ) {
 			self::$request['created'][] = $id;
 			$ids                        = array_values( array_unique( array_merge( (array) ( $row['created_post_ids'] ?? array() ), array( $id ) ) ) );
-			Aura_Worker_Door_Log::patch_pending( $seq, array( 'created_post_ids' => $ids ) );
+			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'created_post_ids' => $ids ) ) ) {
+				// THE POST EXISTS AND THE ROW CANNOT BE TOLD (Ruling P26).
+				// Carrying on would leave this id in request memory alone: a
+				// timeout or fatal before finish_creation() then leaves the
+				// reconciler nothing but the watermark, whose suspicion
+				// partition_created() treats as UNPROVEN — so the post would
+				// get neither an envelope nor compensation, and nobody could
+				// undo it. Abort while the hook still holds the id: the throw
+				// unwinds Elementor's callback and execute() finishes the
+				// creation from the in-memory witness, which either makes the
+				// post restorable or trashes it.
+				throw new Aura_Worker_Door_Witness_Exception( $id, esc_html( sprintf( 'the door log could not record created post %d', $id ) ) ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- the message is escaped; the id is structured evidence the catch reads, never rendered.
+			}
 		} else {
 			$others = array_values( array_unique( array_merge( (array) ( $row['other_inserts'] ?? array() ), array( $id ) ) ) );
 			Aura_Worker_Door_Log::patch_pending( $seq, array( 'other_inserts' => $others ) );
