@@ -590,8 +590,10 @@ final class DoorReconcilerTest extends TestCase {
 		}
 		Aura_Worker_Door_Log::ack( $epoch, 2 ); // rows 1 and 2 deleted, floor 2
 
-		$new = Aura_Worker_Door_Log::rotate_epoch(); // Aura's decision, through /door/rotate
+		$rotation = Aura_Worker_Door_Log::rotate_epoch( $epoch ); // Aura's decision, through /door/rotate
+		$new      = $rotation['epoch'];
 
+		$this->assertTrue( $rotation['rotated'] );
 		$this->assertNotSame( $epoch, $new );
 		$frag = $this->fragment( 0, $new );
 		$this->assertSame( 2, $frag['log_floor'], 'the ack floor survived the rotation' );

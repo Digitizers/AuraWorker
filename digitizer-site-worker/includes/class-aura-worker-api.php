@@ -1513,16 +1513,15 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
-		$rotated = false;
-		if ( '' !== $epoch && $epoch === Aura_Worker_Door_Log::epoch() ) {
-			Aura_Worker_Door_Log::rotate_epoch();
-			$rotated = true;
-		}
+		// No read-compare here: rotate_epoch() IS the compare, fenced on the
+		// epoch named, so two granted rotations answering the same rewind
+		// cannot both mint one (Ruling P23).
+		$out = Aura_Worker_Door_Log::rotate_epoch( $epoch );
 
 		return new WP_REST_Response(
 			array(
-				'rotated' => $rotated,
-				'epoch'   => Aura_Worker_Door_Log::epoch(),
+				'rotated' => (bool) $out['rotated'],
+				'epoch'   => (string) $out['epoch'],
 				'floor'   => Aura_Worker_Door_Log::floor(),
 			),
 			200

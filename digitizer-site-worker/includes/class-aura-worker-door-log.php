@@ -425,13 +425,48 @@ class Aura_Worker_Door_Log {
 	 * ever. The log then served `[]` on every poll while `count_unacked()`
 	 * climbed to MAX_UNACKED and closed the door (Ruling P2').
 	 *
-	 * @return string The new epoch.
+	 * A COMPARE-AND-SWAP on the epoch it was asked to replace (Ruling P23).
+	 * Two separately granted rotations answering the SAME rewind both pass
+	 * the caller's current-epoch check before either writes; an
+	 * unconditional delete then removed the epoch the winner had just
+	 * minted and rotated a second time — invalidating an ack already in
+	 * flight against the winner's, which is the very starvation rotation
+	 * exists to end. The delete is FENCED on `$expected`, the same shape
+	 * every other mutex delete in the door uses, and a 0-row delete means
+	 * somebody else got there first: the epoch now in force is answered,
+	 * and nothing is written.
+	 *
+	 * The closure state is cleared only by the winner — a loser that
+	 * cleared it would be reopening a log the winner's own rotation has
+	 * already accounted for.
+	 *
+	 * @param string $expected The epoch the caller means to replace.
+	 * @return array{ rotated: bool, epoch: string } `epoch` is the one now in force either way.
 	 */
-	public static function rotate_epoch() {
-		delete_option( self::EPOCH );
+	public static function rotate_epoch( $expected ) {
+		global $wpdb;
+		$expected = (string) $expected;
+		if ( '' === $expected ) {
+			return array(
+				'rotated' => false,
+				'epoch'   => self::epoch(),
+			);
+		}
+		$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::EPOCH, $expected ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		wp_cache_delete( self::EPOCH, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		if ( 1 !== (int) $gone ) {
+			return array(
+				'rotated' => false,
+				'epoch'   => self::epoch(),
+			);
+		}
 		delete_option( self::FULL_MARKER );
 		delete_option( self::FULL_COUNTER );
-		return self::epoch();
+		return array(
+			'rotated' => true,
+			'epoch'   => self::epoch(),
+		);
 	}
 
 	/**

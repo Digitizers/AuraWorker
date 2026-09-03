@@ -155,8 +155,10 @@ final class DoorLogTest extends TestCase {
 		Aura_Worker_Door_Log::bump_refused();
 		$seq2 = Aura_Worker_Door_Log::open_pending( $this->entry() );
 
-		$after = Aura_Worker_Door_Log::rotate_epoch();
+		$out   = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$after = $out['epoch'];
 
+		$this->assertTrue( $out['rotated'] );
 		$this->assertNotSame( $before, $after );
 		$this->assertSame( $after, Aura_Worker_Door_Log::epoch() );
 		$this->assertSame( 1, Aura_Worker_Door_Log::floor(), 'the ack floor is RETAINED — dropping it manufactures the hole log_after() stops at' );
@@ -174,7 +176,7 @@ final class DoorLogTest extends TestCase {
 		}
 		Aura_Worker_Door_Log::ack( $epoch, 2 ); // rows 1 and 2 are gone; the floor is 2
 
-		Aura_Worker_Door_Log::rotate_epoch();
+		Aura_Worker_Door_Log::rotate_epoch( $epoch );
 
 		$this->assertSame( 2, Aura_Worker_Door_Log::floor() );
 		$this->assertSame( array( 3 ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ), 'log_after() walks from the floor, so it never meets the hole the ack left' );
@@ -238,6 +240,41 @@ final class DoorLogTest extends TestCase {
 		$row['at']                     = gmdate( 'c', time() - $seconds_ago );
 		$GLOBALS['_options'][ $name ]  = $row;
 		$GLOBALS['_rows'][ $name ]     = maybe_serialize( $row );
+	}
+
+	/* ---- rotate_epoch(): a compare-and-swap on the epoch it replaces ---- */
+
+	/**
+	 * Two separately granted rotations for the SAME rewind. Both pass the
+	 * current-epoch check before either writes, so the delete has to be
+	 * fenced on the bytes it was asked to replace — an unconditional one
+	 * deleted the epoch the winner had just minted and rotated a second
+	 * time, invalidating an ack that was already in flight against it.
+	 */
+	public function test_a_second_rotation_racing_the_first_rotates_nothing(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		// The other request wins the race in the window between this call's
+		// read and its fenced DELETE.
+		$GLOBALS['_sa_before_fenced_delete'][ Aura_Worker_Door_Log::EPOCH ] = static function () {
+			$GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ] = 'the-other-requests-epoch';
+			$GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ]    = 'the-other-requests-epoch';
+		};
+
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$this->assertFalse( $out['rotated'], 'somebody else rotated first' );
+		$this->assertSame( 'the-other-requests-epoch', $out['epoch'], 'and the epoch answered is theirs, not a third one' );
+		$this->assertSame( 'the-other-requests-epoch', get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	public function test_rotate_epoch_refuses_an_epoch_this_site_has_moved_past(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+
+		$out = Aura_Worker_Door_Log::rotate_epoch( 'an-epoch-from-another-life' );
+
+		$this->assertFalse( $out['rotated'] );
+		$this->assertSame( $before, $out['epoch'] );
+		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ) );
 	}
 
 	public function test_stale_pending_finds_only_pending_rows_older_than_the_cutoff(): void {
