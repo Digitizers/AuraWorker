@@ -2186,6 +2186,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			}
 			// Aura_Worker_Door_Log::count_unacked(): rows above the ack floor.
 			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\) > (\d+)$/", (string) $query, $m ) ) {
+				// count_unacked()'s COUNT failing at the driver (Ruling P53):
+				// null answer, last_error set — which must NOT read as an empty
+				// log. Scoped to this shape so a test can break the backlog
+				// count without breaking every get_var() in the request.
+				if ( ! empty( $GLOBALS['_sa_door_unacked_error'] ) ) {
+					$GLOBALS['_db_queries'][] = (string) $query;
+					$this->last_error         = 'count failed';
+					return null;
+				}
 				$GLOBALS['_db_queries'][] = (string) $query;
 				$floor = (int) $m[3];
 				$n     = 0;
@@ -2871,6 +2880,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
 	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
+	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
@@ -4123,6 +4133,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
 	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
+	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.

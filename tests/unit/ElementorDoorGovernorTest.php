@@ -344,6 +344,65 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertLessThan( $discard, $marker );
 	}
 
+	/**
+	 * Ruling P53: a backlog that cannot be counted admits nothing.
+	 *
+	 * `get_var()` answers null for a broken statement exactly as for a real
+	 * zero, and `(int) null` is 0 — so a COUNT that failed while ordinary
+	 * option writes still worked reported an EMPTY log, and every admission
+	 * check waved writes past MAX_UNACKED for as long as the failure lasted.
+	 */
+	public function test_an_unreadable_backlog_refuses_the_write_without_closing_the_door(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$this->fillTheLog(); // already at the bound, though the count cannot say so
+		$GLOBALS['_sa_door_unacked_error'] = true;
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code(), 'retryable: nothing ran' );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
+		$row = Aura_Worker_Door_Log::get( Aura_Worker_Door_Log::MAX_UNACKED + 1 );
+		$this->assertSame( 'discarded', $row['result'], 'the reservation is handed back (P29 shape)' );
+		$this->assertTrue( $row['admitted'] );
+		$GLOBALS['_sa_door_unacked_error'] = false;
+		$this->assertFalse( Aura_Worker_Door_Log::is_closed(), 'a database blip is not an overflow' );
+		$this->assertNull( Aura_Worker_Door_Log::full_report() );
+	}
+
+	/** The same rule for a HELD entry's admission (record_terminal_only). */
+	public function test_an_unreadable_backlog_refuses_a_held_entry_without_closing_the_door(): void {
+		$this->registerAll();
+		$this->installRuleset( array() ); // no rule: the call is held
+		$GLOBALS['_sa_door_unacked_error'] = true;
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_held_for_approval', $out->get_error_code(), 'the hold itself still stands' );
+		$ref = (string) $out->get_error_data()['ref'];
+		$this->assertFalse( Aura_Worker_Door_Holds::get_held( $ref )['log_entry'], 'and says its entry was not written' );
+		$GLOBALS['_sa_door_unacked_error'] = false;
+		$this->assertSame( 'discarded', Aura_Worker_Door_Log::get( 1 )['result'] );
+		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
+		$this->assertSame( 1, (int) get_option( 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS ), 0 ) );
+	}
+
+	/** And the fragment says "unknown" rather than a false zero. */
+	public function test_the_fragment_reports_an_unreadable_backlog_as_null(): void {
+		$GLOBALS['_sa_force_door']         = true;
+		Aura_Worker_Elementor_Door::reset_for_tests();
+		$GLOBALS['_sa_door_unacked_error'] = true;
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment( 0, '' );
+
+		$this->assertIsArray( $frag );
+		$this->assertNull( $frag['log_unacked'] );
+		$this->assertNull( Aura_Worker_Elementor_Door::governor_block()['log_unacked'], 'the audit block too' );
+		$GLOBALS['_sa_door_unacked_error'] = false;
+	}
+
 	public function test_coverage_failure_closes_both_transports_reads_included(): void {
 		$this->registerAll();
 		// A later filter replaced the wrapper AFTER wrap_args ran.

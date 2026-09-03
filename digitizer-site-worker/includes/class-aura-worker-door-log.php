@@ -456,11 +456,27 @@ class Aura_Worker_Door_Log {
 		return (int) $n;
 	}
 
-	/** @return int */
+	/**
+	 * How many rows Aura has not acknowledged — or NULL when that cannot be
+	 * read (Ruling P53).
+	 *
+	 * `get_var()` answers null for a broken statement exactly as it does for a
+	 * real zero, and `(int) null` is 0 — so a COUNT that failed while ordinary
+	 * option writes still worked reported an EMPTY log. Every admission check
+	 * compares this against MAX_UNACKED, so a false zero admitted writes past
+	 * the bound for as long as the failure lasted, and `ack()` deleted the
+	 * closure marker over a backlog that was still full.
+	 *
+	 * Null is therefore its own answer, and every caller has to decide what to
+	 * do about not knowing. None of them may treat it as zero.
+	 *
+	 * @return int|null
+	 */
 	public static function count_unacked() {
 		global $wpdb;
-		$like = $wpdb->esc_like( self::PREFIX ) . '%';
-		$n    = $wpdb->get_var(
+		$like             = $wpdb->esc_like( self::PREFIX ) . '%';
+		$wpdb->last_error = '';
+		$n                = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name REGEXP %s AND CAST(SUBSTRING(option_name, %d) AS UNSIGNED) > %d",
 				$like,
@@ -469,6 +485,9 @@ class Aura_Worker_Door_Log {
 				self::floor()
 			)
 		);
+		if ( null === $n || false === $n || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
 		return (int) $n;
 	}
 
@@ -576,7 +595,12 @@ class Aura_Worker_Door_Log {
 				wp_cache_delete( self::PREFIX . $i, 'options' );
 			}
 		}
-		if ( self::is_closed() && self::count_unacked() < self::MAX_UNACKED ) {
+		// Reopened only on a READABLE count under the bound (Ruling P53). An
+		// unreadable one used to cast to 0 and delete the marker over a
+		// backlog that was still full — the door open again with nothing
+		// having been acked.
+		$unacked = self::count_unacked();
+		if ( self::is_closed() && null !== $unacked && $unacked < self::MAX_UNACKED ) {
 			delete_option( self::FULL_MARKER );
 			delete_option( self::FULL_COUNTER );
 		}

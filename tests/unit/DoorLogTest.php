@@ -84,6 +84,50 @@ final class DoorLogTest extends TestCase {
 		$this->assertSame( 'someone/else', $GLOBALS['_options']['aura_worker_door_log_1']['ability'], "the racer's row is untouched" );
 	}
 
+	/**
+	 * Ruling P53: `ack()` reopens the door only on a READABLE count.
+	 *
+	 * An unreadable one cast to 0 and deleted FULL_MARKER over a backlog that
+	 * was still full — the door open again with nothing having been acked.
+	 */
+	public function test_an_ack_with_an_unreadable_count_keeps_the_closure_marker(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$seq   = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		Aura_Worker_Door_Log::close();
+		$GLOBALS['_sa_door_unacked_error'] = true;
+
+		Aura_Worker_Door_Log::ack( $epoch, $seq );
+
+		$GLOBALS['_sa_door_unacked_error'] = false;
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed(), 'the marker survives a count nobody could read' );
+	}
+
+	/** …and a readable count under the bound still reopens it. */
+	public function test_an_ack_with_a_readable_count_still_reopens_the_door(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$seq   = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		Aura_Worker_Door_Log::close();
+
+		Aura_Worker_Door_Log::ack( $epoch, $seq );
+
+		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
+	}
+
+	/** count_unacked() answers NULL rather than a false zero. */
+	public function test_an_unreadable_backlog_counts_as_null_not_zero(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		$this->assertSame( 1, Aura_Worker_Door_Log::count_unacked() );
+
+		$GLOBALS['_sa_door_unacked_error'] = true;
+		$this->assertNull( Aura_Worker_Door_Log::count_unacked() );
+		$GLOBALS['_sa_door_unacked_error'] = false;
+	}
+
 	public function test_seq_is_allocated_by_the_insert_and_is_contiguous(): void {
 		$s1 = Aura_Worker_Door_Log::open_pending( $this->entry() );
 		$s2 = Aura_Worker_Door_Log::open_pending( $this->entry() );

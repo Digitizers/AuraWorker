@@ -432,7 +432,7 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { active, epoch, seam, door, held, interrupted, rewind, log, log_floor, log_unacked, log_full }
+	 * @return array|null { active, epoch, seam, door, held, interrupted, rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::present() ) {
@@ -478,6 +478,8 @@ class Aura_Worker_Elementor_Door {
 			'rewind'      => $rewind,
 			'log'         => Aura_Worker_Door_Log::log_after( $after ),
 			'log_floor'   => Aura_Worker_Door_Log::floor(),
+			// NULL when the backlog could not be counted (Ruling P53): Aura is
+			// told "unknown", never a false zero it would read as an empty log.
 			'log_unacked' => Aura_Worker_Door_Log::count_unacked(),
 			'log_full'    => Aura_Worker_Door_Log::full_report(),
 		);
@@ -1655,7 +1657,18 @@ class Aura_Worker_Elementor_Door {
 			return $seq;
 		}
 		// Admission: the row is the reservation. Count, back out above the bound.
-		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
+		// CANNOT COUNT, CANNOT ADMIT (Ruling P53). A COUNT that failed used to
+		// cast to 0 and read as an empty log, admitting writes past the bound
+		// for as long as the failure lasted. Not knowing is not the same as
+		// being full: the reservation is discarded and the caller gets a
+		// RETRYABLE 503 — the door is NOT closed and no refusal is counted,
+		// because a database blip is not an overflow.
+		$unacked = Aura_Worker_Door_Log::count_unacked();
+		if ( null === $unacked ) {
+			Aura_Worker_Door_Log::discard( $seq );
+			return self::log_unreadable_error();
+		}
+		if ( $unacked > Aura_Worker_Door_Log::MAX_UNACKED ) {
 			// close() BEFORE discard() (Codex round-11 P2): the discard makes
 			// this row terminal and therefore visible to a poll, and the ack
 			// that consumes it must already see FULL_MARKER — an ack that
@@ -2075,7 +2088,19 @@ class Aura_Worker_Elementor_Door {
 			self::bump_counter( 'log_ungoverned' );
 			return false;
 		}
-		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
+		// CANNOT COUNT, CANNOT ADMIT (Ruling P53). A COUNT that failed used to
+		// cast to 0 and read as an empty log, admitting writes past the bound
+		// for as long as the failure lasted. Not knowing is not the same as
+		// being full: the reservation is discarded and the caller gets a
+		// RETRYABLE 503 — the door is NOT closed and no refusal is counted,
+		// because a database blip is not an overflow.
+		$unacked = Aura_Worker_Door_Log::count_unacked();
+		if ( null === $unacked ) {
+			Aura_Worker_Door_Log::discard( $seq );
+			self::bump_counter( 'log_ungoverned' );
+			return false;
+		}
+		if ( $unacked > Aura_Worker_Door_Log::MAX_UNACKED ) {
 			// close() BEFORE discard() (Codex round-11 P2): the discard makes
 			// this row terminal and therefore visible to a poll, and the ack
 			// that consumes it must already see FULL_MARKER — an ack that
@@ -2775,7 +2800,7 @@ class Aura_Worker_Elementor_Door {
 			'seam'                => self::$seam,
 			'door'                => self::door_state(),
 			'held_count'          => $held,
-			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(),
+			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(), // null when unreadable (Ruling P53)
 			'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),
 			'unobserved_30d'      => self::count_30d( 'unobserved' ),
 			'hook_missed_30d'     => self::count_30d( 'hook_missed' ),
@@ -2783,6 +2808,16 @@ class Aura_Worker_Elementor_Door {
 			'queue_full'          => $held >= Aura_Worker_Door_Holds::CAP,
 			'log_full'            => Aura_Worker_Door_Log::full_report(),
 		);
+	}
+
+	/**
+	 * The log's backlog could not be counted, so nothing may be admitted
+	 * (Ruling P53). Retryable: nothing ran, and the door is not closed.
+	 *
+	 * @return WP_Error
+	 */
+	private static function log_unreadable_error() {
+		return new WP_Error( 'aura_log_failed', __( "Aura could not read this site's door log backlog; the call was not run — retry.", 'digitizer-site-worker' ), array( 'status' => 503 ) );
 	}
 
 	/** @return WP_Error */
@@ -3181,7 +3216,18 @@ class Aura_Worker_Elementor_Door {
 			return $seq;
 		}
 		// Admission: the row is the reservation. Count, back out above the bound.
-		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
+		// CANNOT COUNT, CANNOT ADMIT (Ruling P53). A COUNT that failed used to
+		// cast to 0 and read as an empty log, admitting writes past the bound
+		// for as long as the failure lasted. Not knowing is not the same as
+		// being full: the reservation is discarded and the caller gets a
+		// RETRYABLE 503 — the door is NOT closed and no refusal is counted,
+		// because a database blip is not an overflow.
+		$unacked = Aura_Worker_Door_Log::count_unacked();
+		if ( null === $unacked ) {
+			Aura_Worker_Door_Log::discard( $seq );
+			return self::log_unreadable_error();
+		}
+		if ( $unacked > Aura_Worker_Door_Log::MAX_UNACKED ) {
 			// close() BEFORE discard() (Codex round-11 P2): the discard makes
 			// this row terminal and therefore visible to a poll, and the ack
 			// that consumes it must already see FULL_MARKER — an ack that
