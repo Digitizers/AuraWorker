@@ -2237,18 +2237,44 @@ class Aura_Worker_Rules {
 	 * @param int|null $now       Unix time; injected for tests.
 	 * @return array {effect: null|'warn'|'block', rule?: array, recorded?: bool} `allow` is never returned here — it reads as no match.
 	 */
+	/**
+	 * The winner that ENFORCEMENT would apply on the tools path: match()'s
+	 * winner, with an `allow` winner treated as no match at all.
+	 *
+	 * The one accessor for that question, because two callers ask it — the
+	 * enforcing path below, and Aura_Worker_Tools::preview_tool(), which
+	 * shows the operator what approving this call would do. A preview that
+	 * asked match() directly reported `effect: 'allow'` for a call the very
+	 * next request runs with no rule at all: the two disagreeing about the
+	 * same call, which is exactly what site_ref() was threaded through
+	 * match() to prevent.
+	 *
+	 * `allow` is not "permitted, on the record" here. The tools path already
+	 * defaults to the approval queue, so an allow rule changes nothing it
+	 * does; the effect speaks only at the Elementor door, which asks match()
+	 * for itself (class-elementor-door-governor.php).
+	 *
+	 * @param array    $touches  What the call declares it touches.
+	 * @param array    $rules    The ruleset to judge against.
+	 * @param int|null $now      Unix time; injected for tests.
+	 * @param string   $site_ref This site's identity.
+	 * @return array|null The rule enforcement would apply, or null.
+	 */
+	public static function enforceable_match( array $touches, array $rules, $now = null, $site_ref = '' ) {
+		$rule = self::match( $touches, $rules, $now, $site_ref );
+		if ( null !== $rule && 'allow' === ( isset( $rule['effect'] ) ? $rule['effect'] : '' ) ) {
+			return null;
+		}
+		return $rule;
+	}
+
 	public static function enforce( array $touches, $tool_name, $now = null ) {
 		self::note_expired( $now );
 		// Judged in THIS site's identity (self::site_ref(), the one accessor —
 		// the preview path asks the same question of the same record, so the
 		// two can never disagree). The fork inherits this through enforce(),
 		// so its governance wrapper needs no change of its own.
-		$rule = self::match( $touches, self::rules(), $now, self::site_ref() );
-		if ( null !== $rule && 'allow' === $rule['effect'] ) {
-			// The tools path already defaults to the approval queue; `allow`
-			// speaks only at the Elementor door (class-elementor-door-governor.php).
-			$rule = null;
-		}
+		$rule = self::enforceable_match( $touches, self::rules(), $now, self::site_ref() );
 		if ( null === $rule ) {
 			return array( 'effect' => null );
 		}
