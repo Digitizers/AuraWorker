@@ -78,6 +78,7 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-call-context.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-rules.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-door-log.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-door-holds.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-door-blocked-exception.php';
 require_once AURA_WORKER_DIR . 'includes/class-elementor-door-governor.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-abilities.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';

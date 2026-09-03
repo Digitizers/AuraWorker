@@ -956,6 +956,49 @@ class Aura_Worker_Elementor_Door {
 		$input = is_array( $input ) ? $input : array();
 		try {
 			return self::govern_and_run( $slug, $inner, $input );
+		} catch ( Aura_Worker_Door_Blocked_Exception $e ) {
+			// A DELIBERATE refusal, not a governor failure (Ruling P22): a
+			// rule that only became applicable once the write was underway —
+			// today, a class deletion whose collateral pages a rule protects.
+			// It settles `refused` under its own reason and answers 403, the
+			// same code and envelope a block before the call gets.
+			//
+			// `may_have_run` is TRUE all the same, and that is not a
+			// contradiction: Elementor deletes the class row inside its own
+			// callback and only THEN fires the cleanup action this refusal
+			// throws from, so the site did change. What the refusal bought is
+			// the rewrite of the protected pages, which had not happened yet.
+			// The pre-write envelope is named so the operator can undo the
+			// half that did.
+			$seq  = isset( self::$request['seq'] ) ? (int) self::$request['seq'] : 0;
+			$snap = isset( self::$request['snapshot_id'] ) ? (string) self::$request['snapshot_id'] : '';
+			if ( $seq > 0 ) {
+				Aura_Worker_Door_Log::settle(
+					$seq,
+					array(
+						'result'             => 'refused',
+						'reason'             => 'collateral_blocked',
+						'verdict'            => 'block',
+						'rule_key'           => $e->rule_key(),
+						'rule'               => self::rule_evidence( $e->rule() ),
+						'collateral_blocked' => $e->ids(),
+						'may_have_run'       => true,
+						'snapshot_id'        => '' === $snap ? null : $snap,
+					)
+				);
+				self::$request = null;
+			}
+			$blocked = Aura_Worker_Rules::blocked_result( $slug, $e->rule() );
+			return new WP_Error(
+				'aura_rule_blocked',
+				$blocked['error'],
+				array(
+					'status'          => 403,
+					'rule'            => $blocked['rule'],
+					'may_have_run'    => true,
+					'restorable_from' => '' === $snap ? null : $snap,
+				)
+			);
 		} catch ( \Throwable $e ) {
 			// A broken governor must not become an open door — and a throw
 			// AFTER the row was admitted (the callback itself, a snapshot, a
@@ -1169,7 +1212,8 @@ class Aura_Worker_Elementor_Door {
 				}
 				return new WP_Error( 'aura_snapshot_failed', 'Aura could not snapshot this target before the write; it was not run. ' . $why, array( 'status' => 503 ) );
 			}
-			$snapshot_id = (string) $snap['snapshot']['id'];
+			$snapshot_id                  = (string) $snap['snapshot']['id'];
+			self::$request['snapshot_id'] = $snapshot_id; // what a mid-write refusal can point the operator back to
 			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'snapshot_id' => $snapshot_id ) ) ) { // the id lands on the row BEFORE the write, durably
 				// SETTLE it `refused` — this request KNOWS the callback never
 				// ran, and a terminal row is the only way to say so (Ruling
@@ -2305,6 +2349,71 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Judge the pages a class deletion is about to rewrite, against the
+	 * ruleset THIS request is running under (Ruling P22).
+	 *
+	 * The source is `govern()`'s own: the pinned copy when a replay pinned
+	 * one, else the current record — so a ruleset pushed mid-write cannot
+	 * make the collateral verdict disagree with the verdict the call was
+	 * admitted on. Each page is matched ALONE, because the answer has to name
+	 * which pages it is about; `match()` returns one rule for a whole set.
+	 *
+	 * A `block` throws — the call is refused before Elementor's own handler
+	 * (priority 10) rewrites anything, and `execute()` turns it into the same
+	 * 403 a block before the call gets. A `warn` is recorded on the entry and
+	 * proceeds. No ruleset at all judges nothing: a site that cannot say what
+	 * is protected does not get to invent a refusal here, and the call was
+	 * already admitted on that same silence.
+	 *
+	 * @param int[] $ids The pages Elementor named.
+	 * @throws Aura_Worker_Door_Blocked_Exception When a block rule names one of them.
+	 */
+	private static function judge_collateral( array $ids ) {
+		$rec   = null !== self::$pinned_ruleset ? self::$pinned_ruleset : Aura_Worker_Rules::current();
+		$rules = ( is_array( $rec ) && isset( $rec['rules'] ) && is_array( $rec['rules'] ) ) ? $rec['rules'] : array();
+		if ( empty( $rules ) ) {
+			return;
+		}
+		$site    = Aura_Worker_Rules::site_ref();
+		$blocked = array();
+		$warned  = array();
+		$b_rule  = null;
+		$w_rule  = null;
+		foreach ( $ids as $id ) {
+			$rule = Aura_Worker_Rules::match( array( array( 'type' => 'page', 'id' => (string) $id ) ), $rules, null, $site );
+			if ( null === $rule ) {
+				continue;
+			}
+			if ( 'block' === $rule['effect'] ) {
+				$blocked[] = (int) $id;
+				$b_rule    = null === $b_rule ? $rule : $b_rule;
+			} elseif ( 'warn' === $rule['effect'] ) {
+				$warned[] = (int) $id;
+				$w_rule   = null === $w_rule ? $rule : $w_rule;
+			}
+		}
+		if ( ! empty( $blocked ) ) {
+			Aura_Worker_Rules::record_block( (string) self::$request['slug'], $b_rule );
+			$why = sprintf(
+				'deleting this class would rewrite page(s) %s, which %s protects',
+				implode( ', ', $blocked ),
+				(string) ( isset( $b_rule['key'] ) ? $b_rule['key'] : 'a rule' )
+			);
+			throw new Aura_Worker_Door_Blocked_Exception( $b_rule, $blocked, esc_html( $why ) ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- the message is escaped; the rule and the id list are structured evidence the catch reads, never rendered.
+		}
+		if ( ! empty( $warned ) ) {
+			Aura_Worker_Rules::record_warn( (string) self::$request['slug'], $w_rule );
+			Aura_Worker_Door_Log::patch_pending(
+				(int) self::$request['seq'],
+				array(
+					'collateral_warned' => $warned,
+					'collateral_rule'   => self::rule_evidence( $w_rule ),
+				)
+			);
+		}
+	}
+
+	/**
 	 * Elementor deleting a global class REWRITES every page that used it, and
 	 * those pages are not this call's target — they are its collateral. They
 	 * are captured HERE, at priority 1, so the envelope exists (and its id is
@@ -2327,6 +2436,14 @@ class Aura_Worker_Elementor_Door {
 		if ( empty( $ids ) ) {
 			return;
 		}
+		// JUDGE BEFORE CAPTURING (Ruling P22). The call was admitted on
+		// `design_system:*` — the only thing it could declare, because the
+		// pages a class deletion rewrites are not knowable until Elementor
+		// says so, HERE, one priority before it rewrites them. A rule
+		// protecting one of those pages therefore never saw this call, and
+		// the ids were used for nothing but a rollback snapshot: the
+		// protected page was changed and the block only helped afterwards.
+		self::judge_collateral( $ids );
 		$snaps = new Aura_Worker_Snapshots();
 		$env   = $snaps->snapshot_posts(
 			$ids,

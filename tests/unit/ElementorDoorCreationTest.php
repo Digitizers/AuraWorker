@@ -731,6 +731,8 @@ final class ElementorDoorCreationTest extends TestCase {
 		$this->assertSame( $row['collateral_snapshot_ids'], $elementor_saw, 'the id is on the row before Elementor rewrites the pages' );
 		$this->assertSame( 'ok', $row['result'] );
 		$this->assertSame( 'snap_ds', $row['snapshot_id'] );
+		$this->assertArrayNotHasKey( 'collateral_warned', $row, 'no rule names these pages' );
+		$this->assertArrayNotHasKey( 'collateral_blocked', $row );
 
 		$env = $this->envelope( (string) $row['collateral_snapshot_ids'][0] );
 		$this->assertSame( 'page', $env['door_kind'] );
@@ -770,6 +772,96 @@ final class ElementorDoorCreationTest extends TestCase {
 		$row = $this->row( 1 );
 		$this->assertSame( 'failed', $row['result'] );
 		$this->assertTrue( $row['may_have_run'] );
+	}
+
+	/**
+	 * Ruling P22: the collateral pages are JUDGED, not merely captured.
+	 *
+	 * The call declares `design_system:*`, so a rule protecting page 7 never
+	 * saw it — while this hook learns, one priority before Elementor rewrites
+	 * them, exactly which pages the deletion is about to change.
+	 */
+	public function test_a_block_rule_on_a_collateral_page_refuses_before_elementors_cleanup(): void {
+		$this->seedPost( 7 );
+		update_post_meta( 7, '_elementor_data', '[{"class":"a"}]' );
+		$elementor_ran = 0;
+		add_action(
+			'elementor/global_classes/cleanup',
+			static function () use ( &$elementor_ran ) {
+				++$elementor_ran;
+			},
+			10,
+			2
+		);
+		$this->registerClasses(
+			static function () {
+				do_action( 'elementor/global_classes/cleanup', array( 'g-a' ), array( 7 ) );
+				return array( 'ok' => true );
+			}
+		);
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/ds', 'effect' => 'allow', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are fine' ),
+				array( 'key' => 'rule/keep-7', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'the client signed off on this page' ),
+			)
+		);
+
+		$out = wp_get_ability( 'elementor/manage-classes' )->execute( array() );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_rule_blocked', $out->get_error_code() );
+		$this->assertSame( 403, $out->get_error_data()['status'] );
+		$this->assertTrue( $out->get_error_data()['may_have_run'], 'the class row was already deleted inside Elementor' );
+		$this->assertSame( 'snap_ds', $out->get_error_data()['restorable_from'] );
+		$this->assertSame( 0, $elementor_ran, "Elementor's own cleanup never ran, so page 7 was never rewritten" );
+		$this->assertSame( '[{"class":"a"}]', get_post_meta( 7, '_elementor_data', true ) );
+		$this->assertSame( array(), $this->envelopes(), 'nothing was captured either' );
+
+		$row = $this->row( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'collateral_blocked', $row['reason'] );
+		$this->assertSame( array( 7 ), $row['collateral_blocked'] );
+		$this->assertSame( 'rule/keep-7', $row['rule_key'] );
+		$this->assertSame( 'rule/keep-7', $row['rule']['key'] );
+		$this->assertSame( 'snap_ds', $row['snapshot_id'], 'the design-system envelope the deletion can be rolled back from' );
+		$this->assertTrue( $row['may_have_run'] );
+	}
+
+	public function test_a_warn_rule_on_a_collateral_page_is_recorded_and_the_cleanup_proceeds(): void {
+		$this->seedPost( 7 );
+		update_post_meta( 7, '_elementor_data', '[{"class":"a"}]' );
+		$elementor_ran = 0;
+		add_action(
+			'elementor/global_classes/cleanup',
+			static function () use ( &$elementor_ran ) {
+				++$elementor_ran;
+			},
+			10,
+			2
+		);
+		$this->registerClasses(
+			static function () {
+				do_action( 'elementor/global_classes/cleanup', array( 'g-a' ), array( 7 ) );
+				return array( 'ok' => true );
+			}
+		);
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/ds', 'effect' => 'allow', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are fine' ),
+				array( 'key' => 'rule/watch-7', 'effect' => 'warn', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'tell me about it' ),
+			)
+		);
+
+		$out = wp_get_ability( 'elementor/manage-classes' )->execute( array() );
+
+		$this->assertSame( array( 'ok' => true ), $out );
+		$this->assertSame( 1, $elementor_ran, 'a warn does not stop the cleanup' );
+		$row = $this->row( 1 );
+		$this->assertSame( 'ok', $row['result'] );
+		$this->assertSame( array( 7 ), $row['collateral_warned'] );
+		$this->assertSame( 'rule/watch-7', $row['collateral_rule']['key'] );
+		$this->assertSame( 'tell me about it', $row['collateral_rule']['reason'] );
+		$this->assertCount( 1, $row['collateral_snapshot_ids'], 'and the capture still happened' );
 	}
 
 	public function test_a_cleanup_outside_a_design_system_request_is_ignored(): void {

@@ -3169,6 +3169,7 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-unbind.php';
 // door tests require these three themselves too, harmlessly (require_once).
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-log.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-holds.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-blocked-exception.php';
 require_once SA_PLUGIN_DIR . '/includes/class-elementor-door-governor.php';
 // The plugin's admin/settings class: registers settings and owns the token
 // regeneration handler (#67).
