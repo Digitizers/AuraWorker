@@ -243,6 +243,50 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 	/* (a0) the pre-restore capture enumerates the CURRENT set             */
 	/* ------------------------------------------------------------------ */
 
+	/**
+	 * Ruling P38: every pre-restore envelope names the restore it reverses.
+	 *
+	 * The design-system branch discarded the stamp and let `snapshot_for()`
+	 * derive one from `self::$request` — which is null on the restore route —
+	 * so the envelope came out claiming `{ seq: null, ability:
+	 * "elementor/manage-classes" }`: unable to say which restore produced it,
+	 * and filed as if an Elementor call had taken it, unlike the page,
+	 * component and creation captures beside it.
+	 */
+	public function test_a_design_system_pre_restore_envelope_names_the_restore_it_reverses(): void {
+		$this->seedDesignSystem();
+		$snaps = new Aura_Worker_Snapshots();
+		$env   = $this->snapshotFor( 'elementor/manage-classes', array( array( 'type' => 'design_system', 'id' => '*' ) ), array() )['snapshot'];
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_77' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'aura/restore', $row['ability'] );
+		$pre = $snaps->get( $row['snapshot_id'] );
+		$this->assertNotNull( $pre );
+		$this->assertSame( 'design_system', $pre['door_kind'] );
+		$this->assertSame( $env['id'], $pre['door']['restore_of'], 'the envelope it reverses' );
+		$this->assertSame( 1, $pre['door']['seq'], 'the restore entry that took it' );
+		$this->assertSame( 'aura/restore', $pre['door']['ability'], 'taken by the restore, not by an Elementor call' );
+		$this->assertSame( 'act_77', $pre['door']['ref'] );
+	}
+
+	/** The page path carries the same four fields — one stamp, every branch. */
+	public function test_a_page_pre_restore_envelope_carries_the_same_stamp(): void {
+		$env = $this->pageEnvelope();
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_78' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$pre = ( new Aura_Worker_Snapshots() )->get( $row['snapshot_id'] );
+		$this->assertSame( $env['id'], $pre['door']['restore_of'] );
+		$this->assertSame( 1, $pre['door']['seq'] );
+		$this->assertSame( 'aura/restore', $pre['door']['ability'] );
+		$this->assertSame( 'act_78', $pre['door']['ref'] );
+	}
+
 	public function test_a_design_system_pre_restore_capture_enumerates_the_current_set(): void {
 		$this->seedDesignSystem();
 		$snaps = new Aura_Worker_Snapshots();

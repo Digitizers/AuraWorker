@@ -1333,7 +1333,7 @@ class Aura_Worker_API {
 			if ( is_wp_error( $seq ) ) {
 				return $seq;
 			}
-			$cap = Aura_Worker_Elementor_Door::pre_restore_capture( $record );
+			$cap = Aura_Worker_Elementor_Door::pre_restore_capture( $record, $seq, $aura_ref );
 			if ( empty( $cap['success'] ) ) {
 				if ( ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, null, array( 'success' => false, 'error' => 'pre-restore capture failed: ' . (string) ( $cap['error'] ?? '' ) ) ) ) {
 					return self::restore_unsettled( $seq, false );

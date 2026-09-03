@@ -2421,12 +2421,20 @@ class Aura_Worker_Elementor_Door {
 	 * @param array  $input   Input.
 	 * @return array { success, snapshot?, error?, code?, creation? }
 	 */
-	private static function snapshot_for( $slug, array $touches, array $input ) {
+	private static function snapshot_for( $slug, array $touches, array $input, $door = null ) {
 		if ( null !== self::$snapshotter ) {
-			return call_user_func( self::$snapshotter, $slug, $touches, $input );
+			return call_user_func( self::$snapshotter, $slug, $touches, $input, $door );
 		}
 		$snaps = new Aura_Worker_Snapshots();
-		$door  = array(
+		// The stamp normally describes the GOVERNED REQUEST in flight. A
+		// pre-restore capture has no such request — it is taken by the restore
+		// route, not by an Elementor ability — so it passes its own stamp and
+		// this derivation is skipped entirely (Ruling P38). Deriving it from
+		// `self::$request` there produced `{ seq: null, ability:
+		// "elementor/manage-classes" }`: an envelope that could not name the
+		// restore it reverses, and claimed to have been taken by a call
+		// nobody made.
+		$door = is_array( $door ) ? $door : array(
 			'seq'     => isset( self::$request['seq'] ) ? self::$request['seq'] : null,
 			'ability' => $slug,
 		);
@@ -2548,12 +2556,30 @@ class Aura_Worker_Elementor_Door {
 	 * Before a door envelope is restored: capture the CURRENT state the same
 	 * way, so the restore is itself a Change that can be undone.
 	 *
-	 * @param array $record The envelope being restored.
+	 * EVERY branch carries the same door stamp (Ruling P38): `restore_of` (the
+	 * envelope being reversed), the restore ENTRY's `seq`, the `ability` that
+	 * took it — `aura/restore`, which is what `open_restore_entry()` logs —
+	 * and Aura's correlation `ref`. The design-system branch used to drop it
+	 * and let `snapshot_for()` derive a stamp from `self::$request`, which is
+	 * null here: the envelope came out claiming `{ seq: null, ability:
+	 * "elementor/manage-classes" }`, unable to name the restore it reverses
+	 * and misfiled in snapshot and audit data beside the page, component and
+	 * creation captures that carry it.
+	 *
+	 * @param array       $record   The envelope being restored.
+	 * @param int|null    $seq      The restore entry's seq, from open_restore_entry().
+	 * @param string      $aura_ref Aura's correlation id for this restore.
 	 * @return array { success, snapshot?, error? }
 	 */
-	public static function pre_restore_capture( array $record ) {
+	public static function pre_restore_capture( array $record, $seq = null, $aura_ref = '' ) {
 		$snaps = new Aura_Worker_Snapshots();
-		$door  = array( 'restore_of' => (string) ( isset( $record['id'] ) ? $record['id'] : '' ) );
+		$ref   = '' === (string) $aura_ref ? null : preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $aura_ref );
+		$door  = array(
+			'restore_of' => (string) ( isset( $record['id'] ) ? $record['id'] : '' ),
+			'seq'        => null === $seq ? null : (int) $seq,
+			'ability'    => 'aura/restore',
+			'ref'        => $ref,
+		);
 		switch ( (string) ( isset( $record['door_kind'] ) ? $record['door_kind'] : '' ) ) {
 			case 'design_system':
 				// The CURRENT set, not the old envelope's targets: a class or
@@ -2563,7 +2589,8 @@ class Aura_Worker_Elementor_Door {
 				return self::snapshot_for(
 					'elementor/manage-classes',
 					array( array( 'type' => 'design_system', 'id' => '*' ) ),
-					array()
+					array(),
+					$door // explicit: there is no governed request to derive one from
 				);
 			case 'page':
 			case 'component':
@@ -2589,6 +2616,9 @@ class Aura_Worker_Elementor_Door {
 				// the envelope that undoes the undo of it must be judged on
 				// that too (round-3 P1). It is the only marker that survives
 				// — a `posts` capture records no `post_type` of its own.
+				// The creating ABILITY overrides the stamp's `aura/restore`:
+				// is_component_envelope() reads it as its fallback witness, so
+				// the second-order undo is judged the way the creation was.
 				$carried = $door;
 				if ( isset( $record['door']['ability'] ) && is_string( $record['door']['ability'] ) ) {
 					$carried['ability'] = (string) $record['door']['ability'];
