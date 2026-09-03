@@ -662,6 +662,51 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( 'open', Aura_Worker_Elementor_Door::governor_block()['door'] );
 	}
 
+	/**
+	 * Ruling P35: the epoch is minted when door state is CREATED.
+	 *
+	 * `present()` reads the epoch option as the single witness that this site
+	 * has a door, and only `status_fragment()` used to mint one — so a write
+	 * (or a hold) followed by Elementor being disabled BEFORE the first
+	 * `/status` poll left rows nothing would ever report or reconcile. The
+	 * fragment was omitted and reconcile() skipped, indefinitely.
+	 */
+	public function test_a_log_row_written_before_the_first_poll_mints_the_epoch(): void {
+		delete_option( Aura_Worker_Door_Log::EPOCH );
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ] );
+		$this->assertSame( '', (string) get_option( Aura_Worker_Door_Log::EPOCH, '' ), 'nothing has minted one yet' );
+
+		$seq = $this->entry( array(), false ); // a row, and no /status poll
+
+		$epoch = (string) get_option( Aura_Worker_Door_Log::EPOCH, '' );
+		$this->assertNotSame( '', $epoch, 'the row minted it' );
+
+		$this->elementorGoesAway();
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::present() );
+		$this->assertIsArray( Aura_Worker_Elementor_Door::status_fragment( 0, '' ) );
+		$data = $this->api->get_status( new WP_REST_Request( 'GET', '/aura/v1/status' ) )->get_data();
+		$this->assertIsObject( $data['door'] );
+		$this->assertSame( 'discarded', $this->row( $seq )['result'], 'and the reconciler settled it' );
+	}
+
+	/** The same for a HOLD: the queue is door state too. */
+	public function test_a_hold_taken_before_the_first_poll_mints_the_epoch(): void {
+		delete_option( Aura_Worker_Door_Log::EPOCH );
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ] );
+
+		$ref = $this->hold();
+
+		$this->assertNotSame( '', (string) get_option( Aura_Worker_Door_Log::EPOCH, '' ) );
+
+		$this->elementorGoesAway();
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::present() );
+		$frag = Aura_Worker_Elementor_Door::status_fragment( 0, '' );
+		$this->assertIsArray( $frag );
+		$this->assertSame( array( $ref ), array_column( $frag['held'], 'ref' ), 'the queue is reported, not stranded' );
+	}
+
 	/** And a site that never had a door still reports nothing at all (Ruling P6). */
 	public function test_a_site_with_no_door_and_nothing_persisted_reports_nothing(): void {
 		$this->elementorGoesAway();

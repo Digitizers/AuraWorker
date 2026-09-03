@@ -150,6 +150,13 @@ class Aura_Worker_Door_Holds {
 			'created_at' => gmdate( 'c', $now ),
 			'expires_at' => gmdate( 'c', $now + self::TTL_S ),
 		);
+		// Door state is about to exist, so the site's epoch must (Ruling P35):
+		// `present()` reads the epoch option as the single witness that this
+		// site has a door, and a hold taken before the first `/status` poll —
+		// with Elementor disabled in between — would otherwise be a queue
+		// nothing reports and no reconciler ever sweeps. Before the insert, so
+		// the witness can never lag the state it witnesses.
+		Aura_Worker_Door_Log::epoch();
 		if ( ! Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $row ) ) {
 			return new WP_Error( 'aura_hold_failed', 'This site could not store the call for approval; it was not run.', array( 'status' => 503 ) );
 		}

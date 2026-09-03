@@ -88,6 +88,15 @@ class Aura_Worker_Door_Log {
 	 * @return int|WP_Error seq, or `aura_log_failed`.
 	 */
 	public static function open_pending( array $entry ) {
+		// The epoch is minted the moment door state first EXISTS, not the
+		// first time somebody reports it (Ruling P35). `present()` reads the
+		// epoch option as the single witness that this site has a door, and
+		// until now only `status_fragment()` minted one — so a write or a hold
+		// followed by Elementor being disabled BEFORE the first `/status`
+		// poll left rows nothing would ever report or reconcile. Minting here
+		// costs one conditional INSERT on the first row of a site's life and
+		// nothing after it.
+		self::epoch();
 		for ( $try = 0; $try < self::ALLOC_TRIES; $try++ ) {
 			$seq = max( self::highest_row_seq(), self::floor() ) + 1;
 			$row = array_merge(
