@@ -4080,6 +4080,12 @@ function sa_reset_state(): void {
 		// where it expected none.
 		Aura_Worker_Elementor_Door::reset_for_tests();
 	}
+	if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+		// live_identity()'s per-request cache is a static too (Ruling P62): the
+		// client line and dashboard URL a test seeds must not be read through a
+		// previous test's answer.
+		Aura_Worker_Door_Log::forget_live_identity();
+	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;

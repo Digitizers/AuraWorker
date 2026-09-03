@@ -514,52 +514,6 @@ class Aura_Worker_Magic_Link {
 			}
 			return new WP_REST_Response( array( 'error' => 'Connect not completed: the site token could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
 		}
-		// THE DOOR'S BINDING GENERATION — the connect's LAST persistent step,
-		// and only now (Rulings P58/P59, findings F3 and F4).
-		//
-		// A connect does NOT require an unbind first: finish_before_rebind()
-		// above returns true immediately for a site with no unbind marker, so
-		// this callback can install a new binding straight over an old one —
-		// and the departed client's holds would otherwise stay current, be
-		// listed to the replacement client through `/status`, and be approved
-		// through `elementor_replay_ability`, running the old client's input as
-		// the old client's actor.
-		//
-		// AFTER the claim-conditional token write, not before it:
-		//   F3 — a token write that fails verification leaves the OLD token and
-		//        client active, and a generation already rotated would have made
-		//        THEIR pending holds invisible and THEIR log cursor invalid for
-		//        a rebind that never happened;
-		//   F4 — a handler that stalled past SITE_CLAIM_TAKEOVER_AFTER and lost
-		//        the site never reaches this line, because the token write
-		//        above rejected it first. The winner's generation is safe.
-		//
-		// Idempotent by identity: EVERY connect calls it, including a
-		// same-client token rotation, and rotate_binding() is a no-op when the
-		// record already names this (client, dashboard). That is what makes a
-		// FAILED rotation harmless to leave — the next connect does it again —
-		// and it is why the old pre-comparison is gone: the record IS the
-		// comparison now.
-		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
-			$rebound = Aura_Worker_Elementor_Door::rebind(
-				array(
-					'client'    => '' === (string) $client ? null : (string) $client,
-					'dashboard' => '' === (string) $dashboard_url ? null : (string) $dashboard_url,
-				)
-			);
-			if ( ! $rebound ) {
-				// The token IS installed, so this connect is otherwise done —
-				// but the door still belongs to the departed binding, and
-				// saying otherwise would hand its queue to the new client.
-				// Retryable: the next connect rotates.
-				$release();
-				return new WP_Error(
-					'aura_door_failed',
-					__( 'Connect not completed: the Elementor door could not be handed to the new binding; retry.', 'digitizer-site-worker' ),
-					array( 'status' => 503, 'retry_after' => 5 )
-				);
-			}
-		}
 		// The token is stored, so the credential minted beside the PREVIOUS one
 		// is now a credential without a token — revoke it here, before anything
 		// else can fail (round-34). Left until the mint, a binding or gateway-key
@@ -677,6 +631,58 @@ class Aura_Worker_Magic_Link {
 					$release();
 					return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous ruleset could not be cleared; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
 				}
+			}
+		}
+		// THE DOOR'S BINDING GENERATION (Rulings P58/P59/P62, findings F1-F4).
+		//
+		// A connect does NOT require an unbind first: finish_before_rebind()
+		// above returns true immediately for a site with no unbind marker, so
+		// this callback can install a new binding straight over an old one —
+		// and the departed client's holds would otherwise stay current, be
+		// listed to the replacement client through `/status`, and be approved
+		// through `elementor_replay_ability`, running the old client's input as
+		// the old client's actor.
+		//
+		// WHERE THIS SITS is the whole of its safety:
+		//   after the claim-conditional TOKEN write (F3/F4) — a token write
+		//     that failed verification leaves the OLD token and client active,
+		//     and a generation already rotated would have made THEIR pending
+		//     holds invisible and THEIR log cursor invalid for a rebind that
+		//     never happened; and a handler that stalled past
+		//     SITE_CLAIM_TAKEOVER_AFTER and lost the site never reaches here,
+		//     because that write rejected it first;
+		//   after the IDENTITY writes — the client line (the ruleset binding
+		//     sentinel) and `aura_worker_dashboard_url`, both stored and
+		//     verified above. row_is_current() compares the record's identity
+		//     against those two options (Ruling P62), so once this connect
+		//     answers AT ALL — success or `aura_door_failed` — every departed
+		//     row is already foreign, whether or not the rotation below lands.
+		//     That is what makes the retryable failure safe rather than a
+		//     window in which the replacement client can see the old queue.
+		//
+		// Idempotent by identity: EVERY connect calls it, including a
+		// same-client token rotation, and rotate_binding() is a no-op when the
+		// record already names this (client, dashboard) in the `bound` state.
+		// A lazily-minted `unset` record never matches, so a site 2.16 met
+		// already connected rotates on its first connect (Ruling P61).
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			$rebound = Aura_Worker_Elementor_Door::rebind(
+				array(
+					'client'    => '' === (string) $client ? null : (string) $client,
+					'dashboard' => '' === (string) $dashboard_url ? null : (string) $dashboard_url,
+				)
+			);
+			if ( ! $rebound ) {
+				// Retryable: the next connect, called with the same identity,
+				// rotates. Nothing here is left in a state the replacement
+				// client can act on — the identity above already disowned the
+				// departed rows.
+				$release();
+				return new WP_Error(
+					'aura_door_failed',
+					__( 'Connect not completed: the Elementor door could not be handed to the new binding; retry.', 'digitizer-site-worker' ),
+					array( 'status' => 503, 'retry_after' => 5 )
+				);
 			}
 		}
 		// 2.11.0: the callback also mints an Application Password for the admin

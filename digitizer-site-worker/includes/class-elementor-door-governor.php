@@ -197,6 +197,7 @@ class Aura_Worker_Elementor_Door {
 		self::$request             = null;
 		self::$active              = null;
 		self::$seq_lease           = null;
+		Aura_Worker_Door_Log::forget_live_identity();
 		// $GLOBALS['_sa_force_door'] — active()'s test override, standing in
 		// for the module class this suite cannot define — is reset by
 		// sa_reset_state(), not written here: production code reads that
@@ -979,7 +980,7 @@ class Aura_Worker_Elementor_Door {
 		if ( '' === $was ) {
 			return true;
 		}
-		return $was === Aura_Worker_Door_Log::binding_raw();
+		return Aura_Worker_Door_Log::generation_is_live( $was );
 	}
 
 	/**
@@ -1009,10 +1010,11 @@ class Aura_Worker_Elementor_Door {
 		if ( '' === $claimed ) {
 			return true; // claimed before the fence existed
 		}
-		// RAW, and past this request's option cache: the writer that rotated
-		// the generation is another request, and binding() would MINT a
-		// replacement rather than report the absence.
-		return $claimed === Aura_Worker_Door_Log::binding_raw();
+		// The SAME predicate every other reader uses (Ruling P62): the
+		// generation must be current AND its record must still describe the
+		// identity this site is live under, so a connect whose rotation did not
+		// land still makes the departed binding's claim foreign.
+		return Aura_Worker_Door_Log::generation_is_live( $claimed );
 	}
 
 	/**

@@ -453,6 +453,43 @@ final class ConnectProvisionTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P62 (F2): once a changed-client connect ANSWERS, the departed
+	 * rows are foreign — rotation landed or not.
+	 *
+	 * On a keyless site there is no signed grant to fall back on, so a
+	 * replacement client holding the new token could authenticate immediately,
+	 * see the old client's holds through `/status` and replay them. The
+	 * identity options are written before the rotation is attempted, and
+	 * currentness is judged against them, so the failure window is closed by
+	 * construction rather than by rolling the token back.
+	 */
+	public function test_a_keyless_connect_whose_rotation_fails_still_disowns_the_departed_queue(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref = $this->seedDoorState();
+		$gen = Aura_Worker_Door_Log::binding();
+		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+
+		// Keyless: no grant_pubkey at all, which is the case with no signed
+		// grant standing between the new token and a replay.
+		$res = $this->ml->handle_connect(
+			$this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new.example', 'grant_pubkey' => null, 'sign_pubkey' => '' ) )
+		);
+
+		$GLOBALS['_sa_option_cas_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_door_failed', $res->get_error_code() );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), 'the generation did not move' );
+		// The NEW token is live and the new identity is stored, so the door is
+		// already the new client's — and the old client's queue is not in it.
+		Aura_Worker_Door_Log::forget_live_identity();
+		$this->assertSame( 'c2', Aura_Worker_Rules::bound_client() );
+		$this->assertSame( 'https://new.example', get_option( 'aura_worker_dashboard_url' ) );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the departed hold is not readable' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nor listed' );
+		$this->assertSame( 'not_held', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'], 'nor replayable' );
+	}
+
+	/**
 	 * Ruling P59 (F1): a rotation that could not be VERIFIED refuses the
 	 * connect, and the next one finishes the job.
 	 *
@@ -473,7 +510,14 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( 'aura_door_failed', $res->get_error_code() );
 		$this->assertSame( 503, $res->get_error_data()['status'] );
 		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), 'the generation did not move' );
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), "so the old client's hold is still THEIRS" );
+		// …but the identity options DID land before the rotation was attempted,
+		// so the departed rows are already foreign (Ruling P62): a failed
+		// rotation is not a window in which the replacement client can see the
+		// old queue.
+		Aura_Worker_Door_Log::forget_live_identity();
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the departed hold is not readable' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nor listed' );
+		$this->assertSame( 'not_held', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'], 'nor replayable' );
 		// The TOKEN is installed — this is the connect's last step — so the
 		// next attempt with the same identity rotates and completes.
 		$GLOBALS['_sa_option_cas_fail'] = array();

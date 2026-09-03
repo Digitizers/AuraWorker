@@ -1058,6 +1058,15 @@ class Aura_Worker_Door_Holds {
 	 * another generation is simply invisible: not listed, not claimable, not
 	 * counted against the cap, and swept when the reconciler next runs.
 	 *
+	 * TWO questions, not one (Ruling P62): the row's generation must be the
+	 * current one AND that generation's record must still describe the identity
+	 * this site is LIVE under. The connect writes its identity — the client
+	 * line and the dashboard URL — before it rotates, so a changed-client
+	 * connect that answered at all has already made the departed rows foreign,
+	 * whether or not the rotation itself landed. Without the second question a
+	 * failed rotation left the old client's holds listed and replayable under
+	 * the new client's token.
+	 *
 	 * A row with NO binding predates the rule and is treated as ours: refusing
 	 * it would strand approvals nobody can re-issue across an upgrade.
 	 *
@@ -1069,7 +1078,7 @@ class Aura_Worker_Door_Holds {
 		if ( '' === $was ) {
 			return true; // queued before the generation existed
 		}
-		return $was === Aura_Worker_Door_Log::binding();
+		return Aura_Worker_Door_Log::generation_is_live( $was );
 	}
 
 	/**
