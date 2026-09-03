@@ -302,7 +302,7 @@ class Aura_Worker_API {
 					'required'          => false,
 					'type'              => 'string',
 					'sanitize_callback' => 'sanitize_text_field',
-					'description'       => __( "Aura's correlation id for this restore; echoed on the door-log entry.", 'digitizer-site-worker' ),
+					'description'       => __( "Aura's correlation id for this restore; echoed on the door-log entry. When sent, it is BOUND INTO THE GRANT: on a grant-enforced site the approval grant must be minted over { id, aura_ref }, not { id } alone.", 'digitizer-site-worker' ),
 				),
 			),
 		) );
@@ -1234,13 +1234,35 @@ class Aura_Worker_API {
 	 *
 	 * Restore state captured by a prior snapshot (undo a power write).
 	 *
+	 * GRANT BINDING: `aura_ref` is bound into the grant whenever the request
+	 * carries one, so Aura MUST mint the grant over `{ id, aura_ref }` when
+	 * it sends a correlation id — a grant over `{ id }` alone is refused for
+	 * such a request. The ref is written as the door-log entry's `ref`, which
+	 * is how ingestion associates the terminal result with an AgentAction; a
+	 * grant that did not cover it let anyone able to replay a valid restore
+	 * grant substitute a different correlation id (Ruling P13). A request
+	 * with NO `aura_ref` still binds `{ id }` alone, so legacy callers are
+	 * unchanged.
+	 *
 	 * @param WP_REST_Request $request The request object.
 	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
 	 */
 	public function restore_snapshot( $request ) {
 		$id = $request->get_param( 'id' );
+		// Sanitised HERE as well as by the route's own callback: the value
+		// bound into the grant, echoed onto the log entry, must be one
+		// string read once, whatever dispatched the request.
+		$raw_ref  = $request->get_param( 'aura_ref' );
+		$aura_ref = is_string( $raw_ref ) ? sanitize_text_field( $raw_ref ) : '';
 
-		$guard = Aura_Worker_Grant::require_for( $request, 'wp.snapshot.restore', array( 'id' => $id ) );
+		$guard = Aura_Worker_Grant::require_for(
+			$request,
+			'wp.snapshot.restore',
+			'' === $aura_ref ? array( 'id' => $id ) : array(
+				'id'       => $id,
+				'aura_ref' => $aura_ref,
+			)
+		);
 		if ( is_wp_error( $guard ) ) {
 			return $guard;
 		}
@@ -1265,7 +1287,7 @@ class Aura_Worker_API {
 			// A door restore is itself a governed write: RESERVE the log entry
 			// first (a closed or failing log refuses the restore, as it refuses
 			// any other write), then capture, then restore, then settle.
-			$seq = Aura_Worker_Elementor_Door::open_restore_entry( $record, (string) $request->get_param( 'aura_ref' ) );
+			$seq = Aura_Worker_Elementor_Door::open_restore_entry( $record, $aura_ref );
 			if ( is_wp_error( $seq ) ) {
 				return $seq;
 			}

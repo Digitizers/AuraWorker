@@ -42,13 +42,92 @@ final class DoorRestTest extends TestCase {
 		);
 	}
 
+	/** @var string|null the gateway secret key, once enforce_grants() has run */
+	private $grant_secret = null;
+
 	/** Provisions a real gateway pubkey, turning on grant enforcement. */
 	private function enforce_grants(): void {
 		if ( ! function_exists( 'sodium_crypto_sign_keypair' ) ) {
 			$this->markTestSkipped( 'ext-sodium is not available.' );
 		}
 		$kp = sodium_crypto_sign_keypair();
+		$this->grant_secret = sodium_crypto_sign_secretkey( $kp );
 		$GLOBALS['_options']['aura_worker_grant_pubkey'] = base64_encode( sodium_crypto_sign_publickey( $kp ) );
+	}
+
+	/** One signed, single-use grant over ($action, $params), the way Aura mints it. */
+	private function mint( string $action, array $params ): string {
+		$now     = time();
+		$payload = array(
+			'v'             => 1,
+			'tool'          => $action,
+			'params_sha256' => hash( 'sha256', Aura_Worker_Grant::canonical_json( $params ) ),
+			'site'          => (string) get_option( 'aura_worker_site_token', '' ),
+			'nonce'         => bin2hex( random_bytes( 16 ) ),
+			'iat'           => $now,
+			'exp'           => $now + 300,
+		);
+		$json = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+		$sig  = sodium_crypto_sign_detached( $json, (string) $this->grant_secret );
+		$b64  = static function ( string $raw ): string {
+			return rtrim( strtr( base64_encode( $raw ), '+/', '-_' ), '=' );
+		};
+		return $b64( $json ) . '.' . $b64( $sig );
+	}
+
+	/* ---- POST /aura/v2/snapshot/restore: the grant binds aura_ref ---- */
+
+	/**
+	 * `aura_ref` is the correlation id ingestion associates the terminal
+	 * result with an AgentAction. A grant minted over `{id}` alone left it
+	 * unbound, so anyone who could replay a valid restore grant could swap
+	 * the correlation id (Ruling P13).
+	 */
+	public function test_a_grant_over_the_id_alone_is_refused_when_the_request_carries_an_aura_ref(): void {
+		$this->enforce_grants();
+		$req = $this->request( array( 'id' => 'snap_x', 'aura_ref' => 'act_9' ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'wp.snapshot.restore', array( 'id' => 'snap_x' ) ) );
+
+		$res = $this->api->restore_snapshot( $req );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_grant_required', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+	}
+
+	public function test_a_grant_minted_over_the_id_and_the_same_aura_ref_passes(): void {
+		$this->enforce_grants();
+		$req = $this->request( array( 'id' => 'snap_x', 'aura_ref' => 'act_9' ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'wp.snapshot.restore', array( 'id' => 'snap_x', 'aura_ref' => 'act_9' ) ) );
+
+		$res = $this->api->restore_snapshot( $req );
+
+		// Past the grant: the envelope simply is not on this site.
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 404, $res->get_status() );
+	}
+
+	public function test_a_grant_bound_to_one_aura_ref_does_not_authorize_another(): void {
+		$this->enforce_grants();
+		$req = $this->request( array( 'id' => 'snap_x', 'aura_ref' => 'act_OTHER' ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'wp.snapshot.restore', array( 'id' => 'snap_x', 'aura_ref' => 'act_9' ) ) );
+
+		$res = $this->api->restore_snapshot( $req );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_grant_required', $res->get_error_code() );
+	}
+
+	/** A legacy caller that sends no correlation id is unchanged: `{id}` alone. */
+	public function test_a_request_without_an_aura_ref_passes_under_a_grant_over_the_id_alone(): void {
+		$this->enforce_grants();
+		$req = $this->request( array( 'id' => 'snap_x' ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'wp.snapshot.restore', array( 'id' => 'snap_x' ) ) );
+
+		$res = $this->api->restore_snapshot( $req );
+
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 404, $res->get_status() );
 	}
 
 	/* ---- POST /aura/v1/door/reject ---- */

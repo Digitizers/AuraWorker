@@ -636,8 +636,13 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 
 	public function test_a_hostile_correlation_id_reaches_the_row_stripped(): void {
 		$env = $this->pageEnvelope();
+		// TWO strippers, in the order the request meets them: the handler's
+		// own sanitize_text_field() — which is what the route's
+		// sanitize_callback does in production, and now also what is bound
+		// into the grant — takes the tag out, and the governor's allowlist
+		// takes everything outside [A-Za-z0-9_-] out of what is left.
 		$this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act/../<script>-1' ) ) );
-		$this->assertSame( 'actscript-1', Aura_Worker_Door_Log::get( 1 )['ref'] );
+		$this->assertSame( 'act-1', Aura_Worker_Door_Log::get( 1 )['ref'] );
 	}
 
 	public function test_no_correlation_id_leaves_the_ref_null(): void {
