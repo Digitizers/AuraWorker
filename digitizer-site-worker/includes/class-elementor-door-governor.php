@@ -1388,7 +1388,14 @@ class Aura_Worker_Elementor_Door {
 			// creation still needs finishing (round 1).
 			self::$request['creation_done'] = true;
 			if ( is_wp_error( $creation ) ) {
-				return $creation; // compensated + settled inside
+				// FINISHED — compensated and settled inside. The request is
+				// cleared like every other terminal branch: left standing, it
+				// still said "a creation is in flight", so the global insert
+				// observer attributed the next post of the expected type in
+				// this same PHP request to a call that had already ended, and
+				// threw over it (round-9).
+				self::$request = null;
+				return $creation;
 			}
 			self::$request['creation_fields'] = $creation; // what a later throw settles with
 			$terminal                         = array_merge( $terminal, $creation );

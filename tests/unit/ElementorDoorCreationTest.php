@@ -606,6 +606,33 @@ final class ElementorDoorCreationTest extends TestCase {
 		$this->assertSame( array( $made ), $this->row( 1 )['created_post_ids'], 'the row learned it from finish_creation()' );
 	}
 
+	/**
+	 * A compensated creation is FINISHED. Leaving the static request marked
+	 * as a live creation made the global insert observer attribute the next
+	 * post of the expected type in this same PHP request to a call that had
+	 * already ended — and, since round 8, throw over it.
+	 */
+	public function test_a_compensated_creation_leaves_nothing_for_a_later_insert_to_be_attributed_to(): void {
+		$out = $this->withUnwritableSnapshots(
+			function () {
+				return $this->createPage(
+					function () {
+						return array( 'id' => $this->insertPage() );
+					}
+				);
+			}
+		);
+		$this->assertSame( 'aura_snapshot_failed', $out->get_error_code() );
+		$settled = $this->row( 1 );
+
+		$later = wp_insert_post( array( 'post_type' => 'page', 'post_title' => 'nothing to do with it', 'post_author' => 3 ) );
+
+		$this->assertIsInt( $later );
+		$this->assertGreaterThan( 0, $later );
+		$this->assertSame( $settled, $this->row( 1 ), 'the finished call\'s entry is untouched' );
+		$this->assertNotSame( 'trash', get_post( $later )->post_status, 'and the unrelated page is left alone' );
+	}
+
 	/** An `other_inserts` patch is advisory — it records nothing a rollback needs. */
 	public function test_an_other_inserts_patch_that_fails_does_not_abort_the_creation(): void {
 		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
