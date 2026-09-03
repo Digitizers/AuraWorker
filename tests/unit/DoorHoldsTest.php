@@ -107,6 +107,36 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertSame( $fresh, $GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ], 'the value that replaced it survives' );
 	}
 
+	public function test_a_holders_release_never_deletes_a_lock_that_replaced_its_own(): void {
+		// A holds the lock, stalls past LOCK_S, and a racer's fenced delete
+		// replaces the row with ITS lock. A's `finally` then runs. An
+		// unconditional delete_option() there removes the racer's brand-new
+		// lock — and B goes on running hold_locked() with no mutex at all,
+		// which is the serialization the lock exists to provide.
+		//
+		// The window is opened inside the HELD row's own INSERT (the shared
+		// _sa_before_swap seam, which also fires on take_lock()'s insert — the
+		// guard below is what keeps this firing only once the lock is taken).
+		$racers_lock = time() . '|racer';
+		$GLOBALS['_sa_before_swap'] = static function () use ( $racers_lock ) {
+			if ( ! isset( $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] ) ) {
+				return; // take_lock()'s own insert, before there is a lock at all
+			}
+			$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $racers_lock;
+			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = $racers_lock;
+		};
+
+		$this->assertIsString( Aura_Worker_Door_Holds::hold( $this->call() ) );
+
+		$this->assertSame( $racers_lock, $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] ?? null, "the release was fenced on the bytes this request inserted, so the racer's lock stands" );
+	}
+
+	public function test_a_holder_releases_the_lock_it_actually_inserted(): void {
+		$this->assertIsString( Aura_Worker_Door_Holds::hold( $this->call() ) );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Holds::LOCK, $GLOBALS['_rows'], 'the ordinary path still releases' );
+		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK, false ) );
+	}
+
 	public function test_the_51st_hold_is_refused_queue_full(): void {
 		for ( $i = 0; $i < 50; $i++ ) {
 			$this->assertIsString( Aura_Worker_Door_Holds::hold( $this->call() ) );
@@ -225,11 +255,69 @@ final class DoorHoldsTest extends TestCase {
 		$GLOBALS['_options'][ 'aura_worker_door_held_' . $a ]['expires_at'] = gmdate( 'c', time() - 10 );
 		$GLOBALS['_rows'][ 'aura_worker_door_held_' . $a ] = maybe_serialize( $GLOBALS['_options'][ 'aura_worker_door_held_' . $a ] );
 		Aura_Worker_Door_Holds::claim( $b );
-		$GLOBALS['_options'][ 'aura_worker_door_held_' . $b ] = $GLOBALS['_options'][ 'aura_worker_door_claimed_' . $b ];
-		$GLOBALS['_rows'][ 'aura_worker_door_held_' . $b ]    = maybe_serialize( $GLOBALS['_options'][ 'aura_worker_door_held_' . $b ] );
-		Aura_Worker_Door_Holds::sweep( time() );
+		$this->reseedHeldTwin( $b );
+		// …and the claim is OLD, which is the case the sweep owns: a claim
+		// still inside CLAIM_STALE_MS is a replay mid-move (see below).
+		$this->backdateClaim( $b, self::CLAIM_STALE_MS_S + 60 );
+		Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS );
 		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $a, $GLOBALS['_options'] );
 		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $b, $GLOBALS['_options'] );
 		$this->assertArrayHasKey( 'aura_worker_door_claimed_' . $b, $GLOBALS['_options'] );
+	}
+
+	public function test_sweep_leaves_a_held_row_whose_claimed_twin_is_still_in_flight(): void {
+		// claim() inserts the claimed twin and THEN deletes the held row. A
+		// sweep landing in that window used to delete the held row itself;
+		// claim()'s own delete then removed 0 rows, read that as "a reject won"
+		// and backed out by deleting the claimed twin — both rows gone, the
+		// operator's approval lost for ever, `not_held` on every later replay.
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Holds::claim( $ref );
+		$this->reseedHeldTwin( $ref ); // the window: both rows exist
+
+		$gone = Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS );
+
+		$this->assertSame( 0, $gone );
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'a fresh claim is a replay mid-move; its own delete is still coming' );
+		$this->assertArrayHasKey( 'aura_worker_door_claimed_' . $ref, $GLOBALS['_rows'] );
+	}
+
+	public function test_sweep_still_removes_a_held_twin_whose_claim_is_unstamped(): void {
+		// A stamp that cannot be read is not evidence of freshness — the same
+		// rule the creation mutex is cleared by.
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Holds::claim( $ref );
+		$this->reseedHeldTwin( $ref );
+		$this->patchRow( 'aura_worker_door_claimed_' . $ref, array( 'claimed_at' => '' ) );
+
+		$this->assertSame( 1, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'] );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Helpers                                                             */
+	/* ------------------------------------------------------------------ */
+
+	/** The reconciler's stale-claim bound, as the governor declares it. */
+	private const CLAIM_STALE_MS   = 600000;
+	private const CLAIM_STALE_MS_S = 600;
+
+	/** Put the held row back beside its claimed twin — claim()'s own window. */
+	private function reseedHeldTwin( string $ref ): void {
+		$row = $GLOBALS['_options'][ 'aura_worker_door_claimed_' . $ref ];
+		$GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ] = $row;
+		$GLOBALS['_rows'][ 'aura_worker_door_held_' . $ref ]    = maybe_serialize( $row );
+		unset( $GLOBALS['_notoptions'][ 'aura_worker_door_held_' . $ref ] );
+	}
+
+	private function backdateClaim( string $ref, int $seconds_ago ): void {
+		$this->patchRow( 'aura_worker_door_claimed_' . $ref, array( 'claimed_at' => gmdate( 'c', time() - $seconds_ago ) ) );
+	}
+
+	/** Merge fields into a row, in the "database" ($_rows) and the cache alike. */
+	private function patchRow( string $name, array $fields ): void {
+		$row                          = array_merge( (array) $GLOBALS['_options'][ $name ], $fields );
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
 	}
 }

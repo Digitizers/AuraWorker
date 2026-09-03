@@ -40,14 +40,36 @@ class Aura_Worker_Door_Holds {
 		// 59 rows (Codex round-9 P2 on #499). insert_unique() on the lock name is
 		// a real conditional INSERT on the options table's unique key, the same
 		// primitive the creation mutex uses.
-		if ( ! self::take_lock() ) {
+		//
+		// The release is FENCED on the exact bytes this request inserted, and
+		// is not a delete_option(). A holder that overran LOCK_S has already
+		// had its row fence-replaced by a racer's fresh lock; an
+		// unconditional release then deletes THAT — and the racer goes on
+		// running hold_locked() with no mutex at all, which is the whole of
+		// what the lock provides. The same reasoning as take_lock()'s own
+		// fenced delete, applied to the other end of the lock's life.
+		$token = self::take_lock();
+		if ( false === $token ) {
 			return new WP_Error( 'aura_hold_busy', 'This site is admitting another call for approval; retry.', array( 'status' => 503, 'retry_after' => 5 ) );
 		}
 		try {
 			return self::hold_locked( $call );
 		} finally {
-			delete_option( self::LOCK );
+			self::release_lock( $token );
 		}
+	}
+
+	/**
+	 * Delete the lock row ONLY while it still carries the bytes this request
+	 * inserted — never a row a racer installed after this holder went stale.
+	 *
+	 * @param string $token The value take_lock() inserted.
+	 */
+	private static function release_lock( $token ) {
+		global $wpdb;
+		$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::LOCK, (string) $token ) );
+		wp_cache_delete( self::LOCK, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
 	}
 
 	/**
@@ -65,13 +87,18 @@ class Aura_Worker_Door_Holds {
 	 * stale row gets to insert next; a racer that loses the delete just loops
 	 * and meets whichever lock is there afterwards.
 	 *
-	 * @return bool
+	 * The value inserted carries a uuid beside the timestamp so the release
+	 * fence names THIS lock and no other: the staleness read below is an
+	 * `(int)` cast, which reads the timestamp and ignores the rest.
+	 *
+	 * @return string|false The value inserted (the release's fence), or false.
 	 */
 	private static function take_lock() {
 		global $wpdb;
 		for ( $i = 0; $i < 3; $i++ ) {
-			if ( Aura_Worker_Door_Log::insert_unique( self::LOCK, time() ) ) {
-				return true;
+			$token = time() . '|' . wp_generate_uuid4();
+			if ( Aura_Worker_Door_Log::insert_unique( self::LOCK, $token ) ) {
+				return $token;
 			}
 			wp_cache_delete( self::LOCK, 'options' );
 			$raw = self::raw_bytes( self::LOCK );
@@ -311,15 +338,41 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
-	 * Expire holds; remove a held row whose claimed twin exists (§3.7).
+	 * Expire holds; remove a held row whose claimed twin exists (§3.7) — but
+	 * only once that twin is STALE.
 	 *
-	 * @param int $now Unix time.
+	 * claim() moves a hold by inserting the claimed twin and THEN deleting
+	 * the held row, and requires that delete to remove exactly one row. Both
+	 * rows therefore exist for a moment on every single claim. A sweep
+	 * landing in that window deleted the held row itself; claim()'s own
+	 * delete then removed 0 rows, read that as "a reject or the sweep decided
+	 * this must not run", and backed out by deleting the claimed twin. Both
+	 * rows gone: the operator's approval lost for ever, `not_held` on every
+	 * later replay, and no record that anything was ever approved.
+	 *
+	 * So a held row whose twin was claimed less than $claim_stale_ms ago is
+	 * left alone — it belongs to a replay that is mid-move. Past that bound
+	 * the twin is the reconciler's (settle_stale_claim()), and this sweep
+	 * finishing the replay's delete is exactly right. A twin whose
+	 * `claimed_at` cannot be read is not evidence of freshness either, and is
+	 * swept: the same rule the creation mutex is cleared by.
+	 *
+	 * @param int $now            Unix time.
+	 * @param int $claim_stale_ms How old a claim must be before its held twin
+	 *                            is the sweep's to remove (the reconciler's
+	 *                            Aura_Worker_Elementor_Door::CLAIM_STALE_MS).
 	 * @return int How many held rows were removed — the reconciler reports it.
 	 */
-	public static function sweep( $now ) {
+	public static function sweep( $now, $claim_stale_ms ) {
 		$gone = 0;
+		$cut  = (int) $now - (int) floor( (int) $claim_stale_ms / 1000 );
 		foreach ( self::rows( self::HELD ) as $ref => $row ) {
-			if ( null !== self::get_claimed( $ref ) ) {
+			$claimed = self::get_claimed( $ref );
+			if ( null !== $claimed ) {
+				$at = strtotime( (string) ( isset( $claimed['claimed_at'] ) ? $claimed['claimed_at'] : '' ) );
+				if ( false !== $at && $at > $cut ) {
+					continue; // a replay mid-move: its own delete is still coming
+				}
 				delete_option( self::HELD . $ref ); // the replay's own delete, retried
 				$gone++;
 				continue;

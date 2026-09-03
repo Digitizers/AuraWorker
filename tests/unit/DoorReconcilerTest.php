@@ -382,21 +382,41 @@ final class DoorReconcilerTest extends TestCase {
 	/* (g) the hold sweep                                                  */
 	/* ------------------------------------------------------------------ */
 
-	public function test_the_sweep_removes_a_held_row_with_a_claimed_twin_and_an_expired_hold(): void {
+	public function test_the_sweep_expires_a_hold_and_spares_a_held_row_a_live_replay_is_still_moving(): void {
+		// A FRESH claimed twin is a replay mid-move: claim() inserted the twin
+		// and its own delete of the held row has not landed yet. Deleting the
+		// held row here made that delete report 0 rows, which claim() reads as
+		// "a reject won" — it then backs out by deleting the claimed twin too,
+		// and the approval is gone for ever. So the sweep leaves it; the
+		// twin's own age is what makes it anybody else's business.
 		$claimed = $this->hold();
-		$this->claim( $claimed, array(), true ); // fresh: the sweep's business, not the reconciler's
+		$this->claim( $claimed, array(), true ); // fresh
 		$GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $claimed ] = array( 'ref' => $claimed, 'expires_at' => gmdate( 'c', time() + 600 ) );
+		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::HELD . $claimed ]    = maybe_serialize( $GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $claimed ] );
 		$expired = $this->hold();
 		$this->patchOption( Aura_Worker_Door_Holds::HELD . $expired, array( 'expires_at' => gmdate( 'c', time() - 60 ) ) );
 		$live = $this->hold();
 
 		$out = Aura_Worker_Elementor_Door::reconcile();
 
-		$this->assertSame( 2, $out['swept'] );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $claimed ), 'the replay\'s own delete, retried' );
+		$this->assertSame( 1, $out['swept'], 'only the expired hold' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $claimed ), 'the replay\'s own delete is still coming' );
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $claimed ), 'the claim itself is not the sweep\'s to remove' );
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $expired ) );
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $live ) );
+	}
+
+	public function test_the_sweep_finishes_the_delete_of_a_replay_that_died_mid_move(): void {
+		// Past CLAIM_STALE_MS the claim is nobody's live work any more, and
+		// the held row it left behind IS the sweep's to remove.
+		$ref = $this->hold();
+		$this->claim( $ref ); // backdated past CLAIM_STALE_MS
+		$GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $ref ] = array( 'ref' => $ref, 'expires_at' => gmdate( 'c', time() + 600 ) );
+		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::HELD . $ref ]    = maybe_serialize( $GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $ref ] );
+
+		$this->assertSame( 1, Aura_Worker_Door_Holds::sweep( time(), Aura_Worker_Elementor_Door::CLAIM_STALE_MS ) );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim is the reconciler\'s, not the sweep\'s' );
 	}
 
 	/* ------------------------------------------------------------------ */

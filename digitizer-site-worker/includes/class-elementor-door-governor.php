@@ -351,7 +351,7 @@ class Aura_Worker_Elementor_Door {
 			'pruned'         => 0,
 		);
 
-		$out['swept'] = (int) Aura_Worker_Door_Holds::sweep( $now );
+		$out['swept'] = (int) Aura_Worker_Door_Holds::sweep( $now, self::CLAIM_STALE_MS );
 
 		foreach ( Aura_Worker_Door_Holds::stale_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
 			self::settle_stale_claim( (string) $ref, (array) $claim, $out );
