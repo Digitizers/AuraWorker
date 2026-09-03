@@ -1982,10 +1982,20 @@ class Aura_Worker_Elementor_Door {
 			case 'creation':
 				// Undoing a creation trashes the created posts; capturing them
 				// first is what lets the trash itself be undone.
+				//
+				// The creating ABILITY is carried onto the capture: a
+				// component creation is governed as `design_system:*`, and
+				// the envelope that undoes the undo of it must be judged on
+				// that too (round-3 P1). It is the only marker that survives
+				// — a `posts` capture records no `post_type` of its own.
+				$carried = $door;
+				if ( isset( $record['door']['ability'] ) && is_string( $record['door']['ability'] ) ) {
+					$carried['ability'] = (string) $record['door']['ability'];
+				}
 				return $snaps->snapshot_posts(
 					(array) ( isset( $record['created_post_ids'] ) ? $record['created_post_ids'] : array() ),
 					self::PAGE_META_KEYS,
-					array( 'kind_label' => 'creation_restore', 'door' => $door )
+					array( 'kind_label' => 'creation_restore', 'door' => $carried )
 				);
 		}
 		return array( 'success' => true, 'snapshot' => null ); // not a door envelope: nothing to log
@@ -2006,9 +2016,12 @@ class Aura_Worker_Elementor_Door {
 	 * `design_system:*` (touches_for()'s `component` case), so its restore
 	 * declares that too, BESIDE the component post itself — a rule that
 	 * stopped the write must be able to stop the undo of it, and the rule
-	 * might name either. The other kinds already line up: a `page` write
-	 * names its page, a `design_system` write names the category, and a
-	 * `creation`'s restore trashes exactly the ids the creation made.
+	 * might name either. That covers a `manage-component` call naming no id
+	 * as well: it CREATES the component, so its envelope is a `creation`
+	 * whose restore trashes it, and `is_component_envelope()` recognises it
+	 * (round-3 P1). The remaining kinds already line up: a `page` write names
+	 * its page, a `design_system` write names the category, and a `creation`
+	 * of a page trashes exactly the pages it made.
 	 *
 	 * An envelope that names NO target derives no touches, and the matcher
 	 * reads an empty declaration as its `unknown` sentinel — every live rule
@@ -2041,10 +2054,36 @@ class Aura_Worker_Elementor_Door {
 				$touches[] = array( 'type' => 'page', 'id' => (string) $id );
 			}
 		}
-		if ( 'component' === $kind ) {
+		if ( 'component' === $kind
+			|| ( in_array( $kind, array( 'creation', 'creation_restore' ), true ) && self::is_component_envelope( $record ) ) ) {
 			$touches[] = array( 'type' => 'design_system', 'id' => '*' );
 		}
 		return $touches;
+	}
+
+	/**
+	 * Does this envelope cover an Elementor COMPONENT — the thing a
+	 * `manage-component` call writes, and which the door governs as
+	 * `design_system:*`?
+	 *
+	 * Read off the envelope, never off live state: the post may be trashed,
+	 * gone, or a different type by now, and none of that changes what the
+	 * write was judged on. `post_type` is the primary witness —
+	 * snapshot_creation() stores it, and it is the type of the very rows the
+	 * restore would trash. `door.ability` is the fallback, for an envelope
+	 * whose type was not recorded; pre_restore_capture() carries that ability
+	 * onto the `creation_restore` capture it takes, so the second-order undo
+	 * is judged the same way as the first.
+	 *
+	 * @param array $record The envelope.
+	 * @return bool
+	 */
+	private static function is_component_envelope( array $record ) {
+		if ( isset( $record['post_type'] ) && self::CPT_COMPONENT === (string) $record['post_type'] ) {
+			return true;
+		}
+		$door = isset( $record['door'] ) && is_array( $record['door'] ) ? $record['door'] : array();
+		return isset( $door['ability'] ) && 'elementor/manage-component' === (string) $door['ability'];
 	}
 
 	/**

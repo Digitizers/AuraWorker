@@ -634,6 +634,106 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		);
 	}
 
+	/**
+	 * A `manage-component` call naming no id CREATES the component, so its
+	 * envelope is a `creation` — and undoing it TRASHES that component. The
+	 * write was governed as `design_system:*`; so is the undo of it. Read off
+	 * the envelope's own `post_type`, which snapshot_creation() stores.
+	 */
+	public function test_a_block_rule_on_the_design_system_refuses_undoing_a_component_creation(): void {
+		$this->seedPost( 57, Aura_Worker_Elementor_Door::CPT_COMPONENT );
+		$snaps = new Aura_Worker_Snapshots();
+		$rec   = $snaps->snapshot_creation( array( 57 ), Aura_Worker_Elementor_Door::CPT_COMPONENT, array( 'seq' => 1, 'ability' => 'elementor/manage-component' ) );
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $rec['snapshot']['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+		$this->assertSame( 'publish', get_post( 57 )->post_status, 'the component was not trashed' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame(
+			array(
+				array( 'type' => 'page', 'id' => '57' ),
+				array( 'type' => 'design_system', 'id' => '*' ),
+			),
+			$row['touches']
+		);
+	}
+
+	/** The fallback witness: an envelope with no post_type, but an ability that names one. */
+	public function test_a_component_creation_with_no_post_type_is_recognised_by_its_ability(): void {
+		$this->seedPost( 58, Aura_Worker_Elementor_Door::CPT_COMPONENT );
+		$snaps = new Aura_Worker_Snapshots();
+		$rec   = $snaps->snapshot_creation( array( 58 ), '', array( 'seq' => 1, 'ability' => 'elementor/manage-component' ) );
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $rec['snapshot']['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 'publish', get_post( 58 )->post_status );
+	}
+
+	/**
+	 * And the second-order undo: the `creation_restore` capture taken while
+	 * undoing a component creation carries that creation's ability, so
+	 * restoring THAT is judged on the design system too.
+	 */
+	public function test_a_component_creations_own_restore_capture_is_judged_on_the_design_system(): void {
+		$this->seedPost( 60, Aura_Worker_Elementor_Door::CPT_COMPONENT );
+		$snaps = new Aura_Worker_Snapshots();
+		$rec   = $snaps->snapshot_creation( array( 60 ), Aura_Worker_Elementor_Door::CPT_COMPONENT, array( 'seq' => 1, 'ability' => 'elementor/manage-component' ) );
+
+		// No rule yet: the creation is undone, and a creation_restore capture
+		// is taken of the component on its way to the trash.
+		$this->assertSame( 200, $this->api->restore_snapshot( $this->request( array( 'id' => $rec['snapshot']['id'] ) ) )->get_status() );
+		$pre = $snaps->get( Aura_Worker_Door_Log::get( 1 )['snapshot_id'] );
+		$this->assertSame( 'creation_restore', $pre['door_kind'] );
+		$this->assertSame( 'elementor/manage-component', $pre['door']['ability'], 'the creating ability is carried onto the capture' );
+		$this->assertSame( 'trash', get_post( 60 )->post_status );
+
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $pre['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 'trash', get_post( 60 )->post_status, 'the component was not brought back' );
+	}
+
+	public function test_a_design_system_rule_does_not_reach_a_page_creations_restore(): void {
+		$this->seedPost( 59, 'page' );
+		$snaps = new Aura_Worker_Snapshots();
+		$rec   = $snaps->snapshot_creation( array( 59 ), 'page', array( 'seq' => 1, 'ability' => 'elementor/create-page' ) );
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $rec['snapshot']['id'] ) ) );
+
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( 'trash', get_post( 59 )->post_status, 'a page creation touches no design system' );
+		$this->assertSame( array( array( 'type' => 'page', 'id' => '59' ) ), Aura_Worker_Door_Log::get( 1 )['touches'] );
+	}
+
 	public function test_a_design_system_rule_does_not_reach_a_page_restore(): void {
 		$env = $this->pageEnvelope();
 		$this->installRuleset(
