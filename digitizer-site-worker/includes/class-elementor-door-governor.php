@@ -1235,8 +1235,14 @@ class Aura_Worker_Elementor_Door {
 		}
 		// Admission: the row is the reservation. Count, back out above the bound.
 		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
-			Aura_Worker_Door_Log::discard( $seq );
+			// close() BEFORE discard() (Codex round-11 P2): the discard makes
+			// this row terminal and therefore visible to a poll, and the ack
+			// that consumes it must already see FULL_MARKER — an ack that
+			// deletes the row while the log still looks open never runs its
+			// reopen check, and the marker installed after it would shut the
+			// door for ever with nothing left to ack.
 			Aura_Worker_Door_Log::close();
+			Aura_Worker_Door_Log::discard( $seq );
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}
@@ -1593,8 +1599,14 @@ class Aura_Worker_Elementor_Door {
 			return false;
 		}
 		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
-			Aura_Worker_Door_Log::discard( $seq );
+			// close() BEFORE discard() (Codex round-11 P2): the discard makes
+			// this row terminal and therefore visible to a poll, and the ack
+			// that consumes it must already see FULL_MARKER — an ack that
+			// deletes the row while the log still looks open never runs its
+			// reopen check, and the marker installed after it would shut the
+			// door for ever with nothing left to ack.
 			Aura_Worker_Door_Log::close();
+			Aura_Worker_Door_Log::discard( $seq );
 			self::bump_counter( 'log_ungoverned' );
 			return false;
 		}
@@ -2462,8 +2474,14 @@ class Aura_Worker_Elementor_Door {
 		}
 		// Admission: the row is the reservation. Count, back out above the bound.
 		if ( Aura_Worker_Door_Log::count_unacked() > Aura_Worker_Door_Log::MAX_UNACKED ) {
-			Aura_Worker_Door_Log::discard( $seq );
+			// close() BEFORE discard() (Codex round-11 P2): the discard makes
+			// this row terminal and therefore visible to a poll, and the ack
+			// that consumes it must already see FULL_MARKER — an ack that
+			// deletes the row while the log still looks open never runs its
+			// reopen check, and the marker installed after it would shut the
+			// door for ever with nothing left to ack.
 			Aura_Worker_Door_Log::close();
+			Aura_Worker_Door_Log::discard( $seq );
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}

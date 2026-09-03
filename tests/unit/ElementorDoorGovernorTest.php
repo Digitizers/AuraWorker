@@ -222,13 +222,18 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( 1, Aura_Worker_Door_Log::full_report()['refused'] );
 	}
 
-	public function test_at_the_bound_the_request_backs_out_settling_discarded_and_closes(): void {
-		$this->registerAll();
-		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+	/** MAX_UNACKED terminal rows, so the very next entry overflows the bound. */
+	private function fillTheLog(): void {
 		for ( $i = 1; $i <= Aura_Worker_Door_Log::MAX_UNACKED; $i++ ) {
 			$GLOBALS['_options'][ 'aura_worker_door_log_' . $i ] = array( 'seq' => $i, 'result' => 'ok', 'admitted' => true );
 			$GLOBALS['_rows'][ 'aura_worker_door_log_' . $i ]    = maybe_serialize( $GLOBALS['_options'][ 'aura_worker_door_log_' . $i ] );
 		}
+	}
+
+	public function test_at_the_bound_the_request_backs_out_settling_discarded_and_closes(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$this->fillTheLog();
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
 		$this->assertSame( 'aura_log_full', $out->get_error_code() );
 		$row = Aura_Worker_Door_Log::get( Aura_Worker_Door_Log::MAX_UNACKED + 1 );
@@ -236,6 +241,107 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertTrue( $row['admitted'], 'and admitted, so log_after serves past it' );
 		$this->assertTrue( Aura_Worker_Door_Log::is_closed() );
 		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
+	}
+
+	/**
+	 * Ruling P31: the closure marker is installed BEFORE the overflow row is
+	 * settled — at every overflow site.
+	 *
+	 * The discard is what makes that row terminal, and a terminal row is
+	 * served to the next `/status` poll. Settling it first opened a window in
+	 * which a concurrent ack could consume the row while the log still looked
+	 * OPEN — see the test below for what that costs.
+	 */
+	public function test_the_closure_marker_is_installed_before_the_overflow_row_is_settled(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$this->fillTheLog();
+		$seq                    = Aura_Worker_Door_Log::MAX_UNACKED + 1;
+		$GLOBALS['_db_queries'] = array();
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_log_full', $out->get_error_code() );
+		$marker  = -1;
+		$discard = -1;
+		foreach ( $GLOBALS['_db_queries'] as $i => $query ) {
+			if ( -1 === $marker && false !== strpos( (string) $query, Aura_Worker_Door_Log::FULL_MARKER ) ) {
+				$marker = $i;
+			}
+			if ( -1 === $discard && false !== strpos( (string) $query, "'aura_worker_door_log_{$seq}'" ) && false !== strpos( (string) $query, 'discarded' ) ) {
+				$discard = $i;
+			}
+		}
+		$this->assertGreaterThan( -1, $marker, 'the closure marker was installed' );
+		$this->assertGreaterThan( -1, $discard, 'and the overflow row was settled discarded' );
+		$this->assertLessThan( $discard, $marker, 'in that order: an ack that consumes the row must already see the marker' );
+	}
+
+	/**
+	 * The consequence, driven for real: a poll consumes the overflow row and
+	 * acks it the instant it turns terminal.
+	 *
+	 * Settled first, the ack observed an OPEN log, so its reopen check never
+	 * ran — and the marker the writer installed a moment later shut the door
+	 * with the acknowledged row already deleted. Nothing could create another
+	 * entry, so nothing could ever trigger another ack: closed for ever, on a
+	 * log holding zero unacked rows.
+	 */
+	public function test_an_ack_racing_the_overflow_row_still_reopens_the_log(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$this->fillTheLog();
+		$epoch  = Aura_Worker_Door_Log::epoch();
+		$seq    = Aura_Worker_Door_Log::MAX_UNACKED + 1;
+		$racing = false;
+		// Aura's poll + ack, landing the moment the overflow row becomes
+		// terminal — the CAS that settles it has just been applied.
+		$GLOBALS['_sa_after_swap'] = static function ( $name ) use ( $epoch, $seq, &$racing ) {
+			if ( 'aura_worker_door_log_' . $seq !== (string) $name ) {
+				return;
+			}
+			$racing = true;
+			Aura_Worker_Door_Log::ack( $epoch, $seq );
+		};
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_log_full', $out->get_error_code() );
+		$this->assertTrue( $racing, 'the ack really did land on the overflow row' );
+		$this->assertNull( Aura_Worker_Door_Log::get( $seq ), 'which deleted it' );
+		$this->assertSame( 0, Aura_Worker_Door_Log::count_unacked(), 'nothing is unacked any more' );
+		$this->assertFalse( Aura_Worker_Door_Log::is_closed(), 'so the ack saw the marker and its reopen check ran' );
+	}
+
+	/**
+	 * The same order at the SECOND overflow site: record_terminal_only(),
+	 * which is where a HELD call's entry is written. The rule is about the
+	 * reservation, not the line.
+	 */
+	public function test_the_closure_marker_precedes_the_overflow_row_for_a_held_entry_too(): void {
+		$this->registerAll();
+		$this->installRuleset( array() ); // no rule: the call is HELD, not run
+		$this->fillTheLog();
+		$seq                    = Aura_Worker_Door_Log::MAX_UNACKED + 1;
+		$GLOBALS['_db_queries'] = array();
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_held_for_approval', $out->get_error_code(), 'the hold stands; only its log entry overflowed' );
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed() );
+		$marker  = -1;
+		$discard = -1;
+		foreach ( $GLOBALS['_db_queries'] as $i => $query ) {
+			if ( -1 === $marker && false !== strpos( (string) $query, Aura_Worker_Door_Log::FULL_MARKER ) ) {
+				$marker = $i;
+			}
+			if ( -1 === $discard && false !== strpos( (string) $query, "'aura_worker_door_log_{$seq}'" ) && false !== strpos( (string) $query, 'discarded' ) ) {
+				$discard = $i;
+			}
+		}
+		$this->assertGreaterThan( -1, $marker );
+		$this->assertGreaterThan( -1, $discard );
+		$this->assertLessThan( $discard, $marker );
 	}
 
 	public function test_coverage_failure_closes_both_transports_reads_included(): void {
