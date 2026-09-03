@@ -904,6 +904,11 @@ final class UnbindCleanupTest extends TestCase {
 		Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), 1 ); // installs the floor
 		Aura_Worker_Door_Log::close();                                 // the full marker
 		Aura_Worker_Door_Log::bump_refused();                          // and its counter
+		// The binding's working state too (Ruling P44 follow-up): a fresh
+		// binding must inherit neither the creation mutex nor the retention
+		// throttle.
+		update_option( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 1, 'started_at' => gmdate( 'c' ) ) );
+		update_option( Aura_Worker_Elementor_Door::PRUNED_AT, gmdate( 'c' ) );
 		$bucket                       = 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS );
 		$GLOBALS['_options'][ $bucket ] = 4;
 		$GLOBALS['_rows'][ $bucket ]    = maybe_serialize( 4 );
@@ -948,7 +953,9 @@ final class UnbindCleanupTest extends TestCase {
 
 		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
 
-		$this->assertSame( array(), $this->doorRows(), 'no held, claimed, log, floor, marker, counter or epoch row survives' );
+		$this->assertSame( array(), $this->doorRows(), 'no held, claimed, log, floor, marker, counter, epoch, mutex or throttle row survives' );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the creation mutex is not inherited' );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::PRUNED_AT, false ), 'nor the retention throttle' );
 		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $door['held'] ) );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $door['claimed'] ) );

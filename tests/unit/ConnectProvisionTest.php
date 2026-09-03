@@ -414,4 +414,110 @@ final class ConnectProvisionTest extends TestCase {
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 1 ), 600 );
 		$this->assertSame( 200, $this->ml->handle_connect( $this->request() )->get_status() );
 	}
+
+	// -----------------------------------------------------------------------
+	// Ruling P44': the door survives a same-client reconnect, and only that
+	// -----------------------------------------------------------------------
+
+	/** A live previous binding: this site's token, its client, its dashboard. */
+	private function seedPreviousBinding( ?string $client = 'c1', string $dashboard = 'https://dash.example' ): void {
+		$hash = Aura_Worker_Security::hash_token( 'old-token' );
+		$GLOBALS['_options']['aura_worker_site_token'] = $hash;
+		$GLOBALS['_rows']['aura_worker_site_token']    = maybe_serialize( $hash );
+		update_option( 'aura_worker_dashboard_url', $dashboard );
+		if ( null !== $client ) {
+			Aura_Worker_Rules::bind( $client, $hash );
+		}
+	}
+
+	/** A hold and a settled log row belonging to that binding. */
+	private function seedDoorState(): string {
+		foreach ( array( 'class-aura-worker-door-log', 'class-aura-worker-door-holds', 'class-elementor-door-governor' ) as $f ) {
+			require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/' . $f . '.php';
+		}
+		$call = array(
+			'ability' => 'elementor/publish-document',
+			'input'   => array( 'post_id' => 7 ),
+			'touches' => array( array( 'type' => 'page', 'id' => '7' ) ),
+			'actor'   => array( 'user_id' => 3, 'login' => 'bot' ),
+			'verdict' => 'none',
+		);
+		$ref = Aura_Worker_Door_Holds::hold( $call );
+		$this->assertIsString( $ref );
+		$seq = Aura_Worker_Door_Log::open_pending( $call );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		return (string) $ref;
+	}
+
+	/**
+	 * A token ROTATION is not a new owner. The same site reconnecting to the
+	 * same client keeps its pending approvals and its unacked log — discarding
+	 * an operator's queue because their credentials were refreshed would be a
+	 * bug of its own.
+	 */
+	public function test_a_same_client_reconnect_keeps_the_doors_approvals(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref = $this->seedDoorState();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the approval survives a rotation' );
+		$this->assertSame( array( 1 ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ), 'and so does the unacked log' );
+		$this->assertTrue( Aura_Worker_Elementor_Door::present() );
+	}
+
+	/** A DIFFERENT client is a replacement: the departed client's queue goes. */
+	public function test_a_reconnect_under_a_different_client_wipes_the_door(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref = $this->seedDoorState();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
+		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
+		$this->assertFalse( Aura_Worker_Elementor_Door::present(), 'a fresh epoch for the new client' );
+	}
+
+	/** The same client on a DIFFERENT dashboard is a different binding too. */
+	public function test_a_reconnect_to_a_different_dashboard_wipes_the_door(): void {
+		$this->seedPreviousBinding( 'c1', 'https://old-dash.example' );
+		$ref = $this->seedDoorState();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
+	}
+
+	/**
+	 * A binding that cannot be PROVEN the same is treated as replaced: the old
+	 * side names no client (an older dashboard installed it, or the store is
+	 * unbound), so the comparison fails toward the wipe.
+	 */
+	public function test_a_reconnect_over_a_binding_with_no_client_line_wipes_the_door(): void {
+		$this->seedPreviousBinding( null, 'https://dash.example' ); // nothing bound
+		$ref = $this->seedDoorState();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
+	}
+
+	/** And the NEW side naming no client is unprovable in the same way. */
+	public function test_a_reconnect_whose_callback_names_no_client_wipes_the_door(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref = $this->seedDoorState();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'dashboard_url' => 'https://dash.example' ) ) ); // no client line
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
+	}
 }

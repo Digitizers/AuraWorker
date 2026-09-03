@@ -482,6 +482,13 @@ class Aura_Worker_Magic_Link {
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
 		}
+		// WHO THIS SITE IS BOUND TO RIGHT NOW — read BEFORE the token write
+		// below, because bound_client() proves the stored record against the
+		// site's CURRENT token and the write about to happen would make the old
+		// record read as stale. Used only to decide whether the Elementor
+		// door's queue survives this connect (Ruling P44').
+		$prev_client    = class_exists( 'Aura_Worker_Rules' ) ? (string) Aura_Worker_Rules::bound_client() : '';
+		$prev_dashboard = (string) get_option( 'aura_worker_dashboard_url', '' );
 		$token_hash = Aura_Worker_Security::hash_token( $token );
 		// The token is the ONE write whose loss the dashboard cannot see: a
 		// handler resuming after its claim was released could otherwise
@@ -521,11 +528,32 @@ class Aura_Worker_Magic_Link {
 		// be served the old client's queue through `/status` and could approve
 		// one through `elementor_replay_ability`.
 		//
+		// ONLY WHEN THE BINDING CHANGES (Ruling P44'). A token rotation — the
+		// same site reconnecting to the same client — is not a new owner, and
+		// discarding that operator's pending approvals and unacked log because
+		// their credentials were refreshed would be a bug of its own. The
+		// binding is the pair (client id, dashboard URL): the signed `client`
+		// line this callback carries, against the client the ruleset store is
+		// bound to, and the new dashboard URL against the stored one.
+		//
+		// The comparison FAILS TOWARD THE WIPE. Either side missing a client
+		// line (an older dashboard, an unbound or unreadable store, a record
+		// whose token no longer matches) is a binding that cannot be PROVEN the
+		// same, and an unprovable binding is treated as replaced — the safe
+		// direction is always the departed client's approvals not surviving.
+		// An unbind still wipes unconditionally; this condition is the
+		// connect's alone.
+		//
 		// Here, not before the token write: until that write lands the old
 		// binding is still live, and a connect that fails afterwards must not
 		// have emptied a queue that still belongs to somebody. Fenced on the
 		// same claim as every other write in this handler.
-		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+		$same_binding = '' !== $prev_client
+			&& '' !== $client
+			&& hash_equals( $prev_client, $client )
+			&& '' !== $prev_dashboard
+			&& $prev_dashboard === $dashboard_url;
+		if ( ! $same_binding && class_exists( 'Aura_Worker_Elementor_Door' ) ) {
 			Aura_Worker_Elementor_Door::wipe_for_unbind( $site_claim_key, $site_fence );
 		}
 		// The token is stored, so the credential minted beside the PREVIOUS one

@@ -270,6 +270,9 @@ class Aura_Worker_Elementor_Door {
 	 * therefore false afterwards, and `/status` carries no `door` fragment
 	 * until this site is governed again.
 	 *
+	 * The creation mutex and the retention throttle go too: working state of
+	 * the binding that is leaving, not history of the site.
+	 *
 	 * KEPT: the snapshot envelopes and the 30-day counter buckets — this
 	 * SITE's content and audit history, neither of them the binding's
 	 * transaction state.
@@ -280,6 +283,19 @@ class Aura_Worker_Elementor_Door {
 	 */
 	public static function wipe_for_unbind( $claim, $fence ) {
 		Aura_Worker_Door_Holds::wipe( $claim, $fence ); // takes the hold lock, and empties the log inside it
+		// The creation mutex and the retention throttle are this binding's
+		// working state too, and a fresh binding should inherit neither: an
+		// inherited mutex would refuse the new client's first creation until
+		// the reconciler cleared it, and an inherited throttle would skip its
+		// first prune. The mutex is fenced BY VALUE everywhere it is released,
+		// so deleting it here cannot disturb a creation that is still running —
+		// that request's own release simply matches no row, which is already
+		// how it behaves when the reconciler clears a stale one.
+		foreach ( array( self::CREATING, self::PRUNED_AT ) as $option ) {
+			Aura_Worker_Rules::delete_option_if_claimed( $option, $claim, $fence );
+			wp_cache_delete( $option, 'options' );
+		}
+		wp_cache_delete( 'notoptions', 'options' );
 	}
 
 	/**
