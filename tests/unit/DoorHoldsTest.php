@@ -295,6 +295,53 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/* ------------------------------------------------------------------ */
+	/* An expired hold is not held (Ruling P18)                            */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * listing() hides an expired hold and sweep() deletes it — but both run
+	 * on a `/status` poll, and an unpolled site can sit past a hold's seven
+	 * days with the row still there. A ref an approver kept must not still
+	 * execute (Ruling P18).
+	 */
+	public function test_get_held_answers_null_for_an_expired_row_and_removes_it(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->patchRow( 'aura_worker_door_held_' . $ref, array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'and it is gone, exactly as the sweep would have left it' );
+	}
+
+	public function test_get_held_leaves_an_expired_row_whose_claimed_twin_is_in_flight(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Holds::claim( $ref );
+		$this->reseedHeldTwin( $ref );
+		$this->patchRow( 'aura_worker_door_held_' . $ref, array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'the claim owns this ref; the sweep decides that row, not a reader' );
+	}
+
+	public function test_claim_refuses_an_expired_row_and_creates_no_twin(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->patchRow( 'aura_worker_door_held_' . $ref, array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+
+		$out = Aura_Worker_Door_Holds::claim( $ref );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'not_held', $out->get_error_code() );
+		$this->assertArrayNotHasKey( 'aura_worker_door_claimed_' . $ref, $GLOBALS['_rows'], 'nothing was claimed' );
+	}
+
+	public function test_a_hold_that_expires_a_second_from_now_is_still_held(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->patchRow( 'aura_worker_door_held_' . $ref, array( 'expires_at' => gmdate( 'c', time() + 1 ) ) );
+
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+	}
+
+	/* ------------------------------------------------------------------ */
 	/* Helpers                                                             */
 	/* ------------------------------------------------------------------ */
 

@@ -157,10 +157,54 @@ class Aura_Worker_Door_Holds {
 		);
 	}
 
-	/** @param string $ref Ref. @return array|null */
+	/**
+	 * Has this hold's seven days run out?
+	 *
+	 * The SAME expression listing() and sweep() judge by, so the three cannot
+	 * disagree about one row — including about a row whose `expires_at` is
+	 * missing or unreadable, which all three read as expired: a hold that
+	 * cannot say when it ends is not evidence that it has not.
+	 *
+	 * @param array $row Held row.
+	 * @param int   $now Unix time.
+	 * @return bool
+	 */
+	private static function is_expired( array $row, $now ) {
+		return strtotime( (string) ( isset( $row['expires_at'] ) ? $row['expires_at'] : '' ) ) <= (int) $now;
+	}
+
+	/**
+	 * The held row for this ref, or null — and an EXPIRED row is not held
+	 * (Ruling P18).
+	 *
+	 * listing() hides an expired hold and sweep() deletes it, but both run
+	 * from a `/status` poll: on a site that has not been polled since the
+	 * hold's seven days ran out, the row is still there, and a reader that
+	 * returned it let an approval using a previously retained ref execute a
+	 * mutation after the hold had ostensibly expired.
+	 *
+	 * The row is deleted here the way sweep() would — but only when it has NO
+	 * claimed twin. A claimed twin means a replay owns this ref and its own
+	 * delete is still coming; deleting the held row underneath it is exactly
+	 * the race sweep() refuses to enter (round-9), and a reader has even less
+	 * business entering it.
+	 *
+	 * @param string $ref Ref.
+	 * @return array|null
+	 */
 	public static function get_held( $ref ) {
-		$row = get_option( self::HELD . self::clean( $ref ), null );
-		return is_array( $row ) ? $row : null;
+		$ref = self::clean( $ref );
+		$row = get_option( self::HELD . $ref, null );
+		if ( ! is_array( $row ) ) {
+			return null;
+		}
+		if ( self::is_expired( $row, time() ) ) {
+			if ( null === self::get_claimed( $ref ) ) {
+				delete_option( self::HELD . $ref );
+			}
+			return null;
+		}
+		return $row;
 	}
 
 	/** @param string $ref Ref. @return array|null */
@@ -202,6 +246,14 @@ class Aura_Worker_Door_Holds {
 		$ref  = self::clean( $ref );
 		$held = self::from_db( self::HELD . $ref );
 		if ( null === $held ) {
+			return self::not_held();
+		}
+		if ( self::is_expired( $held, time() ) ) {
+			// Refused BEFORE the twin is inserted (Ruling P18): claiming an
+			// expired hold would move it out of reach of the sweep and hand
+			// the caller a row to execute. The row is left alone — the sweep
+			// owns its deletion, and get_held() has already answered null to
+			// anyone who asked.
 			return self::not_held();
 		}
 		$claimed               = $held;

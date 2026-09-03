@@ -665,6 +665,42 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 'aura_target_unattributed', $log[1]['code'] );
 	}
 
+	/**
+	 * The approval arrives after the hold's seven days, on a site whose
+	 * `/status` never ran to sweep it (Ruling P18).
+	 */
+	public function test_an_expired_hold_is_not_replayed(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref  = $this->holdCall();
+		$name = 'aura_worker_door_held_' . $ref;
+		$row  = array_merge( (array) $GLOBALS['_options'][ $name ], array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'not_held', $out['reason'] );
+		$this->assertSame( array(), $this->ran, 'an expired approval executes nothing' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and nothing was claimed' );
+	}
+
+	public function test_a_hold_a_second_from_expiry_still_replays(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref  = $this->holdCall();
+		$name = 'aura_worker_door_held_' . $ref;
+		$row  = array_merge( (array) $GLOBALS['_options'][ $name ], array( 'expires_at' => gmdate( 'c', time() + 1 ) ) );
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertTrue( $out['ok'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+	}
+
 	// -----------------------------------------------------------------------
 	// The `ran` witness
 	// -----------------------------------------------------------------------
