@@ -151,6 +151,22 @@ final class ElementorReplayTest extends TestCase {
 		}
 	}
 
+	/**
+	 * The held row as it comes back from an unclaim, minus the `restored_at`
+	 * stamp unclaim() adds (Ruling P41) — so a test can still say "everything
+	 * the hold carried is back" without pinning byte-identity the sweep now
+	 * depends on NOT holding.
+	 */
+	private function holdWithoutRestoreStamp( string $ref ): ?array {
+		$row = Aura_Worker_Door_Holds::get_held( $ref );
+		if ( ! is_array( $row ) ) {
+			return null;
+		}
+		$this->assertArrayHasKey( 'restored_at', $row, 'an unclaimed hold says so' );
+		unset( $row['restored_at'] );
+		return $row;
+	}
+
 	/** A warn rule on page 7. */
 	private function warnRule( string $reason = 'careful' ): array {
 		return array(
@@ -588,7 +604,7 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertStringContainsString( 'disk full', $out['error'] );
 		$this->assertArrayNotHasKey( 'claim_retained', $out );
 		$this->assertSame( array(), $this->ran, 'the write never happened' );
-		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is back, byte for byte' );
+		$this->assertSame( $before, $this->holdWithoutRestoreStamp( $ref ), 'the hold is back, field for field' );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
 		$log = Aura_Worker_Door_Log::log_after( 0 );
 		$this->assertSame( 'refused', $log[1]['result'] );
@@ -635,7 +651,7 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 'retry_later', $out['reason'], 'the approval is not spent on a call that never ran' );
 		$this->assertSame( 'aura_log_failed', $out['code'] );
 		$this->assertSame( array(), $this->ran, 'the write never happened' );
-		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is back, byte for byte' );
+		$this->assertSame( $before, $this->holdWithoutRestoreStamp( $ref ), 'the hold is back, field for field' );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
 		$log = Aura_Worker_Door_Log::log_after( 0 );
 		$this->assertSame( 'refused', $log[1]['result'] );
@@ -655,6 +671,82 @@ final class ElementorReplayTest extends TestCase {
 		$second = Aura_Worker_Elementor_Door::replay( $ref, null );
 		$this->assertTrue( $second['ok'] );
 		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+	}
+
+	/**
+	 * Ruling P41, end to end: a `/status` sweep landing inside the unclaim of
+	 * a replay that outran CLAIM_STALE_MS must not cost the approval.
+	 *
+	 * The sweep used to delete the hold this unclaim had just restored, and
+	 * give_back() — which judged only by the CLAIMED row — still answered
+	 * `retry_later`. Aura retried a ref that was held by nothing.
+	 */
+	public function test_a_sweep_inside_the_unclaim_of_a_long_running_replay_keeps_the_approval(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array( 'success' => false, 'error' => 'disk full' );
+			}
+		);
+		// This replay is still running past the stale bound when it gives up,
+		// and a poll arrives between unclaim()'s held INSERT and its claimed
+		// DELETE.
+		$GLOBALS['_sa_after_insert_unique'][ Aura_Worker_Door_Holds::HELD . $ref ] = static function () use ( $ref ) {
+			$row = get_option( Aura_Worker_Door_Holds::CLAIMED . $ref, array() );
+			$row['claimed_at'] = gmdate( 'c', time() - 3600 );
+			$GLOBALS['_options'][ Aura_Worker_Door_Holds::CLAIMED . $ref ] = $row;
+			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::CLAIMED . $ref ]    = maybe_serialize( $row );
+			Aura_Worker_Door_Holds::sweep( time(), Aura_Worker_Elementor_Door::CLAIM_STALE_MS );
+		};
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertArrayNotHasKey( 'claim_retained', $out, 'the hold IS back, so nothing is retained' );
+		$this->assertSame( array(), $this->ran );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'and `retry_later` is true: the ref is held again' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+
+		// …and the same approval still works.
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array( 'success' => true, 'snapshot' => array( 'id' => 'snap_test' ) );
+			}
+		);
+		$this->assertTrue( Aura_Worker_Elementor_Door::replay( $ref, null )['ok'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+	}
+
+	/**
+	 * The give_back() half on its own: an unclaim whose CLAIMED row vanished
+	 * entirely (a release racing it) leaves nothing held — and that IS the
+	 * approval lost, whatever the claimed row says. Judged by the claimed row
+	 * alone, this answered a bare `retry_later` (Ruling P41).
+	 */
+	public function test_an_unclaim_that_restores_nothing_says_the_approval_is_spent(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array( 'success' => false, 'error' => 'disk full' );
+			}
+		);
+		// Both rows are taken out from under the replay before it gives up.
+		$GLOBALS['_sa_before_swap'] = static function () use ( $ref ) {
+			if ( null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
+				Aura_Worker_Door_Holds::release( $ref );
+			}
+		};
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertTrue( $out['claim_retained'], 'nothing is held, so Aura must not expect a second approval' );
 	}
 
 	public function test_a_move_back_that_cannot_insert_keeps_the_claimed_row_and_says_so(): void {
@@ -744,7 +836,7 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 'retry_later', $out['reason'] );
 		$this->assertSame( 'aura_log_full', $out['code'] );
 		$this->assertSame( array(), $this->ran );
-		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertSame( $before, $this->holdWithoutRestoreStamp( $ref ) );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
 	}
 

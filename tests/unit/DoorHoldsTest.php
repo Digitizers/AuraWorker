@@ -182,7 +182,11 @@ final class DoorHoldsTest extends TestCase {
 
 		$this->assertTrue( Aura_Worker_Door_Holds::unclaim( $ref ) );
 
-		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ), 'the row that comes back is the row that was held' );
+		$back = Aura_Worker_Door_Holds::get_held( $ref );
+		$this->assertIsArray( $back );
+		$this->assertArrayHasKey( 'restored_at', $back, 'the row says an unclaim put it back (Ruling P41)' );
+		unset( $back['restored_at'] );
+		$this->assertSame( $before, $back, 'everything else is the row that was held' );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and the twin is gone' );
 		$this->assertSame( 1, Aura_Worker_Door_Holds::count() );
 		// The approval was not spent: the ref can be claimed again.
@@ -279,6 +283,58 @@ final class DoorHoldsTest extends TestCase {
 
 		$this->assertSame( 0, $gone );
 		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'a fresh claim is a replay mid-move; its own delete is still coming' );
+		$this->assertArrayHasKey( 'aura_worker_door_claimed_' . $ref, $GLOBALS['_rows'] );
+	}
+
+	/**
+	 * Ruling P41: a sweep that meets an unclaim mid-move FINISHES it.
+	 *
+	 * unclaim() inserts the held row and only then deletes the claimed twin.
+	 * A replay still going past CLAIM_STALE_MS makes that twin look stale, so
+	 * a concurrent `/status` sweep saw the transient pair, applied claim()'s
+	 * rule and deleted the hold that had just been restored. unclaim()'s own
+	 * delete then succeeded, give_back() answered `retry_later` — and the ref
+	 * was held by nothing at all. The operator's approval was gone.
+	 */
+	public function test_a_sweep_racing_an_unclaim_finishes_the_move_instead_of_deleting_the_hold(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Holds::claim( $ref );
+		// The replay is still running well past the stale bound.
+		$this->backdateClaim( $ref, self::CLAIM_STALE_MS_S + 60 );
+		$swept = null;
+		// The window: the sweep lands after unclaim()'s held INSERT and before
+		// its claimed DELETE.
+		$GLOBALS['_sa_after_insert_unique'][ Aura_Worker_Door_Holds::HELD . $ref ] = static function () use ( &$swept ) {
+			$swept = Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS );
+		};
+
+		$restored = Aura_Worker_Door_Holds::unclaim( $ref );
+
+		$this->assertSame( 0, $swept, 'nothing was swept — a move was finished' );
+		$this->assertFalse( $restored, 'unclaim reports what it can see: the sweep had already deleted its twin' );
+		$held = Aura_Worker_Door_Holds::get_held( $ref );
+		$this->assertIsArray( $held, 'and the hold is BACK, which is what a retry depends on' );
+		$this->assertArrayHasKey( 'restored_at', $held );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row is gone, deleted by whichever side got there first' );
+		// The approval was not spent: the ref can be claimed again.
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+	}
+
+	/**
+	 * The other half of that comparison: a held row restored BEFORE the claim
+	 * beside it is claim()'s move, not an unclaim's, so today's rule stands.
+	 */
+	public function test_a_stale_claim_taken_after_a_restore_still_sweeps_the_held_row(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Holds::claim( $ref );
+		$this->assertTrue( Aura_Worker_Door_Holds::unclaim( $ref ) ); // stamps restored_at
+		Aura_Worker_Door_Holds::claim( $ref );                        // …and it is claimed again
+		$this->reseedHeldTwin( $ref );                                // claim()'s own window
+		$this->patchRow( 'aura_worker_door_held_' . $ref, array( 'restored_at' => gmdate( 'c', time() - 3600 ) ) );
+		$this->backdateClaim( $ref, self::CLAIM_STALE_MS_S + 60 );
+
+		$this->assertSame( 1, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ), 'the restore is older than the claim: this is claim()\'s move' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'] );
 		$this->assertArrayHasKey( 'aura_worker_door_claimed_' . $ref, $GLOBALS['_rows'] );
 	}
 

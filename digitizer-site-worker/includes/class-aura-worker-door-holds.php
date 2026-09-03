@@ -354,8 +354,18 @@ class Aura_Worker_Door_Holds {
 	 * first (a real conditional INSERT — a held row already there means
 	 * somebody else owns this ref now, and the claimed row stays put), then
 	 * DELETE the claimed twin and require exactly one row. `claimed_at` and
-	 * `terminal_seq` are dropped, so what comes back is byte-identical to the
-	 * row the hold was stored as.
+	 * `terminal_seq` are dropped.
+	 *
+	 * The restored row carries `restored_at` and is therefore NOT
+	 * byte-identical to the row the hold was originally stored as (Ruling
+	 * P41). Nothing depends on that identity: every reader takes the row as it
+	 * finds it, and every writer that fences does so on the bytes it has just
+	 * read — claim() copies the CURRENT held row into its twin and deletes the
+	 * held row BY NAME, not by value; refresh_rule(), refresh_touches(),
+	 * note_unlogged() and stamp_terminal_seq() all read with from_db() and
+	 * compare-and-swap on that. What `restored_at` buys is the one thing the
+	 * sweep could not otherwise know: WHICH move is in flight when it meets a
+	 * held row and a claimed twin together — see sweep().
 	 *
 	 * The lost-delete case does NOT back the insert out, which is where this
 	 * differs from claim(): claim() backs out because a held row deleted
@@ -376,6 +386,10 @@ class Aura_Worker_Door_Holds {
 		}
 		$held = $claimed;
 		unset( $held['claimed_at'], $held['terminal_seq'] );
+		// The witness the sweep reads to tell this move from claim()'s
+		// (Ruling P41). Stamped BEFORE the insert, so a row that exists always
+		// carries it.
+		$held['restored_at'] = gmdate( 'c' );
 		if ( ! Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $held ) ) {
 			return false; // a held row is already there — the claimed row stands
 		}
@@ -492,6 +506,21 @@ class Aura_Worker_Door_Holds {
 				if ( false !== $at && $at > $cut ) {
 					continue; // a replay mid-move: its own delete is still coming
 				}
+				// A stale claim beside a held row is a move that stopped
+				// halfway, and there are TWO moves it could be (Ruling P41).
+				// claim() inserts the claimed row then deletes the held one;
+				// unclaim() inserts the held row then deletes the claimed one.
+				// Assuming the first deleted the hold a replay was in the
+				// middle of RESTORING: the sweep removed the hold, unclaim()'s
+				// own claimed delete then succeeded, give_back() answered
+				// `retry_later` — and the ref was held by nothing. The
+				// operator's approval was gone.
+				//
+				// `restored_at` says which. Finish the unclaim instead, and do
+				// not count it: nothing was swept, a move was completed.
+				if ( self::finish_unclaim_in_flight( $ref, $row, $at ) ) {
+					continue;
+				}
 				delete_option( self::HELD . $ref ); // the replay's own delete, retried
 				$gone++;
 				continue;
@@ -502,6 +531,54 @@ class Aura_Worker_Door_Holds {
 			}
 		}
 		return $gone;
+	}
+
+	/**
+	 * Is the move in flight an UNCLAIM, and if so, finish it (Ruling P41).
+	 *
+	 * The held row wins the comparison when it is the YOUNGER of the pair: a
+	 * `restored_at` at or after the twin's `claimed_at` means the hold was put
+	 * back after that claim was taken, so what is unfinished is the claimed
+	 * row's deletion. A `claimed_at` that cannot be read is not evidence of
+	 * anything, so a present `restored_at` decides — the same reading the
+	 * freshness check above gives an unstamped claim.
+	 *
+	 * A held row with no `restored_at` was never restored by an unclaim, so
+	 * the move can only be claim()'s and the caller's original rule stands.
+	 *
+	 * The delete is FENCED on the exact bytes read a statement earlier, like
+	 * every other conditional delete in this class: a claimed row a racer
+	 * replaced in between is a different row and must not be removed by this
+	 * one. The held row is never touched here.
+	 *
+	 * @param string $ref        Ref.
+	 * @param array  $held       The held row, as the sweep read it.
+	 * @param int|false $claimed_at The twin's `claimed_at`, or false when unreadable.
+	 * @return bool The move was an unclaim (finished, or already finished).
+	 */
+	private static function finish_unclaim_in_flight( $ref, array $held, $claimed_at ) {
+		$restored = strtotime( (string) ( isset( $held['restored_at'] ) ? $held['restored_at'] : '' ) );
+		if ( false === $restored ) {
+			return false; // no unclaim ever restored this row: it is claim()'s move
+		}
+		if ( false !== $claimed_at && $restored < $claimed_at ) {
+			return false; // restored BEFORE this claim was taken: the claim is the later move
+		}
+		$bytes = self::raw_bytes( self::CLAIMED . $ref );
+		if ( null === $bytes ) {
+			return true; // the unclaim's own delete already landed
+		}
+		global $wpdb;
+		$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+				self::CLAIMED . $ref,
+				$bytes
+			)
+		);
+		wp_cache_delete( self::CLAIMED . $ref, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return true;
 	}
 
 	/**

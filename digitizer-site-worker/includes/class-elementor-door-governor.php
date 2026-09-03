@@ -2196,12 +2196,20 @@ class Aura_Worker_Elementor_Door {
 			'code'   => $code,
 			'error'  => $message,
 		);
-		if ( ! Aura_Worker_Door_Holds::unclaim( $ref ) && null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
-			// The hold could not be put back and the claimed row still stands:
-			// it is the only record of this attempt, and the reconciler owns
-			// it from here. Say so — Aura must not expect this ref to answer a
-			// second approval.
-			$out['claim_retained'] = true;
+		if ( ! Aura_Worker_Door_Holds::unclaim( $ref ) ) {
+			// unclaim() answering false is not by itself the approval being
+			// lost (Ruling P41). It reports what it could SEE — and a `/status`
+			// sweep that finished this very move's claimed delete a moment
+			// earlier makes it answer false while the hold is demonstrably
+			// back. The truth about a retry is whether the ref is HELD again.
+			//
+			// So the flag goes up when the hold is NOT back, or when the
+			// claimed row still stands — it is then the only record of this
+			// attempt and the reconciler owns it from here. Either way Aura
+			// must not expect this ref to answer a second approval.
+			if ( null === Aura_Worker_Door_Holds::get_held( $ref ) || null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
+				$out['claim_retained'] = true;
+			}
 		}
 		return $out;
 	}
