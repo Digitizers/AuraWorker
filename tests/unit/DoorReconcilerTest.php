@@ -475,10 +475,32 @@ final class DoorReconcilerTest extends TestCase {
 
 		$this->assertNotSame( $before, $frag['epoch'], 'a new epoch, so Aura re-fetches from 0' );
 		$this->assertSame( Aura_Worker_Door_Log::epoch(), $frag['epoch'] );
-		$this->assertSame( 0, $frag['log_floor'] );
+		$this->assertSame( 0, $frag['log_floor'], 'nothing was ever acked here, so the retained floor is still 0' );
 		$this->assertFalse( get_option( Aura_Worker_Door_Log::FULL_MARKER, false ) );
 		$this->assertFalse( get_option( Aura_Worker_Door_Log::FULL_COUNTER, false ) );
 		$this->assertSame( array( 1 ), array_column( $frag['log'], 'seq' ), 'the rewound rows are re-served from 0' );
+	}
+
+	public function test_a_rotation_on_a_site_that_has_acked_keeps_the_floor_and_goes_on_serving(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		for ( $i = 1; $i <= 3; $i++ ) {
+			$seq = $this->entry( array(), true, false );
+			Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		}
+		Aura_Worker_Door_Log::ack( $epoch, 2 ); // rows 1 and 2 deleted, floor 2
+
+		$rotated = $this->fragment( 9, $epoch ); // a cursor above every row: the log rotates
+
+		$this->assertNotSame( $epoch, $rotated['epoch'] );
+		$new = $rotated['epoch'];
+
+		$frag = $this->fragment( 0, $new );
+		$this->assertSame( 2, $frag['log_floor'], 'the ack floor survived the rotation' );
+		$this->assertSame( array( 3 ), array_column( $frag['log'], 'seq' ), 'row 3 is served — the deleted 1 and 2 are below the floor, not a hole' );
+
+		$fourth = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $fourth, array( 'result' => 'ok' ) );
+		$this->assertSame( array( 3, 4 ), array_column( $this->fragment( 0, $new )['log'], 'seq' ), 'the log did not wedge' );
 	}
 
 	public function test_a_cursor_above_the_floor_but_at_an_existing_row_does_not_rotate(): void {

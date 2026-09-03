@@ -309,6 +309,21 @@ class Aura_Worker_Door_Log {
 	 * Aura committed everything up to $seq: raise the floor (upward only,
 	 * BEFORE the delete), delete the rows, reopen if under the bound.
 	 *
+	 * $seq is CLAMPED to the top of the log — the highest seq that exists,
+	 * or the floor when the ack emptied it, which is exactly the ceiling
+	 * open_pending() allocates above. An ack is a caller's assertion about
+	 * numbers this site issued, and a nonsense one (PHP_INT_MAX, a cursor
+	 * from a different site) must not become the site's own floor: the next
+	 * open_pending() would compute PHP_INT_MAX + 1 as a FLOAT, mint option
+	 * names like `aura_worker_door_log_9.2233720368548E+18` that the row
+	 * REGEXP never matches again, and the log would never allocate a
+	 * readable number afterwards.
+	 *
+	 * The purge is bounded by the FLOOR the raise settled on, never by $seq:
+	 * a stale ack below a floor that is already higher would otherwise leave
+	 * the rows in `($seq, $floor]` behind — under the floor, so never served,
+	 * never acked and never deleted.
+	 *
 	 * @param string $epoch The epoch Aura is acking.
 	 * @param int    $seq   Highest seq of its contiguous committed prefix.
 	 * @return array{ acked: int, floor: int }
@@ -317,6 +332,13 @@ class Aura_Worker_Door_Log {
 		global $wpdb;
 		$seq = (int) $seq;
 		if ( ! is_string( $epoch ) || $epoch !== self::epoch() ) {
+			return array( 'acked' => 0, 'floor' => self::floor() );
+		}
+		$top = max( self::highest_row_seq(), self::floor() );
+		if ( $seq > $top ) {
+			$seq = $top;
+		}
+		if ( $seq < 1 ) {
 			return array( 'acked' => 0, 'floor' => self::floor() );
 		}
 		// Floor: INSERT if absent, else raise only when lower. The floor as it
@@ -336,7 +358,7 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( self::FLOOR, 'options' );
 		$floor = self::floor();
 		$acked = 0;
-		if ( $seq <= $floor ) {
+		if ( $floor > 0 ) {
 			$prev_floor = $prev_floor_before_raise; // read BEFORE the raise, below
 			$like  = $wpdb->esc_like( self::PREFIX ) . '%';
 			$acked = (int) $wpdb->query(
@@ -345,10 +367,10 @@ class Aura_Worker_Door_Log {
 					$like,
 					self::ROW_REGEXP,
 					strlen( self::PREFIX ) + 1,
-					$seq
+					$floor
 				)
 			);
-			for ( $i = $prev_floor + 1; $i <= $seq; $i++ ) {
+			for ( $i = $prev_floor + 1; $i <= $floor; $i++ ) {
 				wp_cache_delete( self::PREFIX . $i, 'options' );
 			}
 		}
@@ -387,15 +409,22 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * Mints a new epoch, clears the floor and closure state, and leaves every
-	 * log row in place — the reconciler's recovery from an epoch mismatch it
-	 * cannot otherwise resolve (Task 9).
+	 * Mints a new epoch, clears the closure state, and leaves every log row
+	 * — and the ACK FLOOR — in place: the reconciler's recovery from an
+	 * epoch mismatch it cannot otherwise resolve (Task 9).
+	 *
+	 * The floor is RETAINED, and that is the whole of the rule. It is not
+	 * Aura's cursor, which the new epoch invalidates anyway; it is this
+	 * site's record of which numbers no longer have rows. Deleting it made
+	 * `log_after(0)` walk from 1 on any site that had ever acked, where it
+	 * met the first deleted number, read it as a hole, and stopped — for
+	 * ever. The log then served `[]` on every poll while `count_unacked()`
+	 * climbed to MAX_UNACKED and closed the door (Ruling P2').
 	 *
 	 * @return string The new epoch.
 	 */
 	public static function rotate_epoch() {
 		delete_option( self::EPOCH );
-		delete_option( self::FLOOR );
 		delete_option( self::FULL_MARKER );
 		delete_option( self::FULL_COUNTER );
 		return self::epoch();

@@ -145,7 +145,7 @@ final class DoorLogTest extends TestCase {
 		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
 	}
 
-	public function test_rotate_epoch_mints_a_new_epoch_clears_floor_and_closure_but_keeps_every_row(): void {
+	public function test_rotate_epoch_mints_a_new_epoch_clears_closure_and_keeps_the_floor_and_every_row(): void {
 		$before = Aura_Worker_Door_Log::epoch();
 		$seq    = Aura_Worker_Door_Log::open_pending( $this->entry() );
 		Aura_Worker_Door_Log::admit( $seq );
@@ -159,10 +159,60 @@ final class DoorLogTest extends TestCase {
 
 		$this->assertNotSame( $before, $after );
 		$this->assertSame( $after, Aura_Worker_Door_Log::epoch() );
-		$this->assertSame( 0, Aura_Worker_Door_Log::floor() );
+		$this->assertSame( 1, Aura_Worker_Door_Log::floor(), 'the ack floor is RETAINED — dropping it manufactures the hole log_after() stops at' );
 		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
 		$this->assertNull( Aura_Worker_Door_Log::full_report() );
 		$this->assertNotNull( Aura_Worker_Door_Log::get( $seq2 ), 'a row survives the rotation' );
+	}
+
+	public function test_a_rotation_after_an_ack_still_serves_the_rows_that_are_left(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		for ( $i = 1; $i <= 3; $i++ ) {
+			Aura_Worker_Door_Log::open_pending( $this->entry() );
+			Aura_Worker_Door_Log::admit( $i );
+			Aura_Worker_Door_Log::settle( $i, array( 'result' => 'ok' ) );
+		}
+		Aura_Worker_Door_Log::ack( $epoch, 2 ); // rows 1 and 2 are gone; the floor is 2
+
+		Aura_Worker_Door_Log::rotate_epoch();
+
+		$this->assertSame( 2, Aura_Worker_Door_Log::floor() );
+		$this->assertSame( array( 3 ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ), 'log_after() walks from the floor, so it never meets the hole the ack left' );
+	}
+
+	public function test_an_ack_above_every_row_is_clamped_to_the_top_of_the_log(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( 1 );
+		Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
+
+		$out = Aura_Worker_Door_Log::ack( $epoch, PHP_INT_MAX );
+
+		$this->assertSame( 1, $out['floor'], 'the floor never rises above a seq that exists' );
+		$this->assertSame( 1, $out['acked'] );
+		$this->assertSame( 2, Aura_Worker_Door_Log::open_pending( $this->entry() ), 'the next number is an integer, and its option name is parseable' );
+		$this->assertArrayHasKey( 'aura_worker_door_log_2', $GLOBALS['_options'] );
+	}
+
+	public function test_an_ack_below_the_floor_still_deletes_every_row_the_floor_covers(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		for ( $i = 1; $i <= 3; $i++ ) {
+			Aura_Worker_Door_Log::open_pending( $this->entry() );
+			Aura_Worker_Door_Log::admit( $i );
+			Aura_Worker_Door_Log::settle( $i, array( 'result' => 'ok' ) );
+		}
+		Aura_Worker_Door_Log::ack( $epoch, 3 );
+		// Rows 1..3 were deleted; re-seed one BELOW the floor, the shape a
+		// half-applied delete (or a restored backup) leaves behind.
+		$row = array( 'seq' => 2, 'result' => 'ok', 'admitted' => true, 'at' => gmdate( 'c' ) );
+		$GLOBALS['_options']['aura_worker_door_log_2'] = $row;
+		$GLOBALS['_rows']['aura_worker_door_log_2']    = maybe_serialize( $row );
+		unset( $GLOBALS['_notoptions']['aura_worker_door_log_2'] );
+
+		$out = Aura_Worker_Door_Log::ack( $epoch, 1 ); // a stale ack, below the floor
+
+		$this->assertSame( 3, $out['floor'], 'the floor only rises' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_log_2', $GLOBALS['_rows'], 'the purge is bounded by the FLOOR, so nothing under it is orphaned' );
 	}
 
 	public function test_patch_pending_writes_fields_onto_a_still_pending_row_without_touching_result(): void {
