@@ -193,6 +193,53 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertNotSame( 'legacy-gen', Aura_Worker_Door_Log::binding() );
 	}
 
+	/** The dashboard base URL a legacy (clientless) connect would leave behind. */
+	private function legacyConnect( string $dashboard ): void {
+		$GLOBALS['_options']['aura_worker_dashboard_url'] = $dashboard;
+		$GLOBALS['_rows']['aura_worker_dashboard_url']    = maybe_serialize( $dashboard );
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => $dashboard ) );
+	}
+
+	/**
+	 * Ruling P66 (F1): a clientless connect ALWAYS rotates.
+	 *
+	 * The legacy callback signs no `client` line, so the identity it states is
+	 * nothing but a dashboard base URL — and two distinct Aura customers
+	 * commonly share one. Equality on that answered "same binding", so
+	 * reconnecting the site to a DIFFERENT customer left the departed client's
+	 * generation current and its held mutations approvable by the replacement.
+	 */
+	public function test_a_second_clientless_connect_on_the_same_dashboard_rotates(): void {
+		$this->legacyConnect( 'https://dash.example' );
+		$first = Aura_Worker_Door_Log::binding();
+		$ref   = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'held under the first connect' );
+
+		$this->legacyConnect( 'https://dash.example' ); // the replacement customer, same dashboard
+
+		$this->assertNotSame( $first, Aura_Worker_Door_Log::binding(), 'an unprovable identity never equals' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the departed client\'s hold is foreign' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
+		$this->assertSame( 'not_held', Aura_Worker_Door_Holds::claim( $ref )->get_error_code() );
+	}
+
+	/**
+	 * …and a clientless site still serves its OWN queue between connects: the
+	 * record names no client, the live identity names none either, and the
+	 * dashboards match, so its rows are current.
+	 */
+	public function test_a_clientless_site_serves_its_own_queue_between_connects(): void {
+		$this->legacyConnect( 'https://dash.example' );
+
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertSame( array( $ref ), array_column( Aura_Worker_Door_Holds::listing(), 'ref' ) );
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count() );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+	}
+
 	/**
 	 * rotate_binding() mints a value nothing older can match — and is a NO-OP
 	 * when the record already names the identity being installed (Ruling P59).

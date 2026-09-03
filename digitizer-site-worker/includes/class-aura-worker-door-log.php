@@ -503,6 +503,53 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * Is a stated identity PROVABLE — i.e. does it name a client (Ruling P66)?
+	 *
+	 * The callback URL a legacy dashboard signs carries no `client` line, so
+	 * the identity such a connect states is nothing but a dashboard base URL —
+	 * and two distinct Aura customers routinely share one. Comparing those two
+	 * identities for equality answered "same binding" for what is in fact a
+	 * different customer's site: reconnecting with a new token left the old
+	 * generation current, and the replacement client could then see, approve
+	 * and replay the departed client's held mutations.
+	 *
+	 * A dashboard URL alone is not an identity. It cannot be proven the same,
+	 * so it is never treated as the same.
+	 *
+	 * @param string|null $client The record's or the target's client.
+	 * @return bool
+	 */
+	private static function identity_is_provable( $client ) {
+		return null !== $client && '' !== (string) $client;
+	}
+
+	/**
+	 * Does this RECORD still describe the identity the site is live under?
+	 *
+	 * The general rule is Ruling P66's: an unprovable identity never equals
+	 * another, so a rotation never short-circuits on one. THIS comparison
+	 * carries the one deliberate exception — a `bound` record naming no client
+	 * is current while the LIVE client is also absent and the dashboards match.
+	 *
+	 * Why the exception is safe, and wanted. Safe because a clientless connect
+	 * now always rotates, so the generation a row is stamped with is that
+	 * ONE connect's: a second clientless connect — the case the finding is
+	 * about — mints a new generation and the earlier connect's rows fail the
+	 * comparison before this predicate is ever reached. Wanted because without
+	 * it a clientless site's own queue would be foreign to itself the moment
+	 * it was written, and such a site could never serve a hold at all.
+	 *
+	 * @param string|null $rec_client    Record's client.
+	 * @param string|null $rec_dashboard Record's dashboard.
+	 * @param string|null $client        Live client.
+	 * @param string|null $dashboard     Live dashboard.
+	 * @return bool
+	 */
+	private static function identity_still_describes( $rec_client, $rec_dashboard, $client, $dashboard ) {
+		return $rec_client === $client && $rec_dashboard === $dashboard;
+	}
+
+	/**
 	 * `generation_is_live()` asked of the DATABASE, for the fences (Ruling
 	 * P64). A read it cannot trust answers false: the mutation does not run.
 	 *
@@ -520,7 +567,7 @@ class Aura_Worker_Door_Log {
 		if ( self::BINDING_UNSET === $f['state'] ) {
 			return true;
 		}
-		return $f['client'] === $f['live_client'] && $f['dashboard'] === $f['live_dashboard'];
+		return self::identity_still_describes( $f['client'], $f['dashboard'], $f['live_client'], $f['live_dashboard'] );
 	}
 
 	/**
@@ -550,7 +597,7 @@ class Aura_Worker_Door_Log {
 			return true;
 		}
 		$live = self::live_identity();
-		return $rec['client'] === $live['client'] && $rec['dashboard'] === $live['dashboard'];
+		return self::identity_still_describes( $rec['client'], $rec['dashboard'], $live['client'], $live['dashboard'] );
 	}
 
 	/**
@@ -616,10 +663,33 @@ class Aura_Worker_Door_Log {
 		// as equal to an unbind meant the unbind rotated nothing and callbacks
 		// waiting at the generation fence walked through after the site had
 		// been unbound. `unset` always rotates.
-		if ( null !== $rec ) {
+		//
+		// A CLIENTLESS CONNECT ALWAYS ROTATES (Ruling P66). The legacy connect
+		// callback signs no `client` line, so both sides of this comparison
+		// state nothing but a dashboard base URL — which two different Aura
+		// customers commonly share. Treating those as the same binding meant a
+		// site reconnected to a DIFFERENT customer on the same dashboard kept
+		// the departed client's generation current, and the replacement could
+		// receive and approve mutations that were never theirs. An identity
+		// that cannot be proven the same is not the same.
+		//
+		// THE COST, stated plainly: a legacy dashboard re-saving the same
+		// site's token rotates the generation every time, which retires that
+		// site's outstanding holds and moves its epoch even though nothing
+		// about the site changed. An unnecessary rotation costs a queue; a
+		// missed one hands one customer's writes to another.
+		//
+		// An UNBIND is exempt, and is the only exemption: `unbound` states
+		// nobody at all, which is fully determined and cannot be confused with
+		// another customer's claim on the same dashboard. Its idempotence is
+		// load-bearing — the unbind step is retried until every kind reports
+		// clean, and a second pass must not keep minting generations.
+		$provable = self::BINDING_UNBOUND === $target || self::identity_is_provable( $client );
+		if ( null !== $rec && $provable ) {
 			$state = self::normalise_binding( $rec );
 			if ( self::BINDING_UNSET !== $state['state']
 				&& $state['state'] === $target
+				&& ( self::BINDING_UNBOUND === $target || self::identity_is_provable( $state['client'] ) )
 				&& $state['client'] === $client
 				&& $state['dashboard'] === $dashboard
 			) {
