@@ -1363,19 +1363,37 @@ class Aura_Worker_API {
 		// ability call; this is the same fence, on the same predicate, for the
 		// path that does not go through a callback at all. Read UNCACHED, so a
 		// rebind another PHP process completed is seen (Ruling P64).
-		if ( null !== $seq && ! Aura_Worker_Elementor_Door::binding_unchanged_for_row( $seq ) ) {
-			if ( ! Aura_Worker_Elementor_Door::refuse_restore_entry( $seq, $pre ) ) {
+		$fence = ( null === $seq ) ? 'ok' : Aura_Worker_Elementor_Door::binding_unchanged_for_row( $seq );
+		if ( 'ok' !== $fence ) {
+			// A MISSING row has nothing to settle (Ruling P74); an UNREADABLE
+			// one is attempted, and says which fact it is refusing on.
+			if ( 'missing' !== $fence
+				&& ! Aura_Worker_Elementor_Door::refuse_restore_entry( $seq, $pre, ( 'unreadable' === $fence ) ? 'fence_unreadable' : 'binding_changed' ) ) {
 				return self::restore_unsettled( $seq, false );
 			}
+			if ( 'changed' === $fence ) {
+				return new WP_REST_Response(
+					Aura_Worker_Rules::with_warnings(
+						array(
+							'success' => false,
+							'code'    => 'aura_binding_changed',
+							'error'   => 'This site was rebound to another Aura client while this restore was being admitted; nothing was restored.',
+						)
+					),
+					409
+				);
+			}
+			// Not a proven rebind: the fence could not be established.
+			// Retryable, and nothing was restored.
 			return new WP_REST_Response(
 				Aura_Worker_Rules::with_warnings(
 					array(
 						'success' => false,
-						'code'    => 'aura_binding_changed',
-						'error'   => 'This site was rebound to another Aura client while this restore was being admitted; nothing was restored.',
+						'code'    => 'aura_log_failed',
+						'error'   => 'This site could not establish which Aura binding this restore belongs to; nothing was restored.',
 					)
 				),
-				409
+				503
 			);
 		}
 

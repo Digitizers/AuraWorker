@@ -588,7 +588,7 @@ final class ElementorDoorCreationTest extends TestCase {
 		// answers nothing — this request's cache holds a null for the name.
 		// The row itself is still in the database, which is what every later
 		// write goes through.
-		$GLOBALS['_sa_option_cache']['aura_worker_door_log_1'] = null;
+		$GLOBALS['_sa_option_cache']['aura_worker_door_log_1'] = 2;
 
 		$out = $this->createPage(
 			function () {
@@ -891,6 +891,44 @@ final class ElementorDoorCreationTest extends TestCase {
 		$row = $this->row( 1 );
 		$this->assertSame( 'ok', $row['result'] );
 		$this->assertSame( Aura_Worker_Door_Holds::LEASE_UNSUPPORTED, $row['lease'] );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* (f2e) a pre-callback fence that cannot read its row                 */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Ruling P74 (F2): a row the fence cannot READ is a failed fence.
+	 *
+	 * `get_option()` answers null for a missing row and for a broken read
+	 * alike, and the round-30 build let that null through as permission to
+	 * proceed — so a rebind landing while the call was admitted let the old
+	 * request enter its mutation at precisely the moment nothing could prove
+	 * whose it was. `binding_changed` stays reserved for a PROVEN mismatch;
+	 * this is its own answer, and its own retryable refusal.
+	 */
+	public function test_a_fence_that_cannot_read_its_row_refuses_before_elementor_runs(): void {
+		// Let the watermark's own patch read the row, then break every read
+		// after it — the next one is the fence's.
+		$GLOBALS['_sa_option_read_fail']['aura_worker_door_log_1'] = 2;
+
+		$out = $this->createPage( function () { return array( 'id' => $this->insertPage() ); } );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code(), 'NOT aura_binding_changed: nothing was proven' );
+		$this->assertSame( 503, $out->get_error_data()['status'], 'retryable: nothing ran' );
+		$this->assertArrayNotHasKey( 'elementor/create-page', $this->ran, 'Elementor never ran' );
+		$this->assertSame( array(), $GLOBALS['_posts'] );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the mutex is released' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		// The watermark LANDED, so the refusal is the fence's and nothing
+		// earlier: everything between the stamp and the callback is this fence.
+		$this->assertArrayHasKey( 'post_watermark', $row );
+		// The refusal is ATTEMPTED, not guaranteed: settle() reads the row too,
+		// and this is a request whose reads of that row are failing. A row left
+		// `pending` is what the reconciler is for.
+		$this->assertSame( 'pending', $row['result'] );
 	}
 
 	/* ------------------------------------------------------------------ */

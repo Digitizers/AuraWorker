@@ -2194,8 +2194,21 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// otherwise a later shared failure would satisfy the assertion
 				// just as well and the test would prove nothing.
 				if ( ! empty( $GLOBALS['_sa_option_read_fail'][ $name ] ) ) {
-					$this->last_error = 'read failed';
-					return null;
+					// `true` fails every read of this name; a positive INT lets
+					// that many through FIRST and fails from then on — which is
+					// how a test breaks one specific read of a sequence that
+					// touches the same row several times (Ruling P74's fence,
+					// which comes after the watermark's own patch).
+					$fail = $GLOBALS['_sa_option_read_fail'][ $name ];
+					if ( is_int( $fail ) && $fail > 0 ) {
+						// Let this one through and count it down. -1 rather
+						// than 0 because 0 is empty(), and the guard above
+						// would then stop failing altogether.
+						$GLOBALS['_sa_option_read_fail'][ $name ] = ( $fail > 1 ) ? $fail - 1 : -1;
+					} else {
+						$this->last_error = 'read failed';
+						return null;
+					}
 				}
 				// The row, not the cache (see sa_read_option_uncached()).
 				$answer = sa_read_option_uncached( $name );

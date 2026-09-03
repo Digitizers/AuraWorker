@@ -1012,23 +1012,32 @@ class Aura_Worker_Elementor_Door {
 	 * captures, then writes the site, and the same rebind can land in that gap.
 	 * It fences with THIS predicate rather than one of its own.
 	 *
+	 * AND A ROW IT CANNOT READ IS A FAILED FENCE (Ruling P74). `get_option()`
+	 * answers null for a missing row and for a broken read alike, and the
+	 * round-30 build let that null through so the witness patch a few lines
+	 * later could report it — which meant the old request entered its mutation
+	 * at exactly the moment nothing could prove whose it was. The read is RAW
+	 * now, and a fence that cannot establish its answer refuses.
+	 * `binding_changed` stays reserved for a PROVEN mismatch: `missing` and
+	 * `unreadable` are their own answers, and the caller reports each as what
+	 * it is.
+	 *
 	 * @param int $seq The log seq.
-	 * @return bool
+	 * @return string ok|changed|missing|unreadable
 	 */
 	public static function binding_unchanged_for_row( $seq ) {
-		$row = Aura_Worker_Door_Log::get( (int) $seq );
-		if ( ! is_array( $row ) ) {
-			// The ROW could not be read — a different failure from a binding
-			// that moved, and one the witness patch a few lines later reports
-			// honestly. Mislabelling it `binding_changed` would tell Aura this
-			// site was rebound when it was not.
-			return true;
+		$row = Aura_Worker_Door_Log::row_for_fence( (int) $seq );
+		if ( false === $row ) {
+			return 'unreadable';
+		}
+		if ( null === $row ) {
+			return 'missing';
 		}
 		$was = isset( $row['binding'] ) ? (string) $row['binding'] : '';
 		if ( '' === $was ) {
-			return false; // an EMPTY stamp is a mismatch, never a legacy pass (Ruling P72)
+			return 'changed'; // an EMPTY stamp is a mismatch, never a legacy pass (Ruling P72)
 		}
-		return Aura_Worker_Door_Log::generation_is_live_uncached( $was );
+		return Aura_Worker_Door_Log::generation_is_live_uncached( $was ) ? 'ok' : 'changed';
 	}
 
 	/**
@@ -2027,28 +2036,41 @@ class Aura_Worker_Elementor_Door {
 		// generation as the database has it NOW. A replay checks its CLAIM's
 		// generation as well: the two are written at different moments, and a
 		// rebind between them is exactly what the claim comparison catches.
-		$ours = self::binding_unchanged_for_row( $seq );
-		if ( $ours && null !== self::$replay_ack ) {
-			$ours = self::replay_binding_unchanged( (string) self::$replay_ack['ref'] );
+		$fence = self::binding_unchanged_for_row( $seq );
+		if ( 'ok' === $fence && null !== self::$replay_ack ) {
+			$fence = self::replay_binding_unchanged( (string) self::$replay_ack['ref'] ) ? 'ok' : 'changed';
 		}
-		if ( ! $ours ) {
+		if ( 'ok' !== $fence ) {
 			if ( $creating ) {
 				self::release_creation_mutex();
 			}
-			Aura_Worker_Door_Log::settle(
-				$seq,
-				array(
-					'result'       => 'refused',
-					'reason'       => 'binding_changed',
-					'may_have_run' => false,
-				)
-			);
+			// A MISSING row has nothing to settle — a settle would be writing
+			// to the row that is not there (Ruling P74). An UNREADABLE one is
+			// ATTEMPTED: the row exists, and a refusal it can hold is worth
+			// writing even though the read that would have proved the binding
+			// failed.
+			$reason = ( 'unreadable' === $fence ) ? 'fence_unreadable' : 'binding_changed';
+			if ( 'missing' !== $fence ) {
+				Aura_Worker_Door_Log::settle(
+					$seq,
+					array(
+						'result'       => 'refused',
+						'reason'       => $reason,
+						'may_have_run' => false,
+					)
+				);
+			}
 			self::$request = null;
-			return new WP_Error(
-				'aura_binding_changed',
-				'This site was rebound to another Aura client while this call was being admitted; it was not run.',
-				array( 'status' => 409 )
-			);
+			if ( 'changed' === $fence ) {
+				return new WP_Error(
+					'aura_binding_changed',
+					'This site was rebound to another Aura client while this call was being admitted; it was not run.',
+					array( 'status' => 409 )
+				);
+			}
+			// NOT a proven rebind — the fence simply could not be established.
+			// Retryable, and nothing ran.
+			return new WP_Error( 'aura_log_failed', 'This site could not establish which Aura binding this call belongs to; it was not run.', array( 'status' => 503 ) );
 		}
 
 		// THE CALLBACK IS ABOUT TO BE ENTERED (Ruling P33). The `ran` witness
@@ -3472,16 +3494,21 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * The seq lease is released here, as it is on every other terminus.
 	 *
-	 * @param int        $seq The reserved entry.
-	 * @param array|null $pre Pre-restore envelope (or null).
+	 * The REASON is the fence's own answer (Ruling P74): `binding_changed` for
+	 * a proven mismatch, `fence_unreadable` when the fence could not be
+	 * established at all. They are different facts and Aura is told which.
+	 *
+	 * @param int        $seq    The reserved entry.
+	 * @param array|null $pre    Pre-restore envelope (or null).
+	 * @param string     $reason binding_changed|fence_unreadable.
 	 * @return bool The entry is terminal.
 	 */
-	public static function refuse_restore_entry( $seq, $pre ) {
+	public static function refuse_restore_entry( $seq, $pre, $reason = 'binding_changed' ) {
 		$settled = Aura_Worker_Door_Log::settle(
 			(int) $seq,
 			array(
 				'result'       => 'refused',
-				'reason'       => 'binding_changed',
+				'reason'       => (string) $reason,
 				'may_have_run' => false,
 				'snapshot_id'  => is_array( $pre ) ? (string) $pre['id'] : null,
 			)

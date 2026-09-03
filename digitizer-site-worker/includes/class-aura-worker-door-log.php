@@ -1020,6 +1020,37 @@ class Aura_Worker_Door_Log {
 		return is_array( $val ) ? $val : null;
 	}
 
+	/**
+	 * One log row, read for a FENCE (Ruling P74).
+	 *
+	 * `get()` goes through `get_option()`, which answers null for a missing row
+	 * and for a read that failed alike — and the fence used to read that null
+	 * as "no stamp, carry on". A rebind landing while the call was admitted
+	 * then let the old request enter its mutation at precisely the moment
+	 * nothing could prove which binding owned it.
+	 *
+	 * Three answers, because there are three facts: the row, NULL for a row
+	 * that is genuinely absent, and FALSE for a read that failed. The fence
+	 * refuses on both of the last two, and tells them apart because only one
+	 * of them has anything to record.
+	 *
+	 * @param int $seq Log seq.
+	 * @return array|null|false
+	 */
+	public static function row_for_fence( $seq ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$raw              = self::raw_option( self::PREFIX . (int) $seq );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return false;
+		}
+		if ( null === $raw ) {
+			return null;
+		}
+		$val = maybe_unserialize( $raw );
+		return is_array( $val ) ? $val : false;
+	}
+
 	/** @return int */
 	public static function floor() {
 		return (int) get_option( self::FLOOR, 0 );
