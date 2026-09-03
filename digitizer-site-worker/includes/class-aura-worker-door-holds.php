@@ -28,6 +28,14 @@ class Aura_Worker_Door_Holds {
 	const TTL_S   = 604800;
 	const CAP     = 50;
 	const LOCK    = 'aura_worker_door_hold_lock';
+	/**
+	 * A replay's EXECUTION LEASE lives exactly as long as its database
+	 * connection, so it cannot outlive the request that took it (Ruling P52).
+	 * The hard cap bounds the one case a named lock cannot: a lease stranded
+	 * on a persistent connection.
+	 */
+	const LEASE_PREFIX     = 'aura_door_replay_';
+	const LEASE_HARD_CAP_S = 86400;
 	/* wipe()'s three answers, NAMED so a caller cannot conflate them (Ruling P49'). */
 	const WIPE_DONE   = 'wiped';  // every statement ran under a lock this call held
 	const WIPE_FAILED = 'failed'; // they ran and at least one failed — the caller may still finish its own share
@@ -796,9 +804,77 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
+	 * The MySQL named lock that IS this replay's execution lease (Ruling P52).
+	 *
+	 * Scoped by blog so two sites on one network never share a lease, and the
+	 * ref is HASHED because MySQL caps a lock name at 64 characters and a
+	 * `door_<uuid>` ref plus the prefix and blog id would overrun it.
+	 *
+	 * @param string $ref Hold ref.
+	 * @return string
+	 */
+	public static function lease_name( $ref ) {
+		$blog = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 1;
+		return self::LEASE_PREFIX . $blog . '_' . md5( self::clean( $ref ) );
+	}
+
+	/**
+	 * Take the lease, without waiting.
+	 *
+	 * @param string $ref Hold ref.
+	 * @return int|null 1 taken, 0 held by another connection, null when the
+	 *                  server could not answer (no GET_LOCK, a driver error).
+	 */
+	public static function take_lease( $ref ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$got              = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', self::lease_name( $ref ) ) );
+		if ( null === $got || '' !== (string) $wpdb->last_error ) {
+			return null; // no lease available here; the age rule still protects
+		}
+		return (int) $got;
+	}
+
+	/**
+	 * Release it. Best effort — the connection closing releases it anyway,
+	 * which is the property this whole mechanism rests on.
+	 *
+	 * @param string $ref Hold ref.
+	 * @return void
+	 */
+	public static function release_lease( $ref ) {
+		global $wpdb;
+		$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', self::lease_name( $ref ) ) );
+	}
+
+	/**
+	 * Is somebody holding this ref's lease right now?
+	 *
+	 * IS_USED_LOCK answers the holding connection's id, or NULL when the lock
+	 * is free — and NULL is also what a broken statement answers, so the error
+	 * flag is what tells them apart.
+	 *
+	 * @param string $ref Hold ref.
+	 * @return bool|null TRUE held, FALSE free, NULL unknown (unreadable or unsupported).
+	 */
+	public static function lease_is_held( $ref ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$who              = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s)', self::lease_name( $ref ) ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		return null !== $who;
+	}
+
+	/**
 	 * Is any replay between its claim and its callback right now (Ruling P50)?
 	 *
-	 * Judged the way the sweep and the reconciler judge a claim: younger than
+	 * The EXECUTION LEASE decides first (Ruling P52): a claimed row whose
+	 * named lock is held belongs to a request that is demonstrably still
+	 * alive, however long it has been running — age is not death, and an
+	 * approved callback may legitimately run for longer than CLAIM_STALE_MS.
+	 * Only when no lease is held does the age rule apply: younger than
 	 * CLAIM_STALE_MS is in flight, older is a died request somebody else owns.
 	 * A claim whose stamp cannot be read is treated as IN FLIGHT — an
 	 * unreadable stamp is not evidence of staleness, the same rule `sweep()`
@@ -819,8 +895,27 @@ class Aura_Worker_Door_Holds {
 			// and "may" is exactly what an unreadable answer leaves.
 			return true;
 		}
-		foreach ( $rows as $row ) {
-			$at = strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) );
+		$cap = time() - self::LEASE_HARD_CAP_S;
+		foreach ( $rows as $ref => $row ) {
+			$at    = strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) );
+			$lease = self::lease_is_held( (string) $ref );
+			if ( true === $lease ) {
+				// RUNNING, whatever its age (Ruling P52). The lease lives as
+				// long as the request's database connection, so this is not a
+				// guess about death — it is the request saying it is alive.
+				return true;
+			}
+			if ( null === $lease ) {
+				// The server could not say (no GET_LOCK, a driver error). Fail
+				// closed under a hard cap, which also bounds a lease stranded
+				// on a persistent connection.
+				if ( false === $at || $at > $cap ) {
+					return true;
+				}
+				continue;
+			}
+			// No lease held: the age rule, unchanged. It still covers the
+			// window between the claim and the GET_LOCK a statement later.
 			if ( false === $at || $at > $cut ) {
 				return true;
 			}

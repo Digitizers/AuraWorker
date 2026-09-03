@@ -461,6 +461,76 @@ final class ElementorReplayTest extends TestCase {
 	 * approval on a callback that never ran.
 	 */
 	/**
+	 * Ruling P52: the lease is taken for the replay and released after it,
+	 * on the normal path and on a throwing one alike.
+	 */
+	public function test_the_execution_lease_is_held_for_the_replay_and_released_after(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref  = $this->holdCall();
+		$name = Aura_Worker_Door_Holds::lease_name( $ref );
+		$held = null;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( $name, &$held ) {
+				$held = ! empty( $GLOBALS['_sa_named_locks'][ $name ] );
+			}
+		);
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::replay( $ref, null )['ok'] );
+
+		$this->assertTrue( $held, 'held across the callback' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_sa_named_locks'], 'and released after' );
+	}
+
+	/** The `finally` releases it even when the callback throws. */
+	public function test_the_execution_lease_is_released_when_the_callback_throws(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		$this->register(
+			'elementor/publish-document',
+			static function () {
+				throw new RuntimeException( 'elementor died mid-write' );
+			}
+		);
+
+		$this->assertSame( 'failed', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'] );
+
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Holds::lease_name( $ref ), $GLOBALS['_sa_named_locks'] );
+	}
+
+	/** A ref another request is already replaying is a lost race, and the claim goes back. */
+	public function test_a_ref_already_leased_elsewhere_is_a_lost_race(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $ref ) ] = true;
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'not_held', $out['reason'] );
+		$this->assertSame( array(), $this->ran, 'nothing ran' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the claim went back' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+	}
+
+	/** A server with no GET_LOCK still replays — the age rule remains the floor. */
+	public function test_a_site_without_named_locks_still_replays(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref                             = $this->holdCall();
+		$GLOBALS['_sa_named_lock_error'] = true;
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$GLOBALS['_sa_named_lock_error'] = false;
+		$this->assertTrue( $out['ok'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+	}
+
+	/**
 	 * Ruling P42: the replay route is not a way around a closed door.
 	 *
 	 * `replay()` invokes the stored callback directly — that is the point of

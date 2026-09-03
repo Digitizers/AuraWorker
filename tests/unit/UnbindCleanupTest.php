@@ -1193,6 +1193,78 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P52: an EXECUTION LEASE, not an age guess.
+	 *
+	 * An approved Elementor callback may legitimately run for longer than
+	 * CLAIM_STALE_MS. The age rule called that death and let a concurrent
+	 * unbind or changed-client connect wipe the claim, log and binding while
+	 * the callback was still mutating the site. A MySQL named lock lives
+	 * exactly as long as the request's database connection, so while it is
+	 * held nothing has to guess.
+	 */
+	public function test_a_wipe_refuses_while_a_lease_is_held_however_old_the_claim(): void {
+		$door = $this->seedDoor(); // its claim is already older than CLAIM_STALE_MS
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $door['claimed'] ) ] = true;
+		$before = $this->doorRows();
+		$fence  = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertSame(
+			Aura_Worker_Door_Holds::WIPE_BUSY,
+			Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ),
+			'age is not death: the lease says the request is alive'
+		);
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$this->assertSame( $before, $this->doorRows(), 'nothing was deleted' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** …and the reconciler leaves that claim alone rather than calling it interrupted. */
+	public function test_the_reconciler_skips_a_claim_whose_lease_is_held(): void {
+		$door = $this->seedDoor();
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $door['claimed'] ) ] = true;
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 0, $out['settled_claims'], 'running, not stale' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $door['claimed'] ) );
+	}
+
+	/** No lease held and the claim is stale: the unchanged rule, the wipe proceeds. */
+	public function test_a_wipe_proceeds_past_a_stale_claim_with_no_lease(): void {
+		$this->seedDoor();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$this->assertSame( array(), $this->doorRows() );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * A server that cannot answer IS_USED_LOCK leaves the question UNKNOWN, so
+	 * the row counts as in flight under a 24-hour hard cap — which also bounds
+	 * a lease stranded on a persistent connection.
+	 */
+	public function test_an_unanswerable_lease_is_in_flight_under_the_hard_cap_and_not_past_it(): void {
+		$door                              = $this->seedDoor();
+		$GLOBALS['_sa_named_lock_error']   = true;
+		$fence                             = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'unknown ⇒ in flight' );
+
+		// …and past the cap the wipe proceeds, so a stranded lease cannot
+		// block a rebind for ever.
+		$name                         = Aura_Worker_Door_Holds::CLAIMED . $door['claimed'];
+		$row                          = get_option( $name, array() );
+		$row['claimed_at']            = gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 );
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$GLOBALS['_sa_named_lock_error'] = false;
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
 	 * Ruling P49': an unreadable count is not an empty door.
 	 *
 	 * `has_state()` decides whether a wipe may report success and whether the

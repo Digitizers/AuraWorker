@@ -594,6 +594,14 @@ class Aura_Worker_Elementor_Door {
 	 * @param array  $out   Counters, by reference.
 	 */
 	private static function settle_stale_claim( $ref, array $claim, array &$out ) {
+		if ( true === Aura_Worker_Door_Holds::lease_is_held( $ref ) ) {
+			// RUNNING, not stale (Ruling P52). The lease is held by a live
+			// database connection, so this claim belongs to a request that has
+			// not finished — settling it here would write `interrupted` over a
+			// call that is still going, and release a hold its own request is
+			// about to answer for. Age said ten minutes; the lease says alive.
+			return;
+		}
 		$seq = (int) ( isset( $claim['terminal_seq'] ) ? $claim['terminal_seq'] : 0 );
 		if ( $seq > 0 ) {
 			if ( $seq <= Aura_Worker_Door_Log::floor() ) {
@@ -2189,6 +2197,7 @@ class Aura_Worker_Elementor_Door {
 		// user: the grant authorised it, not this field, so it never refuses.
 		$approver             = self::actor();
 		$approved_by          = is_wp_error( $approver ) ? null : $approver;
+		$leased               = false; // set once this replay owns its execution lease (Ruling P52)
 		try {
 			// RE-JUDGE THE CURRENT TOUCHES, NOT THE STORED ONES (Ruling P34).
 			// `$held['touches']` is what the OPERATOR saw when the call was
@@ -2330,6 +2339,28 @@ class Aura_Worker_Elementor_Door {
 					'reason' => 'not_held',
 				);
 			}
+			// THE EXECUTION LEASE (Ruling P52). A MySQL named lock lives exactly
+			// as long as this request's database connection, so while it is
+			// held nothing has to GUESS whether the request is still running —
+			// which is what the CLAIM_STALE_MS age rule was doing, and why an
+			// approved callback that legitimately ran for more than ten minutes
+			// could have its claim, log and binding wiped out from under it.
+			//
+			// Taken AFTER the claim, so the row this lease names is already
+			// ours. Released in the `finally` below — and by the connection
+			// closing, whatever happens to this request.
+			$lease = Aura_Worker_Door_Holds::take_lease( $ref );
+			if ( 0 === $lease ) {
+				// Somebody else is already replaying this very ref: a lost
+				// race, the same answer claim() gives for one. The claim goes
+				// back so the winner's outcome is the only one.
+				Aura_Worker_Door_Holds::unclaim( $ref );
+				return array(
+					'ok'     => false,
+					'reason' => 'not_held',
+				);
+			}
+			$leased = ( 1 === $lease ); // null ⇒ no lease available here; the age rule still protects
 			// FROM HERE TO execute() THE CLAIM IS HELD, SO EVERY EXIT MUST
 			// SETTLE IT (Ruling P40). The permission callback is third-party
 			// code — Elementor's, or whatever a plugin filtered onto the
@@ -2499,6 +2530,9 @@ class Aura_Worker_Elementor_Door {
 			}
 			return $out;
 		} finally {
+			if ( $leased ) {
+				Aura_Worker_Door_Holds::release_lease( $ref );
+			}
 			self::$replay_ack     = null;
 			self::$pinned_ruleset = null;
 			self::$memo           = array();

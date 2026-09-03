@@ -2126,6 +2126,47 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return (string) $n;
 			}
+			// MySQL NAMED LOCKS (Ruling P52): the Elementor door's replay
+			// execution lease. Modelled as a map of held names — this process
+			// IS the one connection, which is exactly the property the lease
+			// rests on. `_sa_named_locks` is also the seam a test uses to mark
+			// a name held by "another request", and `_sa_named_lock_error`
+			// makes IS_USED_LOCK fail the way an old server without the
+			// function would.
+			if ( preg_match( "/^SELECT GET_LOCK\('([^']*)', 0\)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$name                     = stripslashes( $m[1] );
+				if ( ! empty( $GLOBALS['_sa_named_lock_error'] ) ) {
+					$this->last_error = 'no such function';
+					return null;
+				}
+				if ( ! empty( $GLOBALS['_sa_named_locks'][ $name ] ) ) {
+					return '0'; // another connection holds it
+				}
+				$GLOBALS['_sa_named_locks'][ $name ] = true;
+				return '1';
+			}
+			if ( preg_match( "/^SELECT RELEASE_LOCK\('([^']*)'\)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$name                     = stripslashes( $m[1] );
+				if ( empty( $GLOBALS['_sa_named_locks'][ $name ] ) ) {
+					return '0';
+				}
+				unset( $GLOBALS['_sa_named_locks'][ $name ] );
+				return '1';
+			}
+			if ( preg_match( "/^SELECT IS_USED_LOCK\('([^']*)'\)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$name                     = stripslashes( $m[1] );
+				if ( ! empty( $GLOBALS['_sa_named_lock_error'] ) ) {
+					$this->last_error = 'no such function';
+					return null;
+				}
+				// A connection id when held; NULL when free — the same shape,
+				// which is why production consults last_error to tell a free
+				// lock from a broken statement.
+				return empty( $GLOBALS['_sa_named_locks'][ $name ] ) ? null : '77';
+			}
 			// The liveness probe Aura_Worker_Health::check_db_connection() issues.
 			// A reachable database answers '1' — a string, which is what the
 			// production comparison (`=== '1'`) is written against. Honouring
@@ -2881,6 +2922,8 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
 	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
+	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
@@ -4134,6 +4177,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
 	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
+	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
