@@ -213,7 +213,7 @@ admin-ajax action, not by a REST route.
 | `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many abilities pass the discovery rule such a server applies — a property of the abilities, not proof any server serves them; a registry-resolving server (Angie's) picks up mutating ones outside SiteAgent's approval path |
 | `audit_rules` | read | operator-ruleset presence + age, 24h block/warn counts, expired-but-listed rules, enforcement points in this build |
 | `snapshot_get` | read | retrieve a stored snapshot of page content (reversible write metadata) |
-| `elementor_replay_ability` | read | check Elementor MCP server replay capability and pending door log |
+| `elementor_replay_ability` | write | executes an approved held Elementor write (destructive, requires Aura approval) — claims the hold, re-judges it against the current ruleset, and runs the original mutation as the user who asked |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |

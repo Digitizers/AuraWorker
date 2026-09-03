@@ -99,10 +99,10 @@ Read tools:
 * `get_seo_meta` — Read a post/page's SEO title, description, and focus keyword from the active SEO plugin (Rank Math, Yoast, or SEOPress)
 * `list_page_blocks` — Read a page's Gutenberg block structure (block names, attributes, nesting)
 * `snapshot_get` — Retrieve a stored snapshot of page content (reversible write metadata)
-* `elementor_replay_ability` — Check Elementor MCP server replay capability and pending door log
 
 Write tools (approval-gated):
 
+* `elementor_replay_ability` — Executes an approved held Elementor write (destructive, requires Aura approval): claims the hold, re-judges it against the current ruleset, and runs the original Elementor mutation as the user who asked
 * `update_plugin_safely` — Backup, update, health-check, auto-rollback on failure
 * `clear_caches` — Flush object/opcode caches and detected page-cache plugins
 * `cleanup_transients` — Remove expired transients to reduce autoload bloat
