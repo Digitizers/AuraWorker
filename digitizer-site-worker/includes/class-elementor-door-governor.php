@@ -1260,7 +1260,29 @@ class Aura_Worker_Elementor_Door {
 		if ( ! empty( self::$request['collateral'] ) ) {
 			$terminal['collateral_snapshot_ids'] = self::$request['collateral'];
 		}
-		Aura_Worker_Door_Log::settle( $seq, $terminal );
+		if ( ! Aura_Worker_Door_Log::settle( $seq, $terminal ) ) {
+			// THE WRITE RAN AND THE LOG COULD NOT SAY SO (Ruling P16).
+			// Returning the callback's result here told the caller it
+			// succeeded while the row sat pending — `log_after` stops at a
+			// pending row, so every later entry waited behind it, and the
+			// reconciler eventually reported `interrupted` for a mutation
+			// that had completed. The row is LEFT pending on purpose: it
+			// carries `ran` under a replay, and `interrupted` is the honest
+			// terminal state for an outcome the log never learned. What
+			// changes is the ANSWER — a caller must not be told a write
+			// succeeded on the strength of a record that does not exist.
+			self::bump_counter( 'log_ungoverned' );
+			self::$request = null;
+			return new WP_Error(
+				'aura_log_failed',
+				'The write ran but this site could not record its outcome; check the site before retrying.',
+				array(
+					'status'       => 503,
+					'may_have_run' => true,
+					'seq'          => $seq,
+				)
+			);
+		}
 		self::$request = null;
 		return $result;
 	}

@@ -727,6 +727,31 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
 	}
 
+	/**
+	 * The same failure under an approval: the entry is non-terminal, so
+	 * replay() answers `interrupted` and KEEPS the claim — a call that may
+	 * have run is never handed back for a second approval (Ruling P16).
+	 */
+	public function test_a_terminal_settle_that_fails_after_the_callback_is_interrupted_and_keeps_the_claim(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_2'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'settled_at' );
+		};
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'interrupted', $out['reason'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'], 'it ran' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim is kept — it may have run' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'and it is not approvable again' );
+		$entry = Aura_Worker_Door_Log::get( 2 );
+		$this->assertSame( 'pending', $entry['result'] );
+		$this->assertTrue( $entry['ran'] );
+	}
+
 	public function test_the_stamp_and_the_ran_witness_are_on_the_row_before_the_callback(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );

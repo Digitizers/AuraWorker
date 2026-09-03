@@ -355,6 +355,34 @@ final class ElementorDoorGovernorTest extends TestCase {
 	}
 
 	/**
+	 * The write RAN and the log could not say so (Ruling P16). Returning the
+	 * callback's result would tell the caller it succeeded while the row sits
+	 * pending — blocking every later entry, and eventually reported
+	 * `interrupted` for a mutation that completed. The honest answer is that
+	 * it may have run.
+	 */
+	public function test_a_terminal_settle_that_fails_after_the_callback_answers_may_have_run(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		// Only the terminal settle fails; the admission and the snapshot patch land.
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'settled_at' );
+		};
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertTrue( $out->get_error_data()['may_have_run'] );
+		$this->assertSame( 1, $out->get_error_data()['seq'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'], 'it did run — once' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'pending', $row['result'], 'left for the reconciler: the outcome is unknown to the log' );
+		$this->assertSame( 1, (int) get_option( 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS ), 0 ) );
+	}
+
+	/**
 	 * A throw AFTER the row was admitted settles that row rather than leaving
 	 * it pending: `log_after` stops at a pending row, so every later entry
 	 * would wait for the reconciler to call a KNOWN failure "interrupted".
