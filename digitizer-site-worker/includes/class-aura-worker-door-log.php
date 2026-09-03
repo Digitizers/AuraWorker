@@ -637,11 +637,29 @@ class Aura_Worker_Door_Log {
 	 * happened, and a changed-client connect would complete with the departed
 	 * client's holds still current (F1).
 	 *
-	 * @param array $identity { client: string|null, dashboard: string|null }.
+	 * CLAIM-CONDITIONAL when a fence is supplied (Ruling P68). An unbind's
+	 * Phase B can run long enough for `SITE_CLAIM_TAKEOVER_AFTER` to elapse and
+	 * a replacement connect to seize the site claim; a stale cleanup resuming
+	 * afterwards would rotate the WINNER's binding to `unbound`, and every hold
+	 * the new client queued would go invisible while its governed callbacks
+	 * failed the binding fence until somebody reconnected. Every other Phase-B
+	 * step is joined to the claim row; so is this one now — and joined in the
+	 * SAME statement as the compare-and-swap, so there is no window between
+	 * checking the claim and acting on it.
+	 *
+	 * @param array  $identity { client: string|null, dashboard: string|null }.
+	 * @param string $claim    Site-claim option name ('' ⇒ unconditional).
+	 * @param string $fence    The caller's claim fence ('' ⇒ unconditional).
 	 * @return bool The record now names this identity.
 	 */
-	public static function rotate_binding( array $identity ) {
+	public static function rotate_binding( array $identity, $claim = '', $fence = '' ) {
 		global $wpdb;
+		$claim   = (string) $claim;
+		$fence   = (string) $fence;
+		$claimed = ( '' !== $claim && '' !== $fence );
+		if ( ( '' !== $claim ) !== ( '' !== $fence ) ) {
+			return false; // half a condition is not one
+		}
 		$client    = isset( $identity['client'] ) && '' !== (string) $identity['client'] ? (string) $identity['client'] : null;
 		$dashboard = isset( $identity['dashboard'] ) && '' !== (string) $identity['dashboard'] ? (string) $identity['dashboard'] : null;
 
@@ -705,10 +723,45 @@ class Aura_Worker_Door_Log {
 			'dashboard' => $dashboard,
 		);
 
+		$like = $claimed ? $wpdb->esc_like( $fence . '|' ) . '%' : '';
 		if ( null === $rec ) {
 			// No record at all: a real conditional INSERT, so a concurrent
-			// minter cannot be overwritten blind.
-			$done = self::insert_unique( self::BINDING, $next );
+			// minter cannot be overwritten blind. Under a claim it is the same
+			// INSERT with the claim row as its source, so a caller whose claim
+			// was taken over mints nothing either.
+			if ( $claimed ) {
+				$wpdb->last_error = '';
+				$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->prepare(
+						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, 'yes' FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+						self::BINDING,
+						maybe_serialize( $next ),
+						$claim,
+						$like,
+						self::BINDING
+					)
+				);
+				$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+			} else {
+				$done = self::insert_unique( self::BINDING, $next );
+			}
+		} elseif ( $claimed ) {
+			// The compare-and-swap AND the claim check, in one statement
+			// (Ruling P68): a claim seized by a replacement connect between the
+			// two would otherwise let a stale cleanup rotate the winner's
+			// record out from under it.
+			$wpdb->last_error = '';
+			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s AND o.option_value = %s",
+					$claim,
+					$like,
+					maybe_serialize( $next ),
+					self::BINDING,
+					$raw
+				)
+			);
+			$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
 		} else {
 			// COMPARE-AND-SWAP on the bytes just read (F1): a transient failure
 			// must not read as a rotation that happened, or a changed-client

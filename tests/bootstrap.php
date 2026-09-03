@@ -2529,8 +2529,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// round-9): one UPDATE joined to the claim row, and its INSERT
 			// counterpart for a site whose token row does not exist yet. A
 			// caller that no longer owns the claim matches no row.
-			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
-				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', $m );
+			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'(?: AND o\.option_value = '(.*)')?$/s", $query, $m ) ) {
+				// The optional trailing `AND o.option_value = …` is the door
+				// binding's claim-conditional COMPARE-AND-SWAP (Ruling P68):
+				// the claim check and the CAS in ONE statement, so a claim
+				// seized between them cannot exist. Modelled here as MySQL
+				// would: both conditions, or no row.
+				$cas = isset( $m[5] ) ? stripslashes( $m[5] ) : null;
+				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', array_slice( $m, 0, 5 ) );
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
 					// `true` fails every write; a positive INT fails that many
 					// and then lets it through, as update_option() does; a
@@ -2548,6 +2554,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
+				}
+				if ( null !== $cas && (string) sa_read_option_uncached( $name ) !== $cas ) {
+					return 0; // the bytes moved under the caller
 				}
 				// A claimed write that REPORTS SUCCESS while the stored value
 				// diverges from what the caller asked for — a silently lost or

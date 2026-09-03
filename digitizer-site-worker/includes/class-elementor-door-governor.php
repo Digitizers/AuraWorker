@@ -298,8 +298,8 @@ class Aura_Worker_Elementor_Door {
 	 * @param array $identity { client: string|null, dashboard: string|null }.
 	 * @return bool The door now belongs to that identity.
 	 */
-	public static function rebind( array $identity ) {
-		return Aura_Worker_Door_Log::rotate_binding( $identity );
+	public static function rebind( array $identity, $claim = '', $fence = '' ) {
+		return Aura_Worker_Door_Log::rotate_binding( $identity, $claim, $fence );
 	}
 
 	/**

@@ -986,5 +986,49 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
 	}
 
+	/**
+	 * Ruling P68 (F1): a stale Phase B whose claim was taken over rotates
+	 * nothing.
+	 *
+	 * Phase B can outlive SITE_CLAIM_TAKEOVER_AFTER — the credential revocation
+	 * alone is several REST-shaped reads — and a replacement connect seizes the
+	 * claim and completes in the meantime. Every option step is joined to the
+	 * claim row; the rotation was not, so the stale cleanup resuming here
+	 * rotated the WINNER's binding to `unbound`: its holds went invisible and
+	 * its governed callbacks failed the binding fence until somebody
+	 * reconnected.
+	 */
+	public function test_a_stale_cleanup_whose_claim_was_taken_over_leaves_the_winner_alone(): void {
+		$this->seedDoor();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		// The replacement connect: it seizes the claim and binds the site to
+		// its own client, all while this cleanup is still working.
+		$winner = '';
+		add_action(
+			'aura_worker_unbind_step',
+			static function ( $step ) use ( &$winner ) {
+				if ( 'grant' !== $step || '' !== $winner ) {
+					return;
+				}
+				$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
+				$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = maybe_serialize( 'winner-fence|' . time() );
+				Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://app.example' ) );
+				$winner = Aura_Worker_Door_Log::binding();
+			}
+		);
+
+		$done = Aura_Worker_Unbind::cleanup( true, $fence );
+
+		$this->assertNotSame( '', $winner, 'the replacement really did rotate' );
+		$this->assertFalse( $done, 'the stale cleanup reports nothing complete' );
+		$this->assertSame( $winner, Aura_Worker_Door_Log::binding(), 'the winner\'s generation stands' );
+		$rec = Aura_Worker_Door_Log::binding_record();
+		$this->assertSame( 'bound', $rec['state'], 'and it was never rotated to unbound' );
+		$this->assertSame( 'c2', $rec['client'] );
+		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers(), 'the step is reported not done' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays' );
+	}
+
 	/** A caller that lost the site claim deletes nothing — the same fence every step uses. */
 }

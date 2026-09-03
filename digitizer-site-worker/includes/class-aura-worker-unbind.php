@@ -1070,9 +1070,19 @@ final class Aura_Worker_Unbind {
 		// change exactly one row, and a failure is REPORTED — `door` is a
 		// leftovers() kind again, so the token stays and the drain's next
 		// Phase-B pass rotates for real.
+		// CLAIM-CONDITIONED, like every option step above it (Ruling P68).
+		// This Phase B can outlive `SITE_CLAIM_TAKEOVER_AFTER`: a replacement
+		// connect seizes the claim and completes, and a stale cleanup resuming
+		// here would rotate the WINNER's binding to `unbound` — its holds gone
+		// invisible, its governed callbacks failing the binding fence, until
+		// somebody reconnected. The claim row is joined INTO the rotation's own
+		// compare-and-swap, so there is no window between asking and acting. A
+		// lost claim rotates nothing, `door` stays a leftover, and this call
+		// answers `cleanup_complete: false` — the same outcome every other step
+		// has when the claim is gone.
 		do_action( 'aura_worker_unbind_step', 'door' );
 		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
-			Aura_Worker_Elementor_Door::rebind( array( 'client' => null, 'dashboard' => null ) );
+			Aura_Worker_Elementor_Door::rebind( array( 'client' => null, 'dashboard' => null ), $claim, $fence );
 		}
 
 		if ( array() !== self::leftovers() ) {
