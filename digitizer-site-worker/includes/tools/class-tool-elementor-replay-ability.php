@@ -71,7 +71,7 @@ class Aura_Tool_Elementor_Replay_Ability extends Aura_Tool_Base {
 			'result'           => 'mixed',
 			'snapshot_id'      => 'string|null',
 			'created_post_ids' => 'int[]',
-			'reason'           => 'not_held|refused_by_current_rule|refused_by_permission|refused_by_missing_ability|refused|warn_changed|retry_later|interrupted|failed',
+			'reason'           => 'not_held|refused_by_current_rule|refused_by_permission|refused_by_missing_ability|target_unattributed|refused|warn_changed|retry_later|interrupted|failed',
 			'code'             => 'string',
 			'claim_retained'   => 'bool',
 			'rule'             => 'object',

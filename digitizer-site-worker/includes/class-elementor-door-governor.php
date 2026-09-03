@@ -1868,13 +1868,62 @@ class Aura_Worker_Elementor_Door {
 		self::$memo           = array();
 		$prev_user            = get_current_user_id();
 		try {
-			$verdict = self::govern( $slug, (array) $held['touches'], $input );
+			// RE-JUDGE THE CURRENT TOUCHES, NOT THE STORED ONES (Ruling P34).
+			// `$held['touches']` is what the OPERATOR saw when the call was
+			// refused; what matters now is what would actually run. For a
+			// `manage-classes` deletion those differ whenever Elementor's
+			// class→posts index moved during the hold — a page that started
+			// using the class is new collateral — and judging the stale set
+			// let a warn on that page run unacknowledged and a block be
+			// discovered only after the class was already deleted.
+			//
+			// This is also what makes the memo safe: govern() memoises on
+			// (slug, input), and the wrapper re-enters govern() with the
+			// touches IT computes a moment later in the same request. Both
+			// calls therefore see the same current touches — the memo is
+			// populated HERE, from touches_for(), with exactly the input the
+			// wrapper will pass. And judge_collateral()'s "already judged"
+			// set is self::$request['touches'], which the wrapper fills from
+			// its own touches_for() call, so it is the current set too.
+			$touches = self::touches_for( $slug, $input );
+			if ( is_wp_error( $touches ) ) {
+				// The target stopped being one Aura can attribute — the page
+				// was deleted, or the ability was un-mapped by an upgrade.
+				// Retrying cannot help, so the approval is spent rather than
+				// parked for a reconciler that would write a false
+				// `interrupted`.
+				self::record_terminal_only(
+					$slug,
+					(array) $held['actor'],
+					(array) $held['touches'],
+					'refused',
+					array(
+						'ref'    => $ref,
+						'reason' => 'target_unattributed',
+						'error'  => $touches->get_error_message(),
+					)
+				);
+				Aura_Worker_Door_Holds::reject( $ref );
+				return array(
+					'ok'     => false,
+					'reason' => 'target_unattributed',
+					'code'   => (string) $touches->get_error_code(),
+				);
+			}
+			if ( $touches !== (array) $held['touches'] ) {
+				// Aura's next listing must show what would run, not what would
+				// have. Best effort: a hold a reject or the sweep removed
+				// meanwhile is not recreated, and the judgement below stands
+				// on the current touches either way.
+				Aura_Worker_Door_Holds::refresh_touches( $ref, $touches );
+			}
+			$verdict = self::govern( $slug, $touches, $input );
 			if ( 'block' === $verdict['effect'] ) {
 				Aura_Worker_Rules::record_block( $slug, $verdict['rule'] );
 				self::record_terminal_only(
 					$slug,
 					(array) $held['actor'],
-					(array) $held['touches'],
+					$touches, // the CURRENT touches — what was judged (Ruling P34)
 					'refused',
 					array(
 						'ref'      => $ref,
@@ -1923,7 +1972,7 @@ class Aura_Worker_Elementor_Door {
 				self::record_terminal_only(
 					$slug,
 					(array) $held['actor'],
-					(array) $held['touches'],
+					$touches, // the CURRENT touches (Ruling P34)
 					'refused',
 					array(
 						'ref'    => $ref,
@@ -1944,7 +1993,7 @@ class Aura_Worker_Elementor_Door {
 				self::record_terminal_only(
 					$slug,
 					(array) $held['actor'],
-					(array) $held['touches'],
+					$touches, // the CURRENT touches (Ruling P34)
 					'refused',
 					array(
 						'ref'    => $ref,

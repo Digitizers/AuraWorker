@@ -164,6 +164,21 @@ final class ElementorReplayTest extends TestCase {
 		);
 	}
 
+	/** A `manage-classes` delete, and the pages Elementor says it would rewrite. */
+	private function classDelete(): array {
+		return array( 'operations' => array( array( 'action' => 'delete', 'id' => 'g-a' ) ) );
+	}
+
+	/** Seed a page the class→posts index can name. */
+	private function seedPage( int $id ): void {
+		$GLOBALS['_posts'][ $id ] = (object) array(
+			'ID'           => $id,
+			'post_type'    => 'page',
+			'post_status'  => 'publish',
+			'post_content' => '',
+		);
+	}
+
 	// -----------------------------------------------------------------------
 	// (a) the happy path
 	// -----------------------------------------------------------------------
@@ -1000,5 +1015,147 @@ final class ElementorReplayTest extends TestCase {
 
 		$this->assertTrue( $out['ok'] );
 		$this->assertSame( 'warn', Aura_Worker_Door_Log::log_after( 0 )[1]['verdict'] );
+	}
+
+	// -----------------------------------------------------------------------
+	// Ruling P34: the CURRENT touches are re-judged, not the stored ones
+	// -----------------------------------------------------------------------
+
+	/**
+	 * The class→posts index moved while the hold waited: page 13 started
+	 * using the class, and a warn rule protects it.
+	 *
+	 * Re-judging the STORED touches saw only page 12, so the design-system
+	 * ack was accepted, the call was claimed and run — and page 13's warn was
+	 * discovered at priority 1, where (before Ruling P32) it was merely
+	 * recorded. Re-judging the CURRENT touches holds the call for a second
+	 * acknowledgement, naming the rule the operator has not seen.
+	 */
+	public function test_a_page_that_started_using_the_class_forces_a_fresh_acknowledgement(): void {
+		$this->seedPage( 12 );
+		$this->seedPage( 13 );
+		$this->registerAll();
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/ds', 'effect' => 'warn', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are shared' ),
+			)
+		);
+		$GLOBALS['_sa_class_relations'] = array( 'g-a' => array( 12 ) );
+		$ref                            = $this->holdCall( 'elementor/manage-classes', $this->classDelete() );
+		$this->assertSame(
+			array( 'design_system:*', 'page:12' ),
+			$this->refs( Aura_Worker_Door_Holds::get_held( $ref )['touches'] ),
+			'what the operator was shown'
+		);
+
+		// The approval Aura is about to send acknowledges the design-system
+		// rule — the only one that existed when the hold was made.
+		$ds_ack = Aura_Worker_Elementor_Door::rule_evidence(
+			array( 'key' => 'rule/ds', 'effect' => 'warn', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are shared' )
+		);
+
+		// …and meanwhile page 13 starts using the class, under a warn rule.
+		$GLOBALS['_sa_class_relations'] = array( 'g-a' => array( 12, 13 ) );
+		// The page rule is ordered first: `match()` returns ONE rule for a
+		// whole touch set, and within a rank the first match wins — so this
+		// is the rule the operator must now answer for. Judged on the STORED
+		// touches it would not match at all (page 13 is not in that set), the
+		// design-system ack would be accepted, and the call would run.
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/watch-13', 'effect' => 'warn', 'target' => array( 'type' => 'page', 'id' => '13' ), 'reason' => 'new page, tell me' ),
+				array( 'key' => 'rule/ds', 'effect' => 'warn', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are shared' ),
+			)
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, array( 'key' => $ds_ack['key'], 'ruleHash' => $ds_ack['ruleHash'] ) );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'warn_changed', $out['reason'] );
+		$this->assertSame( 'rule/watch-13', $out['rule']['key'], 'the rule the operator has not acknowledged' );
+		$this->assertSame( array(), $this->ran, 'nothing ran' );
+		$this->assertSame(
+			array( 'design_system:*', 'page:12', 'page:13' ),
+			$this->refs( Aura_Worker_Door_Holds::get_held( $ref )['touches'] ),
+			'and the hold now shows what would actually run'
+		);
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'never claimed' );
+	}
+
+	/**
+	 * The same drift, but the new page is BLOCKED. Before Ruling P34 that was
+	 * discovered inside judge_collateral() — one priority after Elementor had
+	 * already deleted the class row — so the refusal came too late to prevent
+	 * the deletion. Now it never gets past the re-judgement.
+	 */
+	public function test_a_page_that_started_using_the_class_under_a_block_refuses_before_the_class_is_deleted(): void {
+		$this->seedPage( 12 );
+		$this->seedPage( 13 );
+		$deleted = 0;
+		$this->register(
+			'elementor/manage-classes',
+			static function () use ( &$deleted ) {
+				++$deleted; // Elementor deleting the class row
+				return array( 'ok' => true );
+			}
+		);
+		do_action( 'wp_abilities_api_init' );
+		$this->installRuleset( array() ); // no rule: the call is held with verdict `none`
+		$GLOBALS['_sa_class_relations'] = array( 'g-a' => array( 12 ) );
+		$ref                            = $this->holdCall( 'elementor/manage-classes', $this->classDelete() );
+
+		$GLOBALS['_sa_class_relations'] = array( 'g-a' => array( 12, 13 ) );
+		$this->installRuleset(
+			array( array( 'key' => 'rule/keep-13', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '13' ), 'reason' => 'hands off' ) )
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'refused_by_current_rule', $out['reason'] );
+		$this->assertSame( 'rule/keep-13', $out['rule_key'] );
+		$this->assertSame( 0, $deleted, 'the class was never deleted' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is rejected, not parked' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused_by_current_rule', end( $log )['reason'] );
+		$this->assertSame(
+			array( 'design_system:*', 'page:12', 'page:13' ),
+			$this->refs( end( $log )['touches'] ),
+			'the entry records what was judged'
+		);
+	}
+
+	/**
+	 * The target stopped being one Aura can attribute while the hold waited —
+	 * the page was deleted. Retrying can never help, so the approval is spent
+	 * rather than parked (Ruling P34).
+	 */
+	public function test_a_target_that_became_unattributable_during_the_hold_is_refused_for_good(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		unset( $GLOBALS['_posts'][7] ); // the page is gone
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'target_unattributed', $out['reason'] );
+		$this->assertSame( 'aura_target_unattributed', $out['code'] );
+		$this->assertSame( array(), $this->ran );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'target_unattributed', end( $log )['reason'] );
+	}
+
+	/** "type:id" for each touch, so an assertion reads like the declaration. */
+	private function refs( array $touches ): array {
+		return array_map(
+			static function ( $t ) {
+				return $t['type'] . ':' . $t['id'];
+			},
+			$touches
+		);
 	}
 }

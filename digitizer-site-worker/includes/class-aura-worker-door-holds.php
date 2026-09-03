@@ -243,6 +243,35 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
+	 * Update the TOUCHES on a held row IN PLACE (Ruling P34).
+	 *
+	 * What a call touches is not fixed for the life of a hold: a
+	 * `manage-classes` deletion's collateral pages come from Elementor's
+	 * class→posts index, and that index moves while the hold waits. The
+	 * operator must be shown what would run NOW, not what would have run when
+	 * the call was first refused — so a replay that recomputes the touches
+	 * writes them back here before it answers.
+	 *
+	 * Same fenced compare-and-swap as refresh_rule(): a conditional UPDATE on
+	 * the row as it stands, never `update_option()`, which would recreate a
+	 * row a reject or the sweep deleted meanwhile.
+	 *
+	 * @param string $ref     Ref.
+	 * @param array  $touches Touches, as touches_for() returns them.
+	 * @return bool
+	 */
+	public static function refresh_touches( $ref, array $touches ) {
+		$option = self::HELD . self::clean( $ref );
+		$before = self::from_db( $option );
+		if ( null === $before ) {
+			return false;
+		}
+		$after            = $before;
+		$after['touches'] = $touches;
+		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+	}
+
+	/**
 	 * Mark a held row whose door-log entry could not be written (Ruling P25).
 	 *
 	 * A conditional UPDATE on the row as it stands, never update_option():
