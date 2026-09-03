@@ -724,8 +724,9 @@ class Aura_Worker_Door_Holds {
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
 	 * @return bool|null TRUE when every statement ran under a lock this call
-	 *                   held; FALSE when they ran and one failed; NULL when the
-	 *                   lock could not be taken and nothing was attempted.
+	 *                   held; FALSE when they ran and one failed; NULL when
+	 *                   nothing was attempted at all — the lock could not be
+	 *                   taken (P46), or a replay is in flight (P50).
 	 */
 	public static function wipe( $claim, $fence ) {
 		global $wpdb;
@@ -745,6 +746,27 @@ class Aura_Worker_Door_Holds {
 			return null;
 		}
 		try {
+			// NO WIPE ACROSS A LIVE REPLAY (Ruling P50). This is the mechanism
+			// the previous three rounds kept patching around: a replay that has
+			// CLAIMED its hold is between the claim and its callback, and
+			// nothing the wipe deletes can make that request stop. So the wipe
+			// does not start.
+			//
+			// A claimed row younger than CLAIM_STALE_MS is a replay in flight;
+			// anything older is a died request the reconciler owns, and waiting
+			// for it would block a rebind for ever. Because claim() takes this
+			// same lock (Ruling P47a), a claim cannot begin while this check
+			// and the deletes below are running — so after a successful wipe
+			// there is no replay in flight, and none can start: the held rows
+			// it would claim from are gone.
+			//
+			// COST, stated: a replay that died mid-flight blocks a rebind for
+			// at most CLAIM_STALE_MS, until `/status` reconciles it. The unbind
+			// marks `door` a leftover and retries; the changed-binding connect
+			// answers `aura_door_busy` and Aura retries.
+			if ( self::a_replay_is_in_flight() ) {
+				return null; // nothing attempted, like a lock that could not be taken
+			}
 			// EVERY result counted (Ruling P49). A transient database error on
 			// the held-prefix delete used to be invisible: the later statements
 			// succeeded, the wipe reported true, and a changed-client connect
@@ -764,6 +786,29 @@ class Aura_Worker_Door_Holds {
 		} finally {
 			self::release_lock( $token );
 		}
+	}
+
+	/**
+	 * Is any replay between its claim and its callback right now (Ruling P50)?
+	 *
+	 * Judged the way the sweep and the reconciler judge a claim: younger than
+	 * CLAIM_STALE_MS is in flight, older is a died request somebody else owns.
+	 * A claim whose stamp cannot be read is treated as IN FLIGHT — an
+	 * unreadable stamp is not evidence of staleness, the same rule
+	 * `sweep()` applies in the other direction.
+	 *
+	 * @return bool
+	 */
+	private static function a_replay_is_in_flight() {
+		$ms  = class_exists( 'Aura_Worker_Elementor_Door' ) ? (int) Aura_Worker_Elementor_Door::CLAIM_STALE_MS : 600000;
+		$cut = time() - (int) floor( $ms / 1000 );
+		foreach ( self::rows( self::CLAIMED ) as $row ) {
+			$at = strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) );
+			if ( false === $at || $at > $cut ) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**

@@ -292,7 +292,10 @@ class Aura_Worker_Elementor_Door {
 		// what this call reports.
 		$ok = Aura_Worker_Door_Holds::wipe( $claim, $fence );
 		if ( null === $ok ) {
-			return false; // the lock was never taken: nothing was deleted, and nothing may be
+			// Nothing was attempted — the lock could not be taken (P46), or a
+			// replay is in flight (P50) — so nothing here may be deleted
+			// either. The caller retries.
+			return false;
 		}
 		// The creation mutex and the retention throttle are this binding's
 		// working state too, and a fresh binding should inherit neither: an
@@ -1826,15 +1829,16 @@ class Aura_Worker_Elementor_Door {
 			return new WP_Error( 'aura_log_failed', 'The door log could not record that this call was about to run; it was not run.', array( 'status' => 503 ) );
 		}
 
-		// IS THIS STILL THE BINDING THAT APPROVED THE CALL (Ruling P47)?
+		// IS THIS STILL THE BINDING THAT APPROVED THE CALL?
 		//
-		// The last thing checked before the callback, because it is the last
-		// thing that can change: a changed-client connect (or an unbind) wipes
-		// the door while this replay is mid-flight, and everything it deletes —
-		// the claimed row, the log, the epoch — was the DEPARTED client's. The
-		// claim itself is now taken under the hold lock, so it cannot land
-		// inside the wipe's deletes; this catches the other order, where the
-		// claim was already ours and the wipe happened afterwards.
+		// DEFENCE IN DEPTH, not the protection itself (Ruling P50). The
+		// protection is that a wipe REFUSES TO START while any claimed row is
+		// younger than CLAIM_STALE_MS, and `claim()` takes the same lock the
+		// wipe does — so a replay in flight and a wipe cannot overlap at all.
+		// This check remains because it is cheap and because it is the only
+		// thing that would notice a wipe reaching the door by some route
+		// nobody has thought of: an operator deleting options by hand, a
+		// migration, a future caller that forgets the rule.
 		//
 		// The BINDING GENERATION is the witness (Ruling P51): only a wipe
 		// deletes it and the next binding mints a fresh one, so the value
@@ -1844,12 +1848,6 @@ class Aura_Worker_Elementor_Door {
 		// which MINTS one and would quietly manufacture agreement on a site
 		// whose binding was just deleted.
 		//
-		// RESIDUAL WINDOW, stated rather than hidden: a wipe landing between
-		// this read and `call_user_func()` below is not caught. It is the same
-		// class of residual as the P37 allocation re-check — narrowed to two
-		// statements, not closed — and closing it would mean holding the hold
-		// lock across the ability's own execution, which is an arbitrary amount
-		// of third-party work.
 		if ( null !== self::$replay_ack ) {
 			$ours = self::replay_binding_unchanged( (string) self::$replay_ack['ref'] );
 			if ( ! $ours ) {

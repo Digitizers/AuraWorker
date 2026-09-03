@@ -538,6 +538,28 @@ final class ConnectProvisionTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P50: a changed-binding connect during a LIVE replay is refused.
+	 *
+	 * A replay between its claim and its callback cannot be stopped by
+	 * deleting rows out from under it, so the wipe does not start and the
+	 * connect answers `aura_door_busy` — the same retryable refusal a busy
+	 * hold lock gets, and Aura retries in seconds.
+	 */
+	public function test_a_changed_binding_connect_refuses_while_a_replay_is_in_flight(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref = $this->seedDoorState();
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) ); // a replay is running
+		$before_token = get_option( 'aura_worker_site_token' );
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_door_busy', $res->get_error_code() );
+		$this->assertSame( $before_token, get_option( 'aura_worker_site_token' ), 'nothing of the new binding was written' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), "and the replay's claim is untouched" );
+	}
+
+	/**
 	 * Ruling P48: the busy path leaves NOTHING of the new binding behind.
 	 *
 	 * `aura_worker_connect_user_id` used to be the handler's first persistent

@@ -897,6 +897,9 @@ final class UnbindCleanupTest extends TestCase {
 		$held    = Aura_Worker_Door_Holds::hold( $call );
 		$claimed = Aura_Worker_Door_Holds::hold( $call );
 		Aura_Worker_Door_Holds::claim( $claimed );
+		// A DIED replay, not a live one: a claim younger than CLAIM_STALE_MS
+		// stops the wipe outright (Ruling P50), which is its own test below.
+		$this->ageClaim( $claimed );
 		for ( $i = 0; $i < 3; $i++ ) {
 			$seq = Aura_Worker_Door_Log::open_pending( $call );
 			Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
@@ -992,6 +995,15 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertNull( $frag['log_full'] );
 	}
 
+	/** Backdate a claimed row past CLAIM_STALE_MS, in the database and the cache alike. */
+	private function ageClaim( string $ref, int $extra_s = 60 ): void {
+		$name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+		$row  = get_option( $name, array() );
+		$row['claimed_at']          = gmdate( 'c', time() - (int) ( Aura_Worker_Elementor_Door::CLAIM_STALE_MS / 1000 ) - $extra_s );
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+	}
+
 	/** The LIKE pattern the held-prefix delete actually carries (underscores escaped). */
 	private function heldLikePattern(): string {
 		return $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD ) . '%';
@@ -1063,6 +1075,54 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( array(), Aura_Worker_Unbind::leftovers() );
 		$this->assertSame( array(), $this->doorRows() );
 		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	/**
+	 * Ruling P50: a wipe does not START while a replay is in flight.
+	 *
+	 * This is the mechanism the previous three rounds kept patching around. A
+	 * replay that has CLAIMED its hold is between the claim and its callback,
+	 * and nothing the wipe deletes can make that request stop — so the wipe
+	 * refuses instead, and the caller retries.
+	 */
+	public function test_a_wipe_refuses_while_a_replay_is_in_flight(): void {
+		$door = $this->seedDoor();
+		// The claimed row is FRESH again: a live replay, not a died one.
+		$this->ageClaim( $door['claimed'], -30 ); // thirty seconds in the future of the bound
+		$before = $this->doorRows();
+		$fence  = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		$this->assertSame( $before, $this->doorRows(), 'nothing was deleted' );
+		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ), 'and the lock it took was released' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** A claim older than CLAIM_STALE_MS is a died replay the reconciler owns: the wipe proceeds. */
+	public function test_a_wipe_proceeds_past_a_stale_claim(): void {
+		$door = $this->seedDoor(); // seedDoor() already ages its claim
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		$this->assertSame( array(), $this->doorRows() );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $door['claimed'] ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** A claim whose stamp cannot be read is treated as IN FLIGHT, not as stale. */
+	public function test_a_claim_with_an_unreadable_stamp_stops_the_wipe(): void {
+		$door = $this->seedDoor();
+		$name = Aura_Worker_Door_Holds::CLAIMED . $door['claimed'];
+		$row  = get_option( $name, array() );
+		$row['claimed_at']            = '';
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+		$fence                        = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
 	/**
