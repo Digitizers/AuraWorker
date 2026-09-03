@@ -301,6 +301,34 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( 'Elementor MCP (studio)', $log[0]['actor']['app_password_name'] );
 	}
 
+	/**
+	 * Ruling P25: a terminal-only entry is admitted BY its settle.
+	 *
+	 * The row used to be admitted first, so a failed settle left an admitted
+	 * pending row — `log_after()` stops at it, and the reconciler later called
+	 * a call that never ran `interrupted`. Un-admitted, the same failure
+	 * leaves a row the reconciler discards, which is the honest state.
+	 */
+	public function test_a_held_entry_whose_settle_fails_leaves_an_unadmitted_row(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'settled_at' );
+		};
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_held_for_approval', $out->get_error_code(), 'the hold row is the durable fact; the log row is evidence' );
+		$ref = (string) $out->get_error_data()['ref'];
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertFalse( Aura_Worker_Door_Holds::get_held( $ref )['log_entry'], 'and the hold row says its entry was not written' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'pending', $row['result'] );
+		$this->assertFalse( $row['admitted'], 'never admitted, so the reconciler discards it rather than interrupting it' );
+		$this->assertSame( 1, (int) get_option( 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS ), 0 ) );
+		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ), 'an un-admitted row is not served' );
+	}
+
 	/** §3.9: a site that cannot store a hold refuses — nothing runs ungoverned. */
 	public function test_a_hold_that_cannot_be_stored_refuses(): void {
 		$this->registerAll();

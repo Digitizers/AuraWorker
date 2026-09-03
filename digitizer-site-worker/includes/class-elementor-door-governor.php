@@ -1385,7 +1385,13 @@ class Aura_Worker_Elementor_Door {
 		if ( 'warn' === $verdict['verdict'] ) {
 			Aura_Worker_Rules::record_warn( $slug, $verdict['rule'] );
 		}
-		self::record_terminal_only(
+		// The HOLD is the durable fact — the operator can act on it, and a
+		// replay reads it, whatever the log managed to record — so a hold is
+		// never refused because its evidence could not be written. The miss
+		// is noted ON the hold row instead, so an entry that never appears is
+		// explained rather than merely absent (Ruling P25). `log_ungoverned`
+		// is bumped inside record_terminal_only(), where every other one is.
+		$logged = self::record_terminal_only(
 			$slug,
 			$actor,
 			$touches,
@@ -1396,6 +1402,9 @@ class Aura_Worker_Elementor_Door {
 				'rule_key' => isset( $verdict['rule']['key'] ) ? $verdict['rule']['key'] : null,
 			)
 		);
+		if ( ! $logged ) {
+			Aura_Worker_Door_Holds::note_unlogged( $ref );
+		}
 		$refusal            = new WP_Error(
 			'aura_held_for_approval',
 			sprintf( 'This write is queued for approval in Aura (ref %s). Do not retry; it will run if approved.', $ref ),
@@ -1452,10 +1461,19 @@ class Aura_Worker_Elementor_Door {
 			self::bump_counter( 'log_ungoverned' );
 			return false;
 		}
-		Aura_Worker_Door_Log::admit( $seq );
-		// settle() admits too, so the entry is served whether or not the
-		// admit above landed; its own answer is the whole of "durable".
-		return Aura_Worker_Door_Log::settle( $seq, array_merge( array( 'result' => $result ), $extra ) );
+		// NOT admitted here (Ruling P25): settle() admits in the same write,
+		// so a successful settle yields exactly the admitted terminal row it
+		// always did — and a FAILED one leaves an UN-ADMITTED pending row,
+		// which the reconciler discards. Admitting first made that same
+		// failure leave an admitted pending row: `log_after()` stops at one,
+		// so every later entry waited behind it, and the reconciler
+		// eventually called a call that never ran `interrupted`. Discarded is
+		// the honest state for an entry whose call never happened.
+		if ( ! Aura_Worker_Door_Log::settle( $seq, array_merge( array( 'result' => $result ), $extra ) ) ) {
+			self::bump_counter( 'log_ungoverned' );
+			return false;
+		}
+		return true;
 	}
 	/* ------------------------------------------------------------------ */
 	/* Replay: Aura's approval of a held call                              */

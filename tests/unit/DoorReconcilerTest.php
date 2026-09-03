@@ -575,6 +575,48 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( 'open', $this->fragment()['door'] );
 	}
 
+	/**
+	 * The other half of Ruling P25: the row a failed terminal-only settle
+	 * leaves is DISCARDED, never `interrupted` — nothing ran under it.
+	 */
+	public function test_a_terminal_only_entry_whose_settle_fails_is_discarded_not_interrupted(): void {
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'settled_at' );
+		};
+
+		$written = $this->recordTerminalOnly( 'held', array( 'ref' => 'door_x' ) );
+
+		$this->assertFalse( $written, 'the caller is told its evidence is not durable' );
+		$row = $this->row( 1 );
+		$this->assertSame( 'pending', $row['result'] );
+		$this->assertFalse( $row['admitted'], 'the settle is what admits it, and it did not land' );
+		$this->assertSame( 1, $this->counter( 'log_ungoverned' ) );
+
+		unset( $GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] );
+		$this->patchOption( Aura_Worker_Door_Log::PREFIX . 1, array( 'at' => $this->longAgo() ) );
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 1, $out['discarded'] );
+		$this->assertSame( 0, $out['interrupted'], 'nothing ever ran under this number' );
+		$this->assertSame( 'discarded', $this->row( 1 )['result'] );
+		$this->assertSame( array( 1 ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ), 'and a terminal row is served, so the log is not blocked' );
+	}
+
+	/** The governor's private terminal-only writer — the unit under test here. */
+	private function recordTerminalOnly( string $result, array $extra ): bool {
+		$m = new ReflectionMethod( Aura_Worker_Elementor_Door::class, 'record_terminal_only' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		return (bool) $m->invoke( null, 'elementor/publish-document', array( 'user_id' => 3, 'login' => 'bot' ), array( array( 'type' => 'page', 'id' => '7' ) ), $result, $extra );
+	}
+
+	/** The rolling counter bump_counter() writes. */
+	private function counter( string $name ): int {
+		return (int) get_option( 'aura_worker_door_c_' . $name . '_h' . (int) floor( time() / HOUR_IN_SECONDS ), 0 );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (j) a rewound log is REPORTED; /status never rotates (Ruling P20)   */
 	/* ------------------------------------------------------------------ */

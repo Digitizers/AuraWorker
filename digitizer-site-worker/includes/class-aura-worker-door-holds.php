@@ -243,6 +243,29 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
+	 * Mark a held row whose door-log entry could not be written (Ruling P25).
+	 *
+	 * A conditional UPDATE on the row as it stands, never update_option():
+	 * the same rule refresh_rule() follows, so a hold a reject or the sweep
+	 * removed meanwhile is not recreated by a note about it. Best effort by
+	 * design — the hold itself already stands, and this only explains why no
+	 * entry accompanies it.
+	 *
+	 * @param string $ref Ref.
+	 * @return bool
+	 */
+	public static function note_unlogged( $ref ) {
+		$option = self::HELD . self::clean( $ref );
+		$before = self::from_db( $option );
+		if ( null === $before ) {
+			return false;
+		}
+		$after              = $before;
+		$after['log_entry'] = false;
+		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+	}
+
+	/**
 	 * Claim by MOVE: insert the claimed twin, then delete the held row and
 	 * require that delete to remove one row.
 	 *
