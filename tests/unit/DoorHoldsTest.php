@@ -145,6 +145,55 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P61 (F1): a LAZY record is not an unbound site.
+	 *
+	 * 2.16 meeting an already-connected site mints a placeholder with a null
+	 * identity. Treating that as equal to an unbind's target meant the unbind
+	 * rotated NOTHING — and callbacks waiting at the generation fence walked
+	 * through after the site had been unbound.
+	 */
+	public function test_an_unbind_rotates_a_lazily_minted_record(): void {
+		$before = Aura_Worker_Door_Log::binding(); // the lazy mint
+		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'] );
+
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) ) );
+
+		$this->assertNotSame( $before, Aura_Worker_Door_Log::binding(), 'the generation moved' );
+		$this->assertSame( 'unbound', Aura_Worker_Door_Log::binding_record()['state'] );
+	}
+
+	/** …and a connect rotates it too: `unset` is never equal to anything. */
+	public function test_a_connect_rotates_a_lazily_minted_record(): void {
+		$before = Aura_Worker_Door_Log::binding();
+
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) ) );
+
+		$this->assertNotSame( $before, Aura_Worker_Door_Log::binding() );
+		$this->assertSame( 'bound', Aura_Worker_Door_Log::binding_record()['state'] );
+	}
+
+	/** An already-unbound record does not rotate again for another unbind. */
+	public function test_an_unbind_of_an_already_unbound_record_is_a_no_op(): void {
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) );
+		$gen = Aura_Worker_Door_Log::binding();
+
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) ) );
+
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding() );
+	}
+
+	/** A record written before the state existed reads as `unset`. */
+	public function test_a_record_without_a_state_reads_as_unset(): void {
+		$legacy = array( 'gen' => 'legacy-gen', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $legacy;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $legacy );
+
+		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'] );
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) ), 'and rotates' );
+		$this->assertNotSame( 'legacy-gen', Aura_Worker_Door_Log::binding() );
+	}
+
+	/**
 	 * rotate_binding() mints a value nothing older can match — and is a NO-OP
 	 * when the record already names the identity being installed (Ruling P59).
 	 */

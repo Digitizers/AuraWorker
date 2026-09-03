@@ -24,6 +24,13 @@ class Aura_Worker_Door_Log {
 	const EPOCH        = 'aura_worker_door_epoch';
 	/** The BINDING generation (Rulings P51/P58): minted like the epoch, rotated ONLY by a rebind. */
 	const BINDING      = 'aura_worker_door_binding';
+	/* The binding record's STATE (Ruling P61) — a lazy mint is never a stated identity. */
+	const BINDING_UNSET   = 'unset';
+	const BINDING_BOUND   = 'bound';
+	const BINDING_UNBOUND = 'unbound';
+
+	/** @var array|null live_identity()'s per-request cache */
+	private static $live_identity = null;
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
 	const MAX_UNACKED  = 2000;
@@ -114,29 +121,89 @@ class Aura_Worker_Door_Log {
 	 * nothing else, is why a rotation that failed can simply be retried by the
 	 * next connect rather than needing to be undone.
 	 *
-	 * Minted lazily with a NULL identity, which reads as "rotate on the first
-	 * connect": a site that has never been connected under this rule has a
-	 * generation but no claim about whose it is.
+	 * The record carries a STATE, and that is what tells a lazy mint apart from
+	 * a real one (Ruling P61). A site that 2.16 meets already connected has no
+	 * record, so the first reader mints one — and a null identity on that
+	 * placeholder used to be indistinguishable from "this site is unbound", so
+	 * a later unbind saw its own target already in place, rotated nothing, and
+	 * callbacks waiting at the generation fence walked through after the site
+	 * had been unbound. `unset` is never equal to anything: it always rotates.
 	 *
-	 * @return array{ gen: string, client: string|null, dashboard: string|null }
+	 * A record written before this rule has no `state` and reads as `unset`,
+	 * which is exactly right — nobody ever stated whose it was.
+	 *
+	 * @return array{ gen: string, state: string, client: string|null, dashboard: string|null }
 	 */
 	public static function binding_record() {
 		$cur = get_option( self::BINDING, null );
 		if ( is_array( $cur ) && isset( $cur['gen'] ) && '' !== (string) $cur['gen'] ) {
-			return $cur;
+			return self::normalise_binding( $cur );
 		}
 		self::insert_unique(
 			self::BINDING,
 			array(
 				'gen'       => wp_generate_uuid4(),
+				'state'     => self::BINDING_UNSET,
 				'client'    => null,
 				'dashboard' => null,
 			)
 		); // a concurrent mint loses the INSERT and reads the winner's
 		$cur = get_option( self::BINDING, null );
 		return is_array( $cur ) && isset( $cur['gen'] )
-			? $cur
-			: array( 'gen' => '', 'client' => null, 'dashboard' => null );
+			? self::normalise_binding( $cur )
+			: array( 'gen' => '', 'state' => self::BINDING_UNSET, 'client' => null, 'dashboard' => null );
+	}
+
+	/**
+	 * Fill in what an older record does not carry: no `state` means nobody
+	 * ever stated whose this door is (Ruling P61).
+	 *
+	 * @param array $rec Raw record.
+	 * @return array
+	 */
+	private static function normalise_binding( array $rec ) {
+		$state = isset( $rec['state'] ) ? (string) $rec['state'] : '';
+		if ( ! in_array( $state, array( self::BINDING_BOUND, self::BINDING_UNBOUND ), true ) ) {
+			$state = self::BINDING_UNSET;
+		}
+		return array(
+			'gen'       => (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' ),
+			'state'     => $state,
+			'client'    => isset( $rec['client'] ) && null !== $rec['client'] ? (string) $rec['client'] : null,
+			'dashboard' => isset( $rec['dashboard'] ) && null !== $rec['dashboard'] ? (string) $rec['dashboard'] : null,
+		);
+	}
+
+	/**
+	 * The identity this site is bound to RIGHT NOW, as the connect stores it
+	 * (Ruling P62) — read once per request.
+	 *
+	 * `client` comes from the ruleset store's binding sentinel through
+	 * `Aura_Worker_Rules::bound_client()` (which proves it against the site's
+	 * current token), and `dashboard` from the `aura_worker_dashboard_url`
+	 * option. Those are the two things a connect writes to say whose site this
+	 * is, and they are written BEFORE the generation rotates — so a departed
+	 * binding's rows stop being current the moment a changed-client connect
+	 * answers, whether or not its rotation landed.
+	 *
+	 * @return array{ client: string|null, dashboard: string|null }
+	 */
+	public static function live_identity() {
+		if ( null !== self::$live_identity ) {
+			return self::$live_identity;
+		}
+		$client    = class_exists( 'Aura_Worker_Rules' ) ? (string) Aura_Worker_Rules::bound_client() : '';
+		$dashboard = (string) get_option( 'aura_worker_dashboard_url', '' );
+		self::$live_identity = array(
+			'client'    => '' === $client ? null : $client,
+			'dashboard' => '' === $dashboard ? null : $dashboard,
+		);
+		return self::$live_identity;
+	}
+
+	/** Test seam / per-request cache reset for live_identity(). */
+	public static function forget_live_identity() {
+		self::$live_identity = null;
 	}
 
 	/**
@@ -354,6 +421,36 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * Is this generation the one the site is LIVE under (Ruling P62)?
+	 *
+	 * The generation must be current AND its record must still describe the
+	 * identity the site is actually bound to now. The second half is what
+	 * covers a rotation that did not land: the connect writes its identity
+	 * options before it rotates, so by the time it answers — success or
+	 * `aura_door_failed` — the record still names the DEPARTED client while the
+	 * site is live under the new one, and every row stamped with it is foreign.
+	 *
+	 * An `unset` record makes no claim about whose the door is, so it cannot
+	 * contradict the live identity: rows stamped by it stay current, which is
+	 * the pre-P62 behaviour and the right one for a site nobody has stated
+	 * anything about.
+	 *
+	 * @param string $gen The generation stamped on a row.
+	 * @return bool
+	 */
+	public static function generation_is_live( $gen ) {
+		$rec = self::binding_record();
+		if ( (string) $gen !== (string) $rec['gen'] ) {
+			return false;
+		}
+		if ( self::BINDING_UNSET === $rec['state'] ) {
+			return true;
+		}
+		$live = self::live_identity();
+		return $rec['client'] === $live['client'] && $rec['dashboard'] === $live['dashboard'];
+	}
+
+	/**
 	 * The current generation, read RAW from the database and NEVER minted
 	 * (Rulings P51/P59).
 	 *
@@ -402,19 +499,35 @@ class Aura_Worker_Door_Log {
 		$rec = null === $raw ? null : maybe_unserialize( $raw );
 		$rec = is_array( $rec ) && isset( $rec['gen'] ) ? $rec : null;
 
+		// The TARGET state: an unbind states nobody, everything else states a
+		// binding (a keyless connect is still `bound` — it names a dashboard).
+		$target = ( null === $client && null === $dashboard ) ? self::BINDING_UNBOUND : self::BINDING_BOUND;
+
 		// ALREADY THIS IDENTITY ⇒ nothing to do (Ruling P59). This is what
 		// makes the rotation safe to retry: every connect calls it, and only a
 		// connect that actually CHANGES the binding moves the generation.
-		if ( null !== $rec
-			&& ( isset( $rec['client'] ) ? $rec['client'] : null ) === $client
-			&& ( isset( $rec['dashboard'] ) ? $rec['dashboard'] : null ) === $dashboard
-		) {
-			return true;
+		//
+		// STATE FIRST (Ruling P61). A lazily-minted `unset` record has a null
+		// identity and is NOT an unbound site — it is a site nobody has stated
+		// anything about, typically one 2.16 met already connected. Treating it
+		// as equal to an unbind meant the unbind rotated nothing and callbacks
+		// waiting at the generation fence walked through after the site had
+		// been unbound. `unset` always rotates.
+		if ( null !== $rec ) {
+			$state = self::normalise_binding( $rec );
+			if ( self::BINDING_UNSET !== $state['state']
+				&& $state['state'] === $target
+				&& $state['client'] === $client
+				&& $state['dashboard'] === $dashboard
+			) {
+				return true;
+			}
 		}
 
 		$was  = self::epoch(); // read BEFORE the swap, so the rotate below fences on it
 		$next = array(
 			'gen'       => wp_generate_uuid4(),
+			'state'     => $target,
 			'client'    => $client,
 			'dashboard' => $dashboard,
 		);
@@ -442,6 +555,7 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( self::BINDING, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
+		self::forget_live_identity();
 		if ( ! $done ) {
 			return false;
 		}
