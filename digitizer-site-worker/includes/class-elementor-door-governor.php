@@ -414,7 +414,11 @@ class Aura_Worker_Elementor_Door {
 	 *    better evidence about its row than the row's age is, and settling
 	 *    the row first would leave the claim to be settled from an entry it
 	 *    no longer explains.
-	 * 3. Stale pending ROWS: the requests that never held anything.
+	 * 3. Stale pending ROWS: the requests that never held anything. Each is
+	 *    SETTLED before it is recovered (Ruling P45) — the pending-only settle
+	 *    is what decides which of two concurrent reconcilers, or which of a
+	 *    reconciler and the row's own late-finishing owner, may snapshot or
+	 *    compensate the creation it left behind.
 	 * 4. The creation mutex, by age alone.
 	 * 5. Retention: door envelopes older than 30 days (Ruling R6), and the
 	 *    counter buckets past the same window — at most once every
@@ -559,7 +563,25 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * Settle one admitted, pending row `interrupted`.
+	 * Settle one admitted, pending row `interrupted` — SETTLE FIRST, then
+	 * recover (Ruling P45).
+	 *
+	 * The settle is the CLAIM. `settle()` is pending-only and the first
+	 * terminal writer wins (Ruling P27), so exactly one caller can move this
+	 * row out of `pending` — and only that caller may then touch the site.
+	 * Recovering first was a race with real side effects: two `/status` polls
+	 * reconciling the same stale creation, or the original long-running
+	 * request settling after this poll read the row, both ran
+	 * `finish_stale_creation()` before anything established a winner. Two
+	 * envelopes for one creation was the mild outcome; the sharp one was a
+	 * loser whose snapshot failed calling `compensate()` and TRASHING posts the
+	 * winner had already made restorable, or had already reported `ok`.
+	 *
+	 * So the recovery's evidence lands by annotate(), not by settle: the row is
+	 * already terminal by then, and annotate() adds fields without touching
+	 * what it says happened. `interrupted` is the result either way — the
+	 * envelope and the compensation describe HOW the site was left, not what
+	 * happened to the call.
 	 *
 	 * Whatever the dead request already patched onto the row — the snapshot
 	 * id, the collateral ids — is carried by settle()'s own merge; only a
@@ -568,17 +590,27 @@ class Aura_Worker_Elementor_Door {
 	 * from `self::$request`, which belongs to whatever request is running now.
 	 *
 	 * @param array $row The log row.
-	 * @return bool The row settled.
+	 * @return bool The row settled BECAUSE OF THIS CALL.
 	 */
 	private static function settle_interrupted( array $row ) {
-		$seq    = (int) ( isset( $row['seq'] ) ? $row['seq'] : 0 );
-		$fields = array( 'result' => 'interrupted' );
+		$seq = (int) ( isset( $row['seq'] ) ? $row['seq'] : 0 );
+		if ( ! Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'interrupted' ) ) ) {
+			// Somebody else settled it: the owner finishing late, or another
+			// poll. NOTHING happens here — no envelope, no compensation. The
+			// winner owns the recovery.
+			return false;
+		}
 		if ( isset( $row['post_watermark'] ) ) {
 			// A watermark is only ever stamped by a creation that got past the
 			// mutex, so its presence IS "this row was creating".
-			$fields = array_merge( $fields, self::finish_stale_creation( $seq, $row ) );
+			$fields = self::finish_stale_creation( $seq, $row );
+			if ( ! empty( $fields ) ) {
+				// Evidence only — annotate() drops `result` and `settled_at`,
+				// so the verdict written a statement ago stands.
+				Aura_Worker_Door_Log::annotate( $seq, $fields );
+			}
 		}
-		return Aura_Worker_Door_Log::settle( $seq, $fields );
+		return true;
 	}
 
 	/**

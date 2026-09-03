@@ -339,6 +339,83 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array( 11 ), $rec['created_post_ids'], 'a restore of this envelope trashes 11 alone' );
 	}
 
+	/**
+	 * Ruling P45: the pending-only settle IS the claim, so only one reconciler
+	 * recovers a stale creation.
+	 *
+	 * Recovering first meant two `/status` polls could both run
+	 * `finish_stale_creation()` — two envelopes for one creation, and worse, a
+	 * loser whose snapshot failed calling compensate() and TRASHING the posts
+	 * the winner had just made restorable.
+	 */
+	public function test_two_reconcilers_on_one_stale_creation_produce_exactly_one_envelope(): void {
+		$seq = $this->staleCreation();
+		// A SECOND `/status` poll landing inside the first one's settle — both
+		// read the same pending row, which is the whole race. Fires once:
+		// sa_before_swap() does not clear its own seam.
+		$GLOBALS['_sa_before_swap'] = static function () {
+			$GLOBALS['_sa_before_swap'] = null;
+			Aura_Worker_Elementor_Door::reconcile();
+		};
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 0, $out['interrupted'], 'the nested poll settled it first; this one settles nothing' );
+		$row = $this->row( $seq );
+		$this->assertSame( 'interrupted', $row['result'] );
+		$this->assertSame( array( 11 ), $row['created_post_ids'] );
+		$this->assertArrayNotHasKey( 'compensated', $row, 'nothing was trashed' );
+		$this->assertNotEmpty( $row['snapshot_id'], 'the winner enveloped the creation' );
+		$this->assertNotNull( get_post( 11 ), 'and the created post still stands' );
+		$this->assertCount(
+			1,
+			array_filter(
+				(array) glob( WP_CONTENT_DIR . '/aura-backups/snapshots/snap_*.json' ),
+				static function ( $f ) {
+					$rec = json_decode( (string) file_get_contents( (string) $f ), true );
+					return 'creation' === (string) ( $rec['door_kind'] ?? '' );
+				}
+			),
+			'exactly one creation envelope'
+		);
+	}
+
+	/**
+	 * The live-owner case: the request that owns the row settles it while this
+	 * poll is mid-sweep. The reconciler must neither envelope nor compensate —
+	 * the owner's verdict stands and the site is the owner's to describe.
+	 */
+	public function test_an_owner_that_settles_first_leaves_the_reconciler_nothing_to_do(): void {
+		$seq = $this->staleCreation();
+		// The owner finishing late, between this poll's staleness read and its
+		// settle.
+		// Fires ONCE: sa_before_swap() does not clear its own seam, and the
+		// settle below is itself a swap.
+		$GLOBALS['_sa_before_swap'] = static function () use ( $seq ) {
+			$GLOBALS['_sa_before_swap'] = null;
+			Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok', 'created_post_ids' => array( 11 ) ) );
+		};
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 0, $out['interrupted'], 'the owner won' );
+		$row = $this->row( $seq );
+		$this->assertSame( 'ok', $row['result'], "and its verdict stands" );
+		$this->assertArrayNotHasKey( 'compensated', $row, 'the loser trashed nothing' );
+		$this->assertNotNull( get_post( 11 ) );
+		$this->assertSame(
+			array(),
+			array_filter(
+				(array) glob( WP_CONTENT_DIR . '/aura-backups/snapshots/snap_*.json' ),
+				static function ( $f ) {
+					$rec = json_decode( (string) file_get_contents( (string) $f ), true );
+					return 'creation' === (string) ( $rec['door_kind'] ?? '' );
+				}
+			),
+			'and never enveloped a creation it does not own'
+		);
+	}
+
 	public function test_a_stale_creation_whose_envelope_cannot_be_stored_is_compensated(): void {
 		$seq = $this->staleCreation();
 
