@@ -932,14 +932,26 @@ final class Aura_Worker_Unbind {
 			$left[] = 'grant_pubkey';
 		}
 		// The door's binding GENERATION (Ruling P59). Asked the way every other
-		// kind is asked — is it done — not "did step (4a)'s call return true":
-		// an unbound site is bound to nobody, so a record still naming a client
-		// or a dashboard means the rotation has not landed and the departed
-		// client's holds are still current. Names ONLY that; the queue, the log
-		// and the epoch are not deleted by an unbind and are not owed.
+		// kind is asked — is it done — not "did step (4a)'s call return true".
+		// Names ONLY that; the queue, the log and the epoch are not deleted by
+		// an unbind and are not owed.
+		//
+		// THE STATE, not the identity fields (Ruling P69). An `unset` record —
+		// the placeholder 2.16 lazily mints on a site it meets already
+		// connected — has a null client AND a null dashboard, so an identity
+		// test read it as "already unbound" and let the cleanup delete the
+		// token while the rotation's CAS had in fact failed. That is the worst
+		// possible reading: `generation_is_live()` treats an `unset` record's
+		// generation as CURRENT, so every row the departed binding stamped
+		// stayed live, on a site that could no longer be told anything.
+		//
+		// Only the explicit `unbound` constant discharges this step. `unset`
+		// and `bound` are leftovers whatever their identity fields say — the
+		// difference between "somebody stated this site is bound to nobody"
+		// and "nobody has ever stated anything".
 		if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
 			$rec = Aura_Worker_Door_Log::binding_record();
-			if ( null !== ( isset( $rec['client'] ) ? $rec['client'] : null ) || null !== ( isset( $rec['dashboard'] ) ? $rec['dashboard'] : null ) ) {
+			if ( Aura_Worker_Door_Log::BINDING_UNBOUND !== ( isset( $rec['state'] ) ? (string) $rec['state'] : '' ) ) {
 				$left[] = 'door';
 			}
 		}

@@ -198,7 +198,9 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	public function test_leftovers_names_every_pending_step_and_nothing_else(): void {
-		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ), Aura_Worker_Unbind::leftovers() );
+		// `door` is owed too (Ruling P69): nothing has stated this site is
+		// unbound, and a record that merely names nobody is not a statement.
+		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' ), Aura_Worker_Unbind::leftovers() );
 	}
 
 	public function test_leftovers_is_empty_with_no_marker(): void {
@@ -1028,6 +1030,35 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( 'c2', $rec['client'] );
 		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers(), 'the step is reported not done' );
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays' );
+	}
+
+	/**
+	 * Ruling P69 (F2): an `unset` record is not an unbound site.
+	 *
+	 * 2.16 meeting an already-connected site lazily mints a placeholder whose
+	 * client and dashboard are both null — so an IDENTITY test read a failed
+	 * rotation as a completed one and let the cleanup delete the token. That is
+	 * the worst possible reading: `generation_is_live()` treats an `unset`
+	 * record's generation as CURRENT, so every row the departed binding stamped
+	 * stayed live, on a site nobody could tell anything ever again.
+	 */
+	public function test_an_unset_record_after_a_failed_rotation_still_owes_the_door(): void {
+		$this->seedDoor();
+		// The placeholder: minted, never stated. Its identity fields are null,
+		// exactly like an unbound record's.
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = array( 'gen' => 'placeholder-gen', 'state' => 'unset', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] );
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::BINDING ] = true; // the CAS fails transiently
+
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$done  = Aura_Worker_Unbind::cleanup( true, $fence );
+
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'], 'the rotation really did not land' );
+		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers(), 'only `unbound` discharges the step' );
+		$this->assertFalse( $done, 'cleanup_complete is false' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'and the token is retained, so a retry can still be told' );
+		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
 	/** A caller that lost the site claim deletes nothing — the same fence every step uses. */
