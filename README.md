@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.15.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.16.0-green" alt="Stable" />
 </p>
 
 ---
@@ -189,7 +189,7 @@ admin-ajax action, not by a REST route.
 | `POST` | `/tools/execute` | Execute a tool with validated parameters |
 | `GET` | `/context` | Full site context for AI decision-making |
 
-**Built-in MCP tools (27):**
+**Built-in MCP tools (29):**
 
 | Tool | Kind | Purpose |
 |------|------|---------|
@@ -212,6 +212,8 @@ admin-ajax action, not by a REST route.
 | `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
 | `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many abilities pass the discovery rule such a server applies — a property of the abilities, not proof any server serves them; a registry-resolving server (Angie's) picks up mutating ones outside SiteAgent's approval path |
 | `audit_rules` | read | operator-ruleset presence + age, 24h block/warn counts, expired-but-listed rules, enforcement points in this build |
+| `snapshot_get` | read | retrieve a stored snapshot of page content (reversible write metadata) |
+| `elementor_replay_ability` | read | check Elementor MCP server replay capability and pending door log |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |
@@ -226,6 +228,10 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.16.0
+
+- Elementor MCP door governance: every write through Elementor >= 4.3's official MCP server is held for approval in Aura unless an operator `allow` rule covers it; `block` refuses; every write that runs is snapshotted first on the site and recorded in a per-site door log Aura drains. New tools `elementor_replay_ability`, `snapshot_get`; new routes `/aura/v1/door/reject`, `/aura/v1/door/ack`; `/status` carries `door`; `audit_mcp_exposure` carries `elementor.governor`. Rules gain the `allow` effect and the `design_system` / `page_create` targets.
 
 ### 2.15.0
 
