@@ -805,6 +805,49 @@ final class ElementorDoorCreationTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the mutex is released' );
 	}
 
+	/**
+	 * Ruling P67 (F2): an unreadable watermark is not a watermark of zero.
+	 *
+	 * `get_var()` answers null both for "no rows" and for a statement that
+	 * failed at the driver, and the `(int)` cast turned both into 0 — a mark
+	 * below every post that ever existed. Option writes can keep working while
+	 * that read fails, so the creation was admitted with a valid-looking mark,
+	 * and a later diff that DID succeed claimed every historical post of the
+	 * requested type by this actor as this call's.
+	 */
+	public function test_a_watermark_that_cannot_be_read_refuses_before_elementor_runs(): void {
+		$GLOBALS['_sa_watermark_error'] = true;
+
+		$out = $this->createPage( function () { return array( 'id' => $this->insertPage() ); } );
+
+		$GLOBALS['_sa_watermark_error'] = false;
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'], 'retryable: nothing ran' );
+		$this->assertArrayNotHasKey( 'elementor/create-page', $this->ran, 'Elementor never ran' );
+		$this->assertSame( array(), $GLOBALS['_posts'] );
+		$row = $this->row( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'watermark_unreadable', $row['reason'], 'and NOT watermark_failed: the row took the write fine' );
+		$this->assertFalse( $row['may_have_run'] );
+		$this->assertArrayNotHasKey( 'post_watermark', $row, 'no mark of zero was recorded' );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the mutex is released' );
+	}
+
+	/** …and an EMPTY posts table is a real mark of 0: the creation runs. */
+	public function test_an_empty_posts_table_stamps_a_watermark_of_zero_and_runs(): void {
+		$this->assertSame( array(), $GLOBALS['_posts'], 'nothing to be the mark' );
+
+		$out = $this->createPage( function () { return array( 'id' => $this->insertPage() ); } );
+
+		$this->assertIsArray( $out );
+		$this->assertSame( 1, $this->ran['elementor/create-page'] );
+		$row = $this->row( 1 );
+		$this->assertSame( 'ok', $row['result'] );
+		$this->assertSame( 0, $row['post_watermark'] );
+		$this->assertSame( array( $out['id'] ), $row['created_post_ids'] );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (f4/f5) a callback that throws                                      */
 	/* ------------------------------------------------------------------ */

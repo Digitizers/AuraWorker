@@ -729,6 +729,10 @@ class Aura_Worker_Elementor_Door {
 		}
 		$until = false === $from ? null : gmdate( 'Y-m-d H:i:s', $from + (int) floor( self::CLAIM_STALE_MS / 1000 ) );
 		$diff     = ( empty( $types ) || null === $until ) ? array() : self::watermark_diff( (int) $row['post_watermark'], $types, $actor_id, $until );
+		// A witness that could not be asked has not testified (Ruling P67):
+		// the entry says so rather than recording an empty observation.
+		$blind    = ( null === $diff );
+		$diff     = $blind ? array() : $diff;
 		$hooked   = array_map( 'intval', (array) ( isset( $row['created_post_ids'] ) ? $row['created_post_ids'] : array() ) );
 		// The same partition as the live path, through the same helper: a
 		// dead request left no result to name anything, so only witness 1
@@ -744,6 +748,9 @@ class Aura_Worker_Elementor_Door {
 		}
 		if ( ! empty( $part['unproven'] ) ) {
 			$fields['unproven'] = $part['unproven'];
+		}
+		if ( $blind ) {
+			$fields['watermark_unproven'] = 'diff_unreadable';
 		}
 		if ( empty( $created ) ) {
 			return $fields; // nothing proven was inserted: nothing to undo
@@ -1892,19 +1899,31 @@ class Aura_Worker_Elementor_Door {
 				self::$request = null;
 				return $mutex;
 			}
-			if ( ! self::stamp_watermark( $seq ) ) {
+			$stamped = self::stamp_watermark( $seq );
+			if ( true !== $stamped ) {
 				// Without a durable watermark an interrupted creation could
-				// not be found; refuse before Elementor runs.
+				// not be found; refuse before Elementor runs. `null` is the
+				// distinct case the row must name (Ruling P67): the mark could
+				// not be READ, so admitting would have meant creating above a
+				// mark of zero. Retryable either way — nothing ran.
+				$unreadable = ( null === $stamped );
 				self::release_creation_mutex();
 				Aura_Worker_Door_Log::settle(
 					$seq,
 					array(
-						'result' => 'refused',
-						'reason' => 'watermark_failed',
+						'result'       => 'refused',
+						'reason'       => $unreadable ? 'watermark_unreadable' : 'watermark_failed',
+						'may_have_run' => false,
 					)
 				);
 				self::$request = null;
-				return new WP_Error( 'aura_log_failed', 'The door log could not record the creation watermark; it was not run.', array( 'status' => 503 ) );
+				return new WP_Error(
+					'aura_log_failed',
+					$unreadable
+						? 'The creation watermark could not be read; it was not run.'
+						: 'The door log could not record the creation watermark; it was not run.',
+					array( 'status' => 503 )
+				);
 			}
 		}
 
@@ -3725,14 +3744,33 @@ class Aura_Worker_Elementor_Door {
 	 * WITNESS 2 — the high-water mark of wp_posts before the write, so an
 	 * insert core's hook never fired for can still be found afterwards.
 	 *
+	 * UNREADABLE IS NOT ZERO (Ruling P67). `get_var()` answers null both for
+	 * "no rows" and for a statement that failed at the driver, and `(int)`
+	 * turns both into 0 — a mark below every post that ever existed. Option
+	 * writes can still be working while that read fails, so the creation was
+	 * admitted with a valid-looking watermark of zero, and a later diff that
+	 * DID succeed swept up every historical post of the requested type by this
+	 * actor and recorded them as this call's observations: an enormous, wrong
+	 * audit entry, and — where compensation reaches — a trash list.
+	 *
+	 * An empty posts table is a real mark, so a null with NO error is 0. A
+	 * `last_error`, or a false result, is UNREADABLE and refuses.
+	 *
 	 * @param int $seq Log seq.
-	 * @return bool the watermark is on the row; false ⇒ the caller refuses the
-	 *              write: a creation whose watermark is not durable could not
-	 *              be reconstructed by anyone.
+	 * @return bool|null true ⇒ stamped. false ⇒ the row could not take it.
+	 *                   null ⇒ the watermark could not be READ. Both falsy
+	 *                   answers refuse the write: a creation whose watermark
+	 *                   is not durable, or not true, could not be
+	 *                   reconstructed by anyone.
 	 */
 	private static function stamp_watermark( $seq ) {
 		global $wpdb;
-		$max = (int) $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->last_error = '';
+		$raw              = $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		if ( false === $raw || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		$max                        = (int) $raw;
 		self::$request['watermark'] = $max;
 		return Aura_Worker_Door_Log::patch_pending(
 			$seq,
@@ -3778,8 +3816,16 @@ class Aura_Worker_Elementor_Door {
 	 * @param int         $mark     The watermark: the highest post id before the write.
 	 * @param string[]    $types    Post types the creation may legitimately have inserted.
 	 * @param int         $actor_id The actor the creation ran as.
+	 * UNREADABLE IS NOT EMPTY (Ruling P67), the same rule the stamp follows.
+	 * `get_col()` answers an empty array for a statement that failed, which is
+	 * indistinguishable from "the watermark saw nothing" — and "nothing" is
+	 * recorded on the entry as an OBSERVATION. A witness that could not be
+	 * asked has not testified: this answers null, and the callers record the
+	 * second witness as unproven with a reason instead of writing an empty
+	 * observation nobody made.
+	 *
 	 * @param string|null $until    GMT datetime; ids whose `post_modified_gmt` is after it are not this call's.
-	 * @return int[]
+	 * @return int[]|null null ⇒ the diff could not be read.
 	 */
 	private static function watermark_diff( $mark, array $types, $actor_id, $until = null ) {
 		global $wpdb;
@@ -3793,7 +3839,12 @@ class Aura_Worker_Elementor_Door {
 			$sql   .= ' AND post_modified_gmt <= %s';
 			$args[] = (string) $until;
 		}
-		return array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( $sql, $args ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->last_error = '';
+		$col              = $wpdb->get_col( $wpdb->prepare( $sql, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		if ( ! is_array( $col ) || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		return array_map( 'intval', $col );
 	}
 
 	/**
@@ -3857,8 +3908,11 @@ class Aura_Worker_Elementor_Door {
 		// stored. A stamped 0 (an empty posts table) is a real mark and does
 		// diff; only its ABSENCE means "nothing to compare".
 		$diff   = array();
+		$blind  = false;
 		if ( isset( self::$request['watermark'] ) ) {
-			$diff = self::watermark_diff( (int) self::$request['watermark'], $types, $actor_id );
+			$diff  = self::watermark_diff( (int) self::$request['watermark'], $types, $actor_id );
+			$blind = ( null === $diff );
+			$diff  = $blind ? array() : $diff;
 		}
 		$hooked   = array_map( 'intval', (array) self::$request['created'] );
 		$named    = is_array( $result ) && isset( $result['id'] ) && is_numeric( $result['id'] ) ? (int) $result['id'] : 0;
@@ -3876,7 +3930,13 @@ class Aura_Worker_Elementor_Door {
 			// this call — never restorable, never compensated.
 			$fields['unproven'] = $part['unproven'];
 		}
-		if ( empty( $created ) && empty( $missed ) && ! $failed ) {
+		if ( $blind ) {
+			// A witness that could not be asked has not testified (Ruling
+			// P67): the entry names the second witness as unproven, and the
+			// `unobserved` counter — which means "the witnesses saw nothing" —
+			// is NOT bumped, because one of them was never able to look.
+			$fields['watermark_unproven'] = 'diff_unreadable';
+		} elseif ( empty( $created ) && empty( $missed ) && ! $failed ) {
 			self::bump_counter( 'unobserved' ); // a success that inserted nothing the witnesses could see
 		}
 		if ( $named > 0 && ! in_array( $named, $created, true ) ) {

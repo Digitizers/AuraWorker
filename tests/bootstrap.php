@@ -2214,7 +2214,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// which is what the production (int) cast is written against.
 			if ( preg_match( '/^SELECT MAX\(ID\) FROM \S+$/', trim( (string) $query ) ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
-				$ids                      = array_map( 'intval', array_keys( $GLOBALS['_posts'] ) );
+				// The watermark read failing at the driver (Ruling P67): null
+				// answer, last_error set — which must NOT cast to a valid mark
+				// of zero. Scoped to this shape so a test can break the
+				// watermark without breaking every get_var() in the request.
+				if ( ! empty( $GLOBALS['_sa_watermark_error'] ) ) {
+					$this->last_error = 'watermark read failed';
+					return null;
+				}
+				$ids = array_map( 'intval', array_keys( $GLOBALS['_posts'] ) );
 				return empty( $ids ) ? null : (string) max( $ids );
 			}
 			// Aura_Worker_Door_Log::count_unacked(): rows above the ack floor.
