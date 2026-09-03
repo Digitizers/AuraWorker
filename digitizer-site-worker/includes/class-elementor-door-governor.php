@@ -637,7 +637,13 @@ class Aura_Worker_Elementor_Door {
 		if ( true === $lease ) {
 			return true;
 		}
-		if ( null === $lease ) {
+		$unleasable = ( Aura_Worker_Door_Holds::LEASE_UNSUPPORTED === ( isset( $row['lease'] ) ? (string) $row['lease'] : '' ) );
+		if ( null === $lease || $unleasable ) {
+			// Unknown, or admitted on an engine that HAS no named locks
+			// (Ruling P70) — either way there is no lease to read, so the hard
+			// cap decides. Read from the ROW for the stamped case: a site that
+			// gains locks between admission and this sweep would otherwise be
+			// told the never-taken lock is free and settle a live write.
 			$at = strtotime( (string) ( isset( $row['at'] ) ? $row['at'] : '' ) );
 			return false === $at || $at > time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S;
 		}
@@ -1753,9 +1759,40 @@ class Aura_Worker_Elementor_Door {
 		// this row is still running — which it was doing, and a creation that
 		// ran past CLAIM_STALE_MS could have its posts enveloped, or on a
 		// snapshot failure TRASHED, while its own callback was mid-flight.
+		//
+		// A LEASE THAT COULD NOT BE TAKEN REFUSES (Ruling P70). `GET_LOCK`
+		// failing transiently used to be indistinguishable from an engine that
+		// has none, and both simply ran the callback unleased — but a healthy
+		// `IS_USED_LOCK` minutes later then reports the never-acquired lock as
+		// FREE, so a callback still mutating the site past CLAIM_STALE_MS gets
+		// settled `interrupted` and, for a creation, its posts enveloped or
+		// compensated (trashed) mid-flight. Nothing has run at this point — no
+		// mutex is held (it is taken further down, per write kind) and no site
+		// state has been touched — so this is a clean retryable refusal.
+		//
+		// An engine that HAS no named locks is the other answer, and it
+		// proceeds — STAMPED, so the reconciler bounds the row by
+		// LEASE_HARD_CAP_S instead of the ten-minute age rule. Bounded, never
+		// blind.
 		$taken = Aura_Worker_Door_Holds::take_seq_lease( $seq );
 		if ( 1 === $taken ) {
 			self::$seq_lease = $seq;
+		} elseif ( Aura_Worker_Door_Holds::LEASE_UNSUPPORTED === $taken ) {
+			Aura_Worker_Door_Log::patch_pending( $seq, array( 'lease' => Aura_Worker_Door_Holds::LEASE_UNSUPPORTED ) );
+			if ( null !== self::$replay_ack ) {
+				Aura_Worker_Door_Holds::mark_claim_unleasable( (string) self::$replay_ack['ref'] );
+			}
+		} else {
+			Aura_Worker_Door_Log::settle(
+				$seq,
+				array(
+					'result'       => 'refused',
+					'reason'       => 'lease_unavailable',
+					'may_have_run' => false,
+				)
+			);
+			self::$request = null;
+			return new WP_Error( 'aura_log_failed', 'This site could not take an execution lease for the write; it was not run.', array( 'status' => 503 ) );
 		}
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
 			// Settle the reservation before backing out (Codex round-10 P2).
@@ -2452,7 +2489,21 @@ class Aura_Worker_Elementor_Door {
 					'reason' => 'not_held',
 				);
 			}
-			$leased = ( 1 === $lease ); // null ⇒ no lease available here; the age rule still protects
+			if ( null === $lease ) {
+				// A FAILURE, not an engine without locks (Ruling P70). Running
+				// unleased would leave a healthy IS_USED_LOCK reading the
+				// never-taken lock as free, and the reconciler recovering this
+				// replay out from under itself. Nothing has run: the hold goes
+				// back, the same shape every other retryable pre-callback
+				// refusal uses.
+				return self::give_back( $ref, 'aura_lease_unavailable', 'This site could not take an execution lease for the approval; it was not run.', $slug, (array) $held['actor'], isset( $touches ) && is_array( $touches ) ? $touches : array() );
+			}
+			if ( Aura_Worker_Door_Holds::LEASE_UNSUPPORTED === $lease ) {
+				// This engine HAS none. Proceed — stamped on the claim, so the
+				// reconciler bounds it by the hard cap, not the age rule.
+				Aura_Worker_Door_Holds::mark_claim_unleasable( $ref );
+			}
+			$leased = ( 1 === $lease );
 			// FROM HERE TO execute() THE CLAIM IS HELD, SO EVERY EXIT MUST
 			// SETTLE IT (Ruling P40). The permission callback is third-party
 			// code — Elementor's, or whatever a plugin filtered onto the
@@ -3371,9 +3422,23 @@ class Aura_Worker_Elementor_Door {
 		// The same lease as a governed write (Ruling P56): a restore runs a
 		// callback-like body, and the reconciler must not call it dead while
 		// it is still going.
+		// And the same three answers (Ruling P70): a lease that could not be
+		// TAKEN refuses the restore, an engine that HAS none proceeds stamped.
 		$taken = Aura_Worker_Door_Holds::take_seq_lease( $seq );
 		if ( 1 === $taken ) {
 			self::$seq_lease = $seq;
+		} elseif ( Aura_Worker_Door_Holds::LEASE_UNSUPPORTED === $taken ) {
+			Aura_Worker_Door_Log::patch_pending( $seq, array( 'lease' => Aura_Worker_Door_Holds::LEASE_UNSUPPORTED ) );
+		} else {
+			Aura_Worker_Door_Log::settle(
+				$seq,
+				array(
+					'result'       => 'refused',
+					'reason'       => 'lease_unavailable',
+					'may_have_run' => false,
+				)
+			);
+			return new WP_Error( 'aura_log_failed', 'This site could not take an execution lease for the restore; it was not run.', array( 'status' => 503 ) );
 		}
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
 			// Same rule as execute()'s admission (Codex round-10 P2): the

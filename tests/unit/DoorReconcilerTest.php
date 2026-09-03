@@ -680,6 +680,32 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertIsArray( get_option( Aura_Worker_Elementor_Door::CREATING, null ), 'running, not stale' );
 	}
 
+	/**
+	 * Ruling P70 (F3): a row admitted on an engine WITHOUT named locks is
+	 * bounded by the hard cap, not by the ten-minute age rule.
+	 *
+	 * Such a row never had a lease to lose, and asking the engine again is not
+	 * a safe substitute: a site that gains locks between admission and this
+	 * sweep answers "free" for a lock that was never taken, and the reconciler
+	 * settles a write that is still running. The stamp on the row is what makes
+	 * it bounded rather than blind.
+	 */
+	public function test_a_row_stamped_lease_unsupported_is_bounded_by_the_hard_cap(): void {
+		$seq = $this->entry( array( 'lease' => Aura_Worker_Door_Holds::LEASE_UNSUPPORTED ) );
+
+		// Past CLAIM_STALE_MS — and left alone, even though the engine now
+		// answers IS_USED_LOCK perfectly well and calls the lock free.
+		$out = Aura_Worker_Elementor_Door::reconcile();
+		$this->assertSame( 0, $out['interrupted'], 'not the age rule' );
+		$this->assertSame( 'pending', $this->row( $seq )['result'] ?? 'pending' );
+
+		$this->patchOption( Aura_Worker_Door_Log::PREFIX . $seq, array( 'at' => gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 ) ) );
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 1, $out['interrupted'], 'and settled past the hard cap' );
+		$this->assertSame( 'interrupted', $this->row( $seq )['result'] );
+	}
+
 	/** The same mutex with no lease held is cleared by age, exactly as before. */
 	public function test_an_old_mutex_with_no_seq_lease_is_still_cleared(): void {
 		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => $this->longAgo() ) );

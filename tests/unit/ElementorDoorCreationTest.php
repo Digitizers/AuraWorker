@@ -849,6 +849,51 @@ final class ElementorDoorCreationTest extends TestCase {
 	}
 
 	/* ------------------------------------------------------------------ */
+	/* (f2d) an execution lease that could not be taken                    */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Ruling P70 (F3): a lease that could not be TAKEN refuses the write.
+	 *
+	 * A transient GET_LOCK failure used to be indistinguishable from an engine
+	 * that has none, and both simply ran the callback unleased — but a healthy
+	 * IS_USED_LOCK minutes later reports the never-acquired lock as FREE, so a
+	 * callback still mutating the site past CLAIM_STALE_MS is settled
+	 * `interrupted` and its posts enveloped or trashed mid-flight.
+	 */
+	public function test_a_lease_that_cannot_be_taken_refuses_before_elementor_runs(): void {
+		$GLOBALS['_sa_named_lock_fail'] = true;
+
+		$out = $this->createPage( function () { return array( 'id' => $this->insertPage() ); } );
+
+		$GLOBALS['_sa_named_lock_fail'] = false;
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'], 'retryable: nothing ran' );
+		$this->assertArrayNotHasKey( 'elementor/create-page', $this->ran, 'Elementor never ran' );
+		$this->assertSame( array(), $GLOBALS['_posts'] );
+		$row = $this->row( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'lease_unavailable', $row['reason'] );
+		$this->assertFalse( $row['may_have_run'] );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'no mutex is held: the lease comes first' );
+	}
+
+	/** An engine that HAS no named locks runs, stamped — bounded, not blind. */
+	public function test_an_engine_without_named_locks_runs_and_stamps_the_row(): void {
+		$GLOBALS['_sa_named_lock_error'] = true;
+
+		$out = $this->createPage( function () { return array( 'id' => $this->insertPage() ); } );
+
+		$GLOBALS['_sa_named_lock_error'] = false;
+		$this->assertIsArray( $out );
+		$this->assertSame( 1, $this->ran['elementor/create-page'] );
+		$row = $this->row( 1 );
+		$this->assertSame( 'ok', $row['result'] );
+		$this->assertSame( Aura_Worker_Door_Holds::LEASE_UNSUPPORTED, $row['lease'] );
+	}
+
+	/* ------------------------------------------------------------------ */
 	/* (f4/f5) a callback that throws                                      */
 	/* ------------------------------------------------------------------ */
 

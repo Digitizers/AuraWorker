@@ -38,6 +38,17 @@ class Aura_Worker_Door_Holds {
 	/** The same lease, over a log SEQ: every governed write, not only a replay (Ruling P56). */
 	const SEQ_LEASE_PREFIX = 'aura_door_seq_';
 	const LEASE_HARD_CAP_S = 86400;
+
+	/**
+	 * What `get_lock()` answers on an engine that has no named locks at all
+	 * (Ruling P70). Distinct from null, which is a FAILURE: a failure refuses
+	 * the write, while an engine that simply cannot lease is proceeded with
+	 * under the hard cap — bounded, never blind.
+	 */
+	const LEASE_UNSUPPORTED = 'unsupported';
+
+	/** @var bool|null Per-request memo: does this engine have named locks? */
+	private static $locks_supported = null;
 	const LOCK_S  = 30;
 
 	/**
@@ -523,6 +534,30 @@ class Aura_Worker_Door_Holds {
 		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
 	}
 
+	/**
+	 * Record on the CLAIM that this site's engine has no named locks (Ruling
+	 * P70), so the reconciler bounds it by the hard cap rather than by the
+	 * ten-minute age rule — and rather than by asking an engine that might
+	 * answer differently later.
+	 *
+	 * Best effort: a stamp that does not land leaves the row exactly as it was,
+	 * and `claim_is_alive()` falls back to asking the engine, which is the
+	 * pre-P70 behaviour.
+	 *
+	 * @param string $ref Hold ref.
+	 * @return bool
+	 */
+	public static function mark_claim_unleasable( $ref ) {
+		$option = self::CLAIMED . self::clean( $ref );
+		$before = self::from_db( $option );
+		if ( null === $before ) {
+			return false;
+		}
+		$after          = $before;
+		$after['lease'] = self::LEASE_UNSUPPORTED;
+		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+	}
+
 	/** Delete the claimed row and any held twin. @param string $ref Ref. */
 	public static function release( $ref ) {
 		$ref = self::clean( $ref );
@@ -758,7 +793,9 @@ class Aura_Worker_Door_Holds {
 	 * Take the seq lease, without waiting.
 	 *
 	 * @param int $seq Log seq.
-	 * @return int|null 1 taken, 0 held elsewhere, null unavailable.
+	 * @return int|string|null 1 taken, 0 held elsewhere, self::LEASE_UNSUPPORTED
+	 *                         on an engine without named locks, null on a
+	 *                         FAILURE — which the caller refuses (Ruling P70).
 	 */
 	public static function take_seq_lease( $seq ) {
 		return self::get_lock( self::seq_lease_name( $seq ) );
@@ -784,8 +821,9 @@ class Aura_Worker_Door_Holds {
 	 * Take the lease, without waiting.
 	 *
 	 * @param string $ref Hold ref.
-	 * @return int|null 1 taken, 0 held by another connection, null when the
-	 *                  server could not answer (no GET_LOCK, a driver error).
+	 * @return int|string|null 1 taken, 0 held by another connection,
+	 *                         self::LEASE_UNSUPPORTED on an engine without
+	 *                         named locks, null on a FAILURE (Ruling P70).
 	 */
 	public static function take_lease( $ref ) {
 		return self::get_lock( self::lease_name( $ref ) );
@@ -799,12 +837,48 @@ class Aura_Worker_Door_Holds {
 	 */
 	private static function get_lock( $name ) {
 		global $wpdb;
+		if ( false === self::$locks_supported ) {
+			return self::LEASE_UNSUPPORTED; // asked once per request, answered from the memo
+		}
 		$wpdb->last_error = '';
 		$got              = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $name ) );
-		if ( null === $got || '' !== (string) $wpdb->last_error ) {
-			return null; // no lease available here; the age rule still protects
+		$err              = (string) $wpdb->last_error;
+		if ( '' !== $err && self::error_says_no_locks( $err ) ) {
+			self::$locks_supported = false;
+			return self::LEASE_UNSUPPORTED;
 		}
+		if ( null === $got || '' !== $err ) {
+			return null; // a FAILURE, not an engine without locks: the caller refuses
+		}
+		self::$locks_supported = true;
 		return (int) $got;
+	}
+
+	/**
+	 * Does this error say the ENGINE has no named locks, rather than that this
+	 * statement failed (Ruling P70)?
+	 *
+	 * The two are opposite answers — an engine without locks is proceeded with
+	 * under the hard cap, a failed statement refuses the write — and only the
+	 * message tells them apart. MySQL-compatible engines that ship without
+	 * `GET_LOCK` (SQLite integrations, some proxies and forks) answer with a
+	 * missing-function error; anything else is a failure, which is the safe
+	 * default because it refuses.
+	 *
+	 * @param string $err `$wpdb->last_error`.
+	 * @return bool
+	 */
+	private static function error_says_no_locks( $err ) {
+		$err = strtolower( (string) $err );
+		return ( false !== strpos( $err, 'does not exist' ) && false !== strpos( $err, 'function' ) )
+			|| false !== strpos( $err, 'no such function' )
+			|| false !== strpos( $err, 'unknown function' )
+			|| false !== strpos( $err, 'not supported' );
+	}
+
+	/** Test seam: forget whether this engine has named locks. */
+	public static function forget_lock_support() {
+		self::$locks_supported = null;
 	}
 
 	/**
@@ -822,9 +896,16 @@ class Aura_Worker_Door_Holds {
 	 */
 	private static function lock_is_used( $name ) {
 		global $wpdb;
+		if ( false === self::$locks_supported ) {
+			return null; // no locks here: unknown, and the hard cap bounds it
+		}
 		$wpdb->last_error = '';
 		$who              = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s)', $name ) );
-		if ( '' !== (string) $wpdb->last_error ) {
+		$err              = (string) $wpdb->last_error;
+		if ( '' !== $err ) {
+			if ( self::error_says_no_locks( $err ) ) {
+				self::$locks_supported = false;
+			}
 			return null;
 		}
 		return null !== $who;
@@ -892,6 +973,16 @@ class Aura_Worker_Door_Holds {
 		$lease = self::lease_is_held( (string) $ref );
 		if ( true === $lease ) {
 			return true; // running, whatever its age
+		}
+		if ( self::LEASE_UNSUPPORTED === ( isset( $row['lease'] ) ? (string) $row['lease'] : '' ) ) {
+			// Claimed on an engine that HAS no named locks (Ruling P70), so
+			// this row never had a lease to lose. The hard cap bounds it —
+			// never the ten-minute age rule, which would settle a callback
+			// still running, and never "forever", which is the blindness the
+			// stamp exists to avoid. Read from the ROW, not from asking the
+			// engine again: a site that gains locks between the claim and this
+			// sweep would otherwise be told the never-taken lock is free.
+			return false === $at || $at > $cap;
 		}
 		if ( null === $lease ) {
 			return false === $at || $at > $cap; // unknown ⇒ alive under the hard cap

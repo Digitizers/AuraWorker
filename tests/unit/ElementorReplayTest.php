@@ -940,6 +940,32 @@ final class ElementorReplayTest extends TestCase {
 	 * write that never happened — the callback was not even reached, and the
 	 * row's `ran` witness is patched a few lines after the snapshot.
 	 */
+	/**
+	 * Ruling P70 (F3): a replay whose execution lease could not be TAKEN gives
+	 * the approval back rather than running unleased.
+	 *
+	 * `GET_LOCK` failing transiently is not the same as an engine that has
+	 * none: a healthy IS_USED_LOCK minutes later calls the never-acquired lock
+	 * free, and the reconciler recovers this replay out from under itself.
+	 */
+	public function test_a_replay_whose_lease_cannot_be_taken_gives_the_approval_back(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref    = $this->holdCall();
+		$before = Aura_Worker_Door_Holds::get_held( $ref );
+		$GLOBALS['_sa_named_lock_fail'] = true;
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$GLOBALS['_sa_named_lock_fail'] = false;
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertSame( 'aura_lease_unavailable', $out['code'] );
+		$this->assertSame( array(), $this->ran, 'the write never happened' );
+		$this->assertSame( $before, $this->holdWithoutRestoreStamp( $ref ), 'the hold is back, field for field' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+	}
+
 	public function test_a_snapshot_that_throws_under_a_replay_gives_the_approval_back(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );

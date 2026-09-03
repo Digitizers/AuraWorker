@@ -2132,6 +2132,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					$this->last_error = 'no such function';
 					return null;
 				}
+				// A TRANSIENT failure of the statement, distinct from an engine
+				// that has no named locks at all (Ruling P70): the message
+				// carries no missing-function signature, so production must
+				// refuse rather than proceed unleased.
+				if ( ! empty( $GLOBALS['_sa_named_lock_fail'] ) ) {
+					$this->last_error = 'Lost connection to MySQL server during query';
+					return null;
+				}
 				if ( ! empty( $GLOBALS['_sa_named_locks'][ $name ] ) ) {
 					return '0'; // another connection holds it
 				}
@@ -2902,6 +2910,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
@@ -4103,6 +4112,9 @@ function sa_reset_state(): void {
 		// previous test's answer.
 		Aura_Worker_Door_Log::forget_live_identity();
 	}
+	if ( method_exists( 'Aura_Worker_Door_Holds', 'forget_lock_support' ) ) {
+		Aura_Worker_Door_Holds::forget_lock_support(); // Ruling P70's per-request memo
+	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
@@ -4157,6 +4169,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
