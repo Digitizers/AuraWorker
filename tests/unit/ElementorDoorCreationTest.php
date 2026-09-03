@@ -573,6 +573,39 @@ final class ElementorDoorCreationTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the mutex is released' );
 	}
 
+	/**
+	 * The row READ can fail too, and it fails before the id has been written
+	 * anywhere. The witness is kept in memory FIRST, and an unreadable row is
+	 * treated exactly like an unwritable one.
+	 */
+	public function test_a_row_read_that_fails_after_the_insert_aborts_like_a_failed_patch(): void {
+		// The options-table read the observer (priority 1) is about to make
+		// answers nothing — this request's cache holds a null for the name.
+		// The row itself is still in the database, which is what every later
+		// write goes through.
+		$GLOBALS['_sa_option_cache']['aura_worker_door_log_1'] = null;
+
+		$out = $this->createPage(
+			function () {
+				$this->insertPage();
+				return array( 'ok' => true );
+			}
+		);
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertTrue( $out->get_error_data()['may_have_run'] );
+		$this->assertCount( 1, $out->get_error_data()['created_post_ids'], 'the id the hook held in memory' );
+		$made = (int) $out->get_error_data()['created_post_ids'][0];
+
+		$envelopes = $this->creationEnvelopes();
+		$this->assertCount( 1, $envelopes );
+		$this->assertSame( array( $made ), $envelopes[0]['created_post_ids'], 'it is restorable' );
+		unset( $GLOBALS['_sa_option_cache']['aura_worker_door_log_1'] ); // the transient is over
+		$this->assertSame( 'witness_unrecorded', $this->row( 1 )['reason'] );
+		$this->assertSame( array( $made ), $this->row( 1 )['created_post_ids'], 'the row learned it from finish_creation()' );
+	}
+
 	/** An `other_inserts` patch is advisory — it records nothing a rollback needs. */
 	public function test_an_other_inserts_patch_that_fails_does_not_abort_the_creation(): void {
 		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {

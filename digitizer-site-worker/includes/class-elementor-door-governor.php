@@ -977,8 +977,12 @@ class Aura_Worker_Elementor_Door {
 			// holds the id finish_creation() needs. It runs from that
 			// witness — envelope stored ⇒ the post is restorable; store
 			// failed ⇒ compensation trashes it — and the entry says which.
-			$seq    = isset( self::$request['seq'] ) ? (int) self::$request['seq'] : 0;
-			$fields = array(
+			$seq = isset( self::$request['seq'] ) ? (int) self::$request['seq'] : 0;
+			// The IN-MEMORY witness, read before anything clears it: in this
+			// branch the row is precisely what could not be read or written,
+			// so the answer must not be built from one.
+			$created = isset( self::$request['created'] ) ? array_values( array_map( 'intval', (array) self::$request['created'] ) ) : array();
+			$fields  = array(
 				'result'       => 'failed',
 				'reason'       => 'witness_unrecorded',
 				'error'        => $e->getMessage(),
@@ -1009,7 +1013,6 @@ class Aura_Worker_Elementor_Door {
 					Aura_Worker_Door_Log::annotate( $seq, $fields );
 				}
 				self::$request = null;
-				$row           = Aura_Worker_Door_Log::get( $seq );
 			}
 			return new WP_Error(
 				'aura_log_failed',
@@ -1018,8 +1021,8 @@ class Aura_Worker_Elementor_Door {
 					'status'           => 503,
 					'may_have_run'     => true,
 					'seq'              => $seq,
-					'created_post_ids' => isset( $row['created_post_ids'] ) ? $row['created_post_ids'] : array(),
-					'snapshot_id'      => isset( $row['snapshot_id'] ) ? $row['snapshot_id'] : null,
+					'created_post_ids' => $created,
+					'snapshot_id'      => isset( $fields['snapshot_id'] ) ? $fields['snapshot_id'] : null,
 				)
 			);
 		} catch ( Aura_Worker_Door_Blocked_Exception $e ) {
@@ -2451,16 +2454,31 @@ class Aura_Worker_Elementor_Door {
 		if ( null === self::$request || empty( self::$request['creating'] ) || $update ) {
 			return;
 		}
-		$id   = (int) $post_id;
-		$type = is_object( $post ) ? (string) ( $post->post_type ?? '' ) : (string) get_post_type( $id );
-		$seq  = (int) self::$request['seq'];
-		$row  = Aura_Worker_Door_Log::get( $seq );
-		if ( null === $row ) {
-			return;
-		}
-		if ( in_array( $type, (array) self::$request['expected'], true ) ) {
+		$id       = (int) $post_id;
+		$type     = is_object( $post ) ? (string) ( $post->post_type ?? '' ) : (string) get_post_type( $id );
+		$seq      = (int) self::$request['seq'];
+		$expected = in_array( $type, (array) self::$request['expected'], true );
+		if ( $expected ) {
+			// THE IN-MEMORY WITNESS COMES FIRST — before any read that can
+			// fail. It used to be recorded after the row read, so a read that
+			// transiently answered nothing returned here with the id written
+			// NOWHERE: a fatal a moment later left the reconciler only the
+			// watermark's suspicion, which is unproven, and the post got
+			// neither an envelope nor compensation.
 			self::$request['created'][] = $id;
-			$ids                        = array_values( array_unique( array_merge( (array) ( $row['created_post_ids'] ?? array() ), array( $id ) ) ) );
+		}
+		$row = Aura_Worker_Door_Log::get( $seq );
+		if ( null === $row ) {
+			if ( $expected ) {
+				// An unreadable row is exactly as bad as an unwritable one
+				// (Ruling P26): either way the row does not know about a post
+				// that exists. Abort while the hook still holds the id.
+				throw new Aura_Worker_Door_Witness_Exception( $id, esc_html( sprintf( 'the door log row could not be read to record created post %d', $id ) ) ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- the message is escaped; the id is structured evidence the catch reads, never rendered.
+			}
+			return; // an unexpected insert records nothing a rollback needs
+		}
+		if ( $expected ) {
+			$ids = array_values( array_unique( array_merge( (array) ( $row['created_post_ids'] ?? array() ), array( $id ) ) ) );
 			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'created_post_ids' => $ids ) ) ) {
 				// THE POST EXISTS AND THE ROW CANNOT BE TOLD (Ruling P26).
 				// Carrying on would leave this id in request memory alone: a
