@@ -479,9 +479,6 @@ class Aura_Worker_Magic_Link {
 				409
 			);
 		}
-		if ( ! empty( $stored['connect_user_id'] ) ) {
-			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
-		}
 		// WHO THIS SITE IS BOUND TO RIGHT NOW — read BEFORE the token write
 		// below, because bound_client() proves the stored record against the
 		// site's CURRENT token and the write about to happen would make the old
@@ -542,6 +539,17 @@ class Aura_Worker_Magic_Link {
 					array( 'status' => 503, 'retry_after' => 5 )
 				);
 			}
+		}
+		// THE CONNECT USER, after the wipe and not before it (Ruling P48). This
+		// used to be the handler's first persistent write, so the retryable
+		// `aura_door_busy` path above left the OLD token, dashboard and client
+		// active while token-only requests started running as the NEW
+		// administrator — and releasing the site claim restores nothing. The
+		// wipe is now the first persistent effect of a connect, so a refusal
+		// has nothing to undo. Phase B step (2) deletes exactly this option,
+		// which is why it still comes after finish_before_rebind() above.
+		if ( ! empty( $stored['connect_user_id'] ) ) {
+			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
 		}
 		self::write_token_under_claim( $token_hash, $site_fence );
 		// The token write is verified the same way the binding's is: read the row

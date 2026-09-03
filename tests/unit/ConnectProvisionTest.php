@@ -537,6 +537,56 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( $token, get_option( Aura_Worker_Door_Holds::LOCK ), "the holder's lock is untouched" );
 	}
 
+	/**
+	 * Ruling P48: the busy path leaves NOTHING of the new binding behind.
+	 *
+	 * `aura_worker_connect_user_id` used to be the handler's first persistent
+	 * write, so a connect that then refused left the old token, dashboard and
+	 * client active while token-only requests ran as the NEW administrator —
+	 * and releasing the site claim restores nothing. The wipe is now the first
+	 * persistent effect of a connect, so a refusal has nothing to undo.
+	 */
+	public function test_a_busy_changed_binding_connect_writes_no_option_at_all(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		update_option( 'aura_worker_connect_user_id', 41 ); // the OLD binding's administrator
+		update_option( 'aura_worker_grant_pubkey', 'the-old-key' );
+		$this->seedDoorState();
+		$token                                               = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
+		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
+		$before                                              = array(
+			'aura_worker_connect_user_id' => get_option( 'aura_worker_connect_user_id' ),
+			'aura_worker_site_token'      => get_option( 'aura_worker_site_token' ),
+			'aura_worker_dashboard_url'   => get_option( 'aura_worker_dashboard_url' ),
+			'aura_worker_grant_pubkey'    => get_option( 'aura_worker_grant_pubkey' ),
+		);
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new-dash.example' ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_door_busy', $res->get_error_code() );
+		foreach ( $before as $option => $value ) {
+			$this->assertSame( $value, get_option( $option ), $option . ' is exactly what it was' );
+		}
+		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client(), 'and the client line did not move' );
+	}
+
+	/** …and a successful changed-binding connect still writes every one of them. */
+	public function test_a_successful_changed_binding_connect_writes_them_all(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		update_option( 'aura_worker_connect_user_id', 41 );
+		$this->seedDoorState();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new-dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( 1, (int) get_option( 'aura_worker_connect_user_id' ), "the new link's administrator" );
+		$this->assertSame( Aura_Worker_Security::hash_token( 'raw-token' ), get_option( 'aura_worker_site_token' ) );
+		$this->assertSame( 'https://new-dash.example', get_option( 'aura_worker_dashboard_url' ) );
+		$this->assertSame( $this->pubkey, get_option( 'aura_worker_grant_pubkey' ) );
+		$this->assertSame( 'c2', Aura_Worker_Rules::bound_client() );
+	}
+
 	/** And the NEW side naming no client is unprovable in the same way. */
 	public function test_a_reconnect_whose_callback_names_no_client_wipes_the_door(): void {
 		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
