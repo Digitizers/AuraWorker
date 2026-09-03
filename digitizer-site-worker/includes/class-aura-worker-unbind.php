@@ -895,7 +895,7 @@ final class Aura_Worker_Unbind {
 	public static function leftovers(): array {
 		$m = self::read();
 		if ( is_wp_error( $m ) ) {
-			return array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
+			return array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' );
 		}
 		if ( null === $m ) {
 			return array(); // no marker: this site is not mid-unbind and owes nothing
@@ -930,6 +930,15 @@ final class Aura_Worker_Unbind {
 		}
 		if ( ! self::option_absent( 'aura_worker_grant_pubkey' ) ) {
 			$left[] = 'grant_pubkey';
+		}
+		// The Elementor door's transactional state (Ruling P46). Asked the way
+		// every other kind is asked — is it GONE — not "did step (4a)'s call
+		// return true": a wipe that could not take the hold queue's mutex
+		// deletes nothing, and the unbind must not report `cleanup_complete`
+		// until a later Phase-B pass wipes for real. The drain calls cleanup()
+		// again on its next pass, and the lock is held for milliseconds.
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) && Aura_Worker_Elementor_Door::has_state() ) {
+			$left[] = 'door';
 		}
 		return $left;
 	}
@@ -1047,10 +1056,12 @@ final class Aura_Worker_Unbind {
 		// claim as every other step, so a caller that lost the site deletes
 		// nothing.
 		//
-		// NOT in leftovers(): that list gates the token's removal, and the
-		// door is not a credential — a wipe that could not land must not keep
-		// this site's token alive for ever. The next binding's own connect
-		// wipes again (Aura_Worker_Magic_Link's callback) if anything survived.
+		// IN leftovers() since Ruling P46: a wipe that could not take the hold
+		// queue's mutex deletes NOTHING, and reporting `cleanup_complete` over
+		// a queue that is still there would strand the departed client's
+		// approvals for the next binding. So `door` is a leftover like any
+		// other — the token stays, the drain's next Phase-B pass calls
+		// cleanup() again, and the lock is held for milliseconds.
 		do_action( 'aura_worker_unbind_step', 'door' );
 		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
 			Aura_Worker_Elementor_Door::wipe_for_unbind( $claim, $fence );

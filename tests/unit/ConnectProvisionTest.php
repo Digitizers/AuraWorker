@@ -509,6 +509,34 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
 	}
 
+	/**
+	 * Ruling P46: a changed-binding connect that cannot clear the old queue
+	 * writes NOTHING and answers a retryable 503.
+	 *
+	 * The wipe runs before the token/dashboard/grant writes precisely so a
+	 * refusal leaves the site exactly as it was — the old binding whole, and
+	 * Aura retrying in a few seconds.
+	 */
+	public function test_a_changed_binding_connect_refuses_when_the_hold_lock_is_busy(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref                                                 = $this->seedDoorState();
+		$token                                               = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
+		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
+		$before_token                                        = get_option( 'aura_worker_site_token' );
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_door_busy', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertSame( $before_token, get_option( 'aura_worker_site_token' ), 'the old token is untouched' );
+		$this->assertSame( 'https://dash.example', get_option( 'aura_worker_dashboard_url' ), 'and the old dashboard' );
+		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client(), 'the binding did not move' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'and the queue is intact' );
+		$this->assertSame( $token, get_option( Aura_Worker_Door_Holds::LOCK ), "the holder's lock is untouched" );
+	}
+
 	/** And the NEW side naming no client is unprovable in the same way. */
 	public function test_a_reconnect_whose_callback_names_no_client_wipes_the_door(): void {
 		$this->seedPreviousBinding( 'c1', 'https://dash.example' );

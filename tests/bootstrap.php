@@ -2092,6 +2092,24 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
 			}
+			// Aura_Worker_Elementor_Door::has_state() (Ruling P46): how many
+			// door rows are left, excluding the 30-day counter buckets and the
+			// hold-queue lock. Counted over the merged "database" view, the
+			// same one every other door branch reads.
+			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name NOT LIKE '([^']*)' AND option_name != '([^']*)'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$keep = sa_like_to_regex( stripslashes( $m[1] ) );
+				$skip = sa_like_to_regex( stripslashes( $m[2] ) );
+				$lock = stripslashes( $m[3] );
+				$n    = 0;
+				foreach ( array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) ) as $name ) {
+					$name = (string) $name;
+					if ( $name !== $lock && preg_match( $keep, $name ) && ! preg_match( $skip, $name ) && null !== sa_read_option_uncached( $name ) ) {
+						++$n;
+					}
+				}
+				return (string) $n;
+			}
 			// The liveness probe Aura_Worker_Health::check_db_connection() issues.
 			// A reachable database answers '1' — a string, which is what the
 			// production comparison (`=== '1'`) is written against. Honouring
@@ -2847,6 +2865,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
+	// The Elementor door wipe's lock wait (Ruling P46): ON by default so no
+	// test can sleep for LOCK_S proving a busy lock. A test that wants the
+	// retry itself unsets it.
+	$GLOBALS['_sa_door_wipe_no_wait'] = true;
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
@@ -4092,6 +4114,10 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
+	// The Elementor door wipe's lock wait (Ruling P46): ON by default so no
+	// test can sleep for LOCK_S proving a busy lock. A test that wants the
+	// retry itself unsets it.
+	$GLOBALS['_sa_door_wipe_no_wait'] = true;
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).

@@ -194,7 +194,7 @@ final class UnbindCleanupTest extends TestCase {
 		$left = Aura_Worker_Unbind::leftovers();
 
 		$GLOBALS['_sa_option_read_fail'] = array();
-		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ), $left );
+		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' ), $left );
 	}
 
 	public function test_leftovers_names_every_pending_step_and_nothing_else(): void {
@@ -988,6 +988,74 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( 0, $frag['log_floor'] );
 		$this->assertSame( 0, $frag['log_unacked'] );
 		$this->assertNull( $frag['log_full'] );
+	}
+
+	/** Somebody else owns the hold-queue mutex, and their lock is FRESH. */
+	private function holdTheLock( int $age_s = 0 ): string {
+		$token                                                    = ( time() - $age_s ) . '|' . 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ]      = $token;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]         = maybe_serialize( $token );
+		unset( $GLOBALS['_notoptions'][ Aura_Worker_Door_Holds::LOCK ] );
+		return $token;
+	}
+
+	/**
+	 * Ruling P46: a wipe that cannot take the mutex deletes NOTHING.
+	 *
+	 * Entering the deletes on a failed `take_lock()` was worse than not wiping:
+	 * the holder resumes inside `hold_locked()` and inserts its held row AFTER
+	 * the prefix deletes have run, so a changed-client reconnect finished with
+	 * a departed client's stored mutation in the new binding's queue.
+	 */
+	public function test_a_wipe_that_cannot_take_the_hold_lock_deletes_nothing(): void {
+		$this->seedDoor();
+		$lock   = $this->holdTheLock();
+		$before = $this->doorRows(); // the lock row included: it must survive too
+		$fence  = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		$this->assertSame( $before, $this->doorRows(), 'every row survives' );
+		$this->assertSame( $lock, get_option( Aura_Worker_Door_Holds::LOCK ), "and the holder's lock is untouched" );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** A STALE holder is taken over by take_lock()'s own rule, and the wipe runs. */
+	public function test_a_wipe_takes_over_a_stale_hold_lock_and_wipes(): void {
+		$this->seedDoor();
+		$this->holdTheLock( Aura_Worker_Door_Holds::LOCK_S + 60 );
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		$this->assertSame( array(), $this->doorRows() );
+		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ), 'and the wipe released the lock it took' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * …and the unbind reports the debt rather than claiming completion: `door`
+	 * is a leftover like any other, so the token stays and the drain's next
+	 * Phase-B pass wipes for real.
+	 */
+	public function test_an_unbind_blocked_on_the_hold_lock_reports_door_and_completes_on_the_next_pass(): void {
+		$this->seedDoor();
+		$this->holdTheLock();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ), 'not complete' );
+		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers() );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'the token stays while anything is owed' );
+		$this->assertNotEmpty( Aura_Worker_Door_Holds::listing(), 'and the queue is still there' );
+
+		// The holder finishes; the drain calls cleanup() again.
+		delete_option( Aura_Worker_Door_Holds::LOCK );
+		unset( $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] );
+
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
+		$this->assertSame( array(), Aura_Worker_Unbind::leftovers() );
+		$this->assertSame( array(), $this->doorRows() );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
 	}
 
 	/** A caller that lost the site claim deletes nothing — the same fence every step uses. */

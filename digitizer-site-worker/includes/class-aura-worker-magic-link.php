@@ -497,6 +497,52 @@ class Aura_Worker_Magic_Link {
 		// (round-9). So it is not merely preceded by a check — it is
 		// CONDITIONAL on the claim, in one statement, and a handler that no
 		// longer owns the claim writes nothing at all.
+		// THE DEPARTED BINDING'S DOOR STATE, taken BEFORE anything of this
+		// install is written (Rulings P44/P44'/P46). A connect does NOT require
+		// an unbind first: finish_before_rebind() above returns true
+		// immediately for a site with no unbind marker, so this callback can
+		// install a new binding straight over an old one — and the Elementor
+		// door's holds, claims and log rows would survive into it. A hold is a
+		// stored WordPress action with the actor to run it as; the NEW client
+		// would be served the old client's queue through `/status` and could
+		// approve one through `elementor_replay_ability`.
+		//
+		// ONLY WHEN THE BINDING CHANGES (Ruling P44'). A token rotation — the
+		// same site reconnecting to the same client — is not a new owner, and
+		// discarding that operator's pending approvals and unacked log because
+		// their credentials were refreshed would be a bug of its own. The
+		// binding is the pair (client id, dashboard URL): the signed `client`
+		// line this callback carries, against the client the ruleset store is
+		// bound to, and the new dashboard URL against the stored one.
+		//
+		// The comparison FAILS TOWARD THE WIPE. Either side missing a client
+		// line (an older dashboard, an unbound or unreadable store, a record
+		// whose token no longer matches) is a binding that cannot be PROVEN the
+		// same, and an unprovable binding is treated as replaced — the safe
+		// direction is always the departed client's approvals not surviving.
+		// An unbind still wipes unconditionally; this condition is the
+		// connect's alone.
+		//
+		// BEFORE the token write, not after (Ruling P46): the wipe can refuse
+		// — another request may hold the hold queue's mutex — and a refusal
+		// must leave this site exactly as it was. Nothing of the install has
+		// happened yet, so the old binding is still whole and Aura simply
+		// retries in a few seconds.
+		$same_binding = '' !== $prev_client
+			&& '' !== $client
+			&& hash_equals( $prev_client, $client )
+			&& '' !== $prev_dashboard
+			&& $prev_dashboard === $dashboard_url;
+		if ( ! $same_binding && class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			if ( ! Aura_Worker_Elementor_Door::wipe_for_unbind( $site_claim_key, $site_fence ) ) {
+				$release();
+				return new WP_Error(
+					'aura_door_busy',
+					__( 'This site is admitting an Elementor call for approval and could not clear the previous binding\'s queue; retry.', 'digitizer-site-worker' ),
+					array( 'status' => 503, 'retry_after' => 5 )
+				);
+			}
+		}
 		self::write_token_under_claim( $token_hash, $site_fence );
 		// The token write is verified the same way the binding's is: read the row
 		// back from the database and compare (Codex round 30). update_option()
@@ -517,44 +563,6 @@ class Aura_Worker_Magic_Link {
 				return new WP_REST_Response( array( 'error' => 'This connect lost the site to another install; retry.', 'code' => 'aura_connect_lost_claim' ), 409 );
 			}
 			return new WP_REST_Response( array( 'error' => 'Connect not completed: the site token could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
-		}
-		// THE DEPARTED BINDING'S DOOR STATE, taken the moment its token stops
-		// authenticating (Ruling P44). A connect does NOT require an unbind
-		// first: finish_before_rebind() above returns true immediately for a
-		// site with no unbind marker, so this callback can install a new
-		// binding straight over an old one — and the Elementor door's holds,
-		// claims and log rows would survive into it. A hold is a stored
-		// WordPress action with the actor to run it as; the NEW client would
-		// be served the old client's queue through `/status` and could approve
-		// one through `elementor_replay_ability`.
-		//
-		// ONLY WHEN THE BINDING CHANGES (Ruling P44'). A token rotation — the
-		// same site reconnecting to the same client — is not a new owner, and
-		// discarding that operator's pending approvals and unacked log because
-		// their credentials were refreshed would be a bug of its own. The
-		// binding is the pair (client id, dashboard URL): the signed `client`
-		// line this callback carries, against the client the ruleset store is
-		// bound to, and the new dashboard URL against the stored one.
-		//
-		// The comparison FAILS TOWARD THE WIPE. Either side missing a client
-		// line (an older dashboard, an unbound or unreadable store, a record
-		// whose token no longer matches) is a binding that cannot be PROVEN the
-		// same, and an unprovable binding is treated as replaced — the safe
-		// direction is always the departed client's approvals not surviving.
-		// An unbind still wipes unconditionally; this condition is the
-		// connect's alone.
-		//
-		// Here, not before the token write: until that write lands the old
-		// binding is still live, and a connect that fails afterwards must not
-		// have emptied a queue that still belongs to somebody. Fenced on the
-		// same claim as every other write in this handler.
-		$same_binding = '' !== $prev_client
-			&& '' !== $client
-			&& hash_equals( $prev_client, $client )
-			&& '' !== $prev_dashboard
-			&& $prev_dashboard === $dashboard_url;
-		if ( ! $same_binding && class_exists( 'Aura_Worker_Elementor_Door' ) ) {
-			Aura_Worker_Elementor_Door::wipe_for_unbind( $site_claim_key, $site_fence );
 		}
 		// The token is stored, so the credential minted beside the PREVIOUS one
 		// is now a credential without a token — revoke it here, before anything

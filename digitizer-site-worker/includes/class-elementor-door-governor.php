@@ -279,10 +279,16 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
-	 * @return void
+	 * @return bool TRUE only when the whole wipe ran under a held hold lock.
 	 */
 	public static function wipe_for_unbind( $claim, $fence ) {
-		Aura_Worker_Door_Holds::wipe( $claim, $fence ); // takes the hold lock, and empties the log inside it
+		// The queue and the log go first, under the hold lock — and NOTHING
+		// goes if that lock could not be taken (Ruling P46), because a holder
+		// resuming afterwards would insert into a queue this call had already
+		// emptied. The caller is told, and decides.
+		if ( ! Aura_Worker_Door_Holds::wipe( $claim, $fence ) ) {
+			return false;
+		}
 		// The creation mutex and the retention throttle are this binding's
 		// working state too, and a fresh binding should inherit neither: an
 		// inherited mutex would refuse the new client's first creation until
@@ -296,6 +302,36 @@ class Aura_Worker_Elementor_Door {
 			wp_cache_delete( $option, 'options' );
 		}
 		wp_cache_delete( 'notoptions', 'options' );
+		return true;
+	}
+
+	/**
+	 * Is any of the door's transactional state still here (Ruling P46)?
+	 *
+	 * The question `leftovers()` asks about every other kind, asked of the
+	 * door: not "did my delete return true" but "is it gone". A wipe that
+	 * could not take the hold lock leaves everything behind, and the unbind
+	 * must not report `cleanup_complete` until a later Phase-B pass wipes for
+	 * real.
+	 *
+	 * The 30-day counter buckets are excluded — this site's audit history, not
+	 * the binding's state — and so is the hold-queue LOCK itself, which is a
+	 * mutex somebody may be holding for milliseconds, not something a binding
+	 * owns.
+	 *
+	 * @return bool
+	 */
+	public static function has_state() {
+		global $wpdb;
+		$n = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name NOT LIKE %s AND option_name != %s",
+				$wpdb->esc_like( 'aura_worker_door_' ) . '%',
+				$wpdb->esc_like( self::COUNTER_PREFIX ) . '%',
+				Aura_Worker_Door_Holds::LOCK
+			)
+		);
+		return (int) $n > 0;
 	}
 
 	/**

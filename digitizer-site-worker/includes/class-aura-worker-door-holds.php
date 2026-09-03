@@ -29,6 +29,10 @@ class Aura_Worker_Door_Holds {
 	const CAP     = 50;
 	const LOCK    = 'aura_worker_door_hold_lock';
 	const LOCK_S  = 30;
+	/** Extra seconds a wipe waits past LOCK_S, by when any holder is stale (Ruling P46). */
+	const WIPE_GRACE_S = 3;
+	/** How long a wipe sleeps between attempts on a busy lock. */
+	const WIPE_WAIT_US = 500000;
 
 	/**
 	 * @param array $call { ability, input, touches, actor, verdict, rule }.
@@ -656,11 +660,21 @@ class Aura_Worker_Door_Holds {
 	 *
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
-	 * @return void
+	 * @return bool TRUE only when every delete ran under a lock this call held.
 	 */
 	public static function wipe( $claim, $fence ) {
 		global $wpdb;
-		$token = self::take_lock();
+		// ONLY UNDER A LOCK THIS CALL ACTUALLY TOOK (Ruling P46). take_lock()
+		// answers false when another request owns the mutex, and entering the
+		// deletes anyway was worse than not wiping at all: the old binding's
+		// hold() resumes inside hold_locked() and INSERTS its held row after
+		// the prefix deletes have run, so a changed-client reconnect finished
+		// with a departed client's stored mutation sitting in the new
+		// binding's queue, visible through `/status` and replayable.
+		$token = self::take_wipe_lock();
+		if ( false === $token ) {
+			return false; // nothing deleted; the caller decides what that means
+		}
 		try {
 			Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::HELD ) . '%', $claim, $fence );
 			Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::CLAIMED ) . '%', $claim, $fence );
@@ -669,10 +683,40 @@ class Aura_Worker_Door_Holds {
 			Aura_Worker_Door_Log::wipe( $claim, $fence );
 			wp_cache_delete( 'notoptions', 'options' );
 			wp_cache_delete( 'alloptions', 'options' );
+			return true;
 		} finally {
+			self::release_lock( $token );
+		}
+	}
+
+	/**
+	 * take_lock() with the patience a wipe can afford (Ruling P46).
+	 *
+	 * hold()'s own three tries are right for a WRITE that a caller can simply
+	 * retry — but a wipe that gives up silently leaves the departed client's
+	 * approvals in the new binding's queue, so it waits instead. The budget is
+	 * LOCK_S plus a small grace: any holder older than LOCK_S is stale by
+	 * take_lock()'s own rule and gets taken over, so a live holder is the only
+	 * thing that can outlast this, and a live holder finishes in milliseconds.
+	 *
+	 * The suite must not sleep for half a minute to prove a busy lock, so the
+	 * wait is skippable through `$GLOBALS['_sa_door_wipe_no_wait']` — read
+	 * only, never written by production code, and the tests' bootstrap turns
+	 * it ON by default so no test can sleep by accident.
+	 *
+	 * @return string|false The lock's fence value, or false.
+	 */
+	private static function take_wipe_lock() {
+		$deadline = microtime( true ) + (float) ( self::LOCK_S + self::WIPE_GRACE_S );
+		while ( true ) {
+			$token = self::take_lock();
 			if ( false !== $token ) {
-				self::release_lock( $token );
+				return $token;
 			}
+			if ( ! empty( $GLOBALS['_sa_door_wipe_no_wait'] ) || microtime( true ) >= $deadline ) {
+				return false;
+			}
+			usleep( self::WIPE_WAIT_US );
 		}
 	}
 
