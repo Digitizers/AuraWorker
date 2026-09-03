@@ -317,7 +317,7 @@ class Aura_Worker_Elementor_Door {
 		return array(
 			'epoch'       => $site,
 			'seam'        => self::$seam,
-			'door'        => 'ok' === self::$seam ? 'open' : 'closed',
+			'door'        => self::door_state(),
 			'held'        => Aura_Worker_Door_Holds::listing(),
 			'interrupted' => $interrupted,
 			// The log was rewound under this epoch (or it was not: null).
@@ -1864,6 +1864,27 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Is the door open? ONE definition, for every reader (Ruling P24).
+	 *
+	 * Two independent things close it, and each was being reported by only
+	 * one caller. The SEAM: coverage that could not be verified means writes
+	 * may be reaching Elementor ungoverned, so the transport is refused. The
+	 * LOG: at MAX_UNACKED every governed write is answered `aura_log_full`,
+	 * which is a closed door by any honest reading — and the status fragment
+	 * went on reporting `open` whenever coverage was healthy, contradicting
+	 * both governor_block() and the ack response on the very poll an
+	 * operator would be looking at to find out why writes were failing.
+	 *
+	 * Public because the ack route answers with it too: three readers, one
+	 * answer.
+	 *
+	 * @return string `open` or `closed`.
+	 */
+	public static function door_state() {
+		return ( 'ok' === self::$seam && ! Aura_Worker_Door_Log::is_closed() ) ? 'open' : 'closed';
+	}
+
+	/**
 	 * The `elementor.governor` block of `audit_mcp_exposure` (Task 11): what
 	 * THIS site's door log and hold queue say, for the fleet rollup — a site
 	 * whose log is full, whose hold queue is full, or whose seam never
@@ -1888,7 +1909,7 @@ class Aura_Worker_Elementor_Door {
 			'active'              => true,
 			'epoch'               => '' === $epoch ? null : $epoch,
 			'seam'                => self::$seam,
-			'door'                => Aura_Worker_Door_Log::is_closed() ? 'closed' : 'open',
+			'door'                => self::door_state(),
 			'held_count'          => $held,
 			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(),
 			'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),

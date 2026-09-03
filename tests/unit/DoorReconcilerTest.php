@@ -554,6 +554,27 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertArrayNotHasKey( 'door', $data, 'Aura keys on the fragment being absent' );
 	}
 
+	/**
+	 * Ruling P24: a full log IS a closed door. Every governed write answers
+	 * `aura_log_full` once the log reaches MAX_UNACKED, and governor_block()
+	 * and the ack response both say `closed` — the status fragment went on
+	 * reporting `open` because its own field only ever described the seam.
+	 */
+	public function test_a_closed_log_is_reported_as_a_closed_door(): void {
+		$this->assertSame( 'open', $this->fragment()['door'], 'nothing is wrong yet' );
+
+		Aura_Worker_Door_Log::close();
+
+		$frag = $this->fragment();
+		$this->assertSame( 'closed', $frag['door'] );
+		$this->assertNotNull( $frag['log_full'], 'and it says why' );
+		$this->assertSame( 'ok', $frag['seam'], 'the seam itself is healthy — the LOG is what closed the door' );
+		$this->assertSame( 'closed', Aura_Worker_Elementor_Door::governor_block()['door'], 'the audit agrees' );
+
+		delete_option( Aura_Worker_Door_Log::FULL_MARKER ); // as an ack under the bound reopens it
+		$this->assertSame( 'open', $this->fragment()['door'] );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (j) a rewound log is REPORTED; /status never rotates (Ruling P20)   */
 	/* ------------------------------------------------------------------ */

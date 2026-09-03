@@ -1471,7 +1471,7 @@ class Aura_Worker_API {
 				'floor'   => (int) $result['floor'],
 				'epoch'   => Aura_Worker_Door_Log::epoch(),
 				'unacked' => Aura_Worker_Door_Log::count_unacked(),
-				'door'    => Aura_Worker_Door_Log::is_closed() ? 'closed' : 'open',
+				'door'    => Aura_Worker_Elementor_Door::door_state(),
 			),
 			200
 		);

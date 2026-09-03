@@ -129,8 +129,11 @@ final class McpExposureGovernorTest extends TestCase {
 		sa_register_ability( 'elementor/create-page', array( 'execute_callback' => '__return_true', 'permission_callback' => '__return_true' ) );
 		$b = $this->block();
 		$this->assertTrue( $b['active'] );
-		$this->assertSame( 'unchecked', $b['seam'] );
-		$this->assertSame( 'open', $b['door'], 'is_closed() is about the LOG, not the seam' );
+		$this->assertSame( 'unchecked', $b['seam'], 'and the audit still says WHY' );
+		// A seam that is not `ok` closes the transport (close_transport()
+		// answers every door request 503), so the door is shut — one
+		// definition for every reader, Ruling P24.
+		$this->assertSame( 'closed', $b['door'] );
 	}
 
 	public function test_door_is_closed_when_the_log_is_full_and_log_full_reports_it(): void {

@@ -19,6 +19,14 @@ final class DoorRestTest extends TestCase {
 	protected function setUp(): void {
 		sa_reset_state();
 		$GLOBALS['_options']['aura_worker_site_token'] = Aura_Worker_Security::hash_token( 'tok' );
+		// The coverage check every real request has already run by dispatch
+		// time (`wp_abilities_api_init` fires on init, REST on rest_api_init).
+		// The ack response's `door` field reads the seam through
+		// door_state(), so a suite that never decided it would be reading
+		// whatever the previous test class left on the static.
+		Aura_Worker_Elementor_Door::reset_for_tests();
+		Aura_Worker_Elementor_Door::init();
+		do_action( 'wp_abilities_api_init' );
 		$this->api = new Aura_Worker_API( new Aura_Worker_Security() );
 	}
 
