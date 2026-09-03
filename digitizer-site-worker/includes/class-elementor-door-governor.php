@@ -960,6 +960,29 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Is this LOG ROW still the current binding's (Ruling P60)?
+	 *
+	 * Every governed write is stamped with the generation that admitted it, so
+	 * every governed write can be fenced — a direct Elementor MCP call
+	 * authenticated with the departing binding's Application Password included,
+	 * which is the case a replay-only fence could not see.
+	 *
+	 * A row with NO binding predates the stamp and is accepted, the same
+	 * allowance every other reader of this field makes.
+	 *
+	 * @param int $seq The log seq.
+	 * @return bool
+	 */
+	private static function binding_unchanged_for_row( $seq ) {
+		$row = Aura_Worker_Door_Log::get( (int) $seq );
+		$was = is_array( $row ) && isset( $row['binding'] ) ? (string) $row['binding'] : '';
+		if ( '' === $was ) {
+			return true;
+		}
+		return $was === Aura_Worker_Door_Log::binding_raw();
+	}
+
+	/**
 	 * Is the claimed row still ours, under the BINDING it was claimed in
 	 * (Rulings P51/P58)?
 	 *
@@ -1881,7 +1904,7 @@ class Aura_Worker_Elementor_Door {
 			return new WP_Error( 'aura_log_failed', 'The door log could not record that this call was about to run; it was not run.', array( 'status' => 503 ) );
 		}
 
-		// IS THIS STILL THE BINDING THAT APPROVED THE CALL?
+		// IS THIS STILL THE BINDING THIS CALL BELONGS TO?
 		//
 		// THE FENCE (Ruling P51, kept by P58). A rebind mints a new generation
 		// while this replay is mid-flight — a changed-client connect, or an
@@ -1898,27 +1921,40 @@ class Aura_Worker_Elementor_Door {
 		// never binding(), which MINTS one and would quietly manufacture
 		// agreement on a site whose generation option had gone missing.
 		//
-		if ( null !== self::$replay_ack ) {
+		// EVERY governed write, not only a replay (Ruling P60). A direct
+		// Elementor MCP request authenticates with the DEPARTING binding's
+		// Application Password, and a changed-client connect or an unbind can
+		// rotate the generation between this row's admission and its callback:
+		// the old request would otherwise run the mutation for a client that no
+		// longer governs this site, and — depending on timing — under a log row
+		// stamped with the replacement's generation.
+		//
+		// The row's own `binding`, written by open_pending(), against the
+		// generation as the database has it NOW. A replay checks its CLAIM's
+		// generation as well: the two are written at different moments, and a
+		// rebind between them is exactly what the claim comparison catches.
+		$ours = self::binding_unchanged_for_row( $seq );
+		if ( $ours && null !== self::$replay_ack ) {
 			$ours = self::replay_binding_unchanged( (string) self::$replay_ack['ref'] );
-			if ( ! $ours ) {
-				if ( $creating ) {
-					self::release_creation_mutex();
-				}
-				Aura_Worker_Door_Log::settle(
-					$seq,
-					array(
-						'result'       => 'refused',
-						'reason'       => 'binding_changed',
-						'may_have_run' => false,
-					)
-				);
-				self::$request = null;
-				return new WP_Error(
-					'aura_binding_changed',
-					'This site was rebound to another Aura client while the approval was running; it was not run.',
-					array( 'status' => 409 )
-				);
+		}
+		if ( ! $ours ) {
+			if ( $creating ) {
+				self::release_creation_mutex();
 			}
+			Aura_Worker_Door_Log::settle(
+				$seq,
+				array(
+					'result'       => 'refused',
+					'reason'       => 'binding_changed',
+					'may_have_run' => false,
+				)
+			);
+			self::$request = null;
+			return new WP_Error(
+				'aura_binding_changed',
+				'This site was rebound to another Aura client while this call was being admitted; it was not run.',
+				array( 'status' => 409 )
+			);
 		}
 
 		// THE CALLBACK IS ABOUT TO BE ENTERED (Ruling P33). The `ran` witness

@@ -441,6 +441,60 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertArrayNotHasKey( Aura_Worker_Door_Holds::seq_lease_name( 1 ), $GLOBALS['_sa_named_locks'] );
 	}
 
+	/**
+	 * Ruling P60: the binding fence covers EVERY governed write.
+	 *
+	 * A direct Elementor MCP request authenticates with the departing
+	 * binding's Application Password, and a changed-client connect or an
+	 * unbind can rotate the generation between this row's admission and its
+	 * callback. The replay-only fence never saw it, so the old request ran the
+	 * mutation for a client that no longer governs the site.
+	 */
+	public function test_a_direct_write_refuses_when_the_binding_rotates_before_the_callback(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$inner_ran = 0;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$inner_ran ) {
+				++$inner_ran;
+			}
+		);
+		// The rebind lands the instant this call's row exists — after
+		// open_pending() stamped it with the CURRENT generation, and before the
+		// fence a few statements later. That is the window: admitted under one
+		// binding, about to run under another.
+		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () {
+			Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://new.example' ) );
+		};
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_binding_changed', $out->get_error_code() );
+		$this->assertSame( 409, $out->get_error_data()['status'] );
+		$this->assertSame( 0, $inner_ran, 'the write path was never entered' );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'binding_changed', $row['reason'] );
+		$this->assertFalse( $row['may_have_run'] );
+	}
+
+	/** An unchanged generation runs exactly as before. */
+	public function test_a_direct_write_under_an_unchanged_binding_still_runs(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$gen = Aura_Worker_Door_Log::binding();
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( array( 'ok' => true, 'input' => array( 'post_id' => 7 ) ), $out );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding() );
+		$this->assertSame( 'ok', Aura_Worker_Door_Log::get( 1 )['result'] );
+	}
+
 	public function test_coverage_failure_closes_both_transports_reads_included(): void {
 		$this->registerAll();
 		// A later filter replaced the wrapper AFTER wrap_args ran.
