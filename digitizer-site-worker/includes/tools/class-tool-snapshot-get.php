@@ -10,7 +10,9 @@
  * Aura mirrors as `DoorSnapshot.contentJson` — this tool is how it gets read
  * back. Never returns `payload_path`: that is a local filesystem path, not
  * something a caller off-site has any use for, and leaking it would name
- * exactly where on disk the plugin keeps its rollback envelopes.
+ * exactly where on disk the plugin keeps its rollback envelopes. And never
+ * returns the PAYLOAD of an envelope that is not a door capture — see
+ * execute().
  *
  * @package Aura_Worker
  * @since 2.16.0
@@ -44,7 +46,7 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 	 * @return string
 	 */
 	public function get_description() {
-		return 'Read a stored snapshot envelope by id — the record captured before a power write or a door-governed Elementor change, and its raw payload (base64, up to 2 MiB). Never returns the on-disk payload path. Read-only; makes no changes.';
+		return 'Read a stored snapshot envelope by id — the record captured before a power write or a door-governed Elementor change. The raw payload (base64, up to 2 MiB) is returned only for door captures; any other envelope comes back as metadata with withheld: true. Never returns the on-disk payload path. Read-only; makes no changes.';
 	}
 
 	/**
@@ -71,8 +73,9 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 		return array(
 			'found'     => 'bool — whether a snapshot with this id exists on this site',
 			'record'    => 'object|null — the stored envelope (kind, target/targets, door metadata, …), never including payload_path; null when not found',
-			'payload'   => 'string|null — the raw payload, base64-encoded, when it is at most 2 MiB; null when the snapshot has no payload, could not be read, or was withheld as too large',
+			'payload'   => 'string|null — the raw payload, base64-encoded, when it is at most 2 MiB; null when the snapshot has no payload, could not be read, or was withheld',
 			'truncated' => 'bool — present and true only when the payload exceeds 2 MiB and was withheld',
+			'withheld'  => 'bool — present and true only when this envelope is not a door capture (its door_kind is not one of page|component|design_system|creation|creation_restore), in which case the record is described but its payload is never returned',
 		);
 	}
 
@@ -108,6 +111,28 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 
 		$payload_path = isset( $record['payload_path'] ) ? (string) $record['payload_path'] : '';
 		unset( $record['payload_path'] );
+
+		// The payload of a NON-DOOR envelope is never returned. This tool
+		// exists to read back what the Elementor door captured before a
+		// governed write — what Aura mirrors as `DoorSnapshot.contentJson` —
+		// and it is read-only, so it is reachable by a session with no write
+		// scope at all. The snapshot ROUTE does not jail option names, so such
+		// a session can `snapshot_option( '<anything>' )` and would then read
+		// the stored value straight back out of here: a read-scoped session
+		// with a general options-table read primitive. Gated on `door_kind`
+		// (Aura_Worker_Snapshots::DOOR_KINDS), the same field retention is
+		// keyed on, never on `kind` — a door capture of a page IS a `posts`
+		// record. The metadata still comes back: what was captured and when is
+		// not the secret; the bytes are.
+		$door_kind = isset( $record['door_kind'] ) ? (string) $record['door_kind'] : '';
+		if ( ! in_array( $door_kind, Aura_Worker_Snapshots::DOOR_KINDS, true ) ) {
+			return array(
+				'found'    => true,
+				'record'   => $record,
+				'payload'  => null,
+				'withheld' => true,
+			);
+		}
 
 		if ( '' === $payload_path || ! file_exists( $payload_path ) ) {
 			return array(

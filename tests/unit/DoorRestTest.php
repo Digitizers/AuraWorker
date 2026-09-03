@@ -211,6 +211,29 @@ final class DoorRestTest extends TestCase {
 		$this->assertSame( 'A page', $unserialized[7]['fields']['post_title'] );
 	}
 
+	public function test_snapshot_get_withholds_the_payload_of_an_envelope_that_is_not_a_door_capture(): void {
+		// A read-scoped session can snapshot ANY option through
+		// POST /aura/v2/snapshot — option names are not jailed there — and
+		// would then read the stored value straight back out of this tool.
+		// snapshot_get exists to hand back what the DOOR captured, so an
+		// envelope whose door_kind is not one of DOOR_KINDS comes back as
+		// metadata only.
+		update_option( 'aura_worker_secret_thing', 'the-bytes-nobody-asked-for' );
+		$snapshots = new Aura_Worker_Snapshots();
+		$captured  = $snapshots->snapshot_option( 'aura_worker_secret_thing' );
+		$this->assertTrue( $captured['success'] );
+
+		$tool = new Aura_Tool_Snapshot_Get();
+		$out  = $tool->execute( array( 'id' => $captured['snapshot']['id'] ) );
+
+		$this->assertTrue( $out['found'] );
+		$this->assertSame( 'option', $out['record']['kind'], 'the record itself is still described' );
+		$this->assertNull( $out['payload'] );
+		$this->assertTrue( $out['withheld'] );
+		$this->assertArrayNotHasKey( 'truncated', $out, 'withheld is not truncated: nothing about the size was the reason' );
+		$this->assertArrayHasKey( 'withheld', $tool->get_returns(), 'and the shape declares it' );
+	}
+
 	public function test_snapshot_get_answers_found_false_for_an_unknown_id(): void {
 		$tool = new Aura_Tool_Snapshot_Get();
 		$out  = $tool->execute( array( 'id' => 'snap_does_not_exist_at_all' ) );
