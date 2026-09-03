@@ -66,12 +66,46 @@ class Aura_Worker_Door_Log {
 				$name
 			)
 		);
-		if ( 1 === (int) $rows && '' === (string) $wpdb->last_error ) {
-			wp_cache_delete( $name, 'options' );
-			wp_cache_delete( 'notoptions', 'options' );
-			return true;
+		// EVICTED ON BOTH OUTCOMES (Ruling P72). A LOST insert means somebody
+		// else's row is under this name RIGHT NOW — and this request has very
+		// likely just cached the name as absent (`notoptions`) on the read that
+		// decided to mint. Leaving that negative in place made the loser read
+		// `null` for a row that demonstrably exists, and a lazy mint then
+		// answered '' for a generation the winner had already installed.
+		wp_cache_delete( $name, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		return ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+	}
+
+	/**
+	 * Re-read a name from the DATABASE after a lost mint (Ruling P72).
+	 *
+	 * The caches are gone by the time this runs (insert_unique() evicts them
+	 * either way), but a cache eviction is not a read: the value has to come
+	 * from the row the winner wrote, and `get_option()` on a busy site can
+	 * still be served a negative another code path re-primed. So this asks
+	 * `$wpdb` directly, with `last_error` cleared first.
+	 *
+	 * NULL means UNREADABLE — the row is genuinely absent, or the read failed.
+	 * Neither is a value a writer may stamp: an empty stamp used to read as
+	 * "queued before the generation existed", i.e. permanently current, so a
+	 * replacement client could claim and run the previous client's mutation.
+	 *
+	 * @param string $name Option name.
+	 * @return mixed|null The unserialised value, or null when unreadable.
+	 */
+	private static function reread_after_mint( $name ) {
+		global $wpdb;
+		wp_cache_delete( $name, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		$wpdb->last_error = '';
+		$raw              = self::raw_option( $name );
+		if ( null === $raw || '' !== (string) $wpdb->last_error ) {
+			return null;
 		}
-		return false;
+		return maybe_unserialize( $raw );
 	}
 
 	/**
@@ -85,8 +119,13 @@ class Aura_Worker_Door_Log {
 		if ( is_string( $cur ) && '' !== $cur ) {
 			return $cur;
 		}
-		self::insert_unique( self::EPOCH, wp_generate_uuid4() ); // a concurrent mint loses the INSERT and reads the winner's
-		$cur = get_option( self::EPOCH, '' );
+		if ( self::insert_unique( self::EPOCH, wp_generate_uuid4() ) ) {
+			$cur = get_option( self::EPOCH, '' );
+			return is_string( $cur ) ? $cur : '';
+		}
+		// LOST the mint (Ruling P72): the winner's row exists, and this
+		// request's own negative cache must not be what it reads back.
+		$cur = self::reread_after_mint( self::EPOCH );
 		return is_string( $cur ) ? $cur : '';
 	}
 
@@ -109,7 +148,15 @@ class Aura_Worker_Door_Log {
 	 */
 	public static function binding() {
 		$rec = self::binding_record();
-		return (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' );
+		$gen = (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' );
+		// NULL, NOT '' (Ruling P72). A real record always carries a generation,
+		// so an empty one means the mint could not be established — the row
+		// could not be read, or the lost-insert re-read failed. Stamping ''
+		// on a hold, a claim or a log row wrote something every reader treated
+		// as permanently current: after a rebind the replacement client could
+		// claim and execute the previous client's stored mutation. A writer
+		// that cannot name its binding refuses instead.
+		return '' === $gen ? null : $gen;
 	}
 
 	/**
@@ -139,7 +186,7 @@ class Aura_Worker_Door_Log {
 		if ( is_array( $cur ) && isset( $cur['gen'] ) && '' !== (string) $cur['gen'] ) {
 			return self::normalise_binding( $cur );
 		}
-		self::insert_unique(
+		$won = self::insert_unique(
 			self::BINDING,
 			array(
 				'gen'       => wp_generate_uuid4(),
@@ -147,8 +194,12 @@ class Aura_Worker_Door_Log {
 				'client'    => null,
 				'dashboard' => null,
 			)
-		); // a concurrent mint loses the INSERT and reads the winner's
-		$cur = get_option( self::BINDING, null );
+		);
+		// A LOST mint reads the WINNER's row from the database, never this
+		// request's negative cache (Ruling P72). An unreadable answer is
+		// reported as an empty generation, which `binding()` turns into null
+		// and every writer refuses to stamp.
+		$cur = $won ? get_option( self::BINDING, null ) : self::reread_after_mint( self::BINDING );
 		return is_array( $cur ) && isset( $cur['gen'] )
 			? self::normalise_binding( $cur )
 			: array( 'gen' => '', 'state' => self::BINDING_UNSET, 'client' => null, 'dashboard' => null );
@@ -248,6 +299,15 @@ class Aura_Worker_Door_Log {
 		// costs one conditional INSERT on the first row of a site's life and
 		// nothing after it.
 		self::epoch();
+		// WHOSE ENTRY THIS IS, BEFORE ANY NUMBER IS TAKEN (Ruling P72). A row
+		// stamped with an empty binding read as "written before the generation
+		// existed" and was therefore current for ever — so a write admitted
+		// during a first-reader race stayed runnable after a rebind. Nothing
+		// has been reserved yet, so refusing here is retryable and free.
+		$binding = self::binding();
+		if ( null === $binding ) {
+			return new WP_Error( 'aura_log_failed', 'This site could not establish which Aura binding this call belongs to; it was not run.', array( 'status' => 503 ) );
+		}
 		for ( $try = 0; $try < self::ALLOC_TRIES; $try++ ) {
 			$seq = max( self::highest_row_seq(), self::floor() ) + 1;
 			$row = array_merge(
@@ -259,7 +319,7 @@ class Aura_Worker_Door_Log {
 					// the SITE's audit trail and is served whatever the current
 					// binding is, so a reader has to be able to see that an
 					// entry belongs to a client that has since gone.
-					'binding'  => self::binding(),
+					'binding'  => $binding,
 					'result'   => 'pending',
 					'admitted' => false,
 				)
@@ -561,8 +621,8 @@ class Aura_Worker_Door_Log {
 		if ( ! $f['ok'] ) {
 			return false;
 		}
-		if ( (string) $gen !== $f['gen'] ) {
-			return false;
+		if ( '' === (string) $gen || (string) $gen !== $f['gen'] ) {
+			return false; // an EMPTY stamp is never current (Ruling P72)
 		}
 		if ( self::BINDING_UNSET === $f['state'] ) {
 			return true;
@@ -590,8 +650,8 @@ class Aura_Worker_Door_Log {
 	 */
 	public static function generation_is_live( $gen ) {
 		$rec = self::binding_record();
-		if ( (string) $gen !== (string) $rec['gen'] ) {
-			return false;
+		if ( '' === (string) $gen || (string) $gen !== (string) $rec['gen'] ) {
+			return false; // an EMPTY stamp is never current (Ruling P72)
 		}
 		if ( self::BINDING_UNSET === $rec['state'] ) {
 			return true;

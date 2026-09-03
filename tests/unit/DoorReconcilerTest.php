@@ -617,7 +617,7 @@ final class DoorReconcilerTest extends TestCase {
 		// twin's own age is what makes it anybody else's business.
 		$claimed = $this->hold();
 		$this->claim( $claimed, array(), true ); // fresh
-		$GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $claimed ] = array( 'ref' => $claimed, 'expires_at' => gmdate( 'c', time() + 600 ) );
+		$GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $claimed ] = array( 'ref' => $claimed, 'expires_at' => gmdate( 'c', time() + 600 ), 'binding' => Aura_Worker_Door_Log::binding() );
 		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::HELD . $claimed ]    = maybe_serialize( $GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $claimed ] );
 		$expired = $this->hold();
 		$live    = $this->hold();

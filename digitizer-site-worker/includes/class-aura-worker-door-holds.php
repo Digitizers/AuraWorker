@@ -173,6 +173,15 @@ class Aura_Worker_Door_Holds {
 			return new WP_Error( 'aura_hold_queue_full', 'Aura\'s approval queue for this site is full (50 held calls); ask the operator to act on it.', array( 'status' => 503 ) );
 		}
 		$ref = 'door_' . wp_generate_uuid4();
+		// WHOSE QUEUE THIS ROW JOINS, before anything is written (Ruling P72).
+		// An empty stamp used to read as "queued before the generation
+		// existed" — permanently current — so a hold taken during a
+		// first-reader race stayed claimable by whichever client came next.
+		// Nothing has been written yet: refusing is retryable and free.
+		$binding = Aura_Worker_Door_Log::binding();
+		if ( null === $binding ) {
+			return new WP_Error( 'aura_hold_failed', 'This site could not establish which Aura binding this call belongs to; it was not held.', array( 'status' => 503, 'retry_after' => 5 ) );
+		}
 		$now = time();
 		$row = array(
 			'ref'        => $ref,
@@ -180,7 +189,7 @@ class Aura_Worker_Door_Holds {
 			// WordPress action waiting for somebody to approve it, and only the
 			// client that queued it may ever be shown or given it — so the
 			// generation is written here and every reader compares it.
-			'binding'    => Aura_Worker_Door_Log::binding(),
+			'binding'    => $binding,
 			'ability'    => (string) $call['ability'],
 			'input'      => is_array( $call['input'] ?? null ) ? $call['input'] : array(),
 			'touches'    => is_array( $call['touches'] ?? null ) ? $call['touches'] : array(),
@@ -452,9 +461,15 @@ class Aura_Worker_Door_Holds {
 		// not a rebind.
 		if ( ! isset( $claimed['binding'] ) || '' === (string) $claimed['binding'] ) {
 			// A hold carries its binding from hold() (Ruling P58); this only
-			// fills it in for a row queued by a build before that, so the P51
-			// fence has something to compare rather than waving it through.
-			$claimed['binding'] = Aura_Worker_Door_Log::binding();
+			// fills it in for a row that somehow carries none, so the P51 fence
+			// has something to compare. It must never fill in '' (Ruling P72) —
+			// that is the value the fence treats as a mismatch, and writing it
+			// here would strand the approval rather than claim it.
+			$fill = Aura_Worker_Door_Log::binding();
+			if ( null === $fill ) {
+				return new WP_Error( 'aura_hold_failed', 'This site could not establish which Aura binding this approval belongs to; it was not claimed.', array( 'status' => 503, 'retry_after' => 5 ) );
+			}
+			$claimed['binding'] = $fill;
 		}
 		if ( ! Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed ) ) {
 			return self::not_held(); // already claimed
@@ -1196,7 +1211,14 @@ class Aura_Worker_Door_Holds {
 	public static function row_is_current( array $row ) {
 		$was = (string) ( isset( $row['binding'] ) ? $row['binding'] : '' );
 		if ( '' === $was ) {
-			return true; // queued before the generation existed
+			// NEVER CURRENT (Ruling P72). No hold predates the generation —
+			// 2.16 introduces the door and the stamp together — so an empty
+			// stamp can only have come from a lazy-mint race that read its own
+			// negative cache. Treating it as legacy made it current for ever,
+			// and after a rebind the replacement client could claim and run the
+			// previous client's stored mutation. The sweep removes such a row
+			// like any other foreign one.
+			return false;
 		}
 		return Aura_Worker_Door_Log::generation_is_live( $was );
 	}

@@ -1002,8 +1002,10 @@ class Aura_Worker_Elementor_Door {
 	 * neither, because both are this process's memory. The fence reads the
 	 * rows itself, and a read it cannot trust refuses.
 	 *
-	 * A row with NO binding predates the stamp and is accepted, the same
-	 * allowance every other reader of this field makes.
+	 * A row with NO binding is REFUSED (Ruling P72). Nothing predates the
+	 * stamp — 2.16 introduces the door and the stamp together — so an empty
+	 * one can only have come from a lazy-mint race, and the old "legacy is
+	 * current" allowance made exactly those rows runnable for ever.
 	 *
 	 * PUBLIC because `execute()` is not the only post-admission mutation the
 	 * door governs (Ruling P65): a snapshot restore reserves its entry, then
@@ -1015,9 +1017,16 @@ class Aura_Worker_Elementor_Door {
 	 */
 	public static function binding_unchanged_for_row( $seq ) {
 		$row = Aura_Worker_Door_Log::get( (int) $seq );
-		$was = is_array( $row ) && isset( $row['binding'] ) ? (string) $row['binding'] : '';
-		if ( '' === $was ) {
+		if ( ! is_array( $row ) ) {
+			// The ROW could not be read — a different failure from a binding
+			// that moved, and one the witness patch a few lines later reports
+			// honestly. Mislabelling it `binding_changed` would tell Aura this
+			// site was rebound when it was not.
 			return true;
+		}
+		$was = isset( $row['binding'] ) ? (string) $row['binding'] : '';
+		if ( '' === $was ) {
+			return false; // an EMPTY stamp is a mismatch, never a legacy pass (Ruling P72)
 		}
 		return Aura_Worker_Door_Log::generation_is_live_uncached( $was );
 	}
@@ -1034,9 +1043,10 @@ class Aura_Worker_Elementor_Door {
 	 * rebind, and answering `binding_changed` there would spend an approval
 	 * for nothing (Ruling P51).
 	 *
-	 * A claimed row carrying NO binding — claimed by a build before this rule —
-	 * is accepted: it predates the fence and refusing it would strand an
-	 * approval nobody can re-issue.
+	 * A claimed row carrying NO binding is REFUSED (Ruling P72). There is no
+	 * build for it to predate: the door, the stamp and this fence all arrive
+	 * in 2.16, so an empty one is a lazy-mint race's leftover — and accepting
+	 * it let a replacement client replay a departed client's approval.
 	 *
 	 * @param string $ref Hold ref.
 	 * @return bool
@@ -1047,7 +1057,7 @@ class Aura_Worker_Elementor_Door {
 			return false; // the row this replay owns is gone
 		}
 		if ( '' === $claimed ) {
-			return true; // claimed before the fence existed
+			return false; // an EMPTY stamp is a mismatch, never a legacy pass (Ruling P72)
 		}
 		// The same predicate every other reader uses (Ruling P62) — the
 		// generation must be current AND its record must still describe the

@@ -2653,8 +2653,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// test can prove the lock is still released on this path
 				// (Aura_Worker_Door_Holds uses insert_unique() for the lock too,
 				// since add_option()'s ON DUPLICATE KEY UPDATE is not a mutex).
+				// `true` loses every insert but the hold-queue lock; a STRING
+				// loses only that one option name, which is how a test breaks a
+				// single lazy mint (Ruling P72) and leaves the rest working.
 				if ( ! empty( $GLOBALS['_sa_insert_unique_fail'] ) && 'aura_worker_door_hold_lock' !== $name ) {
-					return 0;
+					$only = $GLOBALS['_sa_insert_unique_fail'];
+					if ( ! is_string( $only ) || $only === $name ) {
+						return 0;
+					}
 				}
 				if ( $is_ruleset_insert || $is_door_log_insert ) {
 					// A second request inserting between this caller's own

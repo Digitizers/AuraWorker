@@ -166,19 +166,89 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
 	}
 
-	/** A hold queued before the generation existed is treated as ours. */
-	public function test_a_hold_with_no_binding_is_treated_as_the_current_one(): void {
+	/**
+	 * Ruling P72 (a): the LOSER of a first-reader race reads the winner's row.
+	 *
+	 * Two requests meeting a site with no binding record both read the name as
+	 * absent and both try to mint. The loser's `insert_unique()` did not evict
+	 * its own `notoptions` entry, so the `get_option()` after it still answered
+	 * null for a row the winner had demonstrably just inserted — and the mint
+	 * returned ''. Everything that request then stamped carried an empty
+	 * binding, which every reader treated as legacy and therefore permanently
+	 * current: after a rebind, the replacement client could claim and execute
+	 * the previous client's stored mutation.
+	 */
+	public function test_the_loser_of_a_lazy_mint_race_reads_the_winners_generation(): void {
+		// The winner's row, written by another request straight to the
+		// database — and this request's negative cache, from the read that
+		// decided to mint.
+		$winner = array( 'gen' => 'winner-gen', 'state' => 'unset', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] = maybe_serialize( $winner );
+		$GLOBALS['_notoptions'][ Aura_Worker_Door_Log::BINDING ] = true;
+
+		$this->assertSame( 'winner-gen', Aura_Worker_Door_Log::binding() );
+
+		$GLOBALS['_notoptions'][ Aura_Worker_Door_Log::BINDING ] = true; // and again, for the hold's own read
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$this->assertIsString( $ref );
+		$this->assertSame( 'winner-gen', $GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ]['binding'] );
+	}
+
+	/**
+	 * …and a mint that cannot be established at all refuses, retryably.
+	 *
+	 * The alternative is stamping '' — which is exactly the row this ruling
+	 * exists to stop being written.
+	 */
+	public function test_a_hold_refuses_retryably_when_the_binding_cannot_be_minted(): void {
+		// ONLY the binding mint loses, and its row is genuinely absent: the
+		// re-read finds nothing, so the mint is UNREADABLE.
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::BINDING;
+
+		$out = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$GLOBALS['_sa_insert_unique_fail'] = false;
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		Aura_Worker_Door_Holds::forget_held();
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nothing was written' );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::count(), 'and no row is charging the cap' );
+		$this->assertSame(
+			array(),
+			array_filter(
+				array_keys( $GLOBALS['_rows'] ),
+				static function ( $k ) {
+					return 0 === strpos( (string) $k, Aura_Worker_Door_Holds::HELD );
+				}
+			),
+			'no held row was written with an empty binding'
+		);
+	}
+
+	/**
+	 * Ruling P72 (b): a hold carrying NO binding is NOT ours.
+	 *
+	 * There is no build for such a row to predate — 2.16 introduces the door,
+	 * the stamp and the fence together — so an empty stamp can only have come
+	 * from a lazy-mint race that read its own negative cache. The old "legacy
+	 * is current" allowance made exactly those rows current for ever, and after
+	 * a rebind the replacement client could claim and run one.
+	 */
+	public function test_a_hold_with_no_binding_is_foreign_and_is_swept(): void {
 		$ref  = Aura_Worker_Door_Holds::hold( $this->call() );
 		$name = 'aura_worker_door_held_' . $ref;
 		$row  = $GLOBALS['_options'][ $name ];
-		unset( $row['binding'] ); // a row from a build before Ruling P58
+		unset( $row['binding'] ); // what the lost-mint race used to write
 		$GLOBALS['_options'][ $name ] = $row;
 		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+		Aura_Worker_Door_Holds::forget_held();
 
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) );
-
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'never strand an approval nobody can re-issue' );
-		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'not readable' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'not listed' );
+		$this->assertSame( 'not_held', Aura_Worker_Door_Holds::claim( $ref )->get_error_code(), 'not claimable' );
+		$this->assertSame( 1, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ), 'and swept like any other foreign row' );
 	}
 
 	/**
