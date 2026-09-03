@@ -287,6 +287,40 @@ final class ElementorDoorCreationTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P17: the release is a DELETE FENCED on the bytes this request
+	 * inserted, never an unconditional delete_option().
+	 *
+	 * A creation still running past CLAIM_STALE_MS has its mutex cleared by
+	 * the reconciler, and a second creation takes a replacement row. This
+	 * request's `mutex_held` is still set, so an unconditional delete on its
+	 * way out removes the SECOND request's mutex — and a third creation then
+	 * runs beside it.
+	 */
+	public function test_a_release_never_deletes_a_mutex_another_request_took(): void {
+		$replacement = array( 'seq' => 99, 'started_at' => gmdate( 'c' ) );
+		$this->createPage(
+			function () use ( $replacement ) {
+				// The reconciler cleared this call's stale mutex, and another
+				// request's creation took the row.
+				$GLOBALS['_options'][ Aura_Worker_Elementor_Door::CREATING ] = $replacement;
+				$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::CREATING ]    = maybe_serialize( $replacement );
+				return array( 'id' => $this->insertPage() );
+			}
+		);
+
+		$this->assertSame( $replacement, get_option( Aura_Worker_Elementor_Door::CREATING, null ), 'the second creation still owns the site' );
+		$this->assertSame( maybe_serialize( $replacement ), $GLOBALS['_rows'][ Aura_Worker_Elementor_Door::CREATING ] ?? null );
+	}
+
+	/** And the ordinary case is unchanged: a call releases its own row. */
+	public function test_a_release_clears_the_row_this_request_inserted(): void {
+		$this->createPage( function () { return array( 'id' => $this->insertPage() ); } );
+
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ) );
+		$this->assertArrayNotHasKey( Aura_Worker_Elementor_Door::CREATING, $GLOBALS['_rows'] );
+	}
+
+	/**
 	 * A throw BEFORE the watermark was stamped: the diff has no mark to
 	 * compare against, so it makes no claim at all. Treating a missing
 	 * watermark as 0 would attribute every page this user ever made to the

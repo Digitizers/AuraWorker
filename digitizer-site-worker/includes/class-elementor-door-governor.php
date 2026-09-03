@@ -2334,16 +2334,18 @@ class Aura_Worker_Elementor_Door {
 	 * @return true|WP_Error `aura_creation_busy` (503) when another creation holds it.
 	 */
 	private static function take_creation_mutex( $seq ) {
-		$taken = Aura_Worker_Door_Log::insert_unique(
-			self::CREATING,
-			array(
-				'seq'        => (int) $seq,
-				'started_at' => gmdate( 'c' ),
-			)
+		$row   = array(
+			'seq'        => (int) $seq,
+			'started_at' => gmdate( 'c' ),
 		);
+		$taken = Aura_Worker_Door_Log::insert_unique( self::CREATING, $row );
 		if ( $taken ) {
-			// OWNERSHIP: only the request that inserted the row may delete it.
-			self::$request['mutex_held'] = true;
+			// OWNERSHIP: only the request that inserted the row may delete it,
+			// and only THAT row — the release fences on these exact bytes
+			// (Ruling P17), so they are kept here rather than rebuilt later
+			// from a timestamp that has moved on.
+			self::$request['mutex_held']  = true;
+			self::$request['mutex_bytes'] = (string) maybe_serialize( $row );
 		}
 		if ( ! $taken ) {
 			return new WP_Error(
@@ -2574,17 +2576,39 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * Release the creation mutex — but ONLY if this request is the one that
-	 * took it. A request whose mutex insert never landed (it lost the race, or
-	 * the statement threw) must not delete the row: that row is another
-	 * creation's, and deleting it would let a third call in beside it
-	 * (round 1).
+	 * Release the creation mutex — but ONLY the row this request inserted.
+	 *
+	 * Two conditions, and both are load-bearing. `mutex_held` says this
+	 * request took A mutex: one whose insert never landed (it lost the race,
+	 * or the statement threw) must not delete anything, because the row it
+	 * would delete is another creation's (round 1). And the DELETE is FENCED
+	 * on the exact bytes it inserted (Ruling P17), because holding the mutex
+	 * once is not the same as holding it now: a creation still running past
+	 * CLAIM_STALE_MS has its row cleared by the reconciler
+	 * (clear_stale_creation_mutex()) and a second creation takes a
+	 * replacement. This request's flag is still set, so an unconditional
+	 * delete_option() on its way out would remove the SECOND request's mutex
+	 * and let a third creation run beside it. The fence names one row —
+	 * seq + started_at — so a replacement, whose seq differs, is never it.
+	 *
+	 * The same shape as Aura_Worker_Door_Holds::release_lock() and
+	 * clear_stale_creation_mutex(): a fenced DELETE, then both option caches
+	 * evicted, because the compare is on bytes the cache does not hold.
 	 */
 	private static function release_creation_mutex() {
 		if ( null === self::$request || empty( self::$request['mutex_held'] ) ) {
 			return;
 		}
-		delete_option( self::CREATING );
+		global $wpdb;
+		$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+				self::CREATING,
+				(string) ( isset( self::$request['mutex_bytes'] ) ? self::$request['mutex_bytes'] : '' )
+			)
+		);
+		wp_cache_delete( self::CREATING, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
 		self::$request['mutex_held'] = false;
 	}
 }
