@@ -628,6 +628,40 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array( $seq ), array_column( $door['log'], 'seq' ) );
 	}
 
+	/**
+	 * Ruling P30: no Elementor is itself a closed door.
+	 *
+	 * `verify_coverage()`'s inactive branch leaves the seam `ok` on purpose —
+	 * there is nothing uncovered, and closing the transport would 503 a route
+	 * that does not exist (Ruling P6). But an `ok` seam alone then reported
+	 * `door: open` on a site where no governed write could possibly run, in
+	 * all three readers at once.
+	 */
+	public function test_a_door_whose_elementor_went_away_is_closed_however_healthy_its_seam(): void {
+		$this->hold();
+		Aura_Worker_Door_Log::epoch();
+
+		$this->elementorGoesAway();
+		do_action( 'wp_abilities_api_init' ); // verify_coverage()'s inactive branch: seam `ok`
+
+		$this->assertSame( 'ok', Aura_Worker_Elementor_Door::seam(), 'nothing is broken — Elementor is simply gone' );
+		$this->assertFalse( Aura_Worker_Door_Log::is_closed(), 'and the log is nowhere near full' );
+		$this->assertSame( 'closed', Aura_Worker_Elementor_Door::door_state() );
+		$this->assertSame( 'closed', Aura_Worker_Elementor_Door::status_fragment( 0, '' )['door'], 'the fragment agrees' );
+		$this->assertSame( 'closed', Aura_Worker_Elementor_Door::governor_block()['door'], 'and the audit block' );
+	}
+
+	/** The same three readers on a live, healthy door: still `open`. */
+	public function test_a_live_door_with_a_verified_seam_and_an_open_log_is_open(): void {
+		do_action( 'wp_abilities_api_init' );
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::active() );
+		$this->assertSame( 'ok', Aura_Worker_Elementor_Door::seam() );
+		$this->assertSame( 'open', Aura_Worker_Elementor_Door::door_state() );
+		$this->assertSame( 'open', $this->fragment()['door'] );
+		$this->assertSame( 'open', Aura_Worker_Elementor_Door::governor_block()['door'] );
+	}
+
 	/** And a site that never had a door still reports nothing at all (Ruling P6). */
 	public function test_a_site_with_no_door_and_nothing_persisted_reports_nothing(): void {
 		$this->elementorGoesAway();

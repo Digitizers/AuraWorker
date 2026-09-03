@@ -26,6 +26,11 @@ final class DoorRestTest extends TestCase {
 		// whatever the previous test class left on the static.
 		Aura_Worker_Elementor_Door::reset_for_tests();
 		Aura_Worker_Elementor_Door::init();
+		// Elementor IS on this site: every request modelled here is an ack or
+		// a reject against a LIVE door, and since Ruling P30 `door_state()`
+		// reads active() too — a site with no Elementor is closed however
+		// healthy its seam and its log are.
+		$GLOBALS['_sa_force_door'] = true; // stands in for Elementor's MCP module class
 		do_action( 'wp_abilities_api_init' );
 		$this->api = new Aura_Worker_API( new Aura_Worker_Security() );
 	}

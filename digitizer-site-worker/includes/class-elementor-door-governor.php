@@ -2021,14 +2021,30 @@ class Aura_Worker_Elementor_Door {
 	/**
 	 * Is the door open? ONE definition, for every reader (Ruling P24).
 	 *
-	 * Two independent things close it, and each was being reported by only
-	 * one caller. The SEAM: coverage that could not be verified means writes
-	 * may be reaching Elementor ungoverned, so the transport is refused. The
-	 * LOG: at MAX_UNACKED every governed write is answered `aura_log_full`,
-	 * which is a closed door by any honest reading — and the status fragment
-	 * went on reporting `open` whenever coverage was healthy, contradicting
-	 * both governor_block() and the ack response on the very poll an
-	 * operator would be looking at to find out why writes were failing.
+	 * THREE independent things close it, and each was once reported by only
+	 * one caller:
+	 *
+	 * 1. ELEMENTOR ITSELF (Ruling P30). No `active()`, no ability that can
+	 *    execute — so the door is shut whatever else is healthy. This is not
+	 *    hypothetical since Ruling P28: a site whose persisted door state
+	 *    outlives Elementor goes on reporting, and `verify_coverage()`'s
+	 *    inactive branch deliberately leaves the seam `ok` (there is nothing
+	 *    uncovered, and closing the transport would 503 a route that does not
+	 *    exist — Ruling P6). Without this term the `ok` seam alone reported
+	 *    `door: open` on a site where no governed write could possibly run,
+	 *    in all three readers at once.
+	 * 2. The SEAM: coverage that could not be verified means writes may be
+	 *    reaching Elementor ungoverned, so the transport is refused.
+	 * 3. The LOG: at MAX_UNACKED every governed write is answered
+	 *    `aura_log_full`, which is a closed door by any honest reading — and
+	 *    the status fragment went on reporting `open` whenever coverage was
+	 *    healthy, contradicting both governor_block() and the ack response on
+	 *    the very poll an operator would be looking at to find out why writes
+	 *    were failing.
+	 *
+	 * `seam` is still reported beside this on the fragment and the audit
+	 * block, so `active: false` + `seam: ok` + `door: closed` reads exactly as
+	 * what it is: nothing is broken, Elementor is simply gone.
 	 *
 	 * Public because the ack route answers with it too: three readers, one
 	 * answer.
@@ -2036,7 +2052,7 @@ class Aura_Worker_Elementor_Door {
 	 * @return string `open` or `closed`.
 	 */
 	public static function door_state() {
-		return ( 'ok' === self::$seam && ! Aura_Worker_Door_Log::is_closed() ) ? 'open' : 'closed';
+		return ( self::active() && 'ok' === self::$seam && ! Aura_Worker_Door_Log::is_closed() ) ? 'open' : 'closed';
 	}
 
 	/**
