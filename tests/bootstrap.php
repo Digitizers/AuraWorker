@@ -1906,6 +1906,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// working (Ruling P49'). Real wpdb answers the CLEARED
 				// last_result — an empty array — with last_error the only tell.
 				if ( ! empty( $GLOBALS['_sa_rows_read_error'][ stripslashes( $m[1] ) ] ) ) {
+					// `true` fails every read; a positive INT fails that many
+					// and then lets it through — which is how a test breaks the
+					// FIRST read of a request and leaves the second healthy,
+					// the shape Ruling P71 is about.
+					$fail = $GLOBALS['_sa_rows_read_error'][ stripslashes( $m[1] ) ];
+					if ( is_int( $fail ) ) {
+						--$GLOBALS['_sa_rows_read_error'][ stripslashes( $m[1] ) ];
+					}
 					$this->last_error = 'rows read failed';
 					return array();
 				}
@@ -4114,6 +4122,9 @@ function sa_reset_state(): void {
 	}
 	if ( method_exists( 'Aura_Worker_Door_Holds', 'forget_lock_support' ) ) {
 		Aura_Worker_Door_Holds::forget_lock_support(); // Ruling P70's per-request memo
+	}
+	if ( method_exists( 'Aura_Worker_Door_Holds', 'forget_held' ) ) {
+		Aura_Worker_Door_Holds::forget_held(); // Ruling P71's one-read-per-request memo
 	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;

@@ -56,6 +56,7 @@ final class DoorHoldsTest extends TestCase {
 		$out = Aura_Worker_Door_Holds::hold( $this->call() );
 
 		$GLOBALS['_sa_rows_read_error'] = array();
+		Aura_Worker_Door_Holds::forget_held(); // a healthy read is a NEW request (Ruling P71)
 		$this->assertInstanceOf( WP_Error::class, $out );
 		$this->assertSame( 'aura_hold_failed', $out->get_error_code(), 'retryable, and NOT queue_full' );
 		$this->assertSame( 503, $out->get_error_data()['status'] );
@@ -69,9 +70,45 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertSame( 1, Aura_Worker_Door_Holds::count() );
 
 		$GLOBALS['_sa_rows_read_error'][ $this->heldReadKey() ] = true;
+		Aura_Worker_Door_Holds::forget_held(); // the failing read is a NEW request (Ruling P71)
 		$this->assertNull( Aura_Worker_Door_Holds::count() );
 		$this->assertTrue( Aura_Worker_Door_Holds::queue_unreadable() );
 		$GLOBALS['_sa_rows_read_error'] = array();
+	}
+
+	/**
+	 * Ruling P71 (F4): `held` and `held_unreadable` come from ONE read.
+	 *
+	 * They were two queries. A read that failed for `listing()` and succeeded
+	 * for `queue_unreadable()` a microsecond later put `held: []` beside
+	 * `held_unreadable: false` in the same fragment — which is precisely the
+	 * pair Ruling P57 exists to make impossible, and which Aura reads as "the
+	 * queue is empty".
+	 */
+	public function test_a_first_failing_read_leaves_the_fragment_saying_unreadable(): void {
+		// Seeded straight into the store, so this request has not read the
+		// queue yet and the seam below breaks its FIRST read.
+		$row = array(
+			'ref'        => 'door_seeded',
+			'ability'    => 'elementor/publish-document',
+			'actor'      => array( 'user_id' => 3, 'login' => 'bot' ),
+			'touches'    => array(),
+			'verdict'    => 'none',
+			'created_at' => gmdate( 'c' ),
+			'expires_at' => gmdate( 'c', time() + 3600 ),
+			'binding'    => Aura_Worker_Door_Log::binding(),
+		);
+		$GLOBALS['_options']['aura_worker_door_held_door_seeded'] = $row;
+		$GLOBALS['_rows']['aura_worker_door_held_door_seeded']    = maybe_serialize( $row );
+		$GLOBALS['_sa_rows_read_error'][ $this->heldReadKey() ] = 1; // the FIRST held read fails, the next succeeds
+
+		$held       = Aura_Worker_Door_Holds::listing();
+		$unreadable = Aura_Worker_Door_Holds::queue_unreadable();
+
+		$GLOBALS['_sa_rows_read_error'] = array();
+		$this->assertSame( array(), $held );
+		$this->assertTrue( $unreadable, 'an empty list and a readable queue must never be reported together' );
+		$this->assertNull( Aura_Worker_Door_Holds::count(), 'and the cap agrees: unknown, not zero' );
 	}
 
 	/** A sweep with an unreadable read deletes nothing. */

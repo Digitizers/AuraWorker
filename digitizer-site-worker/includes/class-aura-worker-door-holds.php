@@ -49,6 +49,12 @@ class Aura_Worker_Door_Holds {
 
 	/** @var bool|null Per-request memo: does this engine have named locks? */
 	private static $locks_supported = null;
+
+	/** @var array<string,array>|null The held read this request already made. */
+	private static $held_rows = null;
+
+	/** @var bool Whether $held_rows holds an answer (null is one). */
+	private static $held_read = false;
 	const LOCK_S  = 30;
 
 	/**
@@ -191,7 +197,9 @@ class Aura_Worker_Door_Holds {
 		// nothing reports and no reconciler ever sweeps. Before the insert, so
 		// the witness can never lag the state it witnesses.
 		Aura_Worker_Door_Log::epoch();
-		if ( ! Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $row ) ) {
+		$queued = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $row );
+		self::forget_held();
+		if ( ! $queued ) {
 			return new WP_Error( 'aura_hold_failed', 'This site could not store the call for approval; it was not run.', array( 'status' => 503 ) );
 		}
 		return $ref;
@@ -256,6 +264,7 @@ class Aura_Worker_Door_Holds {
 		if ( self::is_expired( $row, time() ) ) {
 			if ( null === self::get_claimed( $ref ) ) {
 				delete_option( self::HELD . $ref );
+				self::forget_held();
 			}
 			return null;
 		}
@@ -302,6 +311,7 @@ class Aura_Worker_Door_Holds {
 			)
 		);
 		wp_cache_delete( self::HELD . $ref, 'options' );
+		self::forget_held();
 		wp_cache_delete( 'notoptions', 'options' );
 		return 1 === (int) $gone ? $row : null;
 	}
@@ -344,7 +354,9 @@ class Aura_Worker_Door_Holds {
 		$after            = $before;
 		$after['verdict'] = 'warn';
 		$after['rule']    = self::rule_fields( $rule );
-		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		$written = Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		self::forget_held();
+		return $written;
 	}
 
 	/**
@@ -373,7 +385,9 @@ class Aura_Worker_Door_Holds {
 		}
 		$after            = $before;
 		$after['touches'] = $touches;
-		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		$written = Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		self::forget_held();
+		return $written;
 	}
 
 	/**
@@ -396,7 +410,9 @@ class Aura_Worker_Door_Holds {
 		}
 		$after              = $before;
 		$after['log_entry'] = false;
-		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		$written = Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		self::forget_held();
+		return $written;
 	}
 
 	/**
@@ -446,6 +462,7 @@ class Aura_Worker_Door_Holds {
 		$wpdb->last_error = '';
 		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::HELD . $ref ) );
 		wp_cache_delete( self::HELD . $ref, 'options' );
+		self::forget_held();
 		if ( 1 !== (int) $gone ) {
 			// A reject or the sweep won the race: the entry we claimed from
 			// no longer exists. Back out; nothing runs.
@@ -513,7 +530,9 @@ class Aura_Worker_Door_Holds {
 		// (Ruling P41). Stamped BEFORE the insert, so a row that exists always
 		// carries it.
 		$held['restored_at'] = gmdate( 'c' );
-		if ( ! Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $held ) ) {
+		$back = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $held );
+		self::forget_held();
+		if ( ! $back ) {
 			return false; // a held row is already there — the claimed row stands
 		}
 		$wpdb->last_error = '';
@@ -531,7 +550,9 @@ class Aura_Worker_Door_Holds {
 		}
 		$after                 = $before;
 		$after['terminal_seq'] = (int) $seq;
-		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		$written = Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		self::forget_held();
+		return $written;
 	}
 
 	/**
@@ -555,7 +576,9 @@ class Aura_Worker_Door_Holds {
 		}
 		$after          = $before;
 		$after['lease'] = self::LEASE_UNSUPPORTED;
-		return Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		$written = Aura_Worker_Door_Log::write_option_where( $option, $after, $before );
+		self::forget_held();
+		return $written;
 	}
 
 	/** Delete the claimed row and any held twin. @param string $ref Ref. */
@@ -563,6 +586,7 @@ class Aura_Worker_Door_Holds {
 		$ref = self::clean( $ref );
 		delete_option( self::CLAIMED . $ref );
 		delete_option( self::HELD . $ref );
+		self::forget_held();
 	}
 
 	/**
@@ -586,6 +610,7 @@ class Aura_Worker_Door_Holds {
 		$wpdb->last_error = '';
 		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::HELD . $ref ) );
 		wp_cache_delete( self::HELD . $ref, 'options' );
+		self::forget_held();
 		return 1 === (int) $gone ? 'rejected' : 'already_claimed';
 	}
 
@@ -597,7 +622,7 @@ class Aura_Worker_Door_Holds {
 	public static function listing() {
 		$out  = array();
 		$now  = time();
-		$held = self::rows( self::HELD );
+		$held = self::held_rows();
 		if ( null === $held ) {
 			// Nothing to LIST is not the same as nothing HELD (Ruling P57), and
 			// the caller must not read an empty list as an empty queue —
@@ -656,7 +681,7 @@ class Aura_Worker_Door_Holds {
 	public static function sweep( $now, $claim_stale_ms ) {
 		$gone = 0;
 		$cut  = (int) $now - (int) floor( (int) $claim_stale_ms / 1000 );
-		$held = self::rows( self::HELD );
+		$held = self::held_rows();
 		if ( null === $held ) {
 			return 0; // unreadable ⇒ nothing to sweep (Ruling P57); never delete on a guess
 		}
@@ -691,12 +716,14 @@ class Aura_Worker_Door_Holds {
 				if ( self::finish_unclaim_in_flight( $ref, $row, $at ) ) {
 					continue;
 				}
-				delete_option( self::HELD . $ref ); // the replay's own delete, retried
+				delete_option( self::HELD . $ref );
+				self::forget_held(); // the replay's own delete, retried
 				$gone++;
 				continue;
 			}
 			if ( strtotime( (string) ( $row['expires_at'] ?? '' ) ) <= (int) $now ) {
 				delete_option( self::HELD . $ref );
+				self::forget_held();
 				$gone++;
 			}
 		}
@@ -1062,13 +1089,14 @@ class Aura_Worker_Door_Holds {
 	private static function purge_expired() {
 		$gone = 0;
 		$now  = time();
-		$held = self::rows( self::HELD );
+		$held = self::held_rows();
 		if ( null === $held ) {
 			return 0; // unreadable ⇒ nothing to purge (Ruling P57)
 		}
 		foreach ( $held as $ref => $row ) {
 			if ( self::is_expired( $row, $now ) && null === self::get_claimed( $ref ) ) {
 				delete_option( self::HELD . $ref );
+				self::forget_held();
 				$gone++;
 			}
 		}
@@ -1093,7 +1121,7 @@ class Aura_Worker_Door_Holds {
 	public static function count() {
 		$now     = time();
 		$claimed = self::rows( self::CLAIMED );
-		$held    = self::rows( self::HELD );
+		$held    = self::held_rows();
 		if ( null === $claimed || null === $held ) {
 			return null;
 		}
@@ -1134,6 +1162,7 @@ class Aura_Worker_Door_Holds {
 			)
 		);
 		wp_cache_delete( $option, 'options' );
+		self::forget_held();
 		wp_cache_delete( 'notoptions', 'options' );
 		return 1 === (int) $gone;
 	}
@@ -1183,7 +1212,7 @@ class Aura_Worker_Door_Holds {
 	 * @return bool
 	 */
 	public static function queue_unreadable() {
-		return null === self::rows( self::HELD );
+		return null === self::held_rows();
 	}
 
 	/**
@@ -1193,6 +1222,41 @@ class Aura_Worker_Door_Holds {
 	 * @param string $prefix HELD or CLAIMED.
 	 * @return array<string,array>|null
 	 */
+	/**
+	 * The held queue, read ONCE per request (Ruling P71).
+	 *
+	 * `listing()` and `queue_unreadable()` each issued their own query, so a
+	 * read that failed for one and succeeded for the other answered `held: []`
+	 * beside `held_unreadable: false` — the exact pair Ruling P57 exists to
+	 * make impossible, and Aura reads it as "the queue is empty". `count()`'s
+	 * held half is the third reader with the same exposure.
+	 *
+	 * So all three derive from ONE result, memoised for the request and
+	 * dropped by every held write this process makes. A null memo is an ANSWER
+	 * (the read failed) and is remembered as one: re-reading on the next
+	 * caller is what let the two disagree.
+	 *
+	 * @return array<string,array>|null
+	 */
+	private static function held_rows() {
+		if ( ! self::$held_read ) {
+			self::$held_rows = self::rows( self::HELD );
+			self::$held_read = true;
+		}
+		return self::$held_rows;
+	}
+
+	/**
+	 * Drop the memo — called by every held write in this process, so a reader
+	 * after a write never sees the queue as it was before it.
+	 *
+	 * @return void
+	 */
+	public static function forget_held() {
+		self::$held_rows = null;
+		self::$held_read = false;
+	}
+
 	private static function rows( $prefix ) {
 		global $wpdb;
 		$like = $wpdb->esc_like( $prefix ) . '%';
