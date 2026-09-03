@@ -271,17 +271,17 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
-	 * The epoch this ref was CLAIMED under, read from the database (Ruling
-	 * P47) — never this request's option cache, because the writer that could
-	 * have taken the row away is another request.
+	 * The BINDING generation this ref was CLAIMED under, read from the
+	 * database (Rulings P47/P51) — never this request's option cache, because
+	 * the writer that could have taken the row away is another request.
 	 *
 	 * @param string $ref Ref.
 	 * @return string|null null when the claimed row is gone; '' when it
-	 *                     carries no epoch (claimed before this rule existed).
+	 *                     carries no binding (claimed before this rule existed).
 	 */
-	public static function claimed_epoch( $ref ) {
+	public static function claimed_binding( $ref ) {
 		$row = self::from_db( self::CLAIMED . self::clean( $ref ) );
-		return null === $row ? null : (string) ( isset( $row['epoch'] ) ? $row['epoch'] : '' );
+		return null === $row ? null : (string) ( isset( $row['binding'] ) ? $row['binding'] : '' );
 	}
 
 	/** @param string $ref Ref. @return array|null */
@@ -408,12 +408,14 @@ class Aura_Worker_Door_Holds {
 		}
 		$claimed               = $held;
 		$claimed['claimed_at'] = gmdate( 'c' );
-		// The BINDING this claim belongs to (Ruling P47). A wipe deletes the
-		// epoch, and the next binding mints a fresh one, so this value can
-		// never be equal across a rebind — which is exactly what the wrapper
-		// re-reads immediately before the callback to prove the site is still
-		// the one that approved this call.
-		$claimed['epoch']      = Aura_Worker_Door_Log::epoch();
+		// The BINDING this claim belongs to (Rulings P47/P51). ONLY a wipe
+		// deletes this value, and the next binding mints a fresh one, so it
+		// can never be equal across a rebind — which is exactly what the
+		// wrapper re-reads before the callback to prove the site is still the
+		// one that approved this call. Deliberately NOT the log epoch: Aura
+		// may rotate that legitimately through `/door/rotate` on a rewind, and
+		// a rotation is not a rebind.
+		$claimed['binding']    = Aura_Worker_Door_Log::binding();
 		if ( ! Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed ) ) {
 			return self::not_held(); // already claimed
 		}
@@ -500,7 +502,7 @@ class Aura_Worker_Door_Holds {
 			return false;
 		}
 		$held = $claimed;
-		unset( $held['claimed_at'], $held['terminal_seq'], $held['epoch'] );
+		unset( $held['claimed_at'], $held['terminal_seq'], $held['binding'] );
 		// The witness the sweep reads to tell this move from claim()'s
 		// (Ruling P41). Stamped BEFORE the insert, so a row that exists always
 		// carries it.

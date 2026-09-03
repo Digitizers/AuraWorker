@@ -931,12 +931,16 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * Is the claimed row still ours, under the epoch it was claimed in
-	 * (Ruling P47)?
+	 * Is the claimed row still ours, under the BINDING it was claimed in
+	 * (Rulings P47/P51)?
 	 *
 	 * FALSE when the claimed row is gone (a wipe took it) or when the site's
-	 * epoch has moved (a wipe deleted it and a new binding minted another).
-	 * A claimed row carrying NO epoch — claimed by a build before this rule —
+	 * binding generation has moved (a wipe deleted it and a new binding minted
+	 * another). NOT the log epoch: `/door/rotate` may rotate that legitimately
+	 * on a rewind, which is not a rebind, and answering `binding_changed`
+	 * there would spend an approval for nothing (Ruling P51).
+	 *
+	 * A claimed row carrying NO binding — claimed by a build before this rule —
 	 * is accepted: it predates the fence and refusing it would strand an
 	 * approval nobody can re-issue.
 	 *
@@ -944,7 +948,7 @@ class Aura_Worker_Elementor_Door {
 	 * @return bool
 	 */
 	private static function replay_binding_unchanged( $ref ) {
-		$claimed = Aura_Worker_Door_Holds::claimed_epoch( $ref );
+		$claimed = Aura_Worker_Door_Holds::claimed_binding( $ref );
 		if ( null === $claimed ) {
 			return false; // the row this replay owns is gone
 		}
@@ -952,10 +956,10 @@ class Aura_Worker_Elementor_Door {
 			return true; // claimed before the fence existed
 		}
 		// RAW, and past this request's option cache: the writer that deleted
-		// the epoch is another request, and epoch() would mint a replacement
-		// rather than report the absence.
-		wp_cache_delete( Aura_Worker_Door_Log::EPOCH, 'options' );
-		return $claimed === (string) get_option( Aura_Worker_Door_Log::EPOCH, '' );
+		// the binding is another request, and binding() would mint a
+		// replacement rather than report the absence.
+		wp_cache_delete( Aura_Worker_Door_Log::BINDING, 'options' );
+		return $claimed === (string) get_option( Aura_Worker_Door_Log::BINDING, '' );
 	}
 
 	/**
@@ -1820,10 +1824,13 @@ class Aura_Worker_Elementor_Door {
 		// inside the wipe's deletes; this catches the other order, where the
 		// claim was already ours and the wipe happened afterwards.
 		//
-		// The epoch is the witness: the wipe deletes it and the next binding
-		// mints a fresh one, so the value stamped on the claimed row can never
-		// survive a rebind. Read RAW — never epoch(), which MINTS one and would
-		// quietly manufacture agreement on a site whose epoch was just deleted.
+		// The BINDING GENERATION is the witness (Ruling P51): only a wipe
+		// deletes it and the next binding mints a fresh one, so the value
+		// stamped on the claimed row can never survive a rebind — and, unlike
+		// the log epoch, `/door/rotate` never moves it, so a legitimate rewind
+		// rotation does not read as a rebind. Read RAW — never binding(),
+		// which MINTS one and would quietly manufacture agreement on a site
+		// whose binding was just deleted.
 		//
 		// RESIDUAL WINDOW, stated rather than hidden: a wipe landing between
 		// this read and `call_user_func()` below is not caught. It is the same

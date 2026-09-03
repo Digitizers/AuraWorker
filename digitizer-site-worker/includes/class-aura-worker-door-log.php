@@ -22,6 +22,8 @@ class Aura_Worker_Door_Log {
 	const PREFIX       = 'aura_worker_door_log_';
 	const FLOOR        = 'aura_worker_door_log_acked';
 	const EPOCH        = 'aura_worker_door_epoch';
+	/** The BINDING generation (Ruling P51): minted like the epoch, deleted ONLY by a wipe. */
+	const BINDING      = 'aura_worker_door_binding';
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
 	const MAX_UNACKED  = 2000;
@@ -78,6 +80,32 @@ class Aura_Worker_Door_Log {
 		}
 		self::insert_unique( self::EPOCH, wp_generate_uuid4() ); // a concurrent mint loses the INSERT and reads the winner's
 		$cur = get_option( self::EPOCH, '' );
+		return is_string( $cur ) ? $cur : '';
+	}
+
+	/**
+	 * The BINDING generation: which Aura binding this site's door belongs to
+	 * (Ruling P51).
+	 *
+	 * Minted lazily, exactly like the epoch, and deleted by ONE thing — the
+	 * wipe. That is the whole difference, and the reason it exists. The epoch
+	 * is the LOG's identity and Aura may legitimately rotate it through the
+	 * grant-gated `POST /aura/v1/door/rotate` (Ruling P20) whenever a rewind is
+	 * detected; a replay in flight would then have seen its fence move for a
+	 * reason that has nothing to do with the binding, be told
+	 * `binding_changed`, and lose an approval the reconciler only reclaims ten
+	 * minutes later. A rotation never touches this value, so the fence answers
+	 * the question it is actually asking.
+	 *
+	 * @return string
+	 */
+	public static function binding() {
+		$cur = get_option( self::BINDING, '' );
+		if ( is_string( $cur ) && '' !== $cur ) {
+			return $cur;
+		}
+		self::insert_unique( self::BINDING, wp_generate_uuid4() ); // a concurrent mint loses the INSERT and reads the winner's
+		$cur = get_option( self::BINDING, '' );
 		return is_string( $cur ) ? $cur : '';
 	}
 
@@ -297,7 +325,8 @@ class Aura_Worker_Door_Log {
 	 * counter all share the `PREFIX`, so one fenced prefix delete takes them
 	 * — and the epoch goes with them, which is the point: the next binding
 	 * starts a FRESH epoch at cursor 0 rather than inheriting a cursor the
-	 * departed client established.
+	 * departed client established. The BINDING generation goes too (Ruling
+	 * P51), which is what a replay in flight is fenced to.
 	 *
 	 * The 30-day counter buckets (`COUNTER_PREFIX`) are NOT touched: they are
 	 * this SITE's audit history, not the binding's transaction state.
@@ -313,10 +342,13 @@ class Aura_Worker_Door_Log {
 		global $wpdb;
 		Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::PREFIX ) . '%', $claim, $fence );
 		Aura_Worker_Rules::delete_option_if_claimed( self::EPOCH, $claim, $fence );
+		// The binding generation goes with it: a replay fenced to it can never
+		// mistake the next binding's door for its own (Ruling P51).
+		Aura_Worker_Rules::delete_option_if_claimed( self::BINDING, $claim, $fence );
 		// These statements go round the option cache, so evict by hand what
 		// delete_option() would have maintained. The numeric rows are read
 		// through row_from_db()/rows(), which never consult it.
-		foreach ( array( self::EPOCH, self::FLOOR, self::FULL_MARKER, self::FULL_COUNTER ) as $name ) {
+		foreach ( array( self::EPOCH, self::BINDING, self::FLOOR, self::FULL_MARKER, self::FULL_COUNTER ) as $name ) {
 			wp_cache_delete( $name, 'options' );
 		}
 		wp_cache_delete( 'notoptions', 'options' );

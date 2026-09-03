@@ -571,13 +571,13 @@ final class ElementorReplayTest extends TestCase {
 			}
 		);
 		// The wipe lands after the claim (its terminal_seq stamp is the first
-		// swap on the claimed row) and before the callback: the epoch and the
-		// claimed row are exactly what it takes.
+		// swap on the claimed row) and before the callback: the binding
+		// generation and the claimed row are exactly what it takes.
 		$this->afterSwapOn(
 			Aura_Worker_Door_Holds::CLAIMED . $ref,
 			static function () {
-				delete_option( Aura_Worker_Door_Log::EPOCH );
-				unset( $GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ] );
+				delete_option( Aura_Worker_Door_Log::BINDING );
+				unset( $GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] );
 			}
 		);
 
@@ -594,18 +594,47 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertFalse( $entry['may_have_run'] );
 	}
 
-	/** A claimed row whose epoch still matches runs exactly as before. */
-	public function test_a_replay_under_an_unchanged_epoch_still_runs(): void {
+	/** A claimed row whose binding still matches runs exactly as before. */
+	public function test_a_replay_under_an_unchanged_binding_still_runs(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );
-		$ref   = $this->holdCall();
-		$epoch = Aura_Worker_Door_Log::epoch();
+		$ref     = $this->holdCall();
+		$binding = Aura_Worker_Door_Log::binding();
 
 		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
 
 		$this->assertTrue( $out['ok'] );
 		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
-		$this->assertSame( $epoch, (string) get_option( Aura_Worker_Door_Log::EPOCH, '' ), 'and the epoch never moved' );
+		$this->assertSame( $binding, (string) get_option( Aura_Worker_Door_Log::BINDING, '' ), 'and the binding never moved' );
+	}
+
+	/**
+	 * Ruling P51: a LEGITIMATE epoch rotation is not a rebind.
+	 *
+	 * `/door/rotate` is how Aura answers a detected rewind (Ruling P20), and it
+	 * leaves the claimed row exactly where it is. Fencing on the log epoch
+	 * turned that into `binding_changed` — an approval spent for nothing, the
+	 * ref unavailable until stale reconciliation consumed it ten minutes later,
+	 * for a callback that never ran.
+	 */
+	public function test_an_epoch_rotation_mid_replay_does_not_look_like_a_rebind(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref     = $this->holdCall();
+		$binding = Aura_Worker_Door_Log::binding();
+		$this->afterSwapOn(
+			Aura_Worker_Door_Holds::CLAIMED . $ref,
+			static function () {
+				// Aura rotating the log epoch on a rewind, mid-replay.
+				Aura_Worker_Door_Log::rotate_epoch( Aura_Worker_Door_Log::epoch() );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertTrue( $out['ok'], 'a rotation is not a rebind' );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'], 'the approved call ran' );
+		$this->assertSame( $binding, (string) get_option( Aura_Worker_Door_Log::BINDING, '' ), 'the binding never moved' );
 	}
 
 	/** The claimed row vanishing outright is the same refusal. */

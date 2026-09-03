@@ -237,19 +237,28 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row still stands' );
 	}
 
-	/** The claimed row records the epoch it was claimed under (Ruling P47). */
-	public function test_a_claim_records_the_epoch_it_was_taken_under(): void {
-		$ref   = Aura_Worker_Door_Holds::hold( $this->call() );
-		$epoch = Aura_Worker_Door_Log::epoch();
+	/** The claimed row records the BINDING it was claimed under (Ruling P51). */
+	public function test_a_claim_records_the_binding_it_was_taken_under(): void {
+		$ref     = Aura_Worker_Door_Holds::hold( $this->call() );
+		$binding = Aura_Worker_Door_Log::binding();
 
 		Aura_Worker_Door_Holds::claim( $ref );
 
-		$this->assertSame( $epoch, Aura_Worker_Door_Holds::claimed_epoch( $ref ) );
-		$this->assertSame( $epoch, Aura_Worker_Door_Holds::get_claimed( $ref )['epoch'] );
+		$this->assertSame( $binding, Aura_Worker_Door_Holds::claimed_binding( $ref ) );
+		$this->assertSame( $binding, Aura_Worker_Door_Holds::get_claimed( $ref )['binding'] );
+		$this->assertArrayNotHasKey( 'epoch', Aura_Worker_Door_Holds::get_claimed( $ref ), 'the log epoch is not the fence' );
 		// …and it does not follow the row back to the queue.
 		Aura_Worker_Door_Holds::unclaim( $ref );
-		$this->assertArrayNotHasKey( 'epoch', Aura_Worker_Door_Holds::get_held( $ref ) );
-		$this->assertNull( Aura_Worker_Door_Holds::claimed_epoch( $ref ), 'and a ref with no claimed row has none' );
+		$this->assertArrayNotHasKey( 'binding', Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertNull( Aura_Worker_Door_Holds::claimed_binding( $ref ), 'and a ref with no claimed row has none' );
+	}
+
+	/** The binding generation is minted once and survives, exactly like the epoch. */
+	public function test_the_binding_generation_is_minted_once_and_is_not_the_epoch(): void {
+		$a = Aura_Worker_Door_Log::binding();
+		$this->assertMatchesRegularExpression( '/^[0-9a-f-]{36}$/', $a );
+		$this->assertSame( $a, Aura_Worker_Door_Log::binding() );
+		$this->assertNotSame( Aura_Worker_Door_Log::epoch(), $a, 'two independent generations' );
 	}
 
 	public function test_unclaim_keeps_the_claimed_row_when_the_held_name_is_taken(): void {
