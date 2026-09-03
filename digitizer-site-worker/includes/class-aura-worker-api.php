@@ -402,6 +402,23 @@ class Aura_Worker_API {
 			),
 		) );
 
+		// v1: Aura's decision to rotate the door-log epoch after `/status`
+		// reported `rewind.detected` (Ruling P20). A WRITE on the log's
+		// identity, so it is grant-gated — `/status` itself never rotates.
+		register_rest_route( self::NAMESPACE, '/door/rotate', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'rotate_door_epoch' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'epoch' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( "The log epoch Aura saw the rewind under; the site rotates only when it is still the current one, so a retry of a rotation that already happened changes nothing.", 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
 	}
 
 	/**
@@ -1455,6 +1472,58 @@ class Aura_Worker_API {
 				'epoch'   => Aura_Worker_Door_Log::epoch(),
 				'unacked' => Aura_Worker_Door_Log::count_unacked(),
 				'door'    => Aura_Worker_Door_Log::is_closed() ? 'closed' : 'open',
+			),
+			200
+		);
+	}
+
+	/**
+	 * POST /aura/v1/door/rotate
+	 *
+	 * Aura's decision to rotate the door-log epoch (Ruling P20). `/status`
+	 * REPORTS a rewound log — a cursor from this epoch that is above every
+	 * row and above the ack floor, which only a restore or a `wp_options`
+	 * roll-back can produce — as `rewind.detected`; acting on it is a WRITE
+	 * on the log's durable identity and lives here, behind a grant.
+	 *
+	 * It used to happen inside `/status`, where a holder of a leaked site
+	 * token could trigger it at will: every rotation invalidates the ack
+	 * Aura is about to send, so repeating it between the poll and
+	 * `/door/ack` starved the log to MAX_UNACKED and closed the write door.
+	 *
+	 * IDEMPOTENT: the rotation happens only when the epoch named is still
+	 * the current one, so a retry (or a second Aura instance answering the
+	 * same report) answers the epoch now in force with `rotated: false`
+	 * rather than minting another.
+	 *
+	 * Deliberately EXEMPT from the rule-guard invariant
+	 * (RulesRestCoverageTest), for the same reason as `door.ack`: this is
+	 * governance-plane bookkeeping on Aura's own log, not a site mutation,
+	 * and a freeze blocking it would strand a rewound log — no ack can ever
+	 * match again — until the door closed itself.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
+	 */
+	public function rotate_door_epoch( $request ) {
+		$epoch = (string) $request->get_param( 'epoch' );
+
+		$guard = Aura_Worker_Grant::require_for( $request, 'door.rotate', array( 'epoch' => $epoch ) );
+		if ( is_wp_error( $guard ) ) {
+			return $guard;
+		}
+
+		$rotated = false;
+		if ( '' !== $epoch && $epoch === Aura_Worker_Door_Log::epoch() ) {
+			Aura_Worker_Door_Log::rotate_epoch();
+			$rotated = true;
+		}
+
+		return new WP_REST_Response(
+			array(
+				'rotated' => $rotated,
+				'epoch'   => Aura_Worker_Door_Log::epoch(),
+				'floor'   => Aura_Worker_Door_Log::floor(),
 			),
 			200
 		);

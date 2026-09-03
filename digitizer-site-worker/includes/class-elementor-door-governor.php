@@ -263,32 +263,46 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * `$after` is Aura's cursor and `$epoch` the epoch that cursor belongs to.
 	 * A cursor from ANOTHER epoch says nothing about this log, so it is
-	 * ignored outright and the log is served from 0 (Codex round-7 P1) —
+	 * ignored and the log is served from the beginning — the same answer
 	 * which is also what an absent `door_epoch` gets.
 	 *
 	 * A cursor from THIS epoch that is above every row AND above the ack
-	 * floor is the one thing that cannot happen while the site's option store
-	 * is intact: a failed ack leaves the rows, a successful one raises the
-	 * floor. It means the options table was restored from a backup under the
-	 * same epoch, so the epoch is ROTATED (Codex round-6 P1 on #499) and the
-	 * NEW one answered — Aura's own epoch check then re-fetches from 0 and
-	 * re-ingests whatever the backup holds.
+	 * floor is impossible: the log was rewound (a restore, a `wp_options`
+	 * roll-back) under the same epoch. It is REPORTED — `rewind.detected`
+	 * with the `top` Aura should have been at — and the cursor is ignored so
+	 * the rows are served from 0. It is NOT acted on here.
+	 *
+	 * THIS ENDPOINT NEVER MUTATES (Ruling P20). It used to rotate the epoch
+	 * itself, which handed anyone holding the site token a way to invalidate
+	 * every ack Aura was about to send: read the epoch, ask for an oversized
+	 * `door_after` between Aura's poll and its `/door/ack`, and the ack then
+	 * names an epoch the site has moved past and is ignored — repeat, and the
+	 * unacked rows climb to MAX_UNACKED and close the write door, with no
+	 * grant anywhere. Rotation is Aura's decision, taken on `rewind.detected`
+	 * through the grant-gated `POST /aura/v1/door/rotate`.
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { epoch, seam, door, held, interrupted, log, log_floor, log_unacked, log_full }
+	 * @return array|null { epoch, seam, door, held, interrupted, rewind, log, log_floor, log_unacked, log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::active() ) {
 			return null;
 		}
-		$after = (int) $after;
-		$site  = Aura_Worker_Door_Log::epoch();
+		$after  = (int) $after;
+		$site   = Aura_Worker_Door_Log::epoch();
+		$rewind = null;
 		if ( (string) $epoch !== $site ) {
 			$after = 0;
-		} elseif ( $after > max( Aura_Worker_Door_Log::highest_row_seq(), Aura_Worker_Door_Log::floor() ) ) {
-			$site  = Aura_Worker_Door_Log::rotate_epoch();
-			$after = 0;
+		} else {
+			$top = max( Aura_Worker_Door_Log::highest_row_seq(), Aura_Worker_Door_Log::floor() );
+			if ( $after > $top ) {
+				$rewind = array(
+					'detected' => true,
+					'top'      => (int) $top,
+				);
+				$after  = 0; // ignored, never acted on: the read reports, Aura decides
+			}
 		}
 		$interrupted = array();
 		foreach ( Aura_Worker_Door_Holds::stale_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
@@ -306,6 +320,10 @@ class Aura_Worker_Elementor_Door {
 			'door'        => 'ok' === self::$seam ? 'open' : 'closed',
 			'held'        => Aura_Worker_Door_Holds::listing(),
 			'interrupted' => $interrupted,
+			// The log was rewound under this epoch (or it was not: null).
+			// Aura answers a detection by calling POST /aura/v1/door/rotate
+			// with a grant, then re-fetching under the new epoch.
+			'rewind'      => $rewind,
 			'log'         => Aura_Worker_Door_Log::log_after( $after ),
 			'log_floor'   => Aura_Worker_Door_Log::floor(),
 			'log_unacked' => Aura_Worker_Door_Log::count_unacked(),

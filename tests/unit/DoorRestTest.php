@@ -243,6 +243,65 @@ final class DoorRestTest extends TestCase {
 		$this->assertSame( 403, $res->get_error_data()['status'] );
 	}
 
+	/* ---- POST /aura/v1/door/rotate ---- */
+
+	/**
+	 * Rotation is a WRITE on the durable log identity, so it is Aura's
+	 * grant-gated decision — never a side effect of a `/status` read
+	 * (Ruling P20).
+	 */
+	public function test_rotate_requires_a_grant_once_one_is_enforced(): void {
+		$this->enforce_grants();
+		$before = Aura_Worker_Door_Log::epoch();
+
+		$res = $this->api->rotate_door_epoch( $this->request( array( 'epoch' => $before ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_grant_required', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ), 'nothing rotated' );
+	}
+
+	public function test_a_grant_over_the_current_epoch_rotates_and_keeps_the_floor_and_the_rows(): void {
+		$this->enforce_grants();
+		for ( $i = 1; $i <= 3; $i++ ) {
+			$seq = Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
+			Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		}
+		$before = Aura_Worker_Door_Log::epoch();
+		Aura_Worker_Door_Log::ack( $before, 2 );  // floor 2, rows 1-2 dropped
+		Aura_Worker_Door_Log::close();
+		Aura_Worker_Door_Log::bump_refused();
+		$req = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 200, $res->status );
+		$this->assertTrue( $res->data['rotated'] );
+		$this->assertNotSame( $before, $res->data['epoch'] );
+		$this->assertSame( Aura_Worker_Door_Log::epoch(), $res->data['epoch'], 'the epoch answered is the one now in force' );
+		$this->assertSame( 2, $res->data['floor'], 'the ack floor is retained (Ruling P2\')' );
+		$this->assertFalse( get_option( Aura_Worker_Door_Log::FULL_MARKER, false ), 'the closure state is cleared' );
+		$this->assertFalse( get_option( Aura_Worker_Door_Log::FULL_COUNTER, false ) );
+		$this->assertIsArray( get_option( 'aura_worker_door_log_3' ), 'the rows themselves are kept' );
+	}
+
+	public function test_a_stale_epoch_answers_the_current_one_without_rotating(): void {
+		$this->enforce_grants();
+		$before = Aura_Worker_Door_Log::epoch();
+		$req    = $this->request( array( 'epoch' => 'an-epoch-this-site-has-moved-past' ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => 'an-epoch-this-site-has-moved-past' ) ) );
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$this->assertSame( 200, $res->status );
+		$this->assertFalse( $res->data['rotated'], 'a retry of a rotation that already happened rotates nothing' );
+		$this->assertSame( $before, $res->data['epoch'] );
+		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
 	/* ---- MCP tool: snapshot_get ---- */
 
 	private function fixture_page( int $id ): void {

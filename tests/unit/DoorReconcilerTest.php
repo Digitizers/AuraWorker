@@ -552,10 +552,17 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/* ------------------------------------------------------------------ */
-	/* (j) a rewound log rotates its epoch                                 */
+	/* (j) a rewound log is REPORTED; /status never rotates (Ruling P20)   */
 	/* ------------------------------------------------------------------ */
 
-	public function test_a_cursor_above_every_row_and_the_floor_rotates_the_epoch(): void {
+	/**
+	 * `/status` is a read. It used to rotate the epoch on an impossible
+	 * cursor, which handed anyone holding the site token a way to invalidate
+	 * every ack Aura was about to send — repeat it between the poll and
+	 * `/door/ack` and the unacked rows climb to MAX_UNACKED and close the
+	 * write door, with no grant anywhere.
+	 */
+	public function test_a_cursor_above_every_row_reports_a_rewind_and_rotates_nothing(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
 		Aura_Worker_Door_Log::close();
@@ -564,12 +571,12 @@ final class DoorReconcilerTest extends TestCase {
 
 		$frag = $this->fragment( 40, $before );
 
-		$this->assertNotSame( $before, $frag['epoch'], 'a new epoch, so Aura re-fetches from 0' );
-		$this->assertSame( Aura_Worker_Door_Log::epoch(), $frag['epoch'] );
-		$this->assertSame( 0, $frag['log_floor'], 'nothing was ever acked here, so the retained floor is still 0' );
-		$this->assertFalse( get_option( Aura_Worker_Door_Log::FULL_MARKER, false ) );
-		$this->assertFalse( get_option( Aura_Worker_Door_Log::FULL_COUNTER, false ) );
-		$this->assertSame( array( 1 ), array_column( $frag['log'], 'seq' ), 'the rewound rows are re-served from 0' );
+		$this->assertSame( array( 'detected' => true, 'top' => 1 ), $frag['rewind'], 'reported, with the top Aura should have been at' );
+		$this->assertSame( $before, $frag['epoch'], 'the epoch is UNCHANGED' );
+		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ), 'and nothing was written' );
+		$this->assertNotFalse( get_option( Aura_Worker_Door_Log::FULL_MARKER, false ), 'a read clears no closure state either' );
+		$this->assertNotFalse( get_option( Aura_Worker_Door_Log::FULL_COUNTER, false ) );
+		$this->assertSame( array( 1 ), array_column( $frag['log'], 'seq' ), 'the impossible cursor is ignored and the log served from 0' );
 	}
 
 	public function test_a_rotation_on_a_site_that_has_acked_keeps_the_floor_and_goes_on_serving(): void {
@@ -580,11 +587,9 @@ final class DoorReconcilerTest extends TestCase {
 		}
 		Aura_Worker_Door_Log::ack( $epoch, 2 ); // rows 1 and 2 deleted, floor 2
 
-		$rotated = $this->fragment( 9, $epoch ); // a cursor above every row: the log rotates
+		$new = Aura_Worker_Door_Log::rotate_epoch(); // Aura's decision, through /door/rotate
 
-		$this->assertNotSame( $epoch, $rotated['epoch'] );
-		$new = $rotated['epoch'];
-
+		$this->assertNotSame( $epoch, $new );
 		$frag = $this->fragment( 0, $new );
 		$this->assertSame( 2, $frag['log_floor'], 'the ack floor survived the rotation' );
 		$this->assertSame( array( 3 ), array_column( $frag['log'], 'seq' ), 'row 3 is served — the deleted 1 and 2 are below the floor, not a hole' );
@@ -594,25 +599,27 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array( 3, 4 ), array_column( $this->fragment( 0, $new )['log'], 'seq' ), 'the log did not wedge' );
 	}
 
-	public function test_a_cursor_above_the_floor_but_at_an_existing_row_does_not_rotate(): void {
+	public function test_a_cursor_above_the_floor_but_at_an_existing_row_is_no_rewind(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
 		$before = Aura_Worker_Door_Log::epoch();
 
 		$frag = $this->fragment( 1, $before ); // a failed ack: the row is still there
 
+		$this->assertNull( $frag['rewind'] );
 		$this->assertSame( $before, $frag['epoch'] );
 		$this->assertSame( array(), $frag['log'], 'served from the cursor, which is where Aura says it is' );
 	}
 
-	public function test_a_cursor_from_another_epoch_is_ignored_and_never_rotates(): void {
+	public function test_a_cursor_from_another_epoch_is_ignored_and_is_no_rewind(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
 		$before = Aura_Worker_Door_Log::epoch();
 
 		$frag = $this->fragment( 40, 'a-different-epoch' );
 
-		$this->assertSame( $before, $frag['epoch'], 'a cursor from another epoch says nothing about this log' );
+		$this->assertNull( $frag['rewind'], 'a cursor from another epoch says nothing about this log — not even that it rewound' );
+		$this->assertSame( $before, $frag['epoch'] );
 		$this->assertSame( array( 1 ), array_column( $frag['log'], 'seq' ), 'served from 0' );
 	}
 

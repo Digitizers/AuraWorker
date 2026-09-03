@@ -159,6 +159,11 @@ final class UnbindRefusalTest extends TestCase {
 			'/aura/v2/rollback/akismet',
 			'/aura/v2/snapshot',
 			'/aura/v2/snapshot/restore',
+			// The door's three operator/Aura routes, all POST on
+			// check_admin_permission — a marked site refuses every one.
+			'/aura/v1/door/reject',
+			'/aura/v1/door/ack',
+			'/aura/v1/door/rotate',
 		);
 		$seen = array_column( array_values( self::mutating_routes() ), 1 );
 		foreach ( $known as $route ) {

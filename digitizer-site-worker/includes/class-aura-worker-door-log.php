@@ -410,8 +410,12 @@ class Aura_Worker_Door_Log {
 
 	/**
 	 * Mints a new epoch, clears the closure state, and leaves every log row
-	 * — and the ACK FLOOR — in place: the reconciler's recovery from an
-	 * epoch mismatch it cannot otherwise resolve (Task 9).
+	 * — and the ACK FLOOR — in place: the recovery from a rewound log, which
+	 * `/status` REPORTS (`rewind.detected`) and Aura DECIDES, through the
+	 * grant-gated `POST /aura/v1/door/rotate` (Ruling P20). It is never a
+	 * side effect of a read: a rotation invalidates every ack in flight, so
+	 * an unauthenticated-by-grant caller who could trigger one could starve
+	 * the log to MAX_UNACKED and close the write door.
 	 *
 	 * The floor is RETAINED, and that is the whole of the rule. It is not
 	 * Aura's cursor, which the new epoch invalidates anyway; it is this

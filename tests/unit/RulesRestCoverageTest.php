@@ -36,6 +36,11 @@ final class RulesRestCoverageTest extends TestCase {
 		// bound and close the door during exactly the window an operator
 		// most wants visibility into it.
 		'door.ack',
+		// The same bookkeeping, one step further: rotating the log's epoch
+		// after `/status` reported a rewind. Not a site mutation, and a
+		// freeze blocking it would strand a rewound log — no ack can ever
+		// match again — until the door closed itself.
+		'door.rotate',
 	);
 
 	protected function setUp(): void {
