@@ -2578,6 +2578,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				// A second request landing right AFTER this insert lands — the
+				// mirror of sa_before_swap()'s window, for a caller whose
+				// reservation IS the insert. Keyed by OPTION NAME and fired
+				// once, like _sa_before_fenced_delete: open_pending()'s
+				// post-insert floor re-check (Ruling P37) is about a racer that
+				// settles and ACKS this very row between the insert and the
+				// re-read, and no other seam can reach that window.
+				if ( isset( $GLOBALS['_sa_after_insert_unique'][ $name ] ) && is_callable( $GLOBALS['_sa_after_insert_unique'][ $name ] ) ) {
+					$racer = $GLOBALS['_sa_after_insert_unique'][ $name ];
+					unset( $GLOBALS['_sa_after_insert_unique'][ $name ] ); // fires once
+					$racer( $name );
+				}
 				return 1;
 			}
 
@@ -2799,6 +2811,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
+	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
@@ -4030,6 +4043,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
+	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active

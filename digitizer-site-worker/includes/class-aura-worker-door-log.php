@@ -92,6 +92,24 @@ class Aura_Worker_Door_Log {
 	 * Later writers add `snapshot_id`, `ran`, `result`, `reason`, `error`,
 	 * `may_have_run`, the creation and collateral evidence, and `settled_at`.
 	 *
+	 * WHY THE FLOOR IS RE-CHECKED **AFTER** THE INSERT (Ruling P37). The
+	 * INSERT is the reservation — before it, this writer owns nothing, and a
+	 * floor read a moment earlier says nothing about the number it is about to
+	 * take. Between computing N and inserting it, another writer can insert
+	 * AND settle N, and `/door/ack` can raise the floor to N and delete that
+	 * row; the conditional INSERT then succeeds by RECREATING N at or below
+	 * the floor. Such a row is admitted and its callback runs, but
+	 * `log_after()` and `count_unacked()` both start above the floor, so Aura
+	 * never sees it and it is never acked — a governed write with no record,
+	 * for ever. Only a reservation can be compared against a floor that moved,
+	 * so the order is: insert, re-read the floor, and give the row back if it
+	 * lost.
+	 *
+	 * The give-back is a DELETE fenced on the exact bytes this call wrote —
+	 * never `delete_option()`, which would remove whatever now stands under
+	 * that name, including a racer's fresh reservation. Same shape as the
+	 * hold-queue lock's and the creation mutex's releases.
+	 *
 	 * @param array $entry Fields (ability, actor, touches, verdict, …).
 	 * @return int|WP_Error seq, or `aura_log_failed`.
 	 */
@@ -117,11 +135,46 @@ class Aura_Worker_Door_Log {
 				)
 			);
 			if ( self::insert_unique( self::PREFIX . $seq, $row ) ) {
-				return $seq;
+				// The ack raises the floor with raw SQL, so this request's
+				// option cache can still hold the value from before it.
+				wp_cache_delete( self::FLOOR, 'options' );
+				if ( $seq > self::floor() ) {
+					return $seq;
+				}
+				// Acked out from under this reservation: hand the number back
+				// and allocate above the floor that moved.
+				self::delete_row_fenced( self::PREFIX . $seq, $row );
+				continue;
 			}
 			// Unique-name collision: a concurrent writer took this number.
 		}
 		return new WP_Error( 'aura_log_failed', 'The door log could not record this call; it was not run.', array( 'status' => 503 ) );
+	}
+
+	/**
+	 * Delete a row ONLY while it still carries the bytes this request wrote.
+	 *
+	 * The predicate is the value, byte for byte, exactly as the hold-queue
+	 * lock and the creation mutex release themselves. A bare `delete_option()`
+	 * would remove whatever stands under that name now — including the
+	 * reservation a racer took after this one lost its number.
+	 *
+	 * @param string $option Option name.
+	 * @param mixed  $value  The value this request inserted.
+	 * @return bool One row removed.
+	 */
+	private static function delete_row_fenced( $option, $value ) {
+		global $wpdb;
+		$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+				$option,
+				maybe_serialize( $value )
+			)
+		);
+		wp_cache_delete( $option, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return 1 === (int) $gone;
 	}
 
 	/** @param int $seq Seq. @return bool */

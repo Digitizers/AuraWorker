@@ -27,6 +27,63 @@ final class DoorLogTest extends TestCase {
 		$this->assertSame( $a, $GLOBALS['_options']['aura_worker_door_epoch'] );
 	}
 
+	/**
+	 * Ruling P37: a reservation acked out from under this writer is handed
+	 * back, and a number above the new floor is taken instead.
+	 *
+	 * The window: this writer computes N and pauses before its INSERT. Another
+	 * writer inserts AND settles N, and `/door/ack` raises the floor to N and
+	 * deletes that row. The conditional INSERT then succeeds by RECREATING N —
+	 * at or below the floor, so the row is admitted, its callback runs, and
+	 * `log_after()` and `count_unacked()` (which both walk from the floor)
+	 * ignore it for ever. A governed write with no record.
+	 */
+	public function test_a_seq_acked_away_between_the_insert_and_the_floor_check_is_handed_back(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		// The racer, landing the instant this writer's row for seq 1 exists:
+		// it settles that row and acks it, so the floor rises to 1 and the row
+		// is deleted — leaving the reservation this writer thinks it holds
+		// pointing at a number below the floor.
+		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( $epoch ) {
+			Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
+			Aura_Worker_Door_Log::ack( $epoch, 1 );
+		};
+
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertSame( 1, Aura_Worker_Door_Log::floor(), 'the ack moved the floor under the reservation' );
+		$this->assertSame( 2, $seq, 'so the number was handed back and re-allocated above it' );
+		$this->assertGreaterThan( Aura_Worker_Door_Log::floor(), $seq );
+		$this->assertArrayNotHasKey( 'aura_worker_door_log_1', $GLOBALS['_options'], 'and no row was left recreated below the floor' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_log_1', $GLOBALS['_rows'] );
+
+		// The re-allocated row is the one Aura actually receives.
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$this->assertSame( array( 2 ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ) );
+		$this->assertSame( 1, Aura_Worker_Door_Log::count_unacked() );
+	}
+
+	/** The give-back is FENCED: a racer's fresh row under that name survives. */
+	public function test_the_handed_back_number_is_deleted_only_while_it_carries_this_writers_bytes(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( $epoch ) {
+			Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
+			Aura_Worker_Door_Log::ack( $epoch, 1 );
+			// …and a third request reserves the (now free) name 1 before this
+			// writer gets to its fenced delete. A bare delete_option() here
+			// would destroy that reservation.
+			$GLOBALS['_options']['aura_worker_door_log_1'] = array( 'seq' => 1, 'result' => 'pending', 'admitted' => false, 'ability' => 'someone/else' );
+			$GLOBALS['_rows']['aura_worker_door_log_1']    = maybe_serialize( $GLOBALS['_options']['aura_worker_door_log_1'] );
+		};
+
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertGreaterThan( 1, $seq );
+		$this->assertSame( 'someone/else', $GLOBALS['_options']['aura_worker_door_log_1']['ability'], "the racer's row is untouched" );
+	}
+
 	public function test_seq_is_allocated_by_the_insert_and_is_contiguous(): void {
 		$s1 = Aura_Worker_Door_Log::open_pending( $this->entry() );
 		$s2 = Aura_Worker_Door_Log::open_pending( $this->entry() );
