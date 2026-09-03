@@ -429,6 +429,54 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 'refused_by_permission', $out['reason'] );
 		$this->assertSame( array(), $this->ran );
 		$this->assertSame( 'this user may not edit pages', Aura_Worker_Door_Log::log_after( 0 )[1]['error'] );
+		$this->assertSame( 'this user may not edit pages', $out['error'], 'the answer says why, not just that' );
+	}
+
+	/**
+	 * Ruling P40: a permission callback that THROWS is refused with a record,
+	 * not left to the reconciler.
+	 *
+	 * The check runs after the claim — deliberately: the claim is what makes
+	 * the actor switch safe against a concurrent replay — and `replay()` had
+	 * only a `finally`, so a throw from Elementor's callback (or from whatever
+	 * a plugin filtered onto it) escaped the whole method. The request died
+	 * with an uncaught error, the CLAIMED row survived, and ten minutes later
+	 * the reconciler called the attempt `interrupted` and spent the operator's
+	 * approval on a callback that never ran.
+	 */
+	public function test_a_permission_callback_that_throws_refuses_and_releases_the_claim(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref       = $this->holdCall();
+		$inner_ran = 0;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$inner_ran ) {
+				++$inner_ran;
+			}
+		);
+		$this->register(
+			'elementor/publish-document',
+			null,
+			static function () {
+				throw new RuntimeException( 'the permission callback exploded' );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'refused_by_permission', $out['reason'] );
+		$this->assertStringContainsString( 'exploded', $out['error'] );
+		$this->assertSame( 0, $inner_ran, 'the write path was never entered' );
+		$this->assertSame( array(), $this->ran, 'and nothing ran' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is released, not left to be replayed for ever' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and no claimed row is left for the reconciler to call `interrupted`' );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertSame( 'refused_by_permission', $log[1]['reason'] );
+		$this->assertSame( $ref, $log[1]['ref'] );
+		$this->assertStringContainsString( 'exploded', $log[1]['error'], 'the throw is what the entry says' );
 	}
 
 	// -----------------------------------------------------------------------

@@ -1994,34 +1994,63 @@ class Aura_Worker_Elementor_Door {
 					'reason' => 'not_held',
 				);
 			}
-			wp_set_current_user( (int) $held['actor']['user_id'] );
-			$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $slug ) : null;
-			if ( ! $ability ) {
-				// Elementor was deactivated (or the ability renamed) during the
-				// hold's seven days. That is a REFUSAL with a record, not
-				// `not_held` — which means "retry", and this one never will
-				// succeed until the plugin comes back.
-				self::record_terminal_only(
-					$slug,
-					(array) $held['actor'],
-					$touches, // the CURRENT touches (Ruling P34)
-					'refused',
-					array(
-						'ref'    => $ref,
-						'reason' => 'ability_missing',
-					)
-				);
-				Aura_Worker_Door_Holds::release( $ref );
-				return array(
-					'ok'     => false,
-					'reason' => 'refused_by_missing_ability',
-				);
+			// FROM HERE TO execute() THE CLAIM IS HELD, SO EVERY EXIT MUST
+			// SETTLE IT (Ruling P40). The lookup and the permission callback
+			// are third-party code — Elementor's, or whatever a plugin
+			// filtered onto the ability — and a THROW from either escaped
+			// `replay()` entirely: the outer `finally` restores the user and
+			// clears the statics, but nothing recorded an entry or moved the
+			// claimed row. The request died with a 500, and ten minutes later
+			// the reconciler called the attempt `interrupted` and spent the
+			// operator's approval on a callback that never ran.
+			//
+			// A throw here is the SAME event as a permission callback
+			// answering false: the site cannot establish that this actor may
+			// run this ability. So it takes the same exit — a refusal WITH a
+			// record, the hold released, `refused_by_permission` — carrying
+			// the throw's message as its `error`.
+			//
+			// The check stays AFTER the claim on purpose: the claim is what
+			// makes the actor switch below safe against a concurrent replay.
+			// Everything from `execute()` on is already owned by the wrapper's
+			// own catch, which settles the row and lets the rules below move
+			// the hold.
+			$why = null; // set to the refusal's message by either branch below
+			try {
+				wp_set_current_user( (int) $held['actor']['user_id'] );
+				$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $slug ) : null;
+				if ( ! $ability ) {
+					// Elementor was deactivated (or the ability renamed) during the
+					// hold's seven days. That is a REFUSAL with a record, not
+					// `not_held` — which means "retry", and this one never will
+					// succeed until the plugin comes back.
+					self::record_terminal_only(
+						$slug,
+						(array) $held['actor'],
+						$touches, // the CURRENT touches (Ruling P34)
+						'refused',
+						array(
+							'ref'    => $ref,
+							'reason' => 'ability_missing',
+						)
+					);
+					Aura_Worker_Door_Holds::release( $ref );
+					return array(
+						'ok'     => false,
+						'reason' => 'refused_by_missing_ability',
+					);
+				}
+				// The ability's OWN permission callback, as the stored actor,
+				// before anything runs. `WP_Ability::check_permissions()` is
+				// public on WP 7.1's class.
+				$allowed = method_exists( $ability, 'check_permissions' ) ? $ability->check_permissions( $input ) : false;
+				if ( true !== $allowed ) {
+					$why = is_wp_error( $allowed ) ? $allowed->get_error_message() : 'the actor no longer has permission for this ability';
+				}
+			} catch ( \Throwable $e ) {
+				$why = $e->getMessage();
 			}
-			// The ability's OWN permission callback, as the stored actor,
-			// before anything runs. `WP_Ability::check_permissions()` is
-			// public on WP 7.1's class.
-			$allowed = method_exists( $ability, 'check_permissions' ) ? $ability->check_permissions( $input ) : false;
-			if ( true !== $allowed ) {
+			if ( null !== $why ) {
 				self::record_terminal_only(
 					$slug,
 					(array) $held['actor'],
@@ -2030,13 +2059,14 @@ class Aura_Worker_Elementor_Door {
 					array(
 						'ref'    => $ref,
 						'reason' => 'refused_by_permission',
-						'error'  => is_wp_error( $allowed ) ? $allowed->get_error_message() : 'the actor no longer has permission for this ability',
+						'error'  => $why,
 					)
 				);
 				Aura_Worker_Door_Holds::release( $ref );
 				return array(
 					'ok'     => false,
 					'reason' => 'refused_by_permission',
+					'error'  => $why,
 				);
 			}
 			self::$replay_ack = array(
