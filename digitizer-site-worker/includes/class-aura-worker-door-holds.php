@@ -35,6 +35,8 @@ class Aura_Worker_Door_Holds {
 	 * on a persistent connection.
 	 */
 	const LEASE_PREFIX     = 'aura_door_replay_';
+	/** The same lease, over a log SEQ: every governed write, not only a replay (Ruling P56). */
+	const SEQ_LEASE_PREFIX = 'aura_door_seq_';
 	const LEASE_HARD_CAP_S = 86400;
 	/* wipe()'s three answers, NAMED so a caller cannot conflate them (Ruling P49'). */
 	const WIPE_DONE   = 'wiped';  // every statement ran under a lock this call held
@@ -833,8 +835,57 @@ class Aura_Worker_Door_Holds {
 	 * @return string
 	 */
 	public static function lease_name( $ref ) {
+		return self::lease_name_for( self::LEASE_PREFIX, self::clean( $ref ) );
+	}
+
+	/**
+	 * The same name builder for ANY leased subject (Ruling P56): a replay is
+	 * named by its hold ref, an ordinary governed write by its log seq.
+	 *
+	 * @param string $prefix `aura_door_replay_` or `aura_door_seq_`.
+	 * @param string $subject Ref or seq.
+	 * @return string
+	 */
+	public static function lease_name_for( $prefix, $subject ) {
 		$blog = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 1;
-		return self::LEASE_PREFIX . $blog . '_' . md5( self::clean( $ref ) );
+		return (string) $prefix . $blog . '_' . md5( (string) $subject );
+	}
+
+	/**
+	 * The execution lease over one log SEQ — every governed write, not only a
+	 * replay (Ruling P56).
+	 *
+	 * @param int $seq Log seq.
+	 * @return string
+	 */
+	public static function seq_lease_name( $seq ) {
+		return self::lease_name_for( self::SEQ_LEASE_PREFIX, (string) (int) $seq );
+	}
+
+	/**
+	 * Take the seq lease, without waiting.
+	 *
+	 * @param int $seq Log seq.
+	 * @return int|null 1 taken, 0 held elsewhere, null unavailable.
+	 */
+	public static function take_seq_lease( $seq ) {
+		return self::get_lock( self::seq_lease_name( $seq ) );
+	}
+
+	/**
+	 * @param int $seq Log seq.
+	 * @return void
+	 */
+	public static function release_seq_lease( $seq ) {
+		self::release_lock_named( self::seq_lease_name( $seq ) );
+	}
+
+	/**
+	 * @param int $seq Log seq.
+	 * @return bool|null TRUE held, FALSE free, NULL unknown.
+	 */
+	public static function seq_lease_is_held( $seq ) {
+		return self::lock_is_used( self::seq_lease_name( $seq ) );
 	}
 
 	/**
@@ -845,13 +896,46 @@ class Aura_Worker_Door_Holds {
 	 *                  server could not answer (no GET_LOCK, a driver error).
 	 */
 	public static function take_lease( $ref ) {
+		return self::get_lock( self::lease_name( $ref ) );
+	}
+
+	/**
+	 * GET_LOCK over one name. ONE implementation for every lease.
+	 *
+	 * @param string $name Lock name.
+	 * @return int|null 1 taken, 0 held elsewhere, null unavailable.
+	 */
+	private static function get_lock( $name ) {
 		global $wpdb;
 		$wpdb->last_error = '';
-		$got              = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', self::lease_name( $ref ) ) );
+		$got              = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $name ) );
 		if ( null === $got || '' !== (string) $wpdb->last_error ) {
 			return null; // no lease available here; the age rule still protects
 		}
 		return (int) $got;
+	}
+
+	/**
+	 * @param string $name Lock name.
+	 * @return void
+	 */
+	private static function release_lock_named( $name ) {
+		global $wpdb;
+		$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+	}
+
+	/**
+	 * @param string $name Lock name.
+	 * @return bool|null TRUE held, FALSE free, NULL unknown.
+	 */
+	private static function lock_is_used( $name ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$who              = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s)', $name ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		return null !== $who;
 	}
 
 	/**
@@ -862,8 +946,7 @@ class Aura_Worker_Door_Holds {
 	 * @return void
 	 */
 	public static function release_lease( $ref ) {
-		global $wpdb;
-		$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', self::lease_name( $ref ) ) );
+		self::release_lock_named( self::lease_name( $ref ) );
 	}
 
 	/**
@@ -877,13 +960,7 @@ class Aura_Worker_Door_Holds {
 	 * @return bool|null TRUE held, FALSE free, NULL unknown (unreadable or unsupported).
 	 */
 	public static function lease_is_held( $ref ) {
-		global $wpdb;
-		$wpdb->last_error = '';
-		$who              = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s)', self::lease_name( $ref ) ) );
-		if ( '' !== (string) $wpdb->last_error ) {
-			return null;
-		}
-		return null !== $who;
+		return self::lock_is_used( self::lease_name( $ref ) );
 	}
 
 	/**

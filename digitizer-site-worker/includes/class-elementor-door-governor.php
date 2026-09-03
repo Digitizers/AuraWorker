@@ -140,6 +140,16 @@ class Aura_Worker_Elementor_Door {
 	private static $replay_ack = null;
 	/** @var bool|null memoised presence — see active() */
 	private static $active = null;
+	/**
+	 * The log seq whose EXECUTION LEASE this request holds (Ruling P56), or
+	 * null. Every governed write takes one, not only a replay: a creation that
+	 * legitimately runs longer than CLAIM_STALE_MS was otherwise recovered —
+	 * snapshotted, or on a snapshot failure TRASHED — while its own callback
+	 * was still running.
+	 *
+	 * @var int|null
+	 */
+	private static $seq_lease = null;
 
 	/* ------------------------------------------------------------------ */
 	/* Wiring                                                              */
@@ -186,6 +196,7 @@ class Aura_Worker_Elementor_Door {
 		self::$replay_ack          = null;
 		self::$request             = null;
 		self::$active              = null;
+		self::$seq_lease           = null;
 		// $GLOBALS['_sa_force_door'] — active()'s test override, standing in
 		// for the module class this suite cannot define — is reset by
 		// sa_reset_state(), not written here: production code reads that
@@ -564,6 +575,14 @@ class Aura_Worker_Elementor_Door {
 			if ( $seq <= 0 ) {
 				continue;
 			}
+			if ( self::write_is_running( $seq, $row ) ) {
+				// RUNNING, not dead (Ruling P56). Age alone said otherwise, and
+				// recovering underneath a live callback meant snapshotting — or,
+				// when that snapshot failed, TRASHING — posts the request was
+				// still creating, with the request then unable to record what
+				// really happened.
+				continue;
+			}
 			if ( empty( $row['admitted'] ) ) {
 				// Never admitted: the request died between open_pending() and
 				// admit(), so nothing was ever run under this number. It keeps
@@ -676,6 +695,31 @@ class Aura_Worker_Elementor_Door {
 		// the only evidence a replay may have mutated the site, and
 		// status_fragment() reports it in `interrupted[]` every poll until the
 		// entry can be written (Codex round-7 P1).
+	}
+
+	/**
+	 * Is the request that owns this pending row still running (Ruling P56)?
+	 *
+	 * The same reading `Aura_Worker_Door_Holds::claim_is_alive()` gives a
+	 * claim, applied to a log seq: the lease decides when it can be read, and
+	 * an answer the server could not give falls back to the hard cap — a row
+	 * younger than LEASE_HARD_CAP_S is treated as in flight, which also bounds
+	 * a lease stranded on a persistent connection.
+	 *
+	 * @param int   $seq The log seq.
+	 * @param array $row The pending row.
+	 * @return bool
+	 */
+	private static function write_is_running( $seq, array $row ) {
+		$lease = Aura_Worker_Door_Holds::seq_lease_is_held( $seq );
+		if ( true === $lease ) {
+			return true;
+		}
+		if ( null === $lease ) {
+			$at = strtotime( (string) ( isset( $row['at'] ) ? $row['at'] : '' ) );
+			return false === $at || $at > time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S;
+		}
+		return false;
 	}
 
 	/**
@@ -1590,7 +1634,23 @@ class Aura_Worker_Elementor_Door {
 				( $ran ? 'Aura\'s governor failed during this call; it may have run — check the site. ' : 'Aura\'s governor failed on this call; it was not run. ' ) . $e->getMessage(),
 				array( 'status' => 503 )
 			);
+		} finally {
+			// THE EXECUTION LEASE, released however this call leaves (Ruling
+			// P56) — the normal return, every early refusal after admission,
+			// and every throw alike. The connection closing releases it too,
+			// which is the property the reconciler relies on.
+			self::release_seq_lease();
 		}
+	}
+
+	/** Release this request's seq lease, if it took one (Ruling P56). */
+	private static function release_seq_lease() {
+		if ( null === self::$seq_lease ) {
+			return;
+		}
+		$seq             = self::$seq_lease;
+		self::$seq_lease = null;
+		Aura_Worker_Door_Holds::release_seq_lease( $seq );
 	}
 
 	/**
@@ -1706,6 +1766,16 @@ class Aura_Worker_Elementor_Door {
 			Aura_Worker_Door_Log::discard( $seq );
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
+		}
+		// THE EXECUTION LEASE for this write (Ruling P56). A named lock lives
+		// exactly as long as this request's database connection, so the
+		// reconciler never has to guess from age whether the request that owns
+		// this row is still running — which it was doing, and a creation that
+		// ran past CLAIM_STALE_MS could have its posts enveloped, or on a
+		// snapshot failure TRASHED, while its own callback was mid-flight.
+		$taken = Aura_Worker_Door_Holds::take_seq_lease( $seq );
+		if ( 1 === $taken ) {
+			self::$seq_lease = $seq;
 		}
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
 			// Settle the reservation before backing out (Codex round-10 P2).
@@ -3295,6 +3365,13 @@ class Aura_Worker_Elementor_Door {
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}
+		// The same lease as a governed write (Ruling P56): a restore runs a
+		// callback-like body, and the reconciler must not call it dead while
+		// it is still going.
+		$taken = Aura_Worker_Door_Holds::take_seq_lease( $seq );
+		if ( 1 === $taken ) {
+			self::$seq_lease = $seq;
+		}
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
 			// Same rule as execute()'s admission (Codex round-10 P2): the
 			// restore provably never ran, so the reservation is discarded
@@ -3333,6 +3410,10 @@ class Aura_Worker_Elementor_Door {
 		if ( ! $settled ) {
 			self::bump_counter( 'log_ungoverned' );
 		}
+		// The restore's terminus releases its lease (Ruling P56). A restore
+		// that never reaches here leaves it to the connection, which is the
+		// same guarantee every other lease rests on.
+		self::release_seq_lease();
 		return $settled;
 	}
 

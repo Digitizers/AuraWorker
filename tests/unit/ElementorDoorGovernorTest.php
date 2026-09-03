@@ -403,6 +403,44 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$GLOBALS['_sa_door_unacked_error'] = false;
 	}
 
+	/** Ruling P56: the seq lease is held across the write and released after. */
+	public function test_the_seq_lease_is_held_across_a_governed_write_and_released_after(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$held = null;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$held ) {
+				$held = ! empty( $GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::seq_lease_name( 1 ) ] );
+			}
+		);
+
+		wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertTrue( $held, 'held across the callback' );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Holds::seq_lease_name( 1 ), $GLOBALS['_sa_named_locks'], 'and released after' );
+	}
+
+	/** …and released when the callback throws. */
+	public function test_the_seq_lease_is_released_when_the_callback_throws(): void {
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		sa_register_ability(
+			'elementor/publish-document',
+			array(
+				'execute_callback'    => static function () {
+					throw new RuntimeException( 'boom' );
+				},
+				'permission_callback' => '__return_true',
+				'meta'                => array(),
+			)
+		);
+		do_action( 'wp_abilities_api_init' );
+
+		wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Holds::seq_lease_name( 1 ), $GLOBALS['_sa_named_locks'] );
+	}
+
 	public function test_coverage_failure_closes_both_transports_reads_included(): void {
 		$this->registerAll();
 		// A later filter replaced the wrapper AFTER wrap_args ran.

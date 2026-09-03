@@ -462,6 +462,58 @@ final class DoorReconcilerTest extends TestCase {
 		);
 	}
 
+	/**
+	 * Ruling P56: an ordinary governed write gets the same execution lease a
+	 * replay does, so age is never mistaken for death here either.
+	 *
+	 * A creation that legitimately runs longer than CLAIM_STALE_MS was
+	 * recovered underneath itself: `finish_stale_creation()` enveloped the
+	 * posts it was still creating — or, when that snapshot failed,
+	 * COMPENSATED and trashed them — while the callback was mid-flight, and
+	 * the live request could then no longer record its real outcome.
+	 */
+	public function test_a_stale_creation_whose_seq_lease_is_held_is_left_alone(): void {
+		$seq = $this->staleCreation();
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::seq_lease_name( $seq ) ] = true;
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 0, $out['interrupted'], 'running, not dead' );
+		$row = $this->row( $seq );
+		$this->assertSame( 'pending', $row['result'], 'its own request still owns the outcome' );
+		$this->assertArrayNotHasKey( 'snapshot_id', $row, 'nothing was enveloped' );
+		$this->assertArrayNotHasKey( 'compensated', $row, 'and nothing was trashed' );
+		$this->assertNotNull( get_post( 11 ) );
+	}
+
+	/** The same row with no lease held is settled and recovered, exactly as before. */
+	public function test_a_stale_creation_with_no_seq_lease_is_still_recovered(): void {
+		$seq = $this->staleCreation();
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 1, $out['interrupted'] );
+		$row = $this->row( $seq );
+		$this->assertSame( 'interrupted', $row['result'] );
+		$this->assertSame( array( 11 ), $row['created_post_ids'] );
+	}
+
+	/**
+	 * A server that cannot answer IS_USED_LOCK leaves it UNKNOWN, so the row
+	 * counts as running under the 24-hour hard cap — and is recovered past it.
+	 */
+	public function test_an_unanswerable_seq_lease_is_running_under_the_hard_cap( ): void {
+		$seq                             = $this->staleCreation();
+		$GLOBALS['_sa_named_lock_error'] = true;
+
+		$this->assertSame( 0, Aura_Worker_Elementor_Door::reconcile()['interrupted'], 'unknown ⇒ running' );
+
+		$this->patchOption( Aura_Worker_Door_Log::PREFIX . $seq, array( 'at' => gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 ) ) );
+
+		$this->assertSame( 1, Aura_Worker_Elementor_Door::reconcile()['interrupted'], 'and recovered past the cap' );
+		$GLOBALS['_sa_named_lock_error'] = false;
+	}
+
 	public function test_a_stale_creation_whose_envelope_cannot_be_stored_is_compensated(): void {
 		$seq = $this->staleCreation();
 
