@@ -554,6 +554,91 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertArrayNotHasKey( 'door', $data, 'Aura keys on the fragment being absent' );
 	}
 
+	/* ------------------------------------------------------------------ */
+	/* Ruling P28: persisted door state outlives Elementor                 */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Elementor deactivated, or its MCP module turned off, between one
+	 * request and the next: active() is false from here on, and the whole
+	 * fragment used to vanish with it.
+	 */
+	private function elementorGoesAway(): void {
+		unset( $GLOBALS['_sa_force_door'] );
+		Aura_Worker_Elementor_Door::reset_for_tests(); // the presence memo is per-request
+		$this->assertFalse( Aura_Worker_Elementor_Door::active() );
+	}
+
+	/**
+	 * Ruling P28: what the door persisted is reported whether or not
+	 * Elementor is still there. Dropping the fragment on the next request hid
+	 * outstanding approvals and terminal results from Aura for as long as the
+	 * plugin stayed off.
+	 */
+	public function test_a_door_whose_elementor_went_away_still_reports_its_state(): void {
+		$ref = $this->hold();
+		$one = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch(); // the site was polled while the door was live
+
+		$this->elementorGoesAway();
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment( 0, $epoch );
+		$this->assertIsArray( $frag, 'persisted door state is enough to report' );
+		$this->assertFalse( $frag['active'], 'and the fragment says Elementor is gone' );
+		$this->assertSame( $epoch, $frag['epoch'] );
+		$this->assertSame( 'unchecked', $frag['seam'], 'nothing verified a seam that is not there' );
+		$this->assertSame( 'closed', $frag['door'] );
+		$this->assertSame( array( $ref ), array_column( $frag['held'], 'ref' ), 'the holds are still awaiting Aura' );
+		$this->assertSame( array( $one ), array_column( $frag['log'], 'seq' ), 'and the log is still served' );
+	}
+
+	/** The audit's block, same rule: the FULL block, with `active: false`. */
+	public function test_the_audit_block_still_reports_a_door_whose_elementor_went_away(): void {
+		$this->hold();
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$this->elementorGoesAway();
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertFalse( $block['active'] );
+		$this->assertSame( $epoch, $block['epoch'] );
+		$this->assertSame( 1, $block['held_count'] );
+		$this->assertSame( 'closed', $block['door'] );
+		$this->assertArrayHasKey( 'log_unacked', $block, 'the full block, not { active: false } alone' );
+	}
+
+	/**
+	 * The other half of the same bug: the gate that dropped the fragment also
+	 * skipped reconcile(), so stale claims and pending rows waited for
+	 * Elementor to come back. `/status` is the only clock this site has.
+	 */
+	public function test_get_status_still_reconciles_when_elementor_went_away(): void {
+		$seq = $this->entry( array(), false ); // stale, never admitted
+		Aura_Worker_Door_Log::epoch();
+
+		$this->elementorGoesAway();
+
+		$data = $this->api->get_status( new WP_REST_Request( 'GET', '/aura/v1/status' ) )->get_data();
+
+		$this->assertIsObject( $data['door'] );
+		$door = (array) $data['door'];
+		$this->assertFalse( $door['active'] );
+		$this->assertSame( 'discarded', $this->row( $seq )['result'], 'settled in the very response that reports it' );
+		$this->assertSame( array( $seq ), array_column( $door['log'], 'seq' ) );
+	}
+
+	/** And a site that never had a door still reports nothing at all (Ruling P6). */
+	public function test_a_site_with_no_door_and_nothing_persisted_reports_nothing(): void {
+		$this->elementorGoesAway();
+
+		$this->assertSame( '', (string) get_option( Aura_Worker_Door_Log::EPOCH, '' ), 'nothing was ever minted' );
+		$this->assertNull( Aura_Worker_Elementor_Door::status_fragment( 0, '' ) );
+		$this->assertSame( array( 'active' => false ), Aura_Worker_Elementor_Door::governor_block() );
+		$data = $this->api->get_status( new WP_REST_Request( 'GET', '/aura/v1/status' ) )->get_data();
+		$this->assertArrayNotHasKey( 'door', $data, 'Aura keys on the fragment being absent' );
+	}
+
 	/**
 	 * Ruling P24: a full log IS a closed door. Every governed write answers
 	 * `aura_log_full` once the log reaches MAX_UNACKED, and governor_block()

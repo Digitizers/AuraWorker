@@ -545,9 +545,17 @@ class Aura_Worker_API {
 		// so what a died request left behind is settled in the very response
 		// that reports it: `/status` is the only clock this site has. An
 		// OBJECT on the wire, like `unbound` above, and ABSENT on a site with
-		// no door — Aura keys on its presence to decide whether this site is
-		// governed at all.
-		if ( class_exists( 'Aura_Worker_Elementor_Door' ) && Aura_Worker_Elementor_Door::active() ) {
+		// no door AND no persisted door state — Aura keys on its presence to
+		// decide whether this site is governed at all.
+		//
+		// present(), not active() (Ruling P28): deactivating Elementor after
+		// the governor stored holds, unacked rows or an in-flight claim used
+		// to drop the fragment AND skip the reconciler on the next request,
+		// so Aura lost sight of outstanding approvals and terminal results
+		// while nothing settled them. Persisted door state is enough to keep
+		// reporting and reconciling; the fragment's own `active` says whether
+		// Elementor is still there.
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) && Aura_Worker_Elementor_Door::present() ) {
 			Aura_Worker_Elementor_Door::reconcile();
 			$status['door'] = (object) Aura_Worker_Elementor_Door::status_fragment(
 				(int) $request->get_param( 'door_after' ),

@@ -255,11 +255,45 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Is there a door to REPORT on — an Elementor ability registered NOW, or
+	 * the state a door left behind (Ruling P28)?
+	 *
+	 * Elementor can be deactivated, or its MCP module turned off, while the
+	 * governor still holds calls awaiting Aura's approval, unacked log rows
+	 * and an in-flight claim. Gating `/status` on active() alone dropped the
+	 * whole fragment on the very next request: Aura lost sight of outstanding
+	 * approvals and terminal results, and — because the same gate skipped
+	 * reconcile() — nothing ever settled the stale claims and pending rows
+	 * either. They waited for Elementor to come back.
+	 *
+	 * So the epoch option is the second witness. It is minted the first time
+	 * anything reports this door and is deleted only by a rotation, so its
+	 * presence means "this site has had a door" — read RAW here, never
+	 * through Aura_Worker_Door_Log::epoch(), which MINTS one and would make
+	 * every site present the moment it was asked.
+	 *
+	 * NOT used by verify_coverage() or close_transport(): those two depend on
+	 * Elementor actually being there, and a door that does not exist is not
+	 * closed.
+	 *
+	 * @return bool
+	 */
+	public static function present() {
+		if ( self::active() ) {
+			return true;
+		}
+		return '' !== (string) get_option( Aura_Worker_Door_Log::EPOCH, '' );
+	}
+
+	/**
 	 * What `/status` says about the door (spec §3.10) — and what Aura drains.
 	 *
-	 * ABSENT on a site with no door: Aura keys on the fragment's presence to
-	 * decide whether this site is governed at all, so a site without
-	 * Elementor must not report a door — open or closed.
+	 * ABSENT on a site with no door AND no persisted door state: Aura keys on
+	 * the fragment's presence to decide whether this site is governed at all,
+	 * so a site that never had Elementor must not report a door — open or
+	 * closed. A site whose door state OUTLIVES Elementor still reports (see
+	 * present()), with `active: false` — that is how Aura tells "Elementor is
+	 * gone, so the door is closed and its seam unchecked" from a broken seam.
 	 *
 	 * `$after` is Aura's cursor and `$epoch` the epoch that cursor belongs to.
 	 * A cursor from ANOTHER epoch says nothing about this log, so it is
@@ -283,10 +317,10 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { epoch, seam, door, held, interrupted, rewind, log, log_floor, log_unacked, log_full }
+	 * @return array|null { active, epoch, seam, door, held, interrupted, rewind, log, log_floor, log_unacked, log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
-		if ( ! self::active() ) {
+		if ( ! self::present() ) {
 			return null;
 		}
 		$after  = (int) $after;
@@ -315,6 +349,9 @@ class Aura_Worker_Elementor_Door {
 			);
 		}
 		return array(
+			// Is Elementor STILL here? A fragment with `active: false` is a
+			// door reported from its own persisted state (Ruling P28).
+			'active'      => self::active(),
 			'epoch'       => $site,
 			'seam'        => self::$seam,
 			'door'        => self::door_state(),
@@ -1999,23 +2036,26 @@ class Aura_Worker_Elementor_Door {
 	 * whose log is full, whose hold queue is full, or whose seam never
 	 * verified, without polling `/status`.
 	 *
-	 * `{ active: false }` ALONE when this site carries no door (Ruling P6):
-	 * the caller already gates the whole `elementor` block on manage_options,
-	 * and there is nothing else honest to report about a door that is not
-	 * there. `seam` is reported exactly as `verify_coverage()` last left it —
+	 * `{ active: false }` ALONE when this site carries no door AND never did
+	 * (Ruling P6): the caller already gates the whole `elementor` block on
+	 * manage_options, and there is nothing else honest to report about a door
+	 * that is not there. A site whose door state OUTLIVED Elementor gets the
+	 * FULL block with `active: false` instead (Ruling P28) — the holds, the
+	 * unacked rows and the counters are all still there to report.
+	 * `seam` is reported exactly as `verify_coverage()` last left it —
 	 * `unchecked` when that has not run in this request is an honest answer,
 	 * not a gap; the audit never forces a coverage check of its own.
 	 *
 	 * @return array
 	 */
 	public static function governor_block() {
-		if ( ! self::active() ) {
+		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
 		$epoch = Aura_Worker_Door_Log::epoch();
 		$held  = Aura_Worker_Door_Holds::count(); // read once — held_count and queue_full are the same fact
 		return array(
-			'active'              => true,
+			'active'              => self::active(),
 			'epoch'               => '' === $epoch ? null : $epoch,
 			'seam'                => self::$seam,
 			'door'                => self::door_state(),
