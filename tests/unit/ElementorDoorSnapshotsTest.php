@@ -464,7 +464,8 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( 'ok', $row['result'] );
 		$this->assertSame( $env['id'], $row['restore_of'] );
 		$this->assertSame( 'act_42', $row['ref'] );
-		$this->assertSame( 'allow', $row['verdict'] );
+		$this->assertSame( array( array( 'type' => 'page', 'id' => '7' ) ), $row['touches'], 'the envelope\'s own target, not an empty set' );
+		$this->assertSame( 'rules_unavailable', $row['verdict'], 'no ruleset is stored on this site, and the entry says so' );
 
 		// The pre-restore envelope is a same-kind capture of what was there.
 		$snaps = new Aura_Worker_Snapshots();
@@ -522,6 +523,115 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertTrue( $snaps->restore( $pre['id'] )['success'] );
 		$this->assertSame( 'publish', get_post( 511 )->post_status );
 		$this->assertSame( '[{"made":true}]', get_post_meta( 511, '_elementor_data', true ) );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* (e2) a restore is judged on what the ENVELOPE touches (Ruling P12)   */
+	/* ------------------------------------------------------------------ */
+
+	public function test_a_block_rule_on_the_targeted_page_refuses_a_door_restore(): void {
+		$env    = $this->pageEnvelope();
+		$before = $this->envelopeCount();
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/keep-7', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'the client signed off on this page' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_9' ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+		$this->assertSame( $before, $this->envelopeCount(), 'nothing was captured' );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
+
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'aura/restore', $row['ability'] );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'block', $row['verdict'] );
+		$this->assertSame( 'rule/keep-7', $row['rule_key'] );
+		$this->assertSame( array( array( 'type' => 'page', 'id' => '7' ) ), $row['touches'] );
+		$this->assertSame( $env['id'], $row['restore_of'] );
+		$this->assertNull( Aura_Worker_Door_Log::get( 2 ), 'no restore entry was reserved beside the refusal' );
+	}
+
+	public function test_a_block_rule_on_the_design_system_refuses_a_design_system_restore(): void {
+		$this->seedDesignSystem();
+		$snap = $this->snapshotFor( 'elementor/manage-classes', array( array( 'type' => 'design_system', 'id' => '*' ) ), array() );
+		update_post_meta( 100, '_elementor_global_classes_order', 'a,changed' );
+		$before = $this->envelopeCount();
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $snap['snapshot']['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( $before, $this->envelopeCount(), 'nothing was captured' );
+		$this->assertSame( 'a,changed', get_post_meta( 100, '_elementor_global_classes_order', true ), 'nothing was restored' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( array( array( 'type' => 'design_system', 'id' => '*' ) ), $row['touches'] );
+	}
+
+	public function test_a_block_rule_on_a_created_page_refuses_undoing_that_creation(): void {
+		$this->seedPost( 511, 'page' );
+		$snaps = new Aura_Worker_Snapshots();
+		$rec   = $snaps->snapshot_creation( array( 511 ), 'page', array( 'seq' => 1, 'ability' => 'elementor/create-page' ) );
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/keep-511', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '511' ), 'reason' => 'live' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $rec['snapshot']['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 'publish', get_post( 511 )->post_status, 'the protected page was not trashed' );
+		$this->assertSame( array( array( 'type' => 'page', 'id' => '511' ) ), Aura_Worker_Door_Log::get( 1 )['touches'] );
+	}
+
+	public function test_a_warn_rule_lets_the_restore_run_and_is_recorded_on_its_entry(): void {
+		$env = $this->pageEnvelope();
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/watch-7', 'effect' => 'warn', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'tell me about it' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( '[{"v":1}]', get_post_meta( 7, '_elementor_data', true ), 'a warn does not stop a restore' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'ok', $row['result'] );
+		$this->assertSame( 'warn', $row['verdict'] );
+		$this->assertSame( 'rule/watch-7', $row['rule_key'] );
+		$this->assertSame( 'rule/watch-7', $row['rule']['key'] );
+		$this->assertSame( 'tell me about it', $row['rule']['reason'] );
+		$this->assertNotSame( '', (string) $row['rule']['ruleHash'] );
+	}
+
+	public function test_a_ruleset_that_matches_nothing_leaves_the_restore_entry_verdict_none(): void {
+		$env = $this->pageEnvelope();
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/other', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '99' ), 'reason' => 'not this one' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'ok', $row['result'] );
+		$this->assertSame( 'none', $row['verdict'] );
+		$this->assertSame( array( array( 'type' => 'page', 'id' => '7' ) ), $row['touches'] );
 	}
 
 	public function test_a_hostile_correlation_id_reaches_the_row_stripped(): void {

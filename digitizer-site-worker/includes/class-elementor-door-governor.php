@@ -1992,32 +1992,117 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * What a restore of this envelope will TOUCH — read off the envelope
+	 * itself, in the vocabulary every other write is judged in (Ruling P12).
+	 *
+	 * A restore is a WRITE: it rewrites the pages an envelope covers, or
+	 * trashes the pages a `creation` envelope names. The REST handler's own
+	 * guard declares `site:*`, which only a freeze can match — a rule
+	 * protecting page 7, or the design system, says nothing about `site:*`
+	 * and could never refuse a restore that rewrites exactly that.
+	 *
+	 * An envelope that names NO target derives no touches, and the matcher
+	 * reads an empty declaration as its `unknown` sentinel — every live rule
+	 * applies. That is the conservative direction, and the right one: an
+	 * envelope that cannot say what it covers has not shown it is safe.
+	 *
+	 * @param array $record The envelope about to be restored.
+	 * @return array[] Touch declarations.
+	 */
+	private static function restore_touches( array $record ) {
+		$kind = (string) ( isset( $record['door_kind'] ) ? $record['door_kind'] : '' );
+		if ( 'design_system' === $kind ) {
+			return array( array( 'type' => 'design_system', 'id' => '*' ) );
+		}
+		if ( 'creation' === $kind ) {
+			// Undoing a creation TRASHES these ids: a rule protecting one of
+			// them protects it from this restore too.
+			$ids = (array) ( isset( $record['created_post_ids'] ) ? $record['created_post_ids'] : array() );
+		} elseif ( in_array( $kind, array( 'page', 'component', 'creation_restore' ), true ) ) {
+			$ids = (array) ( isset( $record['targets'] ) ? $record['targets'] : array() );
+		} else {
+			return array();
+		}
+		$touches = array();
+		foreach ( $ids as $id ) {
+			$id = (int) $id;
+			if ( $id > 0 ) {
+				// `page` and `post` are one id seen from two directions, and
+				// the matcher treats them as such — one type is enough.
+				$touches[] = array( 'type' => 'page', 'id' => (string) $id );
+			}
+		}
+		return $touches;
+	}
+
+	/**
 	 * Reserve the door entry for a restore BEFORE anything is captured or
 	 * written — the same admission every governed write gets. Logging after
 	 * the fact would let a restore run unrecorded when the log was closed or
 	 * the insert failed.
 	 *
+	 * And JUDGE it first, on the envelope's own touches, against the current
+	 * ruleset — the same call `govern()` makes for every other write (Ruling
+	 * P12). The entry used to hard-code an empty touch set and an `allow`
+	 * verdict, so a `block` rule protecting page 7 could not stop a restore
+	 * from rolling page 7 back. A `block` refuses here, before the entry is
+	 * reserved and before anything is captured; `warn`, `allow`, `none` and
+	 * `rules_unavailable` all proceed — a restore is an UNDO, and the only
+	 * verdict that should stop one is a rule that names its target — and the
+	 * entry records what was really judged.
+	 *
 	 * @param array  $record   The envelope about to be restored.
 	 * @param string $aura_ref Aura's correlation id for this restore.
-	 * @return int|WP_Error seq, or aura_log_full / aura_log_failed.
+	 * @return int|WP_Error seq, or aura_rule_blocked / aura_log_full / aura_log_failed.
 	 */
 	public static function open_restore_entry( array $record, $aura_ref = '' ) {
+		$actor = self::actor();
+		$actor = is_wp_error( $actor ) ? array( 'user_id' => 0, 'login' => 'aura', 'via' => 'rest' ) : $actor;
+		// Aura's own correlation id for this restore (its AgentAction's
+		// doorRef), echoed on the entry so ingestion patches THAT row
+		// instead of minting a second one. A refusal carries it too.
+		$restore_of = (string) ( isset( $record['id'] ) ? $record['id'] : '' );
+		$ref        = '' === (string) $aura_ref ? null : preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $aura_ref );
+		$touches    = self::restore_touches( $record );
+		$verdict    = self::govern( 'aura/restore', $touches, array( 'restore_of' => $restore_of ) );
+		if ( 'block' === $verdict['effect'] ) {
+			Aura_Worker_Rules::record_block( 'aura/restore', $verdict['rule'] );
+			self::record_terminal_only(
+				'aura/restore',
+				$actor,
+				$touches,
+				'refused',
+				array(
+					'verdict'    => 'block',
+					'rule_key'   => isset( $verdict['rule']['key'] ) ? (string) $verdict['rule']['key'] : '',
+					'restore_of' => $restore_of,
+					'ref'        => $ref,
+				)
+			);
+			$blocked = Aura_Worker_Rules::blocked_result( 'aura/restore', $verdict['rule'] );
+			return new WP_Error(
+				'aura_rule_blocked',
+				$blocked['error'],
+				array(
+					'status' => 403,
+					'rule'   => $blocked['rule'],
+				)
+			);
+		}
 		if ( Aura_Worker_Door_Log::is_closed() ) {
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}
-		$actor = self::actor();
-		$seq   = Aura_Worker_Door_Log::open_pending(
+		$seq = Aura_Worker_Door_Log::open_pending(
 			array(
 				'ability'    => 'aura/restore',
-				'actor'      => is_wp_error( $actor ) ? array( 'user_id' => 0, 'login' => 'aura', 'via' => 'rest' ) : $actor,
-				'touches'    => array(),
-				'verdict'    => 'allow',
-				'restore_of' => (string) ( isset( $record['id'] ) ? $record['id'] : '' ),
-				// Aura's own correlation id for this restore (its AgentAction's
-				// doorRef), echoed on the entry so ingestion patches THAT row
-				// instead of minting a second one.
-				'ref'        => '' === (string) $aura_ref ? null : preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $aura_ref ),
+				'actor'      => $actor,
+				'touches'    => $touches,
+				'verdict'    => $verdict['verdict'],
+				'rule_key'   => isset( $verdict['rule']['key'] ) ? (string) $verdict['rule']['key'] : null,
+				'rule'       => null !== $verdict['rule'] ? self::rule_evidence( $verdict['rule'] ) : null,
+				'restore_of' => $restore_of,
+				'ref'        => $ref,
 			)
 		);
 		if ( is_wp_error( $seq ) ) {

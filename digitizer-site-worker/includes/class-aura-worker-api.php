@@ -1245,8 +1245,13 @@ class Aura_Worker_API {
 			return $guard;
 		}
 
-		// No narrower resource in the vocabulary: a freeze catches this, and
-		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		// The envelope is not read yet, so this guard can only declare the
+		// site: a freeze catches it, and nothing narrower can. A DOOR
+		// envelope names what it covers, and is judged again on THOSE
+		// touches inside open_restore_entry() below — a rule protecting one
+		// page refuses a restore that would roll that page back, with the
+		// same `aura_rule_blocked` 403 this guard returns (Ruling P12).
+		// (Spec §11 keeps theme/db types out until asked for.)
 		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.snapshot.restore' );
 		if ( is_wp_error( $rule ) ) {
 			return $rule;
