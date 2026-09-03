@@ -2001,6 +2001,15 @@ class Aura_Worker_Elementor_Door {
 	 * protecting page 7, or the design system, says nothing about `site:*`
 	 * and could never refuse a restore that rewrites exactly that.
 	 *
+	 * SYMMETRY WITH THE WRITE: a restore declares what the write that made
+	 * the envelope declared. A `component` write is judged on
+	 * `design_system:*` (touches_for()'s `component` case), so its restore
+	 * declares that too, BESIDE the component post itself — a rule that
+	 * stopped the write must be able to stop the undo of it, and the rule
+	 * might name either. The other kinds already line up: a `page` write
+	 * names its page, a `design_system` write names the category, and a
+	 * `creation`'s restore trashes exactly the ids the creation made.
+	 *
 	 * An envelope that names NO target derives no touches, and the matcher
 	 * reads an empty declaration as its `unknown` sentinel — every live rule
 	 * applies. That is the conservative direction, and the right one: an
@@ -2031,6 +2040,9 @@ class Aura_Worker_Elementor_Door {
 				// the matcher treats them as such — one type is enough.
 				$touches[] = array( 'type' => 'page', 'id' => (string) $id );
 			}
+		}
+		if ( 'component' === $kind ) {
+			$touches[] = array( 'type' => 'design_system', 'id' => '*' );
 		}
 		return $touches;
 	}

@@ -596,6 +596,63 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( array( array( 'type' => 'page', 'id' => '511' ) ), Aura_Worker_Door_Log::get( 1 )['touches'] );
 	}
 
+	/**
+	 * A component write is judged on `design_system:*` (touches_for()'s
+	 * `component` case), so the restore that puts that component back must be
+	 * judged on it too — otherwise a rule that stopped the write cannot stop
+	 * the undo of it. A component restore declares BOTH: its target page and
+	 * the design system.
+	 */
+	public function test_a_block_rule_on_the_design_system_refuses_a_component_restore(): void {
+		$this->seedPost( 56, Aura_Worker_Elementor_Door::CPT_COMPONENT );
+		update_post_meta( 56, '_elementor_data', '[{"c":1}]' );
+		$snap = $this->snapshotFor( 'elementor/manage-component', array( array( 'type' => 'design_system', 'id' => '*' ) ), array( 'id' => 56 ) );
+		update_post_meta( 56, '_elementor_data', '[{"c":2}]' );
+		$before = $this->envelopeCount();
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $snap['snapshot']['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( 403, $res->get_error_data()['status'] );
+		$this->assertSame( $before, $this->envelopeCount(), 'nothing was captured' );
+		$this->assertSame( '[{"c":2}]', get_post_meta( 56, '_elementor_data', true ), 'nothing was restored' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame(
+			array(
+				array( 'type' => 'page', 'id' => '56' ),
+				array( 'type' => 'design_system', 'id' => '*' ),
+			),
+			$row['touches'],
+			'the component and the design system, exactly as its write declared'
+		);
+	}
+
+	public function test_a_design_system_rule_does_not_reach_a_page_restore(): void {
+		$env = $this->pageEnvelope();
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( '[{"v":1}]', get_post_meta( 7, '_elementor_data', true ), 'a page restore touches no design system' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'ok', $row['result'] );
+		$this->assertSame( 'none', $row['verdict'] );
+		$this->assertSame( array( array( 'type' => 'page', 'id' => '7' ) ), $row['touches'] );
+	}
+
 	public function test_a_warn_rule_lets_the_restore_run_and_is_recorded_on_its_entry(): void {
 		$env = $this->pageEnvelope();
 		$this->installRuleset(
