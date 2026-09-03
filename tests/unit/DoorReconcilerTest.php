@@ -209,6 +209,52 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
 	}
 
+	/**
+	 * Ruling P54: ONE predicate, two views of it.
+	 *
+	 * `/status` reported `interrupted[]` from `stale_claims()` — age alone —
+	 * while the reconciler skipped anything holding an execution lease. A
+	 * long-running replay was therefore listed as interrupted on every poll
+	 * while the reconciler was correctly leaving it alone. It is now reported
+	 * as `running`, which is what it is.
+	 */
+	public function test_a_leased_claim_past_the_bound_is_running_not_interrupted(): void {
+		$ref = $this->hold();
+		$this->claim( $ref ); // backdated past CLAIM_STALE_MS
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $ref ) ] = true;
+
+		$out  = Aura_Worker_Elementor_Door::reconcile();
+		$frag = $this->fragment();
+
+		$this->assertSame( 0, $out['settled_claims'], 'the reconciler leaves a running replay alone' );
+		$this->assertSame( array(), $frag['interrupted'], 'and `/status` no longer calls it interrupted' );
+		$this->assertSame( array( $ref ), array_column( $frag['running'], 'ref' ) );
+		$this->assertNotSame( '', $frag['running'][0]['claimed_at'] );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim still stands' );
+	}
+
+	/** An UNLEASED claim past the bound is interrupted, exactly as before. */
+	public function test_an_unleased_claim_past_the_bound_is_still_interrupted(): void {
+		$ref = $this->hold();
+		$this->claim( $ref );
+
+		$frag = $this->fragment();
+
+		$this->assertSame( array( $ref ), array_column( $frag['interrupted'], 'ref' ) );
+		$this->assertSame( array(), $frag['running'] );
+	}
+
+	/** A claim younger than the bound is in neither list. */
+	public function test_a_fresh_claim_is_neither_interrupted_nor_running(): void {
+		$ref = $this->hold();
+		$this->claim( $ref, array(), true ); // fresh
+
+		$frag = $this->fragment();
+
+		$this->assertSame( array(), $frag['interrupted'] );
+		$this->assertSame( array(), $frag['running'] );
+	}
+
 	public function test_a_claim_younger_than_the_stale_bound_is_left_alone(): void {
 		$ref = $this->hold();
 		$this->claim( $ref, array(), true );

@@ -897,26 +897,10 @@ class Aura_Worker_Door_Holds {
 		}
 		$cap = time() - self::LEASE_HARD_CAP_S;
 		foreach ( $rows as $ref => $row ) {
-			$at    = strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) );
-			$lease = self::lease_is_held( (string) $ref );
-			if ( true === $lease ) {
-				// RUNNING, whatever its age (Ruling P52). The lease lives as
-				// long as the request's database connection, so this is not a
-				// guess about death — it is the request saying it is alive.
-				return true;
-			}
-			if ( null === $lease ) {
-				// The server could not say (no GET_LOCK, a driver error). Fail
-				// closed under a hard cap, which also bounds a lease stranded
-				// on a persistent connection.
-				if ( false === $at || $at > $cap ) {
-					return true;
-				}
-				continue;
-			}
-			// No lease held: the age rule, unchanged. It still covers the
-			// window between the claim and the GET_LOCK a statement later.
-			if ( false === $at || $at > $cut ) {
+			// THE shared predicate (Ruling P54) — the same one the reconciler
+			// and `/status` are filtered by, so a claim cannot be alive for one
+			// of them and dead for another.
+			if ( self::claim_is_alive( (string) $ref, (array) $row, $cut, $cap ) ) {
 				return true;
 			}
 		}
@@ -967,6 +951,93 @@ class Aura_Worker_Door_Holds {
 			}
 		}
 		return $out;
+	}
+
+	/**
+	 * Is the request that took this claim still alive? THE predicate — one
+	 * definition, and everything that asks about a claim's liveness asks it
+	 * (Ruling P54).
+	 *
+	 * The EXECUTION LEASE decides first (Ruling P52): a named lock that is held
+	 * belongs to a live database connection, so the request is running however
+	 * long it has been at it. Only when no lease is held does age decide. An
+	 * answer the server could not give is UNKNOWN and falls back to the hard
+	 * cap, which also bounds a lease stranded on a persistent connection.
+	 *
+	 * @param string $ref Hold ref.
+	 * @param array  $row The claimed row.
+	 * @param int    $cut Claims stamped at or before this are old.
+	 * @param int    $cap Claims stamped at or before this are old even when the lease is unknown.
+	 * @return bool
+	 */
+	private static function claim_is_alive( $ref, array $row, $cut, $cap ) {
+		$at    = strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) );
+		$lease = self::lease_is_held( (string) $ref );
+		if ( true === $lease ) {
+			return true; // running, whatever its age
+		}
+		if ( null === $lease ) {
+			return false === $at || $at > $cap; // unknown ⇒ alive under the hard cap
+		}
+		return false === $at || $at > $cut; // no lease: the age rule
+	}
+
+	/**
+	 * The age-stale claims, split into the ones nobody is running any more and
+	 * the ones somebody still is (Ruling P54).
+	 *
+	 * Together they are exactly what `stale_claims()` returns, which is the
+	 * point: one predicate decides which side a row falls on, so the
+	 * reconciler cannot settle a claim `/status` is calling running, and
+	 * `/status` cannot call one interrupted that the reconciler is leaving
+	 * alone. A claim younger than the bound is in neither — it is simply not
+	 * old enough to be anybody's business yet.
+	 *
+	 * @param int $ms Age bound in milliseconds.
+	 * @return array{ stale: array[], running: array[] } Both keyed by ref.
+	 */
+	private static function partition_stale_claims( $ms ) {
+		$cut  = time() - (int) floor( (int) $ms / 1000 );
+		$cap  = time() - self::LEASE_HARD_CAP_S;
+		$out  = array( 'stale' => array(), 'running' => array() );
+		foreach ( self::rows( self::CLAIMED ) as $ref => $row ) {
+			if ( ! ( strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) ) <= $cut ) ) {
+				continue; // young: not stale, and not "running" either — just in progress
+			}
+			$side              = self::claim_is_alive( (string) $ref, (array) $row, $cut, $cap ) ? 'running' : 'stale';
+			$out[ $side ][ $ref ] = $row;
+		}
+		return $out;
+	}
+
+	/**
+	 * Claims old enough to settle AND not held by a live request (Ruling P54).
+	 *
+	 * This is what the reconciler acts on and what `/status` reports as
+	 * `interrupted`. `stale_claims()` — age alone — is kept for callers that
+	 * genuinely mean "old", and is deliberately NOT what either of those two
+	 * uses any more: an approved callback may legitimately run for longer than
+	 * the bound, and settling or reporting it as interrupted was wrong in both
+	 * places for the same reason.
+	 *
+	 * @param int $ms Age bound in milliseconds.
+	 * @return array[] Keyed by ref.
+	 */
+	public static function stale_unleased_claims( $ms ) {
+		$parts = self::partition_stale_claims( $ms );
+		return $parts['stale'];
+	}
+
+	/**
+	 * Claims past the age bound whose request is demonstrably STILL RUNNING —
+	 * reported so the operator sees them, labelled honestly (Ruling P54).
+	 *
+	 * @param int $ms Age bound in milliseconds.
+	 * @return array[] Keyed by ref.
+	 */
+	public static function running_claims( $ms ) {
+		$parts = self::partition_stale_claims( $ms );
+		return $parts['running'];
 	}
 
 	/**

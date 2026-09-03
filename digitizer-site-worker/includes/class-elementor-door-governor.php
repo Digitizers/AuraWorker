@@ -432,7 +432,7 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { active, epoch, seam, door, held, interrupted, rewind, log, log_floor, log_unacked (int|null), log_full }
+	 * @return array|null { active, epoch, seam, door, held, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::present() ) {
@@ -453,12 +453,26 @@ class Aura_Worker_Elementor_Door {
 				$after  = 0; // ignored, never acted on: the read reports, Aura decides
 			}
 		}
+		// THE SAME PREDICATE THE RECONCILER ACTS ON (Ruling P54). Reporting from
+		// `stale_claims()` — age alone — while reconcile() skipped anything
+		// holding an execution lease meant a long-running replay was listed as
+		// `interrupted` on every poll while the reconciler was correctly
+		// leaving it alone. One rule, two views of it.
 		$interrupted = array();
-		foreach ( Aura_Worker_Door_Holds::stale_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
+		foreach ( Aura_Worker_Door_Holds::stale_unleased_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
 			// Whatever reconcile() could not settle a moment ago — a claim
 			// whose `interrupted` entry could not be written is reported here
 			// every poll until it can be.
 			$interrupted[] = array(
+				'ref'        => (string) $ref,
+				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
+			);
+		}
+		// Past the bound and STILL RUNNING: the operator sees it, labelled for
+		// what it is rather than as a failure.
+		$running = array();
+		foreach ( Aura_Worker_Door_Holds::running_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
+			$running[] = array(
 				'ref'        => (string) $ref,
 				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
 			);
@@ -472,6 +486,10 @@ class Aura_Worker_Elementor_Door {
 			'door'        => self::door_state(),
 			'held'        => Aura_Worker_Door_Holds::listing(),
 			'interrupted' => $interrupted,
+			// Claims past CLAIM_STALE_MS whose replay is demonstrably still
+			// running — an execution lease held by a live database connection
+			// (Ruling P54). Never a failure, and never in `interrupted`.
+			'running'     => $running,
 			// The log was rewound under this epoch (or it was not: null).
 			// Aura answers a detection by calling POST /aura/v1/door/rotate
 			// with a grant, then re-fetching under the new epoch.
@@ -533,7 +551,7 @@ class Aura_Worker_Elementor_Door {
 
 		$out['swept'] = (int) Aura_Worker_Door_Holds::sweep( $now, self::CLAIM_STALE_MS );
 
-		foreach ( Aura_Worker_Door_Holds::stale_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
+		foreach ( Aura_Worker_Door_Holds::stale_unleased_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
 			self::settle_stale_claim( (string) $ref, (array) $claim, $out );
 		}
 
@@ -589,19 +607,16 @@ class Aura_Worker_Elementor_Door {
 	 *   through the same admission every entry gets, and release only if it
 	 *   was durably recorded.
 	 *
+	 * The caller has ALREADY established that this claim is stale AND that no
+	 * live request holds its execution lease — `stale_unleased_claims()` is the
+	 * one predicate (Ruling P54), and re-asking it here would be a second,
+	 * drifting copy of the same rule.
+	 *
 	 * @param string $ref   Hold ref.
 	 * @param array  $claim The claimed row.
 	 * @param array  $out   Counters, by reference.
 	 */
 	private static function settle_stale_claim( $ref, array $claim, array &$out ) {
-		if ( true === Aura_Worker_Door_Holds::lease_is_held( $ref ) ) {
-			// RUNNING, not stale (Ruling P52). The lease is held by a live
-			// database connection, so this claim belongs to a request that has
-			// not finished — settling it here would write `interrupted` over a
-			// call that is still going, and release a hold its own request is
-			// about to answer for. Age said ten minutes; the lease says alive.
-			return;
-		}
 		$seq = (int) ( isset( $claim['terminal_seq'] ) ? $claim['terminal_seq'] : 0 );
 		if ( $seq > 0 ) {
 			if ( $seq <= Aura_Worker_Door_Log::floor() ) {
