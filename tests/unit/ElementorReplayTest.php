@@ -460,6 +460,78 @@ final class ElementorReplayTest extends TestCase {
 	 * the reconciler called the attempt `interrupted` and spent the operator's
 	 * approval on a callback that never ran.
 	 */
+	/**
+	 * Ruling P42: the replay route is not a way around a closed door.
+	 *
+	 * `replay()` invokes the stored callback directly — that is the point of
+	 * the route. But when a later filter has REPLACED the callback our
+	 * `wrap_args` installed, the governor wrapper is gone: the write would run
+	 * with no snapshot, no log seq and no judgement, through the very door
+	 * `close_transport()` has already shut for every other caller, and would
+	 * surface only as an `interrupted` row ten minutes later.
+	 */
+	public function test_a_replay_refuses_when_the_ability_no_longer_holds_our_wrapper(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref       = $this->holdCall();
+		$foreign   = 0;
+		$inner_ran = 0;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$inner_ran ) {
+				++$inner_ran;
+			}
+		);
+		// A later filter replaces the stored callback AFTER wrap_args ran —
+		// the same move the coverage test makes.
+		$obj  = wp_get_ability( 'elementor/publish-document' );
+		$prop = new ReflectionProperty( WP_Ability::class, 'execute_callback' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$prop->setAccessible( true ); // a no-op since 8.1, deprecated in 8.5
+		}
+		$prop->setValue(
+			$obj,
+			static function () use ( &$foreign ) {
+				++$foreign;
+				return array( 'ok' => true );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'door_closed', $out['reason'] );
+		$this->assertSame( 0, $foreign, 'the foreign callback never ran' );
+		$this->assertSame( 0, $inner_ran, 'and neither did the write path' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is RETAINED — a deploy can restore the seam' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'nothing was claimed' );
+		$this->assertSame(
+			array( 'held' ),
+			array_column( Aura_Worker_Door_Log::log_after( 0 ), 'result' ),
+			"only the hold's own entry — the replay recorded nothing"
+		);
+	}
+
+	/** The same refusal when coverage failed wholesale: seam `unavailable`. */
+	public function test_a_replay_refuses_while_the_seam_is_unavailable(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref  = $this->holdCall();
+		$obj  = wp_get_ability( 'elementor/publish-document' );
+		$prop = new ReflectionProperty( WP_Ability::class, 'execute_callback' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$prop->setAccessible( true );
+		}
+		$prop->setValue( $obj, '__return_true' );
+		do_action( 'wp_abilities_api_init' ); // verify_coverage(): seam becomes `unavailable`
+		$this->assertSame( 'unavailable', Aura_Worker_Elementor_Door::seam() );
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertSame( 'door_closed', $out['reason'] );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+	}
+
 	public function test_a_permission_callback_that_throws_refuses_and_releases_the_claim(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );

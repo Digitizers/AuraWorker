@@ -785,6 +785,40 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Does this ability still hold OUR wrapper (Ruling P42)?
+	 *
+	 * The same comparison `verify_coverage()` makes, asked of one ability at
+	 * replay time. Three ways to answer no, and all of them mean the same
+	 * thing — a write through this ability would not be governed:
+	 *
+	 * 1. the seam is `unavailable`: coverage could not be verified in this
+	 *    request, so `close_transport()` is already refusing both Elementor
+	 *    transports and the replay route must not be the way around it;
+	 * 2. we never wrapped this slug in this request at all — there is nothing
+	 *    to compare against, and an unwrapped ability is by definition not
+	 *    ours;
+	 * 3. the stored callback is not the closure we installed: a later filter
+	 *    replaced it.
+	 *
+	 * A throw reading the property is a no as well: an ability whose stored
+	 * callback cannot be read cannot be proven to be ours.
+	 *
+	 * @param string $slug    Ability.
+	 * @param object $ability WP_Ability.
+	 * @return bool
+	 */
+	private static function wrapper_is_installed( $slug, $ability ) {
+		if ( 'unavailable' === self::$seam || ! isset( self::$wrapped[ $slug ] ) ) {
+			return false;
+		}
+		try {
+			return self::stored_callback( $ability ) === self::$wrapped[ $slug ];
+		} catch ( \Throwable $e ) {
+			return false;
+		}
+	}
+
+	/**
 	 * @param string $route REST route.
 	 * @return bool
 	 */
@@ -1984,6 +2018,52 @@ class Aura_Worker_Elementor_Door {
 					);
 				}
 			}
+			// THE ABILITY, AND WHOSE CALLBACK IT HOLDS — both BEFORE the claim
+			// (Ruling P42). `replay()` invokes the stored callback directly,
+			// which is the whole point of the replay route: the governor
+			// wrapper is what makes a write governed, and this path calls it
+			// deliberately. But if another filter has REPLACED that stored
+			// callback since, the wrapper is gone and this direct invocation
+			// would run a foreign callback with no snapshot, no log seq and no
+			// judgement — through the one door `close_transport()` has already
+			// shut for every other caller. The mutation would surface only as
+			// an `interrupted` row ten minutes later.
+			//
+			// So the same comparison `verify_coverage()` makes, on this one
+			// ability, before anything is claimed.
+			$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $slug ) : null;
+			if ( ! $ability ) {
+				// Elementor was deactivated (or the ability renamed) during the
+				// hold's seven days. That is a REFUSAL with a record, not
+				// `not_held` — which means "retry", and this one never will
+				// succeed until the plugin comes back.
+				self::record_terminal_only(
+					$slug,
+					(array) $held['actor'],
+					$touches, // the CURRENT touches (Ruling P34)
+					'refused',
+					array(
+						'ref'    => $ref,
+						'reason' => 'ability_missing',
+					)
+				);
+				Aura_Worker_Door_Holds::release( $ref );
+				return array(
+					'ok'     => false,
+					'reason' => 'refused_by_missing_ability',
+				);
+			}
+			if ( ! self::wrapper_is_installed( $slug, $ability ) ) {
+				// NOTHING is recorded and the hold is RETAINED: this is not a
+				// judgement about the call, it is the site being unable to
+				// govern it right now. A deploy that restores the seam makes
+				// the same approval replayable, so the operator's decision
+				// must not be spent on it.
+				return array(
+					'ok'     => false,
+					'reason' => 'door_closed',
+				);
+			}
 			$claimed = Aura_Worker_Door_Holds::claim( $ref );
 			if ( is_wp_error( $claimed ) ) {
 				// `not_held` from claim() is a LOST RACE (a reject or the
@@ -1995,10 +2075,9 @@ class Aura_Worker_Elementor_Door {
 				);
 			}
 			// FROM HERE TO execute() THE CLAIM IS HELD, SO EVERY EXIT MUST
-			// SETTLE IT (Ruling P40). The lookup and the permission callback
-			// are third-party code — Elementor's, or whatever a plugin
-			// filtered onto the ability — and a THROW from either escaped
-			// `replay()` entirely: the outer `finally` restores the user and
+			// SETTLE IT (Ruling P40). The permission callback is third-party
+			// code — Elementor's, or whatever a plugin filtered onto the
+			// ability — and a THROW from it escaped `replay()` entirely: the outer `finally` restores the user and
 			// clears the statics, but nothing recorded an entry or moved the
 			// claimed row. The request died with a 500, and ten minutes later
 			// the reconciler called the attempt `interrupted` and spent the
@@ -2010,36 +2089,16 @@ class Aura_Worker_Elementor_Door {
 			// record, the hold released, `refused_by_permission` — carrying
 			// the throw's message as its `error`.
 			//
-			// The check stays AFTER the claim on purpose: the claim is what
-			// makes the actor switch below safe against a concurrent replay.
-			// Everything from `execute()` on is already owned by the wrapper's
-			// own catch, which settles the row and lets the rules below move
-			// the hold.
+			// The permission check stays AFTER the claim on purpose: the
+			// claim is what makes the actor switch below safe against a
+			// concurrent replay. (The coverage proof above does NOT need the
+			// switch, which is why it can run before the claim and leave the
+			// hold untouched.) Everything from `execute()` on is already owned
+			// by the wrapper's own catch, which settles the row and lets the
+			// rules below move the hold.
 			$why = null; // set to the refusal's message by either branch below
 			try {
 				wp_set_current_user( (int) $held['actor']['user_id'] );
-				$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $slug ) : null;
-				if ( ! $ability ) {
-					// Elementor was deactivated (or the ability renamed) during the
-					// hold's seven days. That is a REFUSAL with a record, not
-					// `not_held` — which means "retry", and this one never will
-					// succeed until the plugin comes back.
-					self::record_terminal_only(
-						$slug,
-						(array) $held['actor'],
-						$touches, // the CURRENT touches (Ruling P34)
-						'refused',
-						array(
-							'ref'    => $ref,
-							'reason' => 'ability_missing',
-						)
-					);
-					Aura_Worker_Door_Holds::release( $ref );
-					return array(
-						'ok'     => false,
-						'reason' => 'refused_by_missing_ability',
-					);
-				}
 				// The ability's OWN permission callback, as the stored actor,
 				// before anything runs. `WP_Ability::check_permissions()` is
 				// public on WP 7.1's class.
