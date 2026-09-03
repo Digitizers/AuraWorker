@@ -454,6 +454,19 @@ class Aura_Worker_Elementor_Door {
 					$out['interrupted']++;
 					Aura_Worker_Door_Holds::release( $ref );
 					$out['settled_claims']++;
+					return;
+				}
+				// The settle did not land. If the entry is TERMINAL now, the
+				// owning request settled it in the window between the read
+				// above and this write (Ruling P27) — its verdict stands, and
+				// the entry Aura needs exists, so this claim is FINISHED. The
+				// branch above answers the same case when the row was already
+				// terminal at the read; this one answers it when it turned
+				// terminal underneath. Keeping the claim would strand the hold
+				// on every poll for ever.
+				if ( Aura_Worker_Door_Log::is_terminal( $seq ) ) {
+					Aura_Worker_Door_Holds::release( $ref );
+					$out['settled_claims']++;
 				}
 				return;
 			}
@@ -978,8 +991,10 @@ class Aura_Worker_Elementor_Door {
 						if ( ! is_wp_error( $creation ) ) {
 							$fields = array_merge( $fields, $creation );
 						} else {
-							// finish_creation() settled its own compensation
-							// onto the row; settle() merges, so it survives.
+							// finish_creation() already settled its own
+							// compensation onto the row, so the settle below
+							// is refused (Ruling P27) and annotate() carries
+							// this reason onto the verdict that stands.
 							$fields['reason'] = 'witness_unrecorded_then_compensated';
 						}
 					} catch ( \Throwable $creation_error ) {
@@ -987,7 +1002,12 @@ class Aura_Worker_Elementor_Door {
 						$fields['creation_error'] = $creation_error->getMessage();
 					}
 				}
-				Aura_Worker_Door_Log::settle( $seq, $fields );
+				if ( ! Aura_Worker_Door_Log::settle( $seq, $fields ) ) {
+					// Already terminal — finish_creation()'s own compensation
+					// settle, or another request's. The result it wrote is
+					// final; this evidence is added beside it.
+					Aura_Worker_Door_Log::annotate( $seq, $fields );
+				}
 				self::$request = null;
 				$row           = Aura_Worker_Door_Log::get( $seq );
 			}
@@ -1091,7 +1111,12 @@ class Aura_Worker_Elementor_Door {
 					// onto this settle instead.
 					$fields = array_merge( $fields, self::$request['creation_fields'] );
 				}
-				Aura_Worker_Door_Log::settle( $seq, $fields );
+				if ( ! Aura_Worker_Door_Log::settle( $seq, $fields ) ) {
+					// Already terminal — finish_creation()'s own compensation
+					// settle, or another request's. The result stands; the
+					// throw is recorded beside it (Ruling P27).
+					Aura_Worker_Door_Log::annotate( $seq, $fields );
+				}
 				self::$request = null;
 			}
 			return new WP_Error(
@@ -1369,17 +1394,27 @@ class Aura_Worker_Elementor_Door {
 			$terminal['collateral_snapshot_ids'] = self::$request['collateral'];
 		}
 		if ( ! Aura_Worker_Door_Log::settle( $seq, $terminal ) ) {
-			// THE WRITE RAN AND THE LOG COULD NOT SAY SO (Ruling P16).
+			// THE WRITE RAN AND THE LOG DOES NOT SAY SO (Ruling P16).
 			// Returning the callback's result here told the caller it
 			// succeeded while the row sat pending — `log_after` stops at a
 			// pending row, so every later entry waited behind it, and the
 			// reconciler eventually reported `interrupted` for a mutation
-			// that had completed. The row is LEFT pending on purpose: it
-			// carries `ran` under a replay, and `interrupted` is the honest
-			// terminal state for an outcome the log never learned. What
-			// changes is the ANSWER — a caller must not be told a write
+			// that had completed. The row is LEFT as it is on purpose: a
+			// pending one carries `ran` under a replay, and `interrupted` is
+			// the honest terminal state for an outcome the log never learned.
+			// What changes is the ANSWER — a caller must not be told a write
 			// succeeded on the strength of a record that does not exist.
-			self::bump_counter( 'log_ungoverned' );
+			//
+			// SOMEBODY ELSE MAY HAVE SETTLED IT FIRST (Ruling P27) — `/status` read
+			// this row as stale while the callback was still running. The
+			// answer is the same either way: the write ran and THIS site did
+			// not record its outcome, so the caller is told `may_have_run`
+			// rather than handed a success over a row that says otherwise.
+			// Only the COUNTER differs: an entry that exists was governed,
+			// just not by us, so `log_ungoverned` stays where it is.
+			if ( ! Aura_Worker_Door_Log::is_terminal( $seq ) ) {
+				self::bump_counter( 'log_ungoverned' );
+			}
 			self::$request = null;
 			return new WP_Error(
 				'aura_log_failed',

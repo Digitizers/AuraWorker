@@ -411,6 +411,40 @@ final class ElementorDoorGovernorTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P27, the live half: `/status` read this row as stale while the
+	 * callback was still running and settled it `interrupted`. The request
+	 * that owns it must NOT overwrite that with `ok` — Aura may already have
+	 * consumed it — so it answers the P16 way instead: the write ran, and
+	 * this site did not record its outcome.
+	 */
+	public function test_a_row_the_reconciler_already_settled_is_not_overwritten_by_the_live_request(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		// Another request's `/status` poll, in the window between the
+		// callback returning and this request settling its own row.
+		add_action(
+			'sa_test_inner_ran',
+			static function () {
+				Aura_Worker_Door_Log::settle( 1, array( 'result' => 'interrupted' ) );
+			}
+		);
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertTrue( $out->get_error_data()['may_have_run'] );
+		$this->assertSame( 1, $out->get_error_data()['seq'] );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'interrupted', $row['result'], 'the first terminal writer wins; a seq never changes meaning' );
+		$this->assertSame(
+			0,
+			(int) get_option( 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS ), 0 ),
+			'the call WAS recorded — just not by us'
+		);
+	}
+
+	/**
 	 * A throw AFTER the row was admitted settles that row rather than leaving
 	 * it pending: `log_after` stops at a pending row, so every later entry
 	 * would wait for the reconciler to call a KNOWN failure "interrupted".

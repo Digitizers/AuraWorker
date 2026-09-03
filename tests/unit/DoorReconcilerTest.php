@@ -576,6 +576,40 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P27, the reconciler's half: the live request settled this entry
+	 * between the staleness read and the write. The entry EXISTS, so the
+	 * claim is finished — keeping it would strand the hold until the next
+	 * sweep, every poll, for ever.
+	 */
+	public function test_a_stale_claim_whose_entry_turns_terminal_under_it_is_released(): void {
+		$ref = $this->hold();
+		$seq = $this->entry( array( 'ran' => true ), true, true );
+		$this->claim( $ref, array( 'terminal_seq' => $seq ) );
+		// The owning request settles it in the window between the
+		// reconciler's staleness read and its own write.
+		$GLOBALS['_sa_before_swap'] = static function () use ( $seq ) {
+			if ( false === strpos( (string) $GLOBALS['wpdb']->last_query, Aura_Worker_Door_Log::PREFIX . $seq ) ) {
+				return;
+			}
+			$row = $GLOBALS['_options'][ Aura_Worker_Door_Log::PREFIX . $seq ];
+			if ( 'pending' !== ( $row['result'] ?? '' ) ) {
+				return;
+			}
+			$row['result']                                              = 'ok';
+			$row['settled_at']                                          = gmdate( 'c' );
+			$GLOBALS['_options'][ Aura_Worker_Door_Log::PREFIX . $seq ] = $row;
+			$GLOBALS['_rows'][ Aura_Worker_Door_Log::PREFIX . $seq ]    = maybe_serialize( $row );
+		};
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 0, $out['interrupted'], 'nothing was written over the owner\'s verdict' );
+		$this->assertSame( 1, $out['settled_claims'] );
+		$this->assertSame( 'ok', $this->row( $seq )['result'] );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim is released, not stranded' );
+	}
+
+	/**
 	 * The other half of Ruling P25: the row a failed terminal-only settle
 	 * leaves is DISCARDED, never `interrupted` — nothing ran under it.
 	 */

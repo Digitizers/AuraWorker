@@ -113,12 +113,31 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * Settle a row terminally — ONCE. PENDING-ONLY (Ruling P27).
+	 *
+	 * A seq must never change meaning. `/status` can read a row as stale
+	 * while the request that owns it is still finishing, so both sides end up
+	 * holding a terminal verdict for the same number: the owner would
+	 * overwrite the reconciler's `interrupted` with `ok`, or the reconciler
+	 * would overwrite an `ok` with the verdict its earlier read implied — and
+	 * Aura may already have consumed the first. The first terminal writer
+	 * wins; everyone after it is told `false` and writes nothing.
+	 *
+	 * A caller that needs to ADD evidence to a row somebody else settled uses
+	 * annotate(), which cannot touch the result.
+	 *
 	 * @param int   $seq      Seq.
 	 * @param array $terminal Must carry `result` in TERMINAL.
-	 * @return bool
+	 * @return bool The row is terminal BECAUSE OF THIS CALL. Use is_terminal()
+	 *              to tell "somebody settled it first" from "the write failed".
 	 */
 	public static function settle( $seq, array $terminal ) {
 		if ( ! isset( $terminal['result'] ) || ! in_array( $terminal['result'], self::TERMINAL, true ) ) {
+			return false;
+		}
+		$option = self::PREFIX . (int) $seq;
+		$before = self::row_from_db( $option );
+		if ( null === $before || 'pending' !== ( isset( $before['result'] ) ? $before['result'] : '' ) ) {
 			return false;
 		}
 		$terminal['settled_at'] = gmdate( 'c' );
@@ -127,7 +146,48 @@ class Aura_Worker_Door_Log {
 		// a `settle()` that succeeded would otherwise leave a terminal row
 		// `log_after` stops at and the reconciler never revisits.
 		$terminal['admitted'] = true;
-		return self::patch( (int) $seq, $terminal );
+		return self::write_option_where( $option, array_merge( $before, $terminal ), $before );
+	}
+
+	/**
+	 * Has this row reached a terminal result?
+	 *
+	 * Read from the DATABASE, not the option cache: the writer that beat this
+	 * one is another request. Terminal is final, so the answer cannot go
+	 * stale in the direction that matters.
+	 *
+	 * @param int $seq Seq.
+	 * @return bool
+	 */
+	public static function is_terminal( $seq ) {
+		$row = self::row_from_db( self::PREFIX . (int) $seq );
+		return null !== $row && 'pending' !== ( isset( $row['result'] ) ? $row['result'] : 'pending' );
+	}
+
+	/**
+	 * Add evidence to a row that is ALREADY terminal, without touching what
+	 * it says happened.
+	 *
+	 * The first terminal writer decides the RESULT (Ruling P27); a later
+	 * writer in the same request may still explain it — the throw that
+	 * followed a compensation, say — but never change it. `result` and
+	 * `settled_at` are dropped from the fields for exactly that reason.
+	 *
+	 * @param int   $seq    Seq.
+	 * @param array $fields Evidence.
+	 * @return bool
+	 */
+	public static function annotate( $seq, array $fields ) {
+		unset( $fields['result'], $fields['settled_at'] );
+		if ( empty( $fields ) ) {
+			return false;
+		}
+		$option = self::PREFIX . (int) $seq;
+		$before = self::row_from_db( $option );
+		if ( null === $before || 'pending' === ( isset( $before['result'] ) ? $before['result'] : 'pending' ) ) {
+			return false; // a pending row is settled, not annotated
+		}
+		return self::write_option_where( $option, array_merge( $before, $fields ), $before );
 	}
 
 	/**

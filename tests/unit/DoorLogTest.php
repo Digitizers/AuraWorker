@@ -242,6 +242,49 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_rows'][ $name ]     = maybe_serialize( $row );
 	}
 
+	/* ---- settle() is pending-only: the first terminal writer wins ---- */
+
+	/**
+	 * Ruling P27: a seq never changes meaning. `/status` can read a row as
+	 * stale while the request that owns it is still finishing, so both sides
+	 * hold a terminal verdict for the same number — and Aura may already have
+	 * consumed the first.
+	 */
+	public function test_settle_refuses_a_row_that_is_already_terminal(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->assertTrue( Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok', 'snapshot_id' => 'snap_1' ) ) );
+		$first = Aura_Worker_Door_Log::get( $seq );
+
+		$this->assertFalse( Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'interrupted' ) ) );
+		$this->assertFalse( Aura_Worker_Door_Log::discard( $seq ), 'and a discard is a settle like any other' );
+
+		$this->assertSame( $first, Aura_Worker_Door_Log::get( $seq ), 'the row is untouched, byte for byte' );
+		$this->assertTrue( Aura_Worker_Door_Log::is_terminal( $seq ) );
+	}
+
+	public function test_is_terminal_answers_false_for_a_pending_row_and_a_missing_one(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->assertFalse( Aura_Worker_Door_Log::is_terminal( $seq ) );
+		$this->assertFalse( Aura_Worker_Door_Log::is_terminal( 9999 ) );
+	}
+
+	/** Evidence may still be ADDED to a terminal row — its result may not. */
+	public function test_annotate_adds_evidence_without_touching_the_result(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'failed', 'reason' => 'snapshot_failed' ) );
+
+		$this->assertTrue( Aura_Worker_Door_Log::annotate( $seq, array( 'reason' => 'exception_then_compensated', 'result' => 'ok' ) ) );
+
+		$row = Aura_Worker_Door_Log::get( $seq );
+		$this->assertSame( 'failed', $row['result'], 'the result a terminal writer set is final' );
+		$this->assertSame( 'exception_then_compensated', $row['reason'] );
+	}
+
+	public function test_annotate_refuses_a_pending_row(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->assertFalse( Aura_Worker_Door_Log::annotate( $seq, array( 'reason' => 'x' ) ), 'a pending row is settled, not annotated' );
+	}
+
 	/* ---- rotate_epoch(): a compare-and-swap on the epoch it replaces ---- */
 
 	/**
