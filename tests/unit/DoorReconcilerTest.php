@@ -329,13 +329,14 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( 1, $out['interrupted'] );
 		$row = $this->row( $seq );
 		$this->assertSame( 'interrupted', $row['result'] );
-		$this->assertSame( array( 11, 12 ), $row['created_post_ids'], 'the hook witness and the watermark diff, unioned' );
+		$this->assertSame( array( 11 ), $row['created_post_ids'], 'only what the insert hook witnessed is this call\'s' );
 		$this->assertSame( array( 12 ), $row['observed_by_watermark'] );
+		$this->assertSame( array( 12 ), $row['unproven'], 'the diff\'s suspicion is recorded, never made restorable' );
 		$this->assertSame( 1, $row['hook_missed'] );
 		$this->assertNotEmpty( $row['snapshot_id'] );
 		$rec = ( new Aura_Worker_Snapshots() )->get( $row['snapshot_id'] );
 		$this->assertSame( 'creation', $rec['door_kind'] );
-		$this->assertSame( array( 11, 12 ), $rec['created_post_ids'] );
+		$this->assertSame( array( 11 ), $rec['created_post_ids'], 'a restore of this envelope trashes 11 alone' );
 	}
 
 	public function test_a_stale_creation_whose_envelope_cannot_be_stored_is_compensated(): void {
@@ -351,7 +352,8 @@ final class DoorReconcilerTest extends TestCase {
 		$row = $this->row( $seq );
 		$this->assertSame( 'interrupted', $row['result'] );
 		$this->assertSame( 'snapshot_failed', $row['reason'] );
-		$this->assertSame( array( 11, 12 ), $row['created_post_ids'], 'both are recorded — recording is not undoing' );
+		$this->assertSame( array( 11 ), $row['created_post_ids'], 'only what the insert hook witnessed is this call\'s' );
+		$this->assertSame( array( 12 ), $row['observed_by_watermark'], '12 is recorded — recording is not attributing' );
 		$this->assertSame( array( 11 ), $row['compensated'], 'only what the insert hook witnessed is trashed' );
 		$this->assertSame( array(), $row['uncompensated'] );
 		$this->assertSame( array( 12 ), $row['unproven'], 'a diff-only id is the watermark\'s suspicion, and is left alone' );

@@ -343,13 +343,22 @@ final class ElementorDoorCreationTest extends TestCase {
 	/* (e) the watermark catches what the hook missed                      */
 	/* ------------------------------------------------------------------ */
 
-	public function test_the_watermark_finds_an_insert_the_hook_never_saw(): void {
+	/**
+	 * A post above the watermark the hook never saw is EVIDENCE, not part of
+	 * the creation (Ruling P11). The watermark cannot tell this call's own
+	 * unhooked insert from a concurrent request's — same user, same type,
+	 * same window — so it is recorded and left alone: out of the envelope's
+	 * `created_post_ids`, which is the set a restore trashes.
+	 */
+	public function test_a_concurrent_insert_the_hook_never_saw_is_evidence_not_part_of_the_creation(): void {
 		$hooked = 0;
 		$quiet  = 0;
 		$this->createPage(
 			function () use ( &$hooked, &$quiet ) {
 				$hooked = $this->insertPage();
-				// A write that never fires wp_insert_post — a direct INSERT.
+				// ANOTHER request's insert, landing above this call's
+				// watermark: seeded straight into the store, so no insert
+				// hook fires and nothing but the diff ever sees it.
 				$quiet = $hooked + 5000;
 				$this->seedPost( $quiet );
 				return array( 'id' => $hooked );
@@ -357,11 +366,66 @@ final class ElementorDoorCreationTest extends TestCase {
 		);
 
 		$row = $this->row( 1 );
-		$this->assertSame( array( $hooked, $quiet ), $row['created_post_ids'] );
+		$this->assertSame( array( $hooked ), $row['created_post_ids'], 'only the hooked id is this call\'s' );
 		$this->assertSame( array( $quiet ), $row['observed_by_watermark'] );
+		$this->assertSame( array( $quiet ), $row['unproven'] );
 		$this->assertSame( 1, $row['hook_missed'] );
 		$this->assertSame( 1, $this->counter( 'hook_missed' ) );
-		$this->assertSame( array( $hooked, $quiet ), $this->envelope( (string) $row['snapshot_id'] )['created_post_ids'] );
+		$this->assertSame( array( $hooked ), $this->envelope( (string) $row['snapshot_id'] )['created_post_ids'], 'a restore of this envelope trashes the hooked id alone' );
+	}
+
+	/**
+	 * The same partition on the compensation path: a snapshot the store
+	 * cannot take trashes what this call PROVABLY made, and never the post
+	 * beside it.
+	 */
+	public function test_an_unproven_id_is_never_compensated(): void {
+		$hooked = 0;
+		$quiet  = 0;
+		$out    = $this->withUnwritableSnapshots(
+			function () use ( &$hooked, &$quiet ) {
+				return $this->createPage(
+					function () use ( &$hooked, &$quiet ) {
+						$hooked = $this->insertPage();
+						$quiet  = $hooked + 5000;
+						$this->seedPost( $quiet );
+						return array( 'id' => $hooked );
+					}
+				);
+			}
+		);
+
+		$this->assertSame( 'aura_snapshot_failed', $out->get_error_code() );
+		$row = $this->row( 1 );
+		$this->assertSame( array( $hooked ), $row['created_post_ids'] );
+		$this->assertSame( array( $quiet ), $row['unproven'] );
+		$this->assertSame( array( $hooked ), $row['compensated'] );
+		$this->assertSame( array(), $row['uncompensated'] );
+		$this->assertSame( 'trash', get_post( $hooked )->post_status );
+		$this->assertSame( 'publish', get_post( $quiet )->post_status, 'the post beside this call survives' );
+	}
+
+	/**
+	 * The one way a diff-only id becomes PROVEN: the callback's own result
+	 * names it. Two witnesses then agree it is this call's — the diff saw it,
+	 * and the ability said it made it.
+	 */
+	public function test_an_id_the_result_names_that_the_diff_also_saw_is_proven(): void {
+		$quiet = 0;
+		$this->createPage(
+			function () use ( &$quiet ) {
+				$quiet = 9500; // above the watermark, no hook, but named below
+				$this->seedPost( $quiet );
+				return array( 'id' => $quiet );
+			}
+		);
+
+		$row = $this->row( 1 );
+		$this->assertSame( array( $quiet ), $row['created_post_ids'] );
+		$this->assertArrayNotHasKey( 'unproven', $row );
+		$this->assertArrayNotHasKey( 'unattributed_result', $row );
+		$this->assertSame( array( $quiet ), $row['observed_by_watermark'], 'the hook still missed it, and the entry still says so' );
+		$this->assertSame( array( $quiet ), $this->envelope( (string) $row['snapshot_id'] )['created_post_ids'] );
 	}
 
 	public function test_a_post_another_author_created_is_not_attributed_to_this_call(): void {

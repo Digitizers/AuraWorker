@@ -486,11 +486,11 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * The creation half of an interrupted row: union the two witnesses (the
-	 * ids the insert hook recorded, and the watermark diff), store the
-	 * `creation` envelope, and compensate when it cannot be stored — the
-	 * posts exist either way, and one that cannot be made restorable is
-	 * undone instead.
+	 * The creation half of an interrupted row: partition the two witnesses
+	 * (the ids the insert hook recorded, and the watermark diff), store the
+	 * `creation` envelope over the proven ones, and compensate those when it
+	 * cannot be stored — the posts exist either way, and one that cannot be
+	 * made restorable is undone instead.
 	 *
 	 * The result stays `interrupted`: what the compensation says is HOW the
 	 * site was left, not what happened to the call.
@@ -520,16 +520,23 @@ class Aura_Worker_Elementor_Door {
 		$until = false === $from ? null : gmdate( 'Y-m-d H:i:s', $from + (int) floor( self::CLAIM_STALE_MS / 1000 ) );
 		$diff     = ( empty( $types ) || null === $until ) ? array() : self::watermark_diff( (int) $row['post_watermark'], $types, $actor_id, $until );
 		$hooked   = array_map( 'intval', (array) ( isset( $row['created_post_ids'] ) ? $row['created_post_ids'] : array() ) );
+		// The same partition as the live path, through the same helper: a
+		// dead request left no result to name anything, so only witness 1
+		// proves. (Ruling P11.)
+		$part     = self::partition_created( $hooked, $diff, 0 );
+		$created  = $part['proven'];
 		$missed   = array_values( array_diff( $diff, $hooked ) );
-		$created  = array_values( array_unique( array_merge( $hooked, $missed ) ) );
 		$fields   = array( 'created_post_ids' => $created );
 		if ( ! empty( $missed ) ) {
 			$fields['observed_by_watermark'] = $missed;
 			$fields['hook_missed']           = count( $missed );
 			self::bump_counter( 'hook_missed' );
 		}
+		if ( ! empty( $part['unproven'] ) ) {
+			$fields['unproven'] = $part['unproven'];
+		}
 		if ( empty( $created ) ) {
-			return $fields; // nothing was inserted: nothing to undo
+			return $fields; // nothing proven was inserted: nothing to undo
 		}
 		$snaps = new Aura_Worker_Snapshots();
 		$env   = $snaps->snapshot_creation(
@@ -545,16 +552,13 @@ class Aura_Worker_Elementor_Door {
 			$fields['snapshot_id'] = (string) $env['snapshot']['id'];
 			return $fields;
 		}
-		// Compensate only what the INSERT HOOK witnessed (Ruling P9(b)). A
-		// diff-only id is the watermark's suspicion, not a witnessed creation
-		// — good enough to record and to put in an envelope, nowhere near
-		// good enough to trash somebody's page on. They are listed under
-		// their own key, never folded into `uncompensated`, which means
-		// "this call made it and it could not be undone".
-		$fields = array_merge( $fields, array( 'reason' => 'snapshot_failed' ), self::compensate( $hooked ) );
-		if ( ! empty( $missed ) ) {
-			$fields['unproven'] = $missed;
-		}
+		// Compensate what this call PROVABLY made — here, exactly what the
+		// insert hook witnessed (Ruling P9(b), P11). A diff-only id is the
+		// watermark's suspicion, nowhere near good enough to trash somebody's
+		// page on; it is already listed under `unproven`, never folded into
+		// `uncompensated`, which means "this call made it and it could not be
+		// undone".
+		$fields = array_merge( $fields, array( 'reason' => 'snapshot_failed' ), self::compensate( $created ) );
 		return $fields;
 	}
 
@@ -2250,9 +2254,49 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * After the inner callback of a creating ability: union the two witnesses,
-	 * store the `creation` envelope, and — when it cannot be stored —
-	 * compensate, because the write already happened.
+	 * THE PARTITION both creation paths share (Ruling P11): what this call
+	 * PROVABLY created, and what only the watermark suspects.
+	 *
+	 * The diff cannot tell this call's own unhooked insert from ANOTHER
+	 * request's — a post of the same type, by the same user, landing above
+	 * the mark while the governed callback runs is indistinguishable from
+	 * one the callback made. So a watermark-only id is evidence and nothing
+	 * more: it is recorded on the entry (`observed_by_watermark`, the
+	 * `hook_missed` counter, `unproven`), and kept OUT of
+	 * `created_post_ids` — the set a `creation` envelope's restore trashes,
+	 * and the set compensation trashes when that envelope cannot be stored.
+	 * Recording is not attributing.
+	 *
+	 * An id the insert hook recorded is proven: core told us, inside the
+	 * write, that this request made it. An id the callback's RESULT names is
+	 * proven only when the diff ALSO saw it — two independent witnesses
+	 * agreeing. A result-named id NEITHER witness saw stays what it always
+	 * was, `unattributed_result`: recorded, never restorable.
+	 *
+	 * @param int[] $hooked    Ids witness 1 (the insert hook) recorded.
+	 * @param int[] $diff      Ids witness 2 (the watermark diff) found.
+	 * @param int   $result_id The id the inner result names, or 0.
+	 * @return array{ proven: int[], unproven: int[] }
+	 */
+	private static function partition_created( array $hooked, array $diff, $result_id ) {
+		$hooked = array_values( array_unique( array_map( 'intval', $hooked ) ) );
+		$diff   = array_values( array_unique( array_map( 'intval', $diff ) ) );
+		$proven = $hooked;
+		$named  = (int) $result_id;
+		if ( $named > 0 && in_array( $named, $diff, true ) && ! in_array( $named, $proven, true ) ) {
+			$proven[] = $named;
+		}
+		return array(
+			'proven'   => $proven,
+			'unproven' => array_values( array_diff( $diff, $proven ) ),
+		);
+	}
+
+	/**
+	 * After the inner callback of a creating ability: partition the two
+	 * witnesses (Ruling P11), store the `creation` envelope over what this
+	 * call provably made, and — when it cannot be stored — compensate that
+	 * same set, because the write already happened.
 	 *
 	 * @param int   $seq    Log seq.
 	 * @param mixed $result Inner result.
@@ -2274,24 +2318,33 @@ class Aura_Worker_Elementor_Door {
 			$diff = self::watermark_diff( (int) self::$request['watermark'], $types, $actor_id );
 		}
 		$hooked   = array_map( 'intval', (array) self::$request['created'] );
-		$missed   = array_values( array_diff( $diff, $hooked ) );
-		$created  = array_values( array_unique( array_merge( $hooked, $missed ) ) );
+		$named    = is_array( $result ) && isset( $result['id'] ) && is_numeric( $result['id'] ) ? (int) $result['id'] : 0;
+		$part     = self::partition_created( $hooked, $diff, $named );
+		$created  = $part['proven'];
+		$missed   = array_values( array_diff( $diff, $hooked ) ); // what witness 1 did not see, proven or not
 		$fields   = array( 'created_post_ids' => $created );
 		if ( ! empty( $missed ) ) {
 			$fields['observed_by_watermark'] = $missed;
 			$fields['hook_missed']           = count( $missed );
 			self::bump_counter( 'hook_missed' );
 		}
-		if ( empty( $created ) && ! $failed ) {
+		if ( ! empty( $part['unproven'] ) ) {
+			// Recorded so an operator can see what the watermark saw beside
+			// this call — never restorable, never compensated.
+			$fields['unproven'] = $part['unproven'];
+		}
+		if ( empty( $created ) && empty( $missed ) && ! $failed ) {
 			self::bump_counter( 'unobserved' ); // a success that inserted nothing the witnesses could see
 		}
-		$named = is_array( $result ) && isset( $result['id'] ) && is_numeric( $result['id'] ) ? (int) $result['id'] : 0;
 		if ( $named > 0 && ! in_array( $named, $created, true ) ) {
 			$fields['unattributed_result'] = $named;
 		}
 		try {
 			if ( empty( $created ) ) {
-				return $fields; // nothing was inserted: nothing to undo; the mutex is released in the finally
+				// Nothing PROVEN was inserted: nothing to put in an envelope
+				// and nothing to undo, whatever the diff suspects beside it.
+				// The mutex is released in the finally.
+				return $fields;
 			}
 			// A callback that inserted and THEN reported failure still left
 			// posts behind: they get an envelope like any creation, or are
