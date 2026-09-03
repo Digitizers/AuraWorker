@@ -1901,6 +1901,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// a prefix, read against the "database" ($_rows, else $_options).
 			if ( preg_match( "/^SELECT option_name, option_value FROM \S+ WHERE option_name LIKE '([^']+)%'$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				// One prefix read failing at the driver, keyed by the PREFIX so
+				// a test can break the claimed-row scan and leave the held one
+				// working (Ruling P49'). Real wpdb answers the CLEARED
+				// last_result — an empty array — with last_error the only tell.
+				if ( ! empty( $GLOBALS['_sa_rows_read_error'][ stripslashes( $m[1] ) ] ) ) {
+					$this->last_error = 'rows read failed';
+					return array();
+				}
 				$re    = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
 				$out   = array();
 				$names = array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) );
@@ -2098,6 +2106,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// same one every other door branch reads.
 			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name NOT LIKE '([^']*)' AND option_name != '([^']*)'$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				// The COUNT failing at the driver: null answer, last_error set —
+				// what a broken statement leaves, which must not read as zero
+				// (Ruling P49'). Scoped to this shape so a test can break the
+				// door's verification without breaking every get_var().
+				if ( ! empty( $GLOBALS['_sa_door_has_state_error'] ) ) {
+					$this->last_error = 'count failed';
+					return null;
+				}
 				$keep = sa_like_to_regex( stripslashes( $m[1] ) );
 				$skip = sa_like_to_regex( stripslashes( $m[2] ) );
 				$lock = stripslashes( $m[3] );
@@ -2854,6 +2870,8 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
+	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
+	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
@@ -4104,6 +4122,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
+	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
+	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.

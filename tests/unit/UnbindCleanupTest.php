@@ -1004,7 +1004,11 @@ final class UnbindCleanupTest extends TestCase {
 		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
 	}
 
-	/** The LIKE pattern the held-prefix delete actually carries (underscores escaped). */
+	/**
+	 * The LIKE pattern the held-prefix delete actually carries (underscores
+	 * escaped). The prefix READ seam is keyed the same way — see
+	 * test_an_unreadable_claimed_row_read_stops_the_wipe.
+	 */
 	private function heldLikePattern(): string {
 		return $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD ) . '%';
 	}
@@ -1185,6 +1189,82 @@ final class UnbindCleanupTest extends TestCase {
 			Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, 'not-the-fence' ),
 			'the deletes matched nothing, so the row is still there and the answer is false'
 		);
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * Ruling P49': an unreadable count is not an empty door.
+	 *
+	 * `has_state()` decides whether a wipe may report success and whether the
+	 * unbind may drop `door` from its leftovers. `get_var()` answers null for a
+	 * broken statement as readily as for a real zero, so reading the value
+	 * alone let a database error report a clean wipe over a door that is still
+	 * full — the one direction this must never fail in.
+	 */
+	public function test_an_unreadable_state_count_reports_the_door_as_still_there(): void {
+		$this->seedDoor();
+		$fence                                   = Aura_Worker_Magic_Link::claim_site();
+		$GLOBALS['_sa_door_has_state_error']     = true;
+
+		$this->assertTrue( Aura_Worker_Elementor_Door::has_state(), 'a read it cannot trust answers "state remains"' );
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		$GLOBALS['_sa_door_has_state_error'] = false;
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** …and the unbind keeps the door owed, so a later pass verifies it for real. */
+	public function test_an_unreadable_state_count_keeps_the_unbind_incomplete(): void {
+		$this->seedDoor();
+		$fence                               = Aura_Worker_Magic_Link::claim_site();
+		$GLOBALS['_sa_door_has_state_error'] = true;
+
+		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
+		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers() );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'the token stays while anything is owed' );
+
+		$GLOBALS['_sa_door_has_state_error'] = false; // the database recovers
+
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
+		$this->assertSame( array(), $this->doorRows() );
+	}
+
+	/**
+	 * The same rule for the in-flight check: a claimed-row read that FAILED is
+	 * not an empty set, so the wipe refuses rather than deleting under a replay
+	 * it could not see (Ruling P49').
+	 */
+	public function test_an_unreadable_claimed_row_read_stops_the_wipe(): void {
+		$this->seedDoor(); // its claim is stale, so only the READ failure can stop this
+		$before                                                                    = $this->doorRows();
+		$GLOBALS['_sa_rows_read_error'][ $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::CLAIMED ) ] = true;
+		$fence                                                                     = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		$GLOBALS['_sa_rows_read_error'] = array();
+		$this->assertSame( $before, $this->doorRows(), 'nothing was deleted' );
+		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ), 'and the lock it took was released' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** wipe() answers a NAMED status, so a caller cannot conflate busy with failed. */
+	public function test_the_wipe_reports_a_named_status_for_each_outcome(): void {
+		$this->seedDoor();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		$token                                              = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
+		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
+		$this->assertSame( Aura_Worker_Door_Holds::WIPE_BUSY, Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'no lock: nothing attempted' );
+		delete_option( Aura_Worker_Door_Holds::LOCK );
+		unset( $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] );
+
+		$GLOBALS['_sa_option_delete_like_fail'][ $this->heldLikePattern() ] = true;
+		$this->assertSame( Aura_Worker_Door_Holds::WIPE_FAILED, Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'ran, and one failed' );
+		$GLOBALS['_sa_option_delete_like_fail'] = array();
+
+		$this->assertSame( Aura_Worker_Door_Holds::WIPE_DONE, Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'every statement ran' );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 

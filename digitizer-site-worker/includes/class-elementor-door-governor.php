@@ -290,13 +290,17 @@ class Aura_Worker_Elementor_Door {
 		// a partial wipe still deletes everything else it can, so the next
 		// pass has less to finish, and the verification below is what decides
 		// what this call reports.
-		$ok = Aura_Worker_Door_Holds::wipe( $claim, $fence );
-		if ( null === $ok ) {
+		$status = Aura_Worker_Door_Holds::wipe( $claim, $fence );
+		if ( Aura_Worker_Door_Holds::WIPE_BUSY === $status ) {
 			// Nothing was attempted — the lock could not be taken (P46), or a
 			// replay is in flight (P50) — so nothing here may be deleted
 			// either. The caller retries.
 			return false;
 		}
+		// Anything that is not an explicit WIPE_DONE is a failure. An answer
+		// this caller does not recognise can only ever mean "do not report
+		// success" (Ruling P49').
+		$ok = ( Aura_Worker_Door_Holds::WIPE_DONE === $status );
 		// The creation mutex and the retention throttle are this binding's
 		// working state too, and a fresh binding should inherit neither: an
 		// inherited mutex would refuse the new client's first creation until
@@ -334,11 +338,18 @@ class Aura_Worker_Elementor_Door {
 	 * mutex somebody may be holding for milliseconds, not something a binding
 	 * owns.
 	 *
+	 * FAILS CLOSED (Ruling P49'): a read that cannot be trusted answers TRUE.
+	 * Every consequence of this method points one way — a `false` lets a wipe
+	 * report success and lets the unbind drop `door` from its leftovers, and
+	 * both are irreversible for the departed client's approvals. A spurious
+	 * `true` only costs another pass.
+	 *
 	 * @return bool
 	 */
 	public static function has_state() {
 		global $wpdb;
-		$n = $wpdb->get_var(
+		$wpdb->last_error = '';
+		$n                = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name NOT LIKE %s AND option_name != %s",
 				$wpdb->esc_like( 'aura_worker_door_' ) . '%',
@@ -346,6 +357,15 @@ class Aura_Worker_Elementor_Door {
 				Aura_Worker_Door_Holds::LOCK
 			)
 		);
+		// AN UNREADABLE COUNT IS NOT A ZERO (Ruling P49'). This answer decides
+		// whether a wipe may report success and whether the unbind may drop
+		// `door` from its leftovers, so the one direction it must never fail
+		// in is "nothing left". get_var() answers null both for a broken
+		// statement and — on a real wpdb — for one that never ran at all, so
+		// the error flag is consulted beside the value.
+		if ( null === $n || false === $n || '' !== (string) $wpdb->last_error ) {
+			return true;
+		}
 		return (int) $n > 0;
 	}
 

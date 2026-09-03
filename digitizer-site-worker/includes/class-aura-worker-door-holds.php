@@ -28,6 +28,10 @@ class Aura_Worker_Door_Holds {
 	const TTL_S   = 604800;
 	const CAP     = 50;
 	const LOCK    = 'aura_worker_door_hold_lock';
+	/* wipe()'s three answers, NAMED so a caller cannot conflate them (Ruling P49'). */
+	const WIPE_DONE   = 'wiped';  // every statement ran under a lock this call held
+	const WIPE_FAILED = 'failed'; // they ran and at least one failed — the caller may still finish its own share
+	const WIPE_BUSY   = 'busy';   // nothing was attempted: no lock (P46), or a replay in flight (P50)
 	const LOCK_S  = 30;
 	/** Extra seconds a wipe waits past LOCK_S, by when any holder is stale (Ruling P46). */
 	const WIPE_GRACE_S = 3;
@@ -723,10 +727,13 @@ class Aura_Worker_Door_Holds {
 	 *
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
-	 * @return bool|null TRUE when every statement ran under a lock this call
-	 *                   held; FALSE when they ran and one failed; NULL when
-	 *                   nothing was attempted at all — the lock could not be
-	 *                   taken (P46), or a replay is in flight (P50).
+	 * @return string One of self::WIPE_DONE, self::WIPE_FAILED, self::WIPE_BUSY.
+	 *                Named constants rather than true/false/null (Ruling P49'):
+	 *                the three answers are three different instructions to the
+	 *                caller — you are done, finish your own share, touch
+	 *                nothing — and a boolean conflates the last two, which is
+	 *                the difference between deleting the creation mutex under a
+	 *                live replay and leaving it alone.
 	 */
 	public static function wipe( $claim, $fence ) {
 		global $wpdb;
@@ -739,11 +746,11 @@ class Aura_Worker_Door_Holds {
 		// binding's queue, visible through `/status` and replayable.
 		$token = self::take_wipe_lock();
 		if ( false === $token ) {
-			// NULL, not false: nothing was attempted, so the caller must not
-			// go on to delete its own share either (Ruling P46). A `false`
-			// means the statements RAN and some of them failed, which is a
-			// different instruction — carry on and let the verification decide.
-			return null;
+			// BUSY, not FAILED: nothing was attempted, so the caller must not
+			// go on to delete its own share either (Ruling P46). FAILED means
+			// the statements RAN and some of them failed, which is a different
+			// instruction — carry on and let the verification decide.
+			return self::WIPE_BUSY;
 		}
 		try {
 			// NO WIPE ACROSS A LIVE REPLAY (Ruling P50). This is the mechanism
@@ -765,7 +772,7 @@ class Aura_Worker_Door_Holds {
 			// marks `door` a leftover and retries; the changed-binding connect
 			// answers `aura_door_busy` and Aura retries.
 			if ( self::a_replay_is_in_flight() ) {
-				return null; // nothing attempted, like a lock that could not be taken
+				return self::WIPE_BUSY; // nothing attempted, like a lock that could not be taken
 			}
 			// EVERY result counted (Ruling P49). A transient database error on
 			// the held-prefix delete used to be invisible: the later statements
@@ -782,7 +789,7 @@ class Aura_Worker_Door_Holds {
 			$ok = Aura_Worker_Door_Log::wipe( $claim, $fence ) && $ok;
 			wp_cache_delete( 'notoptions', 'options' );
 			wp_cache_delete( 'alloptions', 'options' );
-			return $ok;
+			return $ok ? self::WIPE_DONE : self::WIPE_FAILED;
 		} finally {
 			self::release_lock( $token );
 		}
@@ -794,15 +801,25 @@ class Aura_Worker_Door_Holds {
 	 * Judged the way the sweep and the reconciler judge a claim: younger than
 	 * CLAIM_STALE_MS is in flight, older is a died request somebody else owns.
 	 * A claim whose stamp cannot be read is treated as IN FLIGHT — an
-	 * unreadable stamp is not evidence of staleness, the same rule
-	 * `sweep()` applies in the other direction.
+	 * unreadable stamp is not evidence of staleness, the same rule `sweep()`
+	 * applies in the other direction — and so is a claimed-row READ that
+	 * failed outright (Ruling P49').
 	 *
 	 * @return bool
 	 */
 	private static function a_replay_is_in_flight() {
-		$ms  = class_exists( 'Aura_Worker_Elementor_Door' ) ? (int) Aura_Worker_Elementor_Door::CLAIM_STALE_MS : 600000;
-		$cut = time() - (int) floor( $ms / 1000 );
-		foreach ( self::rows( self::CLAIMED ) as $row ) {
+		global $wpdb;
+		$ms               = class_exists( 'Aura_Worker_Elementor_Door' ) ? (int) Aura_Worker_Elementor_Door::CLAIM_STALE_MS : 600000;
+		$cut              = time() - (int) floor( $ms / 1000 );
+		$wpdb->last_error = '';
+		$rows             = self::rows( self::CLAIMED );
+		if ( '' !== (string) $wpdb->last_error ) {
+			// A READ THAT FAILED IS NOT AN EMPTY SET (Ruling P49'). The whole
+			// point of this check is to refuse while a replay MAY be running,
+			// and "may" is exactly what an unreadable answer leaves.
+			return true;
+		}
+		foreach ( $rows as $row ) {
 			$at = strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) );
 			if ( false === $at || $at > $cut ) {
 				return true;
