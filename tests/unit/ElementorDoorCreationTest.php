@@ -992,7 +992,18 @@ final class ElementorDoorCreationTest extends TestCase {
 		$this->assertTrue( $row['may_have_run'] );
 	}
 
-	public function test_a_warn_rule_on_a_collateral_page_is_recorded_and_the_cleanup_proceeds(): void {
+	/**
+	 * Ruling P32, the DRIFT case: a warn rule names a collateral page this
+	 * call never declared, so nobody has acknowledged it — and Elementor is
+	 * stopped, exactly as a block stops it.
+	 *
+	 * Recording the warning and letting the rewrite proceed (the pre-P32
+	 * behaviour this test used to pin) was the one place a `warn` silently
+	 * became an `allow`: everywhere else in this governor a warn HOLDS until
+	 * an operator acknowledges the rule, and the approval that released this
+	 * call answered only for the touches it declared.
+	 */
+	public function test_a_warn_on_an_undeclared_collateral_page_refuses_the_cleanup(): void {
 		$this->seedPost( 7 );
 		update_post_meta( 7, '_elementor_data', '[{"class":"a"}]' );
 		$elementor_ran = 0;
@@ -1017,15 +1028,72 @@ final class ElementorDoorCreationTest extends TestCase {
 			)
 		);
 
+		// The index answers nothing, so touches_for() declares only
+		// `design_system:*` — page 7 arrives at priority 1 as pure drift.
 		$out = wp_get_ability( 'elementor/manage-classes' )->execute( array() );
 
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_rule_blocked', $out->get_error_code() );
+		$this->assertSame( 403, $out->get_error_data()['status'] );
+		$this->assertSame( 'snap_ds', $out->get_error_data()['restorable_from'] );
+		$this->assertSame( 0, $elementor_ran, 'the rewrite never happened' );
+		$row = $this->row( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'collateral_unacknowledged', $row['reason'] );
+		$this->assertSame( 'warn', $row['verdict'] );
+		$this->assertSame( array( 7 ), $row['collateral_unacknowledged'] );
+		$this->assertSame( 'rule/watch-7', $row['rule_key'] );
+		$this->assertTrue( $row['may_have_run'] );
+	}
+
+	/**
+	 * Ruling P32, the acknowledged case: the same warn rule, but page 7 was
+	 * DECLARED — touches_for() asked Elementor's index and found it — so the
+	 * `allow` verdict this call ran under already answered for it. Recorded,
+	 * and the cleanup proceeds.
+	 */
+	public function test_a_warn_on_a_declared_collateral_page_is_recorded_and_the_cleanup_proceeds(): void {
+		$this->seedPost( 7 );
+		update_post_meta( 7, '_elementor_data', '[{"class":"a"}]' );
+		$GLOBALS['_sa_class_relations'] = array( 'g-a' => array( 7 ) );
+		$elementor_ran                  = 0;
+		add_action(
+			'elementor/global_classes/cleanup',
+			static function () use ( &$elementor_ran ) {
+				++$elementor_ran;
+			},
+			10,
+			2
+		);
+		$this->registerClasses(
+			static function () {
+				do_action( 'elementor/global_classes/cleanup', array( 'g-a' ), array( 7 ) );
+				return array( 'ok' => true );
+			}
+		);
+		$this->installRuleset(
+			array(
+				// The page rule must ALLOW here, or the declared page 7 would
+				// make govern() hold the call before it ever runs — which is
+				// case (b), tested in ElementorDoorCollateralTest.
+				array( 'key' => 'rule/ds', 'effect' => 'allow', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are fine' ),
+				array( 'key' => 'rule/ok-7', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'page 7 is fine' ),
+			)
+		);
+
+		$out = wp_get_ability( 'elementor/manage-classes' )->execute(
+			array( 'operations' => array( array( 'action' => 'delete', 'id' => 'g-a' ) ) )
+		);
+
 		$this->assertSame( array( 'ok' => true ), $out );
-		$this->assertSame( 1, $elementor_ran, 'a warn does not stop the cleanup' );
+		$this->assertSame( 1, $elementor_ran, 'an acknowledged page does not stop the cleanup' );
 		$row = $this->row( 1 );
 		$this->assertSame( 'ok', $row['result'] );
-		$this->assertSame( array( 7 ), $row['collateral_warned'] );
-		$this->assertSame( 'rule/watch-7', $row['collateral_rule']['key'] );
-		$this->assertSame( 'tell me about it', $row['collateral_rule']['reason'] );
+		$this->assertSame(
+			array( 'design_system', 'page' ),
+			array_column( $row['touches'], 'type' ),
+			'the entry shows the collateral page was declared and judged'
+		);
 		$this->assertCount( 1, $row['collateral_snapshot_ids'], 'and the capture still happened' );
 	}
 

@@ -883,12 +883,31 @@ class Aura_Worker_Elementor_Door {
 					),
 				);
 			case 'design_system':
-				return array(
+				$touches = array(
 					array(
 						'type' => 'design_system',
 						'id'   => '*',
 					),
 				);
+				// A class DELETION rewrites every page that used the class, so
+				// those pages are part of what this call touches and must be
+				// judged BEFORE it runs (Ruling P32). Elementor can tell us
+				// which they are — `Global_Classes_Relations::get_posts_by_style()`
+				// is exactly what its own `get_posts_affected_by_deletion()`
+				// calls one priority before the rewrite — so declaring only
+				// `design_system:*` was under-declaring, and a `warn` rule on
+				// one of those pages was discovered too late to hold the call.
+				//
+				// `manage-classes` alone: it is the only design-system ability
+				// whose input can delete a class.
+				foreach ( self::class_deletion_collateral( $slug, $input ) as $id ) {
+					$type      = get_post_type( $id );
+					$touches[] = array(
+						'type' => 'page' === $type ? 'page' : 'post',
+						'id'   => (string) $id,
+					);
+				}
+				return $touches;
 			case 'page_create':
 				return array(
 					array(
@@ -912,6 +931,115 @@ class Aura_Worker_Elementor_Door {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * The pages a `manage-classes` call would rewrite by DELETING a class.
+	 *
+	 * BEST EFFORT, by construction: this reads Elementor's own state through
+	 * Elementor's own classes, and every one of them is guarded — an absent
+	 * class, a renamed method or a throw inside Elementor contributes nothing
+	 * rather than failing a call the governor could otherwise judge. What it
+	 * finds only ever ADDS touches, so a miss is the pre-P32 behaviour (the
+	 * drift check in judge_collateral() is still the backstop) and a hit
+	 * turns a page rule into a hold before anything is written.
+	 *
+	 * The `label` → id resolution mirrors Elementor's `translate_delete()`:
+	 * `array_search( $label, $repository->all_labels(), true )` over an
+	 * id => label map. A label that resolves to nothing is a `class_not_found`
+	 * on Elementor's side — nothing is deleted, so nothing is collateral.
+	 *
+	 * @param string $slug  Ability.
+	 * @param array  $input Input.
+	 * @return int[] Post ids, unique, in first-seen order.
+	 */
+	private static function class_deletion_collateral( $slug, array $input ) {
+		if ( 'elementor/manage-classes' !== $slug ) {
+			return array();
+		}
+		$ops = isset( $input['operations'] ) && is_array( $input['operations'] ) ? $input['operations'] : array();
+		if ( empty( $ops ) ) {
+			return array();
+		}
+		$relations = self::global_classes_relations();
+		if ( null === $relations ) {
+			return array();
+		}
+		$labels = null; // resolved once, and only if some operation needs it
+		$ids    = array();
+		foreach ( $ops as $op ) {
+			if ( ! is_array( $op ) || 'delete' !== (string) ( isset( $op['action'] ) ? $op['action'] : '' ) ) {
+				continue;
+			}
+			$class_id = (string) ( isset( $op['id'] ) ? $op['id'] : '' );
+			if ( '' === $class_id ) {
+				$label = (string) ( isset( $op['label'] ) ? $op['label'] : '' );
+				if ( '' === $label ) {
+					continue; // Elementor answers `invalid_input`: neither id nor label
+				}
+				if ( null === $labels ) {
+					$labels = self::global_class_labels();
+				}
+				$found = array_search( $label, $labels, true );
+				if ( false === $found ) {
+					continue; // `class_not_found` — nothing deleted, nothing collateral
+				}
+				$class_id = (string) $found;
+			}
+			try {
+				$posts = $relations->get_posts_by_style( $class_id );
+			} catch ( \Throwable $e ) {
+				continue; // this class contributes nothing; the others still count
+			}
+			foreach ( (array) $posts as $post_id ) {
+				$post_id = (int) $post_id;
+				if ( $post_id > 0 ) {
+					$ids[ $post_id ] = true; // keyed: unique, first-seen order
+				}
+			}
+		}
+		return array_map( 'intval', array_keys( $ids ) );
+	}
+
+	/**
+	 * Elementor's class→posts index, or null when this site cannot answer.
+	 *
+	 * @return object|null
+	 */
+	private static function global_classes_relations() {
+		$class = '\Elementor\Modules\GlobalClasses\Global_Classes_Relations';
+		if ( ! class_exists( $class ) || ! method_exists( $class, 'get_posts_by_style' ) ) {
+			return null;
+		}
+		try {
+			$relations = new $class();
+		} catch ( \Throwable $e ) {
+			return null;
+		}
+		return is_object( $relations ) ? $relations : null;
+	}
+
+	/**
+	 * Elementor's id => label map for the active kit's global classes; an
+	 * empty map when this site cannot answer, which resolves no label.
+	 *
+	 * @return array
+	 */
+	private static function global_class_labels() {
+		$class = '\Elementor\Modules\GlobalClasses\Global_Classes_Repository';
+		if ( ! class_exists( $class ) || ! method_exists( $class, 'make' ) ) {
+			return array();
+		}
+		try {
+			$repo = call_user_func( array( $class, 'make' ) );
+			if ( ! is_object( $repo ) || ! method_exists( $repo, 'all_labels' ) ) {
+				return array();
+			}
+			$labels = $repo->all_labels();
+		} catch ( \Throwable $e ) {
+			return array();
+		}
+		return is_array( $labels ) ? $labels : array();
 	}
 
 	/**
@@ -1082,14 +1210,21 @@ class Aura_Worker_Elementor_Door {
 				Aura_Worker_Door_Log::settle(
 					$seq,
 					array(
-						'result'             => 'refused',
-						'reason'             => 'collateral_blocked',
-						'verdict'            => 'block',
-						'rule_key'           => $e->rule_key(),
-						'rule'               => self::rule_evidence( $e->rule() ),
-						'collateral_blocked' => $e->ids(),
-						'may_have_run'       => true,
-						'snapshot_id'        => '' === $snap ? null : $snap,
+						// `collateral_blocked` / `block` as before, and since
+						// Ruling P32 also `collateral_unacknowledged` / `warn`:
+						// a warn about a page this call never declared refuses
+						// exactly like a block, so it settles through the same
+						// path with its own reason. The ids are keyed BY the
+						// reason, so an operator reading the entry sees which
+						// kind of finding named them.
+						'result'       => 'refused',
+						'reason'       => $e->reason(),
+						'verdict'      => $e->verdict(),
+						'rule_key'     => $e->rule_key(),
+						'rule'         => self::rule_evidence( $e->rule() ),
+						$e->reason()   => $e->ids(),
+						'may_have_run' => true,
+						'snapshot_id'  => '' === $snap ? null : $snap,
 					)
 				);
 				self::$request = null;
@@ -1293,6 +1428,12 @@ class Aura_Worker_Elementor_Door {
 			'slug'       => $slug,
 			'kind'       => $kind,
 			'creating'   => $creating,
+			// What this call was JUDGED on, kept for the collateral drift
+			// check (Ruling P32): a page already in here was seen by govern(),
+			// so an operator approving the hold — or an `allow` rule covering
+			// it — has already answered for it. A page NOT in here is new
+			// evidence, and a warn about it has been acknowledged by nobody.
+			'touches'    => $touches,
 			// The witnesses' shared frame: which types this creation may
 			// insert, and whose inserts they are. Both are read by the hook
 			// observer and by the watermark diff after it.
@@ -2604,13 +2745,16 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * A `block` throws — the call is refused before Elementor's own handler
 	 * (priority 10) rewrites anything, and `execute()` turns it into the same
-	 * 403 a block before the call gets. A `warn` is recorded on the entry and
-	 * proceeds. No ruleset at all judges nothing: a site that cannot say what
+	 * 403 a block before the call gets. A `warn` throws too UNLESS the page it
+	 * names was already among this call's declared touches (Ruling P32): a
+	 * pre-judged page was answered for by the operator's approval or by the
+	 * allow verdict, and is merely recorded; an undeclared one was answered
+	 * for by nobody. No ruleset at all judges nothing: a site that cannot say what
 	 * is protected does not get to invent a refusal here, and the call was
 	 * already admitted on that same silence.
 	 *
 	 * @param int[] $ids The pages Elementor named.
-	 * @throws Aura_Worker_Door_Blocked_Exception When a block rule names one of them.
+	 * @throws Aura_Worker_Door_Blocked_Exception When a block rule names one of them, or a warn rule names one this call never declared.
 	 */
 	private static function judge_collateral( array $ids ) {
 		$rec   = null !== self::$pinned_ruleset ? self::$pinned_ruleset : Aura_Worker_Rules::current();
@@ -2618,11 +2762,12 @@ class Aura_Worker_Elementor_Door {
 		if ( empty( $rules ) ) {
 			return;
 		}
-		$site    = Aura_Worker_Rules::site_ref();
-		$blocked = array();
-		$warned  = array();
-		$b_rule  = null;
-		$w_rule  = null;
+		$site     = Aura_Worker_Rules::site_ref();
+		$blocked  = array();
+		$warned   = array();
+		$b_rule   = null;
+		$w_rule   = null;
+		$w_rules  = array(); // id => the warn rule that named it
 		foreach ( $ids as $id ) {
 			$rule = Aura_Worker_Rules::match( array( array( 'type' => 'page', 'id' => (string) $id ) ), $rules, null, $site );
 			if ( null === $rule ) {
@@ -2632,8 +2777,9 @@ class Aura_Worker_Elementor_Door {
 				$blocked[] = (int) $id;
 				$b_rule    = null === $b_rule ? $rule : $b_rule;
 			} elseif ( 'warn' === $rule['effect'] ) {
-				$warned[] = (int) $id;
-				$w_rule   = null === $w_rule ? $rule : $w_rule;
+				$warned[]              = (int) $id;
+				$w_rules[ (int) $id ]  = $rule;
+				$w_rule                = null === $w_rule ? $rule : $w_rule;
 			}
 		}
 		if ( ! empty( $blocked ) ) {
@@ -2645,16 +2791,73 @@ class Aura_Worker_Elementor_Door {
 			);
 			throw new Aura_Worker_Door_Blocked_Exception( $b_rule, $blocked, esc_html( $why ) ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- the message is escaped; the rule and the id list are structured evidence the catch reads, never rendered.
 		}
-		if ( ! empty( $warned ) ) {
-			Aura_Worker_Rules::record_warn( (string) self::$request['slug'], $w_rule );
-			Aura_Worker_Door_Log::patch_pending(
-				(int) self::$request['seq'],
-				array(
-					'collateral_warned' => $warned,
-					'collateral_rule'   => self::rule_evidence( $w_rule ),
-				)
-			);
+		if ( empty( $warned ) ) {
+			return;
 		}
+		// A warn about a page NOBODY answered for refuses the call (Ruling
+		// P32). Warn semantics everywhere else in this governor mean HELD
+		// until an operator acknowledges the rule — govern() holds, and a
+		// replay runs only because the operator said so. Recording the
+		// warning here and letting Elementor rewrite the page anyway was the
+		// one place a warn silently became an allow: the approval that
+		// released this call covered the touches it DECLARED, and a page
+		// discovered at priority 1 was never among them.
+		//
+		// touches_for() now declares the collateral up front, so the normal
+		// case is that every warned page is already pre-judged and this is
+		// pure drift — the index moved between the judgement and the write,
+		// or Elementor could not answer when we asked.
+		$known  = self::pre_judged_page_ids();
+		$unacked = array();
+		foreach ( $warned as $id ) {
+			if ( ! in_array( (int) $id, $known, true ) ) {
+				$unacked[] = (int) $id;
+			}
+		}
+		if ( ! empty( $unacked ) ) {
+			$rule = isset( $w_rules[ $unacked[0] ] ) ? $w_rules[ $unacked[0] ] : $w_rule;
+			Aura_Worker_Rules::record_warn( (string) self::$request['slug'], $rule );
+			$why = sprintf(
+				'deleting this class would rewrite page(s) %s, which %s warns about and no approval covers',
+				implode( ', ', $unacked ),
+				(string) ( isset( $rule['key'] ) ? $rule['key'] : 'a rule' )
+			);
+			throw new Aura_Worker_Door_Blocked_Exception( $rule, $unacked, esc_html( $why ), 'collateral_unacknowledged', 'warn' ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- the message is escaped; the rule and the id list are structured evidence the catch reads, never rendered.
+		}
+		// Every warned page was pre-judged, so the approval (or the allow
+		// verdict) already answered for it: record and proceed.
+		Aura_Worker_Rules::record_warn( (string) self::$request['slug'], $w_rule );
+		Aura_Worker_Door_Log::patch_pending(
+			(int) self::$request['seq'],
+			array(
+				'collateral_warned' => $warned,
+				'collateral_rule'   => self::rule_evidence( $w_rule ),
+			)
+		);
+	}
+
+	/**
+	 * The page/post ids this request was JUDGED on — its declared touches.
+	 *
+	 * @return int[]
+	 */
+	private static function pre_judged_page_ids() {
+		$touches = ( isset( self::$request['touches'] ) && is_array( self::$request['touches'] ) ) ? self::$request['touches'] : array();
+		$out     = array();
+		foreach ( $touches as $touch ) {
+			if ( ! is_array( $touch ) || ! isset( $touch['type'], $touch['id'] ) ) {
+				continue;
+			}
+			$type = (string) $touch['type'];
+			if ( 'page' !== $type && 'post' !== $type ) {
+				continue;
+			}
+			$id = (int) $touch['id'];
+			if ( $id > 0 ) {
+				$out[] = $id;
+			}
+		}
+		return $out;
 	}
 
 	/**

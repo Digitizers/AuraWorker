@@ -38,14 +38,53 @@ class Aura_Worker_Door_Blocked_Exception extends RuntimeException {
 	private $ids;
 
 	/**
-	 * @param array $rule    The rule that blocked.
-	 * @param int[] $ids     The blocked resource ids.
-	 * @param string $message Message.
+	 * Why the call is being refused — the `reason` the entry settles with.
+	 *
+	 * `collateral_blocked` (a block rule named one of the pages) is the
+	 * default because it was the only case until Ruling P32 added
+	 * `collateral_unacknowledged`: a WARN rule naming a page the approval
+	 * never covered. Both refuse; they differ only in what the operator has
+	 * to do about it, so they are one exception with two reasons rather than
+	 * two classes the catch would have to know apart.
+	 *
+	 * @var string
 	 */
-	public function __construct( array $rule, array $ids, $message = '' ) {
+	private $reason;
+
+	/**
+	 * The verdict the entry records: `block` or `warn`.
+	 *
+	 * @var string
+	 */
+	private $verdict;
+
+	/**
+	 * @param array  $rule    The rule that refused.
+	 * @param int[]  $ids     The refused resource ids.
+	 * @param string $message Message.
+	 * @param string $reason  Entry reason: collateral_blocked|collateral_unacknowledged.
+	 * @param string $verdict Entry verdict: block|warn.
+	 */
+	public function __construct( array $rule, array $ids, $message = '', $reason = 'collateral_blocked', $verdict = 'block' ) {
 		parent::__construct( (string) $message );
-		$this->rule = $rule;
-		$this->ids  = array_values( array_map( 'intval', $ids ) );
+		$this->rule    = $rule;
+		$this->ids     = array_values( array_map( 'intval', $ids ) );
+		$this->reason  = (string) $reason;
+		$this->verdict = (string) $verdict;
+	}
+
+	/**
+	 * @return string collateral_blocked|collateral_unacknowledged.
+	 */
+	public function reason() {
+		return $this->reason;
+	}
+
+	/**
+	 * @return string block|warn.
+	 */
+	public function verdict() {
+		return $this->verdict;
 	}
 
 	/**

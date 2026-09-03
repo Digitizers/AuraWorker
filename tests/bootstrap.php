@@ -2805,6 +2805,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	// kit sets this. UNSET by default so the production lookup is what runs
 	// when no test asked for one.
 	unset( $GLOBALS['_sa_kit_id'] );
+	// Elementor's class → posts reverse index and its id => label map, as the
+	// stubs in tests/elementor-class-stubs.php serve them (Ruling P32). Empty
+	// by default: a test that says nothing about classes gets an index that
+	// answers nothing, which is what every pre-P32 door test assumes.
+	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
+	$GLOBALS['_sa_class_labels']          = array(); // class id => label
+	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
@@ -3170,6 +3177,9 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-unbind.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-log.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-holds.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-blocked-exception.php';
+// Elementor's global-classes index/repository stand-ins — what touches_for()
+// asks which pages a class deletion would rewrite (Ruling P32).
+require_once __DIR__ . '/elementor-class-stubs.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-witness-exception.php';
 require_once SA_PLUGIN_DIR . '/includes/class-elementor-door-governor.php';
 // The plugin's admin/settings class: registers settings and owns the token
@@ -4026,6 +4036,13 @@ function sa_reset_state(): void {
 	// kit sets this. UNSET by default so the production lookup is what runs
 	// when no test asked for one.
 	unset( $GLOBALS['_sa_kit_id'] );
+	// Elementor's class → posts reverse index and its id => label map, as the
+	// stubs in tests/elementor-class-stubs.php serve them (Ruling P32). Empty
+	// by default: a test that says nothing about classes gets an index that
+	// answers nothing, which is what every pre-P32 door test assumes.
+	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
+	$GLOBALS['_sa_class_labels']          = array(); // class id => label
+	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
