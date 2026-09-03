@@ -981,6 +981,91 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertNotNull( $snaps->get( $fresh['snapshot']['id'] ), 'a fresh door envelope stays' );
 	}
 
+	/* -- Ruling P39: on multisite the sweep is per blog -------------------- */
+
+	/**
+	 * One door envelope per blog, plus a LEGACY one with no `blog_id` stamp
+	 * at all, every one of them past retention. Returns their ids.
+	 */
+	private function networkEnvelopes(): array {
+		$this->seedPost( 7, 'page', 'draft' );
+		$ids                       = array();
+		$GLOBALS['_is_multisite']  = true;
+		foreach ( array( 1, 2 ) as $blog ) {
+			$GLOBALS['_current_blog_id'] = $blog;
+			$env                         = $this->snapshotFor( 'elementor/manage-elements', array( array( 'type' => 'page', 'id' => '7' ) ), array( 'post_id' => 7 ) );
+			$ids[ $blog ]                = (string) $env['snapshot']['id'];
+			$this->ageEnvelope( $ids[ $blog ], 31 );
+		}
+		// A capture taken before the stamp existed: unplaceable, so no blog
+		// but the main one may act on it.
+		$GLOBALS['_current_blog_id'] = 1;
+		$legacy                      = $this->snapshotFor( 'elementor/manage-elements', array( array( 'type' => 'page', 'id' => '7' ) ), array( 'post_id' => 7 ) );
+		$ids['legacy']               = (string) $legacy['snapshot']['id'];
+		$this->ageEnvelope( $ids['legacy'], 31 );
+		$path = WP_CONTENT_DIR . '/aura-backups/snapshots/' . $ids['legacy'] . '.json';
+		$rec  = json_decode( file_get_contents( $path ), true );
+		unset( $rec['blog_id'] );
+		file_put_contents( $path, wp_json_encode( $rec ) );
+		return $ids;
+	}
+
+	/**
+	 * Every blog shares one directory, and the reconciler (with its six-hourly
+	 * throttle) runs per blog off that blog's own `/status` poll. Unscoped,
+	 * a polled subsite deleted other subsites' rollback points — envelopes it
+	 * is not even allowed to READ or restore.
+	 */
+	public function test_a_subsite_prunes_only_its_own_envelopes(): void {
+		$ids                         = $this->networkEnvelopes();
+		$snaps                       = new Aura_Worker_Snapshots();
+		$GLOBALS['_current_blog_id'] = 2;
+
+		$this->assertSame( 1, $snaps->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS ) );
+
+		$GLOBALS['_current_blog_id'] = 2;
+		$this->assertNull( $snaps->get( $ids[2] ), "blog 2 pruned its own" );
+		$GLOBALS['_current_blog_id'] = 1;
+		$this->assertNotNull( $snaps->get( $ids[1] ), "blog 1's envelope survived a sweep from blog 2" );
+		$this->assertNotNull( $snaps->get( $ids['legacy'] ), 'and so did the unplaceable legacy one' );
+	}
+
+	/** The main site prunes its own AND the legacy record nobody else may. */
+	public function test_the_main_site_prunes_its_own_and_the_legacy_record(): void {
+		$ids                         = $this->networkEnvelopes();
+		$snaps                       = new Aura_Worker_Snapshots();
+		$GLOBALS['_current_blog_id'] = 1;
+
+		$this->assertSame( 2, $snaps->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS ) );
+
+		$this->assertNull( $snaps->get( $ids[1] ) );
+		$this->assertNull( $snaps->get( $ids['legacy'] ), 'some blog has to, or it lives for ever' );
+		$GLOBALS['_current_blog_id'] = 2;
+		$this->assertNotNull( $snaps->get( $ids[2] ), "blog 2's envelope is still blog 2's to prune" );
+	}
+
+	/** A subsite that is not the main site never prunes the legacy record. */
+	public function test_a_non_main_subsite_leaves_the_legacy_record_alone(): void {
+		$ids                         = $this->networkEnvelopes();
+		$GLOBALS['_main_site_id']    = 1;
+		$GLOBALS['_current_blog_id'] = 2;
+
+		( new Aura_Worker_Snapshots() )->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+
+		$GLOBALS['_current_blog_id'] = 1;
+		$this->assertNotNull( ( new Aura_Worker_Snapshots() )->get( $ids['legacy'] ) );
+	}
+
+	/** Single site is unchanged: everything past retention goes. */
+	public function test_a_single_site_prunes_every_stale_door_envelope(): void {
+		$ids = $this->networkEnvelopes();
+
+		$GLOBALS['_is_multisite']    = false; // the stamps stay on the records
+		$GLOBALS['_current_blog_id'] = 1;
+
+		$this->assertSame( 3, ( new Aura_Worker_Snapshots() )->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS ), 'no network, no scoping' );
+	}
+
 	public function test_pruning_removes_the_payload_too(): void {
 		$this->seedPost( 7, 'page', 'draft' );
 		$snaps = new Aura_Worker_Snapshots();

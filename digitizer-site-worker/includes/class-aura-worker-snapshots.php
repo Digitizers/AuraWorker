@@ -839,15 +839,40 @@ class Aura_Worker_Snapshots {
 	 * `posts` envelope, and the power tools' own `posts`/`file`/`option`
 	 * captures must survive this sweep untouched.
 	 *
+	 * ON MULTISITE, ONLY THIS BLOG'S (Ruling P39). Every blog shares the one
+	 * directory this class is configured with, and the reconciler — plus its
+	 * six-hourly PRUNED_AT throttle — runs independently per blog off that
+	 * blog's own `/status` poll. Unscoped, each polled subsite swept the whole
+	 * NETWORK's envelopes and deleted other subsites' rollback points, which
+	 * both violates the blog ownership `belongs_to_current_blog()` enforces on
+	 * every read and restore, and undoes the undo of writes on sites that were
+	 * never polled.
+	 *
+	 * A LEGACY record — one written before the `blog_id` stamp existed — cannot
+	 * be placed, so only the MAIN site prunes it: some blog has to, or it would
+	 * live for ever, and the main site is the one choice that cannot be made
+	 * twice. This matches `belongs_to_current_blog()`'s reading of an
+	 * unstamped record as "not provably foreign" without letting every subsite
+	 * act on it.
+	 *
+	 * The per-blog full scan remains — it is throttled to once per six hours
+	 * per blog. Per-blog STORAGE (a directory per blog, so the scan is
+	 * naturally scoped) is the follow-up this leaves open.
+	 *
 	 * @param int      $days  Age in days; anything older goes.
 	 * @param string[] $kinds The `door_kind` values to prune (see DOOR_KINDS).
 	 * @return int How many were deleted.
 	 */
 	public function prune_older_than( $days, array $kinds ) {
-		$cut = time() - (int) $days * DAY_IN_SECONDS;
-		$n   = 0;
+		$cut       = time() - (int) $days * DAY_IN_SECONDS;
+		$n         = 0;
+		$network   = function_exists( 'is_multisite' ) && is_multisite();
+		$main_site = ! $network || ! function_exists( 'is_main_site' ) || is_main_site();
 		foreach ( $this->list_snapshots() as $rec ) {
 			if ( ! in_array( (string) ( $rec['door_kind'] ?? '' ), $kinds, true ) ) {
+				continue;
+			}
+			if ( $network && ! self::prunable_here( $rec, $main_site ) ) {
 				continue;
 			}
 			// The stamp persist() wrote is a UTC wall clock with no zone on it.
@@ -860,6 +885,21 @@ class Aura_Worker_Snapshots {
 			}
 		}
 		return $n;
+	}
+
+	/**
+	 * Is this record THIS blog's to prune? Multisite only — the caller has
+	 * already established that (Ruling P39).
+	 *
+	 * @param array $record    The envelope.
+	 * @param bool  $main_site Is the current blog the network's main site?
+	 * @return bool
+	 */
+	private static function prunable_here( array $record, $main_site ) {
+		if ( ! isset( $record['blog_id'] ) ) {
+			return (bool) $main_site; // legacy, unplaceable: one blog prunes it, not every blog
+		}
+		return (int) $record['blog_id'] === self::current_blog_id();
 	}
 
 	/**

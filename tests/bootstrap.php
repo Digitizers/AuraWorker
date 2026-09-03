@@ -3326,6 +3326,19 @@ if ( ! function_exists( 'get_current_blog_id' ) ) {
 	}
 }
 
+if ( ! function_exists( 'is_main_site' ) ) {
+	// Core: always true on a single site; on a network, true only for the
+	// blog the network was created around. The Elementor door's retention
+	// sweep reads it to decide who prunes a LEGACY (unstamped) envelope.
+	function is_main_site( $blog_id = null, $network_id = null ): bool {
+		if ( ! is_multisite() ) {
+			return true;
+		}
+		$blog_id = null === $blog_id ? get_current_blog_id() : (int) $blog_id;
+		return (int) $blog_id === (int) ( $GLOBALS['_main_site_id'] ?? 1 );
+	}
+}
+
 if ( ! function_exists( 'get_site_option' ) ) {
 	function get_site_option( string $option, $default = false ) {
 		return $GLOBALS['_site_options'][ $option ] ?? $default;
@@ -4089,6 +4102,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_is_admin']       = false; // is_admin() — see the stub above.
 	$GLOBALS['_is_multisite']   = false;
 	$GLOBALS['_current_blog_id'] = 1; // get_current_blog_id() — core's own default on a single site.
+	$GLOBALS['_main_site_id']  = 1; // is_main_site() — which blog of a network is the main one (Ruling P39).
 	$GLOBALS['_site_options']   = array();
 	$GLOBALS['_user_meta']      = array();
 	$GLOBALS['_cron_array']     = array();
