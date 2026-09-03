@@ -2215,10 +2215,23 @@ class Aura_Worker_Elementor_Door {
 	 * WordPress user made by hand in that window is attributed to a call that
 	 * never made them.
 	 *
+	 * The bound is `post_modified_gmt`, not `post_date_gmt`. WordPress stamps
+	 * `post_date_gmt` only for a published post — a draft, pending, or
+	 * auto-draft row keeps it at the zero date (`0000-00-00 00:00:00`), which
+	 * always satisfies `<= $until`. Bounding on that column would leave
+	 * ordinary drafts unbounded: a same-type draft the actor created AFTER
+	 * the window closed would still be attributed to a stale call, and a
+	 * restore of that call's `creation` snapshot could trash it.
+	 * `post_modified_gmt` is populated on every insert, drafts included, so it
+	 * bounds every row the same way. The cost is symmetric with the benefit,
+	 * not free: a post created inside the window and only edited later falls
+	 * OUTSIDE `$until` and is excluded from the diff — the conservative
+	 * direction, since an unattributed post is left in place, never trashed.
+	 *
 	 * @param int         $mark     The watermark: the highest post id before the write.
 	 * @param string[]    $types    Post types the creation may legitimately have inserted.
 	 * @param int         $actor_id The actor the creation ran as.
-	 * @param string|null $until    GMT datetime; ids created after it are not this call's.
+	 * @param string|null $until    GMT datetime; ids whose `post_modified_gmt` is after it are not this call's.
 	 * @return int[]
 	 */
 	private static function watermark_diff( $mark, array $types, $actor_id, $until = null ) {
@@ -2230,7 +2243,7 @@ class Aura_Worker_Elementor_Door {
 		$sql  = "SELECT ID FROM {$wpdb->posts} WHERE ID > %d AND post_type IN ($in) AND post_author = %d";
 		$args = array_merge( array( (int) $mark ), $types, array( (int) $actor_id ) );
 		if ( null !== $until ) {
-			$sql   .= ' AND post_date_gmt <= %s';
+			$sql   .= ' AND post_modified_gmt <= %s';
 			$args[] = (string) $until;
 		}
 		return array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( $sql, $args ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching

@@ -128,25 +128,32 @@ final class DoorReconcilerTest extends TestCase {
 
 	/**
 	 * A post that was already there, with every field a capture reads — and a
-	 * `post_date_gmt` the watermark diff's time bound is compared against.
+	 * `post_modified_gmt` the watermark diff's time bound is compared
+	 * against (2.16.0, Codex round-1 P2: `post_date_gmt` is WordPress's zero
+	 * date on an unpublished post, so it cannot be the bound). `$modified`
+	 * mirrors `$gmt` when not given, the way a freshly-made, unedited post
+	 * would; pass it explicitly to seed a post edited after it was made.
 	 */
-	private function seedPost( int $id, string $type = 'page', int $author = 3, ?string $gmt = null ): void {
+	private function seedPost( int $id, string $type = 'page', int $author = 3, ?string $gmt = null, string $status = 'publish', ?string $modified = null ): void {
 		$gmt                      = null === $gmt ? gmdate( 'Y-m-d H:i:s', time() - 1200 ) : $gmt;
+		$modified                 = null === $modified ? $gmt : $modified;
 		$GLOBALS['_posts'][ $id ] = (object) array(
-			'ID'             => $id,
-			'post_type'      => $type,
-			'post_status'    => 'publish',
-			'post_title'     => 'p-' . $id,
-			'post_name'      => 'p-' . $id,
-			'post_parent'    => 0,
-			'post_content'   => '',
-			'post_excerpt'   => '',
-			'menu_order'     => 0,
-			'post_author'    => $author,
-			'post_date'      => $gmt,
-			'post_date_gmt'  => $gmt,
-			'comment_status' => 'closed',
-			'ping_status'    => 'closed',
+			'ID'                => $id,
+			'post_type'         => $type,
+			'post_status'       => $status,
+			'post_title'        => 'p-' . $id,
+			'post_name'         => 'p-' . $id,
+			'post_parent'       => 0,
+			'post_content'      => '',
+			'post_excerpt'      => '',
+			'menu_order'        => 0,
+			'post_author'       => $author,
+			'post_date'         => $gmt,
+			'post_date_gmt'     => $gmt,
+			'post_modified'     => $modified,
+			'post_modified_gmt' => $modified,
+			'comment_status'    => 'closed',
+			'ping_status'       => 'closed',
 		);
 	}
 
@@ -376,6 +383,48 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array( 11 ), $row['created_post_ids'] );
 		$this->assertArrayNotHasKey( 'observed_by_watermark', $row );
 		$this->assertSame( 'publish', get_post( 13 )->post_status );
+	}
+
+	public function test_a_draft_modified_after_the_stale_window_is_not_attributed_by_its_zero_post_date(): void {
+		$this->seedPost( 10 );
+		$this->seedPost( 11 );
+		// A draft's post_date_gmt is WordPress's zero date — it always
+		// satisfies "<= $until", so the OLD bound (post_date_gmt) would
+		// attribute this to the stale call no matter when it was really
+		// made. Only post_modified_gmt places it in time: modified an hour
+		// after this creation was already stale — the same actor, the same
+		// expected type, above the mark, but not this call's (Codex round-1
+		// P2).
+		$until = time() - 1200 + (int) floor( Aura_Worker_Elementor_Door::CLAIM_STALE_MS / 1000 );
+		$this->seedPost( 13, 'page', 3, '0000-00-00 00:00:00', 'draft', gmdate( 'Y-m-d H:i:s', $until + 3600 ) );
+		$seq = $this->entry(
+			array(
+				'ability'          => 'elementor/create-page',
+				'post_watermark'   => 10,
+				'expected_types'   => array( 'page' ),
+				'created_post_ids' => array( 11 ),
+				'started_at'       => $this->longAgo(),
+			)
+		);
+
+		// Under the store-unwritable compensation path too: only the
+		// hooked witness (11) is ever compensated, but if the draft were
+		// wrongly attributed it would have shown up as `unproven` — never
+		// this call's, and never risked.
+		$out = $this->withUnwritableSnapshots(
+			static function () {
+				return Aura_Worker_Elementor_Door::reconcile();
+			}
+		);
+
+		$this->assertSame( 1, $out['interrupted'] );
+		$row = $this->row( $seq );
+		$this->assertSame( array( 11 ), $row['created_post_ids'], 'the draft is not this call\'s — only the hooked id is' );
+		$this->assertArrayNotHasKey( 'observed_by_watermark', $row );
+		$this->assertArrayNotHasKey( 'unproven', $row );
+		$this->assertSame( array( 11 ), $row['compensated'] );
+		$this->assertSame( 'trash', get_post( 11 )->post_status );
+		$this->assertSame( 'draft', get_post( 13 )->post_status, 'an unrelated draft made after the window survives' );
 	}
 
 	/* ------------------------------------------------------------------ */

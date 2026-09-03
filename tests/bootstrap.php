@@ -2317,7 +2317,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// filters: a post of another type, or another author's, is not this
 			// call's, and a fake that ignored either would let the production
 			// code claim posts it never made.
-			if ( preg_match( "/^SELECT ID FROM \S+ WHERE ID > (\d+) AND post_type IN \(([^)]*)\) AND post_author = (\d+)(?: AND post_date_gmt <= '([^']*)')?$/", (string) $query, $m ) ) {
+			if ( preg_match( "/^SELECT ID FROM \S+ WHERE ID > (\d+) AND post_type IN \(([^)]*)\) AND post_author = (\d+)(?: AND post_modified_gmt <= '([^']*)')?$/", (string) $query, $m ) ) {
 				$mark   = (int) $m[1];
 				$types  = array();
 				if ( preg_match_all( "/'([^']*)'/", $m[2], $tm ) ) {
@@ -2341,7 +2341,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					if ( (int) ( $p->post_author ?? 0 ) !== $author ) {
 						continue;
 					}
-					if ( null !== $until && strcmp( (string) ( $p->post_date_gmt ?? '' ), $until ) > 0 ) {
+					if ( null !== $until && strcmp( (string) ( $p->post_modified_gmt ?? '' ), $until ) > 0 ) {
 						continue;
 					}
 					$out[] = (string) (int) $id;
