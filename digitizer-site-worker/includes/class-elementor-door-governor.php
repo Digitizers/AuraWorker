@@ -1153,9 +1153,31 @@ class Aura_Worker_Elementor_Door {
 			}
 			$snapshot_id = (string) $snap['snapshot']['id'];
 			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'snapshot_id' => $snapshot_id ) ) ) { // the id lands on the row BEFORE the write, durably
-				// The row stays PENDING on purpose — a snapshot was taken and
-				// the row does not know it, which is the reconciler's case,
-				// not a terminal one this request can honestly write.
+				// SETTLE it `refused` — this request KNOWS the callback never
+				// ran, and a terminal row is the only way to say so (Ruling
+				// P14). Left pending, the row was the reconciler's case: a
+				// replay reads a pending entry as `interrupted`, keeps the
+				// claim, and ten minutes later the reconciler releases it
+				// rather than making it approvable again — a transient log
+				// write permanently discarding an approved call that
+				// provably never ran. Refused + no `ran` + a retryable code
+				// is exactly the shape replay() gives the hold back for.
+				//
+				// The envelope WAS taken, so its id goes on the terminal row:
+				// the capture is real, on disk, and has to stay traceable
+				// even though the write it was taken for never happened.
+				//
+				// A settle that fails too leaves the row pending, which is
+				// the old behaviour and still correct — the reconciler is the
+				// backstop for a row nothing could write to.
+				Aura_Worker_Door_Log::settle(
+					$seq,
+					array(
+						'result'      => 'refused',
+						'reason'      => 'snapshot_id_unrecorded',
+						'snapshot_id' => $snapshot_id,
+					)
+				);
 				self::$request = null;
 				return new WP_Error( 'aura_log_failed', 'The door log could not record the snapshot before the write; it was not run.', array( 'status' => 503 ) );
 			}

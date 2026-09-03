@@ -689,6 +689,44 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 'ran_witness_failed', $log[1]['reason'] );
 	}
 
+	/**
+	 * The snapshot was TAKEN and the row could not be told (Ruling P14). The
+	 * call provably did not run, so the approval must go back — the row used
+	 * to be left pending, which replay() reads as `interrupted`, keeps the
+	 * claim for, and the reconciler then releases ten minutes later: a
+	 * transient log write permanently discarded an approved call.
+	 */
+	public function test_a_snapshot_id_that_cannot_be_recorded_gives_the_hold_back(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		// Only the pre-write PATCH of the id fails; the terminal settle that
+		// carries the same id (under `snapshot_id_unrecorded`) still lands.
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_2'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'snapshot_id' )
+				&& false === strpos( (string) $value, 'snapshot_id_unrecorded' );
+		};
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertSame( array(), $this->ran, 'nothing ran' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the approval is not spent' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+		$entry = Aura_Worker_Door_Log::get( 2 );
+		$this->assertSame( 'refused', $entry['result'] );
+		$this->assertSame( 'snapshot_id_unrecorded', $entry['reason'] );
+		$this->assertSame( 'snap_test', $entry['snapshot_id'], 'the envelope was taken, and stays traceable' );
+		$this->assertArrayNotHasKey( 'ran', $entry );
+
+		// And the retry Aura is told to make actually works.
+		unset( $GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_2'] );
+		$again = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$this->assertTrue( $again['ok'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+	}
+
 	public function test_the_stamp_and_the_ran_witness_are_on_the_row_before_the_callback(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );

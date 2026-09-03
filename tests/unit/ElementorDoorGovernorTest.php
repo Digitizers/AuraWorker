@@ -324,6 +324,37 @@ final class ElementorDoorGovernorTest extends TestCase {
 	}
 
 	/**
+	 * §3.9-a, the other half: the snapshot was taken and the row could not be
+	 * told. The call is refused — and the row SETTLES `refused`, carrying the
+	 * id of the envelope that was taken, rather than staying pending for the
+	 * reconciler (Ruling P14). `log_after` stops at a pending row, and a
+	 * replay reads one as `interrupted` and keeps its claim.
+	 */
+	public function test_a_snapshot_id_that_cannot_be_recorded_refuses_and_settles_the_row(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array( 'success' => true, 'snapshot' => array( 'id' => 'snap_1' ) );
+			}
+		);
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'snapshot_id' )
+				&& false === strpos( (string) $value, 'snapshot_id_unrecorded' );
+		};
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran, 'nothing ran' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'snapshot_id_unrecorded', $row['reason'] );
+		$this->assertSame( 'snap_1', $row['snapshot_id'], 'the envelope that was taken stays traceable' );
+		$this->assertCount( 1, Aura_Worker_Door_Log::log_after( 0 ), 'settled, so the log is served past it' );
+	}
+
+	/**
 	 * A throw AFTER the row was admitted settles that row rather than leaving
 	 * it pending: `log_after` stops at a pending row, so every later entry
 	 * would wait for the reconciler to call a KNOWN failure "interrupted".
