@@ -342,6 +342,74 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/* ------------------------------------------------------------------ */
+	/* An expired hold does not hold a queue slot (Ruling P21)             */
+	/* ------------------------------------------------------------------ */
+
+	/** Hold $n calls and expire every one of them, without sweeping. */
+	private function expiredHolds( int $n ): array {
+		$refs = array();
+		for ( $i = 0; $i < $n; $i++ ) {
+			$refs[] = $ref = Aura_Worker_Door_Holds::hold( $this->call() );
+			$this->patchRow( 'aura_worker_door_held_' . $ref, array( 'expires_at' => gmdate( 'c', time() - 10 ) ) );
+		}
+		return $refs;
+	}
+
+	/**
+	 * The cap counted rows the queue no longer honours: listing() hides an
+	 * expired hold and get_held() refuses it, but count() still charged a
+	 * slot for it. On a site whose `/status` is not being polled, fifty
+	 * expired approvals closed the door to every new Elementor write.
+	 */
+	public function test_expired_holds_do_not_fill_the_queue_and_are_purged_under_the_lock(): void {
+		$refs = $this->expiredHolds( Aura_Worker_Door_Holds::CAP );
+
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$this->assertIsString( $ref, 'the queue was full of nothing' );
+		foreach ( $refs as $dead ) {
+			$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $dead, $GLOBALS['_rows'], 'the expired rows are gone' );
+		}
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count() );
+	}
+
+	public function test_one_expired_row_beside_a_full_house_of_live_ones_admits_one_more(): void {
+		for ( $i = 0; $i < Aura_Worker_Door_Holds::CAP - 1; $i++ ) {
+			Aura_Worker_Door_Holds::hold( $this->call() );
+		}
+		$this->expiredHolds( 1 );
+
+		$this->assertIsString( Aura_Worker_Door_Holds::hold( $this->call() ) );
+		$this->assertSame( Aura_Worker_Door_Holds::CAP, Aura_Worker_Door_Holds::count() );
+	}
+
+	public function test_a_full_house_of_LIVE_holds_still_refuses(): void {
+		for ( $i = 0; $i < Aura_Worker_Door_Holds::CAP; $i++ ) {
+			Aura_Worker_Door_Holds::hold( $this->call() );
+		}
+
+		$out = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_queue_full', $out->get_error_code() );
+	}
+
+	/**
+	 * A claim in flight still holds its slot, expired or not: the row is the
+	 * replay's, and the sweep — not the cap check — decides when it goes.
+	 */
+	public function test_an_expired_held_row_with_a_claimed_twin_keeps_its_slot(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Holds::claim( $ref );
+		$this->reseedHeldTwin( $ref );
+		$this->patchRow( 'aura_worker_door_held_' . $ref, array( 'expires_at' => gmdate( 'c', time() - 10 ) ) );
+
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count(), 'the claimed ref still counts' );
+		Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'and its held twin was not purged out from under the replay' );
+	}
+
+	/* ------------------------------------------------------------------ */
 	/* Helpers                                                             */
 	/* ------------------------------------------------------------------ */
 

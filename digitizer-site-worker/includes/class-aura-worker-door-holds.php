@@ -126,6 +126,14 @@ class Aura_Worker_Door_Holds {
 
 	/** The body of hold(), run only while the lock is held. */
 	private static function hold_locked( array $call ) {
+		// An expired hold is not an approval anybody can act on — listing()
+		// hides it and get_held() refuses it — so it must not charge a queue
+		// slot either (Ruling P21). Purged HERE, under the lock and before
+		// the cap is read: the sweep only runs from a `/status` poll, and a
+		// site that has not been polled since fifty holds ran out of time
+		// answered `aura_hold_queue_full` to every new Elementor write while
+		// there was nothing live in the queue at all.
+		self::purge_expired();
 		if ( self::count() >= self::CAP ) {
 			return new WP_Error( 'aura_hold_queue_full', 'Aura\'s approval queue for this site is full (50 held calls); ask the operator to act on it.', array( 'status' => 503 ) );
 		}
@@ -453,14 +461,48 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
-	 * Slots in use: every ref with a held OR a claimed row, counted once
-	 * (Codex round-8 P2 — a claim MOVES the row, so counting only held rows
-	 * let interrupted replays accumulate beside another fifty holds).
+	 * Delete every held row that has run out of time and has NO claimed twin
+	 * — the sweep's own rule, judged by the sweep's own predicate.
+	 *
+	 * A twin means a replay owns that ref and its own delete is still
+	 * coming; removing the held row underneath it is the race sweep() and
+	 * get_held() both refuse to enter (round-9). Called under the hold lock,
+	 * so no hold() is racing this one.
+	 *
+	 * @return int How many were deleted.
+	 */
+	private static function purge_expired() {
+		$gone = 0;
+		$now  = time();
+		foreach ( self::rows( self::HELD ) as $ref => $row ) {
+			if ( self::is_expired( $row, $now ) && null === self::get_claimed( $ref ) ) {
+				delete_option( self::HELD . $ref );
+				$gone++;
+			}
+		}
+		return $gone;
+	}
+
+	/**
+	 * Slots in use: every ref with a CLAIMED row, plus every ref whose held
+	 * row is still live, counted once.
+	 *
+	 * A claim MOVES the row, so counting only held rows let interrupted
+	 * replays accumulate beside another fifty holds (Codex round-8 P2) — and
+	 * counting EVERY held row charged a slot for holds the queue no longer
+	 * honours (Ruling P21). A claimed ref counts however old it is: the row
+	 * is a replay's, and only the sweep decides when it goes.
 	 *
 	 * @return int
 	 */
 	public static function count() {
-		$refs = array_merge( array_keys( self::rows( self::HELD ) ), array_keys( self::rows( self::CLAIMED ) ) );
+		$now  = time();
+		$refs = array_keys( self::rows( self::CLAIMED ) );
+		foreach ( self::rows( self::HELD ) as $ref => $row ) {
+			if ( ! self::is_expired( $row, $now ) || in_array( $ref, $refs, true ) ) {
+				$refs[] = $ref;
+			}
+		}
 		return count( array_unique( $refs ) );
 	}
 

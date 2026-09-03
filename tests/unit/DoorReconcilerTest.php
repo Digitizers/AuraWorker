@@ -445,8 +445,11 @@ final class DoorReconcilerTest extends TestCase {
 		$GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $claimed ] = array( 'ref' => $claimed, 'expires_at' => gmdate( 'c', time() + 600 ) );
 		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::HELD . $claimed ]    = maybe_serialize( $GLOBALS['_options'][ Aura_Worker_Door_Holds::HELD . $claimed ] );
 		$expired = $this->hold();
+		$live    = $this->hold();
+		// Expired only AFTER the last hold(): since Ruling P21 hold() itself
+		// purges expired unclaimed rows under its lock, so a hold taken after
+		// this patch would sweep the row before the reconciler ever saw it.
 		$this->patchOption( Aura_Worker_Door_Holds::HELD . $expired, array( 'expires_at' => gmdate( 'c', time() - 60 ) ) );
-		$live = $this->hold();
 
 		$out = Aura_Worker_Elementor_Door::reconcile();
 
