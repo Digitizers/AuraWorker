@@ -31,6 +31,9 @@ class Aura_Worker_Door_Log {
 
 	/** @var array|null live_identity()'s per-request cache */
 	private static $live_identity = null;
+
+	/** @var bool Whether this request has already tried to adopt an `unset` record (Ruling P73). */
+	private static $binding_adopt_tried = false;
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
 	const MAX_UNACKED  = 2000;
@@ -184,7 +187,7 @@ class Aura_Worker_Door_Log {
 	public static function binding_record() {
 		$cur = get_option( self::BINDING, null );
 		if ( is_array( $cur ) && isset( $cur['gen'] ) && '' !== (string) $cur['gen'] ) {
-			return self::normalise_binding( $cur );
+			return self::adopt_if_unset( self::normalise_binding( $cur ) );
 		}
 		$won = self::insert_unique(
 			self::BINDING,
@@ -201,8 +204,88 @@ class Aura_Worker_Door_Log {
 		// and every writer refuses to stamp.
 		$cur = $won ? get_option( self::BINDING, null ) : self::reread_after_mint( self::BINDING );
 		return is_array( $cur ) && isset( $cur['gen'] )
-			? self::normalise_binding( $cur )
+			? self::adopt_if_unset( self::normalise_binding( $cur ) )
 			: array( 'gen' => '', 'state' => self::BINDING_UNSET, 'client' => null, 'dashboard' => null );
+	}
+
+	/**
+	 * ADOPT an `unset` record for the identity this site is demonstrably live
+	 * under (Ruling P73).
+	 *
+	 * A site 2.16 meets already connected has no record, so the first reader
+	 * mints a placeholder — `unset`, naming nobody. Rows queued and written
+	 * afterwards carry that placeholder's generation, and `unset` used to be a
+	 * BYPASS: the generation was live without the identity ever being compared.
+	 *
+	 * That bypass is a window, and a replacement connect walks straight
+	 * through it. A connect publishes the new token, the client sentinel and
+	 * the dashboard URL BEFORE it rotates the generation, so between those two
+	 * writes a request authenticating with the NEW credentials met an `unset`
+	 * record, was told the departed binding's generation was live, and could
+	 * claim and execute the previous client's stored mutation.
+	 *
+	 * Adoption closes it by making the record STATE what everything else can
+	 * already see. It is not a rotation: the generation is unchanged, so the
+	 * site's own rows stay current and no approval is stranded. From that
+	 * moment the record says `bound` and P62's identity comparison applies to
+	 * every reader — so the same replacement connect's identity writes make
+	 * the departed rows foreign the instant they land, rotation or no
+	 * rotation.
+	 *
+	 * A site with NO live identity — never connected — keeps `unset`, and
+	 * nothing is bound there to be protected.
+	 *
+	 * Once per request: a CAS that loses re-reads and uses whatever won.
+	 *
+	 * @param array      $rec  The normalised record.
+	 * @param array|null $live { client, dashboard } — the fence supplies its own
+	 *                         uncached read; everyone else uses the per-request one.
+	 * @return array The record as it now stands.
+	 */
+	private static function adopt_if_unset( array $rec, $live = null ) {
+		if ( self::BINDING_UNSET !== $rec['state'] || '' === (string) $rec['gen'] || self::$binding_adopt_tried ) {
+			return $rec;
+		}
+		$live = is_array( $live ) ? $live : self::live_identity();
+		$client    = isset( $live['client'] ) && '' !== (string) $live['client'] ? (string) $live['client'] : null;
+		$dashboard = isset( $live['dashboard'] ) && '' !== (string) $live['dashboard'] ? (string) $live['dashboard'] : null;
+		if ( null === $client && null === $dashboard ) {
+			return $rec; // never connected: there is nothing to adopt it for
+		}
+		self::$binding_adopt_tried = true;
+
+		global $wpdb;
+		$raw = self::raw_option( self::BINDING );
+		$cur = null === $raw ? null : maybe_unserialize( $raw );
+		if ( ! is_array( $cur ) || ! isset( $cur['gen'] ) ) {
+			return $rec;
+		}
+		$cur = self::normalise_binding( $cur );
+		if ( self::BINDING_UNSET !== $cur['state'] ) {
+			return $cur; // somebody stated it first — theirs stands
+		}
+		$next = array(
+			'gen'       => $cur['gen'], // THE SAME generation: this is not a rotation
+			'state'     => self::BINDING_BOUND,
+			'client'    => $client,
+			'dashboard' => $dashboard,
+		);
+		$wpdb->last_error = '';
+		$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				maybe_serialize( $next ),
+				self::BINDING,
+				$raw
+			)
+		);
+		wp_cache_delete( self::BINDING, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		// Win or lose, the answer is whatever the row says NOW.
+		$after = self::raw_option( self::BINDING );
+		$after = null === $after ? null : maybe_unserialize( $after );
+		return is_array( $after ) && isset( $after['gen'] ) ? self::normalise_binding( $after ) : $next;
 	}
 
 	/**
@@ -254,7 +337,8 @@ class Aura_Worker_Door_Log {
 
 	/** Test seam / per-request cache reset for live_identity(). */
 	public static function forget_live_identity() {
-		self::$live_identity = null;
+		self::$live_identity       = null;
+		self::$binding_adopt_tried = false;
 	}
 
 	/**
@@ -551,6 +635,12 @@ class Aura_Worker_Door_Log {
 		);
 		self::$live_identity = $live; // the rest of the request agrees with the fence
 
+		// The fence sees an ADOPTED record too (Ruling P73), stated against the
+		// identity it just read from the database rather than the one this
+		// request cached — otherwise the `unset` bypass survives exactly where
+		// it matters most.
+		$rec = self::adopt_if_unset( $rec, $live );
+
 		return array(
 			'ok'             => true,
 			'gen'            => $rec['gen'],
@@ -624,9 +714,10 @@ class Aura_Worker_Door_Log {
 		if ( '' === (string) $gen || (string) $gen !== $f['gen'] ) {
 			return false; // an EMPTY stamp is never current (Ruling P72)
 		}
-		if ( self::BINDING_UNSET === $f['state'] ) {
-			return true;
-		}
+		// NO `unset` BYPASS (Ruling P73). An `unset` record can only survive on
+		// a site with no live identity, where the comparison below is null
+		// against null and answers true anyway. Everywhere else the record has
+		// been adopted, so the identity is compared — which is the whole point.
 		return self::identity_still_describes( $f['client'], $f['dashboard'], $f['live_client'], $f['live_dashboard'] );
 	}
 
@@ -653,9 +744,7 @@ class Aura_Worker_Door_Log {
 		if ( '' === (string) $gen || (string) $gen !== (string) $rec['gen'] ) {
 			return false; // an EMPTY stamp is never current (Ruling P72)
 		}
-		if ( self::BINDING_UNSET === $rec['state'] ) {
-			return true;
-		}
+		// NO `unset` BYPASS (Ruling P73) — see generation_is_live_uncached().
 		$live = self::live_identity();
 		return self::identity_still_describes( $rec['client'], $rec['dashboard'], $live['client'], $live['dashboard'] );
 	}

@@ -166,6 +166,60 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
 	}
 
+	/** Publish an identity the way a connect does: token, client sentinel, dashboard. */
+	private function publishIdentity( string $client, string $rawToken ): void {
+		$hash = hash( 'sha256', $rawToken );
+		$GLOBALS['_options']['aura_worker_site_token'] = $hash;
+		$GLOBALS['_rows']['aura_worker_site_token']    = maybe_serialize( $hash );
+		$GLOBALS['_options']['aura_worker_dashboard_url'] = 'https://app.example';
+		$GLOBALS['_rows']['aura_worker_dashboard_url']    = maybe_serialize( 'https://app.example' );
+		Aura_Worker_Rules::bind( $client, $hash );
+		Aura_Worker_Door_Log::forget_live_identity();
+		Aura_Worker_Door_Holds::forget_held();
+	}
+
+	/**
+	 * Ruling P73 (F1): an `unset` record is ADOPTED, never compared blind.
+	 *
+	 * A site 2.16 meets already connected mints an `unset` placeholder, and
+	 * `unset` used to be a BYPASS: its generation was live without the identity
+	 * ever being compared. A connect publishes the new token, client sentinel
+	 * and dashboard URL BEFORE it rotates the generation — so in that interval
+	 * a request authenticating with the REPLACEMENT credentials was told the
+	 * departed binding's generation was live, and could claim and run the
+	 * previous client's stored mutation.
+	 *
+	 * Adoption states what the site can already see, WITHOUT moving the
+	 * generation: the site's own rows stay current, and P62's identity
+	 * comparison starts applying to everybody.
+	 */
+	public function test_an_unset_record_is_adopted_and_a_replacement_identity_makes_the_hold_foreign(): void {
+		// An upgraded site: a placeholder record and a hold stamped with it.
+		$rec = array( 'gen' => 'upgrade-gen', 'state' => 'unset', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
+		$this->publishIdentity( 'client-a', 'tok-a' );
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsString( $ref );
+		$this->assertSame( 'upgrade-gen', $GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ]['binding'], 'the placeholder generation, unchanged' );
+
+		// The first read adopts it — no rotation, so the hold is still ours.
+		$after = Aura_Worker_Door_Log::binding_record();
+		$this->assertSame( 'bound', $after['state'] );
+		$this->assertSame( 'client-a', $after['client'] );
+		$this->assertSame( 'upgrade-gen', $after['gen'], 'ADOPTED, not rotated' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the site still serves its own queue' );
+
+		// The replacement connect publishes its credentials and identity, and
+		// has NOT rotated the generation yet.
+		$this->publishIdentity( 'client-b', 'tok-b' );
+
+		$this->assertSame( 'upgrade-gen', Aura_Worker_Door_Log::binding(), 'the rotation really has not happened' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'and the departed hold is already foreign' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
+		$this->assertSame( 'not_held', Aura_Worker_Door_Holds::claim( $ref )->get_error_code() );
+	}
+
 	/**
 	 * Ruling P72 (a): the LOSER of a first-reader race reads the winner's row.
 	 *

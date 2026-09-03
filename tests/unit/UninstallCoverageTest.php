@@ -117,7 +117,7 @@ final class UninstallCoverageTest extends TestCase {
 	 *   INSERT … ON DUPLICATE KEY UPDATE that no scan of function calls could
 	 *   ever see) and the ruleset store's compare-and-swap on
 	 *   'aura_worker_ruleset'.
-	 * - includes/class-aura-worker-door-log.php (7, 2.16.0) — each door log
+	 * - includes/class-aura-worker-door-log.php (8, 2.16.0) — each door log
 	 *   row's compare-and-set (write_option_where()'s UPDATE, on
 	 *   'aura_worker_door_log_<seq>'), the ack floor's upward-only raise
 	 *   (ack()'s UPDATE on 'aura_worker_door_log_acked'), the closure
@@ -133,7 +133,12 @@ final class UninstallCoverageTest extends TestCase {
 	 *   Ruling P68 — that same rotation's two CLAIM-CONDITIONAL forms on the
 	 *   same 'aura_worker_door_binding' key: an UPDATE and an INSERT, each
 	 *   joined to the site claim row ('aura_worker_connect_lock'), so a stale
-	 *   unbind whose claim was taken over cannot rotate the winner's binding.
+	 *   unbind whose claim was taken over cannot rotate the winner's binding,
+	 *   and — since Ruling P73 — the ADOPTION of an `unset` record on that same
+	 *   'aura_worker_door_binding' key: a compare-and-swap that states the
+	 *   identity the site is already live under WITHOUT moving the generation,
+	 *   so an upgraded site's own rows stay current while a replacement
+	 *   connect's identity writes make the departed ones foreign at once.
 	 *   All names fall under the swept 'aura_worker_' prefix.
 	 * - includes/class-elementor-door-governor.php (1, 2.16.0) — the door's
 	 *   rolling 30-day counters, in the rule counters' shape:
@@ -142,7 +147,7 @@ final class UninstallCoverageTest extends TestCase {
 	 *   Under the swept 'aura_worker_' prefix.
 	 */
 	private const ACKNOWLEDGED_RAW_OPTION_WRITES = array(
-		'includes/class-aura-worker-door-log.php'    => 7,
+		'includes/class-aura-worker-door-log.php'    => 8,
 		'includes/class-aura-worker-magic-link.php'  => 3,
 		'includes/class-aura-worker-rules.php'       => 5,
 		'includes/class-aura-worker.php'             => 2,
