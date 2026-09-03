@@ -670,6 +670,51 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertNull( $snaps->get( $second['snapshot']['id'] ) );
 	}
 
+	public function test_the_reconciler_prunes_door_counter_buckets_past_the_thirty_day_window(): void {
+		// bump_counter() copied Aura_Worker_Rules::bump()'s atomic upsert but
+		// not its sweep, so every hour of every counter was kept for ever —
+		// 720 rows per name is the WINDOW, not the total.
+		$now     = time();
+		$hour    = (int) floor( $now / HOUR_IN_SECONDS );
+		$edge    = (int) floor( ( $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS ); // still inside
+		$outside = $edge - 1;
+		$this->seedBucket( 'log_ungoverned', $hour, 3 );
+		$this->seedBucket( 'log_ungoverned', $edge, 5 );
+		$this->seedBucket( 'log_ungoverned', $outside, 100 );
+		$this->seedBucket( 'unobserved', $outside - 500, 7 );
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 2, $out['pruned_counters'] );
+		$this->assertArrayNotHasKey( 'aura_worker_door_c_log_ungoverned_h' . $outside, $GLOBALS['_rows'] );
+		$this->assertArrayNotHasKey( 'aura_worker_door_c_unobserved_h' . ( $outside - 500 ), $GLOBALS['_rows'] );
+		$this->assertArrayHasKey( 'aura_worker_door_c_log_ungoverned_h' . $edge, $GLOBALS['_rows'], 'the oldest bucket the window still covers survives' );
+		$this->assertSame( 8, Aura_Worker_Elementor_Door::count_30d( 'log_ungoverned', $now ), 'and the survivors still sum' );
+	}
+
+	public function test_the_counter_prune_shares_the_retention_gate(): void {
+		// Bounded like the envelope sweep, and by the same stamp: `/status` is
+		// the hottest endpoint this site has (Ruling P9(a)).
+		$outside = (int) floor( ( time() - 31 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		Aura_Worker_Elementor_Door::reconcile(); // stamps PRUNED_AT
+		$this->seedBucket( 'log_ungoverned', $outside, 100 );
+
+		$this->assertSame( 0, Aura_Worker_Elementor_Door::reconcile()['pruned_counters'], 'the gate skipped' );
+		$this->assertArrayHasKey( 'aura_worker_door_c_log_ungoverned_h' . $outside, $GLOBALS['_rows'] );
+
+		update_option( Aura_Worker_Elementor_Door::PRUNED_AT, gmdate( 'c', time() - Aura_Worker_Elementor_Door::PRUNE_INTERVAL_S - 60 ) );
+
+		$this->assertSame( 1, Aura_Worker_Elementor_Door::reconcile()['pruned_counters'] );
+		$this->assertArrayNotHasKey( 'aura_worker_door_c_log_ungoverned_h' . $outside, $GLOBALS['_rows'] );
+	}
+
+	/** One counter bucket, in the "database" get_col() reads and the cache alike. */
+	private function seedBucket( string $name, int $hour, int $value ): void {
+		$option                          = 'aura_worker_door_c_' . $name . '_h' . $hour;
+		$GLOBALS['_rows'][ $option ]    = (string) $value;
+		$GLOBALS['_options'][ $option ] = (string) $value;
+	}
+
 	/** Rewrite an envelope's stamp $days into the past, on disk. */
 	private function ageSnapshot( string $id, int $days ): void {
 		$file = WP_CONTENT_DIR . '/aura-backups/snapshots/' . $id . '.json';

@@ -60,6 +60,8 @@ class Aura_Worker_Elementor_Door {
 	 * name the mutex actually takes.
 	 */
 	const CREATING = 'aura_worker_door_creating';
+	/** The rolling counter buckets' shared prefix: `<prefix><name>_h<hour>`. */
+	const COUNTER_PREFIX = 'aura_worker_door_c_';
 
 	/** Kit meta the design system lives in (4.3.0-beta1, R3). */
 	const KIT_META_KEYS = array(
@@ -331,24 +333,26 @@ class Aura_Worker_Elementor_Door {
 	 *    no longer explains.
 	 * 3. Stale pending ROWS: the requests that never held anything.
 	 * 4. The creation mutex, by age alone.
-	 * 5. Retention: door envelopes older than 30 days (Ruling R6) — at most
-	 *    once every PRUNE_INTERVAL_S, because the sweep reads every envelope
-	 *    on disk and this runs on the site's hottest endpoint (Ruling P9(a)).
+	 * 5. Retention: door envelopes older than 30 days (Ruling R6), and the
+	 *    counter buckets past the same window — at most once every
+	 *    PRUNE_INTERVAL_S, because both sweeps read every row/file there is
+	 *    and this runs on the site's hottest endpoint (Ruling P9(a)).
 	 *
 	 * A claim is released ONLY once its evidence is durable. Anything else
 	 * loses the one record that a replay may have mutated the site.
 	 *
 	 * @param int|null $now Unix time; defaults to now.
-	 * @return array{ interrupted: int, discarded: int, settled_claims: int, swept: int, pruned: int }
+	 * @return array{ interrupted: int, discarded: int, settled_claims: int, swept: int, pruned: int, pruned_counters: int }
 	 */
 	public static function reconcile( $now = null ) {
 		$now = null === $now ? time() : (int) $now;
 		$out = array(
-			'interrupted'    => 0,
-			'discarded'      => 0,
-			'settled_claims' => 0,
-			'swept'          => 0,
-			'pruned'         => 0,
+			'interrupted'     => 0,
+			'discarded'       => 0,
+			'settled_claims'  => 0,
+			'swept'           => 0,
+			'pruned'          => 0,
+			'pruned_counters' => 0,
 		);
 
 		$out['swept'] = (int) Aura_Worker_Door_Holds::sweep( $now, self::CLAIM_STALE_MS );
@@ -384,7 +388,8 @@ class Aura_Worker_Elementor_Door {
 		// would make the counter a lie.
 		$last = strtotime( (string) get_option( self::PRUNED_AT, '' ) );
 		if ( false === $last || $last <= $now - self::PRUNE_INTERVAL_S ) {
-			$out['pruned'] = (int) ( new Aura_Worker_Snapshots() )->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+			$out['pruned']          = (int) ( new Aura_Worker_Snapshots() )->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+			$out['pruned_counters'] = self::prune_counters( $now );
 			update_option( self::PRUNED_AT, gmdate( 'c', $now ), false );
 		}
 
@@ -1641,10 +1646,63 @@ class Aura_Worker_Elementor_Door {
 	 */
 	private static function bump_counter( $name ) {
 		global $wpdb;
-		$option = 'aura_worker_door_c_' . $name . '_h' . (int) floor( time() / HOUR_IN_SECONDS );
+		$option = self::COUNTER_PREFIX . $name . '_h' . (int) floor( time() / HOUR_IN_SECONDS );
 		$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1", $option ) );
 		wp_cache_delete( $option, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
+	}
+
+	/**
+	 * Delete every counter bucket past the 30-day window count_30d() reads —
+	 * the sweep bump_counter() copied Aura_Worker_Rules::bump()'s atomic
+	 * upsert WITHOUT. Without it a bucket is kept for ever: 720 rows per
+	 * counter name is the WINDOW, not the total, and a site that has bumped
+	 * a counter every hour for a year carries eight thousand dead options
+	 * that nothing will ever read again.
+	 *
+	 * Pruned in PHP over the same (name) listing count_30d() already scans,
+	 * NOT by Aura_Worker_Rules::sweep_options()'s string bound. That sweep
+	 * deletes `option_name < '<prefix>h<hour>'`, which orders names
+	 * lexicographically — correct only because Aura_Worker_Rules::bucket_name()
+	 * zero-pads its hour. The door's suffix is not padded (count_30d()'s own
+	 * comment says so), so a string bound would order `_h9` after `_h100000`
+	 * and delete the wrong rows. Zero-padding the door's suffix instead would
+	 * mean two name formats on every existing site and a migration to
+	 * reconcile them; comparing the parsed integer costs one preg_match per
+	 * row and needs neither.
+	 *
+	 * Bounded by the caller: this runs inside reconcile()'s PRUNE_INTERVAL_S
+	 * gate, under the same PRUNED_AT stamp as the envelope sweep, because it
+	 * reads every counter row there is and `/status` is the site's hottest
+	 * endpoint (Ruling P9(a)).
+	 *
+	 * @param int $now Unix time.
+	 * @return int How many buckets were deleted.
+	 */
+	private static function prune_counters( $now ) {
+		global $wpdb;
+		$oldest = (int) floor( ( (int) $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		$names  = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$wpdb->esc_like( self::COUNTER_PREFIX ) . '%'
+			)
+		);
+		$gone = 0;
+		foreach ( (array) $names as $name ) {
+			// The hour suffix, whatever counter name sits between it and the
+			// prefix. A row under this prefix that carries no numeric hour is
+			// not one of these buckets and is left alone — the same defensive
+			// read count_30d() applies with ctype_digit().
+			if ( ! preg_match( '/_h([0-9]+)$/', (string) $name, $m ) ) {
+				continue;
+			}
+			if ( (int) $m[1] < $oldest ) {
+				delete_option( (string) $name );
+				$gone++;
+			}
+		}
+		return $gone;
 	}
 
 	/**
@@ -1671,7 +1729,7 @@ class Aura_Worker_Elementor_Door {
 		global $wpdb;
 		$now    = null === $now ? time() : (int) $now;
 		$oldest = (int) floor( ( $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
-		$prefix = 'aura_worker_door_c_' . $name . '_h';
+		$prefix = self::COUNTER_PREFIX . $name . '_h';
 		$rows   = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
