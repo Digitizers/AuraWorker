@@ -982,6 +982,13 @@ class Aura_Worker_Elementor_Door {
 	 * authenticated with the departing binding's Application Password included,
 	 * which is the case a replay-only fence could not see.
 	 *
+	 * UNCACHED (Ruling P64). By this point the request has been through
+	 * `get_held()` and whatever else, so both WordPress's option cache and
+	 * `live_identity()`'s per-request static hold answers from before the
+	 * callback — and a rebind completing in another PHP process invalidates
+	 * neither, because both are this process's memory. The fence reads the
+	 * rows itself, and a read it cannot trust refuses.
+	 *
 	 * A row with NO binding predates the stamp and is accepted, the same
 	 * allowance every other reader of this field makes.
 	 *
@@ -994,7 +1001,7 @@ class Aura_Worker_Elementor_Door {
 		if ( '' === $was ) {
 			return true;
 		}
-		return Aura_Worker_Door_Log::generation_is_live( $was );
+		return Aura_Worker_Door_Log::generation_is_live_uncached( $was );
 	}
 
 	/**
@@ -1024,11 +1031,11 @@ class Aura_Worker_Elementor_Door {
 		if ( '' === $claimed ) {
 			return true; // claimed before the fence existed
 		}
-		// The SAME predicate every other reader uses (Ruling P62): the
+		// The same predicate every other reader uses (Ruling P62) — the
 		// generation must be current AND its record must still describe the
-		// identity this site is live under, so a connect whose rotation did not
-		// land still makes the departed binding's claim foreign.
-		return Aura_Worker_Door_Log::generation_is_live( $claimed );
+		// identity this site is live under — asked of the DATABASE rather than
+		// of this process's caches (Ruling P64).
+		return Aura_Worker_Door_Log::generation_is_live_uncached( $claimed );
 	}
 
 	/**

@@ -421,6 +421,109 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * The fence's own read: the binding record and the live identity, taken
+	 * from the DATABASE past every cache (Ruling P64).
+	 *
+	 * The caches are the bug. By the time a replay reaches its fence it has
+	 * already been through `get_held()`, which populated BOTH WordPress's
+	 * option cache for the binding record and `live_identity()`'s per-request
+	 * static — and a rebind completing in ANOTHER PHP process invalidates
+	 * neither of them, because both live in this process's memory. The fence
+	 * would then compare the claim against a generation and an identity that
+	 * were current when this request started and have not been since.
+	 *
+	 * So this reads three rows itself: the binding record, the ruleset store
+	 * (for the binding sentinel `bound_client()` proves against the site's
+	 * current token — its own readers are already uncached, so they are reused
+	 * as they are), and `aura_worker_dashboard_url`. The per-request cache is
+	 * refreshed from what it read, so the rest of the request agrees with the
+	 * fence rather than with its own older answer.
+	 *
+	 * FAILS CLOSED: a read error anywhere answers `ok: false`, and the fence
+	 * refuses. A door that cannot prove whose it is does not run a mutation.
+	 *
+	 * @return array{ ok: bool, gen: string, state: string, client: string|null, dashboard: string|null, live_client: string|null, live_dashboard: string|null }
+	 */
+	public static function fence_identity() {
+		$fail = array(
+			'ok'             => false,
+			'gen'            => '',
+			'state'          => self::BINDING_UNSET,
+			'client'         => null,
+			'dashboard'      => null,
+			'live_client'    => null,
+			'live_dashboard' => null,
+		);
+		if ( ! class_exists( 'Aura_Worker_Rules' ) ) {
+			return $fail;
+		}
+		global $wpdb;
+		$wpdb->last_error = '';
+		$raw              = self::raw_option( self::BINDING );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return $fail;
+		}
+		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		$rec = is_array( $rec ) && isset( $rec['gen'] ) ? self::normalise_binding( $rec ) : null;
+		if ( null === $rec ) {
+			// No record at all. Not a failure — a site nobody has stated
+			// anything about — but the fence has nothing to compare, so it is
+			// reported as an `unset` record with an empty generation, which
+			// matches no stamped row and lets an unstamped one through.
+			$rec = array( 'gen' => '', 'state' => self::BINDING_UNSET, 'client' => null, 'dashboard' => null );
+		}
+
+		$stored = Aura_Worker_Rules::stored_uncached();
+		if ( is_wp_error( $stored ) ) {
+			return $fail;
+		}
+		$client = is_array( $stored ) ? (string) Aura_Worker_Rules::bound_client( $stored ) : '';
+
+		$dash = Aura_Worker_Rules::read_option_uncached( 'aura_worker_dashboard_url' );
+		if ( is_wp_error( $dash ) ) {
+			return $fail;
+		}
+		$dash = null === $dash ? '' : (string) maybe_unserialize( $dash );
+
+		$live = array(
+			'client'    => '' === $client ? null : $client,
+			'dashboard' => '' === $dash ? null : $dash,
+		);
+		self::$live_identity = $live; // the rest of the request agrees with the fence
+
+		return array(
+			'ok'             => true,
+			'gen'            => $rec['gen'],
+			'state'          => $rec['state'],
+			'client'         => $rec['client'],
+			'dashboard'      => $rec['dashboard'],
+			'live_client'    => $live['client'],
+			'live_dashboard' => $live['dashboard'],
+		);
+	}
+
+	/**
+	 * `generation_is_live()` asked of the DATABASE, for the fences (Ruling
+	 * P64). A read it cannot trust answers false: the mutation does not run.
+	 *
+	 * @param string $gen The generation stamped on a row or a claim.
+	 * @return bool
+	 */
+	public static function generation_is_live_uncached( $gen ) {
+		$f = self::fence_identity();
+		if ( ! $f['ok'] ) {
+			return false;
+		}
+		if ( (string) $gen !== $f['gen'] ) {
+			return false;
+		}
+		if ( self::BINDING_UNSET === $f['state'] ) {
+			return true;
+		}
+		return $f['client'] === $f['live_client'] && $f['dashboard'] === $f['live_dashboard'];
+	}
+
+	/**
 	 * Is this generation the one the site is LIVE under (Ruling P62)?
 	 *
 	 * The generation must be current AND its record must still describe the

@@ -607,6 +607,58 @@ final class ElementorReplayTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P64 (F1): the fence reads the database, not this process's caches.
+	 *
+	 * By the time a replay reaches its fence, `get_held()` has already
+	 * populated WordPress's option cache for the binding record AND
+	 * `live_identity()`'s per-request static. A rebind completing in ANOTHER
+	 * PHP process invalidates neither — both are this process's memory — so
+	 * the fence compared the claim against a generation and an identity that
+	 * had stopped being current, and the departed client's mutation ran.
+	 *
+	 * The rebind here is written with raw SQL precisely so no cache is
+	 * touched: that is exactly what another process's rebind looks like from
+	 * inside this one.
+	 */
+	public function test_the_fence_sees_a_rebind_another_process_made_behind_the_caches(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref       = $this->holdCall();
+		$inner_ran = 0;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$inner_ran ) {
+				++$inner_ran;
+			}
+		);
+		// Warm both caches the way a real replay does.
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+		Aura_Worker_Door_Log::live_identity();
+
+		$this->afterSwapOn(
+			Aura_Worker_Door_Holds::CLAIMED . $ref,
+			static function () {
+				// ANOTHER process rebinding: the rows change, the caches in
+				// this one do not.
+				$rec = array(
+					'gen'       => 'gen-from-another-process',
+					'state'     => 'bound',
+					'client'    => 'c2',
+					'dashboard' => 'https://new.example',
+				);
+				$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] = maybe_serialize( $rec );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'binding_changed', $out['reason'] );
+		$this->assertSame( 0, $inner_ran, 'the write path was never entered' );
+		$this->assertSame( array(), $this->ran, "and the departed client's mutation never ran" );
+	}
+
+	/**
 	 * Rulings P51/P58: a replay whose site was REBOUND mid-flight does not run.
 	 *
 	 * A changed-binding connect, or an unbind, mints a new binding generation
