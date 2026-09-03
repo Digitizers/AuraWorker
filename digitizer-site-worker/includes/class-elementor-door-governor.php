@@ -1912,6 +1912,16 @@ class Aura_Worker_Elementor_Door {
 	 * @return array
 	 */
 	public static function replay( $ref, $ack ) {
+		// LAPSED is not the same answer as NEVER HELD (Ruling P43). get_held()
+		// treats an expired row as absent and deletes it, so Aura could not
+		// tell an approval that ran out of time from a ref that was rejected
+		// or already replayed — and the mirror needs to learn that the
+		// operator's seven days expired. Asked FIRST, because get_held() below
+		// would have removed the evidence.
+		$expired = Aura_Worker_Door_Holds::take_expired( $ref );
+		if ( null !== $expired ) {
+			return self::lapsed( $ref, $expired, (array) $expired['touches'] );
+		}
 		$held = Aura_Worker_Door_Holds::get_held( $ref );
 		if ( null === $held || null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
 			return array(
@@ -2160,7 +2170,7 @@ class Aura_Worker_Elementor_Door {
 				// call waited. Nothing ran, so nothing needs a rollback.
 				if ( is_wp_error( $result ) ) {
 					return in_array( $code, self::RETRYABLE_CODES, true )
-						? self::give_back( $ref, $code, $result->get_error_message() )
+						? self::give_back( $ref, $code, $result->get_error_message(), $slug, (array) $held['actor'], $touches )
 						: self::spend_refusal( $ref, $code, $result->get_error_message() );
 				}
 				// A result with no admission cannot happen — unless the claimed
@@ -2191,7 +2201,7 @@ class Aura_Worker_Elementor_Door {
 				// Admitted, refused before the callback, and worth retrying —
 				// the snapshot that failed, the creation mutex, the watermark.
 				// The approval is not spent on a site that could not act.
-				return self::give_back( $ref, $code, $result->get_error_message() );
+				return self::give_back( $ref, $code, $result->get_error_message(), $slug, (array) $held['actor'], $touches );
 			}
 			if ( 'ok' === $outcome ) {
 				Aura_Worker_Door_Holds::release( $ref );
@@ -2248,14 +2258,64 @@ class Aura_Worker_Elementor_Door {
 	 * @param string $message The refusal's message.
 	 * @return array
 	 */
-	private static function give_back( $ref, $code, $message ) {
+	/**
+	 * The operator's approval RAN OUT OF TIME (Ruling P43).
+	 *
+	 * One answer for both places a lapse can be met — a replay arriving after
+	 * the deadline, and one whose hold lapsed while it ran — so Aura's mirror
+	 * learns the same thing either way: the approval is spent, and not because
+	 * anything judged the call.
+	 *
+	 * The row is already deleted by take_expired(); this records what it was.
+	 *
+	 * @param string $ref     Ref.
+	 * @param array  $row     The expired hold row.
+	 * @param array  $touches Touches to record.
+	 * @param string $slug    Ability; taken from the row when empty.
+	 * @param array  $actor   Actor; taken from the row when empty.
+	 * @return array
+	 */
+	private static function lapsed( $ref, array $row, array $touches, $slug = '', array $actor = array() ) {
+		$slug  = '' === (string) $slug ? (string) ( isset( $row['ability'] ) ? $row['ability'] : '' ) : (string) $slug;
+		$actor = empty( $actor ) ? (array) ( isset( $row['actor'] ) ? $row['actor'] : array() ) : $actor;
+		self::record_terminal_only(
+			$slug,
+			$actor,
+			$touches,
+			'refused',
+			array(
+				'ref'    => $ref,
+				'reason' => 'expired',
+			)
+		);
+		return array(
+			'ok'     => false,
+			'reason' => 'expired',
+		);
+	}
+
+	private static function give_back( $ref, $code, $message, $slug = '', array $actor = array(), array $touches = array() ) {
 		$out = array(
 			'ok'     => false,
 			'reason' => 'retry_later',
 			'code'   => $code,
 			'error'  => $message,
 		);
-		if ( ! Aura_Worker_Door_Holds::unclaim( $ref ) ) {
+		$restored = Aura_Worker_Door_Holds::unclaim( $ref );
+		// The hold may have LAPSED while this replay ran (Ruling P43): claimed
+		// at six days and twenty-three hours, back in the queue past seven.
+		// unclaim() restores it unchanged — the deadline is the operator's and
+		// is never extended — so the row that came back is already expired and
+		// the very next get_held() or claim() would drop it. Promising
+		// `retry_later` on a ref nothing can ever claim again is the lie this
+		// removes: take it away here and say what happened.
+		if ( $restored ) {
+			$lapsed = Aura_Worker_Door_Holds::take_expired( $ref );
+			if ( null !== $lapsed ) {
+				return self::lapsed( $ref, $lapsed, $touches, $slug, $actor );
+			}
+		}
+		if ( ! $restored ) {
 			// unclaim() answering false is not by itself the approval being
 			// lost (Ruling P41). It reports what it could SEE — and a `/status`
 			// sweep that finished this very move's claimed delete a moment

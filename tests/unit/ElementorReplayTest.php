@@ -941,25 +941,83 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 'aura_target_unattributed', $log[1]['code'] );
 	}
 
-	/**
-	 * The approval arrives after the hold's seven days, on a site whose
-	 * `/status` never ran to sweep it (Ruling P18).
-	 */
-	public function test_an_expired_hold_is_not_replayed(): void {
-		$this->registerAll();
-		$this->installRuleset( array() );
-		$ref  = $this->holdCall();
-		$name = 'aura_worker_door_held_' . $ref;
-		$row  = array_merge( (array) $GLOBALS['_options'][ $name ], array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+	/** Backdate a held row's deadline, in the database and the cache alike. */
+	private function expireHold( string $ref, int $seconds_ago = 1 ): void {
+		$name                         = 'aura_worker_door_held_' . $ref;
+		$row                          = array_merge( (array) $GLOBALS['_options'][ $name ], array( 'expires_at' => gmdate( 'c', time() - $seconds_ago ) ) );
 		$GLOBALS['_options'][ $name ] = $row;
 		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+	}
+
+	/**
+	 * The approval arrives after the hold's seven days, on a site whose
+	 * `/status` never ran to sweep it (Ruling P18) — and Aura is told the
+	 * approval LAPSED, not that the ref was never held (Ruling P43).
+	 *
+	 * `not_held` means "retry, and read the hold list"; `expired` means the
+	 * operator's decision ran out of time. The mirror has to learn which, so
+	 * the answer is its own reason and a terminal entry records it.
+	 */
+	public function test_an_expired_hold_is_reported_as_expired_not_as_never_held(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		$this->expireHold( $ref );
 
 		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
 
 		$this->assertFalse( $out['ok'] );
-		$this->assertSame( 'not_held', $out['reason'] );
+		$this->assertSame( 'expired', $out['reason'] );
 		$this->assertSame( array(), $this->ran, 'an expired approval executes nothing' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the lapsed row is gone' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'] );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and nothing was claimed' );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', end( $log )['result'] );
+		$this->assertSame( 'expired', end( $log )['reason'] );
+		$this->assertSame( $ref, end( $log )['ref'] );
+	}
+
+	/**
+	 * Ruling P43, the other door: the hold was claimed a moment BEFORE its
+	 * deadline and the replay hit a retryable pre-callback failure after it.
+	 *
+	 * `unclaim()` restores the row unchanged — the operator's seven days are
+	 * the operator's and are never extended — so what came back was already
+	 * expired, and `give_back()` promised `retry_later` on a ref the next
+	 * `get_held()` or `claim()` would drop on sight. The approval was spent
+	 * and Aura was told to try again.
+	 */
+	public function test_a_hold_that_lapses_during_the_replay_is_expired_not_retry_later(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array( 'success' => false, 'error' => 'disk full' );
+			}
+		);
+		// Claimed while still live; the deadline passes during the replay.
+		$this->expireHold( $ref, -2 ); // two seconds from now
+		$GLOBALS['_sa_after_insert_unique'][ Aura_Worker_Door_Holds::CLAIMED . $ref ] = static function () use ( $ref ) {
+			$name                         = Aura_Worker_Door_Holds::CLAIMED . $ref;
+			$row                          = array_merge( (array) get_option( $name, array() ), array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+			$GLOBALS['_options'][ $name ] = $row;
+			$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+		};
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'expired', $out['reason'], 'never retry_later on a ref nothing can claim again' );
+		$this->assertSame( array(), $this->ran );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'nothing is held' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'] );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and nothing is claimed' );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', end( $log )['result'] );
+		$this->assertSame( 'expired', end( $log )['reason'] );
+		$this->assertSame( $ref, end( $log )['ref'] );
 	}
 
 	public function test_a_hold_a_second_from_expiry_still_replays(): void {

@@ -222,6 +222,50 @@ class Aura_Worker_Door_Holds {
 		return $row;
 	}
 
+	/**
+	 * Take an EXPIRED held row: delete it and hand it back (Ruling P43).
+	 *
+	 * `get_held()` answers null for an expired row and deletes it silently, so
+	 * a caller cannot tell "this ref was never held" from "the operator's
+	 * seven days ran out". Those are different answers to Aura — the second
+	 * says the approval LAPSED — and the mirror has to learn which.
+	 *
+	 * The deadline is never extended: the operator's seven days are the
+	 * operator's, and a replay that arrives late is late. So this deletes
+	 * rather than refreshes, FENCED on the bytes it just read, and returns the
+	 * row so the caller can record what lapsed.
+	 *
+	 * Nothing is taken while a claimed twin exists — a replay owns that ref
+	 * and its own move is still coming, the same rule get_held() and sweep()
+	 * follow.
+	 *
+	 * @param string $ref Ref.
+	 * @return array|null The expired row, now deleted; null when it is not
+	 *                    there, not expired, or claimed.
+	 */
+	public static function take_expired( $ref ) {
+		$ref = self::clean( $ref );
+		$row = self::from_db( self::HELD . $ref );
+		if ( null === $row || ! self::is_expired( $row, time() ) || null !== self::get_claimed( $ref ) ) {
+			return null;
+		}
+		$bytes = self::raw_bytes( self::HELD . $ref );
+		if ( null === $bytes ) {
+			return null;
+		}
+		global $wpdb;
+		$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+				self::HELD . $ref,
+				$bytes
+			)
+		);
+		wp_cache_delete( self::HELD . $ref, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return 1 === (int) $gone ? $row : null;
+	}
+
 	/** @param string $ref Ref. @return array|null */
 	public static function get_claimed( $ref ) {
 		$row = get_option( self::CLAIMED . self::clean( $ref ), null );
@@ -366,6 +410,12 @@ class Aura_Worker_Door_Holds {
 	 * compare-and-swap on that. What `restored_at` buys is the one thing the
 	 * sweep could not otherwise know: WHICH move is in flight when it meets a
 	 * held row and a claimed twin together — see sweep().
+	 *
+	 * `expires_at` is copied UNCHANGED (Ruling P43): the operator's seven days
+	 * are the operator's, and returning an approval to the queue is not a
+	 * reason to extend them. A row that lapsed while the replay ran comes back
+	 * expired, and give_back() takes it away again with `expired` rather than
+	 * promising a retry nothing could honour.
 	 *
 	 * The lost-delete case does NOT back the insert out, which is where this
 	 * differs from claim(): claim() backs out because a held row deleted
