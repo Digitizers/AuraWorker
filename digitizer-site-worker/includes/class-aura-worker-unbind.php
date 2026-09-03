@@ -1037,6 +1037,25 @@ final class Aura_Worker_Unbind {
 		do_action( 'aura_worker_unbind_step', 'grant' );
 		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_grant_pubkey', $claim, $fence );
 
+		// (4a) The Elementor door's transactional state (Ruling P44). A HOLD is
+		// a stored WordPress action — an ability, its input, and the ACTOR to
+		// run it as — waiting for somebody to approve it, and it used to
+		// survive every step above: a site later connected to a DIFFERENT Aura
+		// client was served the departed client's holds through `/status` and
+		// could approve one through `elementor_replay_ability`. Bookkeeping,
+		// so it sits after the credentials are revoked; fenced on the same
+		// claim as every other step, so a caller that lost the site deletes
+		// nothing.
+		//
+		// NOT in leftovers(): that list gates the token's removal, and the
+		// door is not a credential — a wipe that could not land must not keep
+		// this site's token alive for ever. The next binding's own connect
+		// wipes again (Aura_Worker_Magic_Link's callback) if anything survived.
+		do_action( 'aura_worker_unbind_step', 'door' );
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			Aura_Worker_Elementor_Door::wipe_for_unbind( $claim, $fence );
+		}
+
 		if ( array() !== self::leftovers() ) {
 			return false; // something is still owed; the token stays, and so does the retry path
 		}

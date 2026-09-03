@@ -2425,6 +2425,28 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
+			// delete_option_if_claimed()'s PREFIX sibling (Ruling P44): the same
+			// claim JOIN, matching option_name by LIKE rather than by name, so
+			// an unbind can take the Elementor door's whole queue and log —
+			// one row per hold, per claim and per log seq — without issuing
+			// thousands of per-name statements.
+			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name LIKE '([^']*)'$/s", $query, $m ) ) {
+				list( , $claim, $like, $names ) = array_map( 'stripslashes', $m );
+				if ( ! sa_claim_like_matches( $claim, $like ) ) {
+					return 0;
+				}
+				$re   = sa_like_to_regex( $names );
+				$gone = 0;
+				foreach ( array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) ) as $name ) {
+					if ( ! preg_match( $re, (string) $name ) || null === sa_read_option_uncached( (string) $name ) ) {
+						continue;
+					}
+					unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+					$GLOBALS['_option_writes'][] = array( 'delete', $name );
+					++$gone;
+				}
+				return $gone;
+			}
 			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
 				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
 				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {

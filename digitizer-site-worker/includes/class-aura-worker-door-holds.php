@@ -632,6 +632,51 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
+	 * Remove this binding's whole QUEUE on unbind, and the log with it
+	 * (Ruling P44).
+	 *
+	 * A hold is a stored WordPress action — an ability, its input, and the
+	 * ACTOR to run it as — waiting for somebody to approve it. It outlived the
+	 * binding that created it: `Aura_Worker_Unbind::cleanup()` removed the
+	 * dashboard options, the ruleset, the grant key and the token, but not
+	 * this. A site later connected to a DIFFERENT Aura client was served the
+	 * departed client's holds through `/status` and could approve one through
+	 * `elementor_replay_ability`, running the old client's input as the old
+	 * client's actor. So an unbind takes the queue.
+	 *
+	 * Under the hold LOCK, because a hold() racing the wipe would otherwise
+	 * insert into a queue that is being emptied — the same mutex hold() itself
+	 * serialises on. The lock row is released, never deleted, by
+	 * release_lock()'s own fence.
+	 *
+	 * KEPT deliberately: the snapshot envelopes (this site's own content
+	 * history, blog-scoped and grant-gated, restorable by whoever the site is
+	 * bound to next) and the door's 30-day counter buckets (this site's audit
+	 * history). Neither is transactional state of the departed binding.
+	 *
+	 * @param string $claim The site-claim option name.
+	 * @param string $fence This caller's claim fence.
+	 * @return void
+	 */
+	public static function wipe( $claim, $fence ) {
+		global $wpdb;
+		$token = self::take_lock();
+		try {
+			Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::HELD ) . '%', $claim, $fence );
+			Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::CLAIMED ) . '%', $claim, $fence );
+			// The log is emptied inside the same lock: a hold admitted between
+			// the two would otherwise leave an entry for a hold that is gone.
+			Aura_Worker_Door_Log::wipe( $claim, $fence );
+			wp_cache_delete( 'notoptions', 'options' );
+			wp_cache_delete( 'alloptions', 'options' );
+		} finally {
+			if ( false !== $token ) {
+				self::release_lock( $token );
+			}
+		}
+	}
+
+	/**
 	 * @param int $ms Age.
 	 * @return array[] claimed rows older than $ms, keyed by ref.
 	 */

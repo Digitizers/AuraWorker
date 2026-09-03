@@ -255,6 +255,34 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * An unbind takes the door's transactional state with it (Ruling P44).
+	 *
+	 * Holds, claims and log rows are the DEPARTED binding's, and they outlived
+	 * it: `Aura_Worker_Unbind::cleanup()` removed the dashboard options, the
+	 * ruleset, the grant key and the token, so a site later connected to a
+	 * different Aura client was served the old client's holds through
+	 * `/status` and could approve one through `elementor_replay_ability` —
+	 * executing the departed client's stored input as its stored WordPress
+	 * actor.
+	 *
+	 * The epoch goes too, so the next binding starts at cursor 0 with a fresh
+	 * epoch rather than inheriting one it never agreed to. `present()` is
+	 * therefore false afterwards, and `/status` carries no `door` fragment
+	 * until this site is governed again.
+	 *
+	 * KEPT: the snapshot envelopes and the 30-day counter buckets — this
+	 * SITE's content and audit history, neither of them the binding's
+	 * transaction state.
+	 *
+	 * @param string $claim The site-claim option name.
+	 * @param string $fence This caller's claim fence.
+	 * @return void
+	 */
+	public static function wipe_for_unbind( $claim, $fence ) {
+		Aura_Worker_Door_Holds::wipe( $claim, $fence ); // takes the hold lock, and empties the log inside it
+	}
+
+	/**
 	 * Is there a door to REPORT on — an Elementor ability registered NOW, or
 	 * the state a door left behind (Ruling P28)?
 	 *

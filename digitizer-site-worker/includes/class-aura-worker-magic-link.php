@@ -511,6 +511,23 @@ class Aura_Worker_Magic_Link {
 			}
 			return new WP_REST_Response( array( 'error' => 'Connect not completed: the site token could not be stored; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
 		}
+		// THE DEPARTED BINDING'S DOOR STATE, taken the moment its token stops
+		// authenticating (Ruling P44). A connect does NOT require an unbind
+		// first: finish_before_rebind() above returns true immediately for a
+		// site with no unbind marker, so this callback can install a new
+		// binding straight over an old one — and the Elementor door's holds,
+		// claims and log rows would survive into it. A hold is a stored
+		// WordPress action with the actor to run it as; the NEW client would
+		// be served the old client's queue through `/status` and could approve
+		// one through `elementor_replay_ability`.
+		//
+		// Here, not before the token write: until that write lands the old
+		// binding is still live, and a connect that fails afterwards must not
+		// have emptied a queue that still belongs to somebody. Fenced on the
+		// same claim as every other write in this handler.
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			Aura_Worker_Elementor_Door::wipe_for_unbind( $site_claim_key, $site_fence );
+		}
 		// The token is stored, so the credential minted beside the PREVIOUS one
 		// is now a credential without a token — revoke it here, before anything
 		// else can fail (round-34). Left until the mint, a binding or gateway-key

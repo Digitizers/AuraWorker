@@ -169,7 +169,7 @@ final class UnbindSettingsTest extends TestCase {
 	/** The order, witnessed: the token is entered last, and only then. */
 	public function test_the_teardown_deletes_the_token_last(): void {
 		$this->remove();
-		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'token' ), $GLOBALS['_unbind_trace'] );
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'door', 'token' ), $GLOBALS['_unbind_trace'] );
 	}
 
 	public function test_remove_aura_data_requires_manage_options(): void {

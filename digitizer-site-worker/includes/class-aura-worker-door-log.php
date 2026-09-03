@@ -290,6 +290,39 @@ class Aura_Worker_Door_Log {
 		return self::write_option_where( $option, array_merge( $before, $fields ), $before );
 	}
 
+	/**
+	 * Remove this binding's whole LOG on unbind (Ruling P44).
+	 *
+	 * Every numeric row, the ack floor, the closure marker and its refusal
+	 * counter all share the `PREFIX`, so one fenced prefix delete takes them
+	 * — and the epoch goes with them, which is the point: the next binding
+	 * starts a FRESH epoch at cursor 0 rather than inheriting a cursor the
+	 * departed client established.
+	 *
+	 * The 30-day counter buckets (`COUNTER_PREFIX`) are NOT touched: they are
+	 * this SITE's audit history, not the binding's transaction state.
+	 *
+	 * Fenced on the site claim exactly as every other unbind step is, so a
+	 * caller that lost the site mid-cleanup deletes nothing.
+	 *
+	 * @param string $claim The site-claim option name.
+	 * @param string $fence This caller's claim fence.
+	 * @return void
+	 */
+	public static function wipe( $claim, $fence ) {
+		global $wpdb;
+		Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::PREFIX ) . '%', $claim, $fence );
+		Aura_Worker_Rules::delete_option_if_claimed( self::EPOCH, $claim, $fence );
+		// These statements go round the option cache, so evict by hand what
+		// delete_option() would have maintained. The numeric rows are read
+		// through row_from_db()/rows(), which never consult it.
+		foreach ( array( self::EPOCH, self::FLOOR, self::FULL_MARKER, self::FULL_COUNTER ) as $name ) {
+			wp_cache_delete( $name, 'options' );
+		}
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+	}
+
 	/** @param int $seq Seq. @return array|null */
 	public static function get( $seq ) {
 		$row = get_option( self::PREFIX . (int) $seq, null );
