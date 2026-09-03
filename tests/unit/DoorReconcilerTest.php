@@ -662,6 +662,49 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'a mutex older than the stale bound is nobody\'s' );
 	}
 
+	/**
+	 * Ruling P63 (F3): the creation mutex honours its own seq lease.
+	 *
+	 * The reconciler's ROW loop already skipped a pending row whose lease was
+	 * held (Ruling P56), but this separate age-only cleanup did not — so an
+	 * Elementor creation running longer than CLAIM_STALE_MS kept its row and
+	 * LOST its mutex, and a second creation could acquire it and run beside the
+	 * first. The mutex exists to make that impossible.
+	 */
+	public function test_a_mutex_whose_seq_lease_is_held_survives_however_old_it_is(): void {
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => $this->longAgo() ) );
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::seq_lease_name( 9 ) ] = true;
+
+		Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertIsArray( get_option( Aura_Worker_Elementor_Door::CREATING, null ), 'running, not stale' );
+	}
+
+	/** The same mutex with no lease held is cleared by age, exactly as before. */
+	public function test_an_old_mutex_with_no_seq_lease_is_still_cleared(): void {
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => $this->longAgo() ) );
+
+		Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ) );
+	}
+
+	/** A server that cannot answer IS_USED_LOCK keeps it under the hard cap. */
+	public function test_an_unanswerable_mutex_lease_keeps_it_under_the_hard_cap(): void {
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => $this->longAgo() ) );
+		$GLOBALS['_sa_named_lock_error'] = true;
+
+		Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertIsArray( get_option( Aura_Worker_Elementor_Door::CREATING, null ), 'unknown ⇒ running' );
+
+		$this->patchOption( Aura_Worker_Elementor_Door::CREATING, array( 'started_at' => gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 ) ) );
+		Aura_Worker_Elementor_Door::reconcile();
+
+		$GLOBALS['_sa_named_lock_error'] = false;
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'and cleared past the cap' );
+	}
+
 	public function test_the_stale_mutex_clear_never_removes_a_creation_that_took_the_row_after_it_read(): void {
 		// The reconciler reads the mutex, judges it stale, and deletes. A
 		// creation starting in between takes the row for itself — and an

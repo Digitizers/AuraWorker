@@ -805,7 +805,9 @@ class Aura_Worker_Elementor_Door {
 	/**
 	 * The creation mutex is one row per SITE, released by its owner alone —
 	 * so a request that died holding it would close creations for ever. It is
-	 * cleared by AGE, which is what `started_at` is for, and a stamp that
+	 * cleared by the same rule every other liveness question follows (Ruling
+	 * P63): the owning seq's EXECUTION LEASE first, and only when no lease is
+	 * held does AGE decide, which is what `started_at` is for. A stamp that
 	 * cannot be read is not evidence of freshness either.
 	 *
 	 * The clear is a DELETE FENCED on the bytes this call read — the shape
@@ -828,6 +830,18 @@ class Aura_Worker_Elementor_Door {
 		$mutex = maybe_unserialize( $raw );
 		if ( ! is_array( $mutex ) ) {
 			return;
+		}
+		// THE MUTEX'S OWN SEQ LEASE DECIDES FIRST (Ruling P63). The row names
+		// the creation that took it, and that creation holds a named lock for as
+		// long as its database connection lives — so a creation legitimately
+		// running past CLAIM_STALE_MS is not dead, however old its stamp is. The
+		// reconciler's row loop already knew that (Ruling P56); this separate
+		// age-only cleanup did not, and cleared the mutex under a LIVE creation,
+		// letting a second one acquire it and run beside the first — the one
+		// thing the mutex exists to prevent.
+		$seq = (int) ( isset( $mutex['seq'] ) ? $mutex['seq'] : 0 );
+		if ( $seq > 0 && self::write_is_running( $seq, array( 'at' => isset( $mutex['started_at'] ) ? $mutex['started_at'] : '' ) ) ) {
+			return; // running: the lease is held, or unanswerable and inside the hard cap
 		}
 		$started = strtotime( (string) ( isset( $mutex['started_at'] ) ? $mutex['started_at'] : '' ) );
 		if ( false === $started || $started <= $now - (int) floor( self::CLAIM_STALE_MS / 1000 ) ) {
