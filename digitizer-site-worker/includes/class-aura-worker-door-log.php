@@ -433,22 +433,53 @@ class Aura_Worker_Door_Log {
 	/**
 	 * Rows still pending (or never admitted) whose `at` is older than $ms.
 	 *
+	 * ONE statement: count_unacked()'s predicate — the numeric rows above the
+	 * ack floor — with the rows themselves returned instead of counted, then
+	 * `result` and age filtered in PHP. It walked `floor()+1 … highest_row_seq()`
+	 * with one get_option() per number, and this runs at the head of EVERY
+	 * `/status` poll: on a site whose ack is a thousand entries behind, that
+	 * was a thousand option reads per poll on the site's hottest endpoint,
+	 * and a gap between the floor and the top cost a read for each number
+	 * that has no row at all.
+	 *
+	 * Ordered by seq ascending, as the walk was — the reconciler settles in
+	 * that order and its counters are reported in it.
+	 *
 	 * @param int $ms Age in milliseconds.
 	 * @return array[]
 	 */
 	public static function stale_pending( $ms ) {
-		$cut = time() - (int) floor( $ms / 1000 );
+		global $wpdb;
+		$cut  = time() - (int) floor( $ms / 1000 );
+		$like = $wpdb->esc_like( self::PREFIX ) . '%';
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name REGEXP %s AND CAST(SUBSTRING(option_name, %d) AS UNSIGNED) > %d",
+				$like,
+				self::ROW_REGEXP,
+				strlen( self::PREFIX ) + 1,
+				self::floor()
+			),
+			ARRAY_A
+		);
 		$out = array();
-		$top = self::highest_row_seq();
-		for ( $seq = self::floor() + 1; $seq <= $top; $seq++ ) {
-			$row = self::get( $seq );
-			if ( null === $row || 'pending' !== ( $row['result'] ?? '' ) ) {
+		foreach ( (array) $rows as $r ) {
+			if ( ! isset( $r['option_name'], $r['option_value'] ) ) {
 				continue;
 			}
-			if ( strtotime( (string) ( $row['at'] ?? '' ) ) <= $cut ) {
-				$out[] = $row;
+			$row = maybe_unserialize( $r['option_value'] );
+			if ( ! is_array( $row ) || 'pending' !== ( $row['result'] ?? '' ) ) {
+				continue;
 			}
+			if ( strtotime( (string) ( $row['at'] ?? '' ) ) > $cut ) {
+				continue;
+			}
+			// Keyed by the NAME's suffix, not by the row's own `seq` field: the
+			// name is what the number is, and a row whose stored `seq` somehow
+			// disagreed must still sort where its row actually lives.
+			$out[ (int) substr( (string) $r['option_name'], strlen( self::PREFIX ) ) ] = $row;
 		}
-		return $out;
+		ksort( $out, SORT_NUMERIC );
+		return array_values( $out );
 	}
 }

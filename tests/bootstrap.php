@@ -1914,6 +1914,29 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return $out;
 			}
+			// Aura_Worker_Door_Log::stale_pending() (2.16.0): the numeric log
+			// rows ABOVE the ack floor, names AND values, in ONE statement —
+			// count_unacked()'s predicate with the rows themselves returned
+			// instead of counted. The per-seq get_option() walk it replaced
+			// was invisible here (the option cache answers it without ever
+			// reaching $wpdb), so it is the SHAPE that is pinned, and this
+			// branch is what pins it. Read against the merged "database" view,
+			// the same one every other door-log branch reads.
+			if ( preg_match( "/^SELECT option_name, option_value FROM \\S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\\(SUBSTRING\\(option_name, \\d+\\) AS UNSIGNED\\) > (\\d+)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$floor = (int) $m[3];
+				$out   = array();
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( ! preg_match( '/_([0-9]+)$/', (string) $name, $mm ) || (int) $mm[1] <= $floor ) {
+						continue;
+					}
+					$out[] = array(
+						'option_name'  => (string) $name,
+						'option_value' => (string) sa_read_option_uncached( (string) $name ),
+					);
+				}
+				return $out;
+			}
 			// The site-wide holder statement (#434 Task 9, reshaped in Task 10's
 			// fix round): the same nonce proof, asked of every Application
 			// Password list at once, answering with ONE ROW PER OWNER behind a

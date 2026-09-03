@@ -253,4 +253,40 @@ final class DoorLogTest extends TestCase {
 
 		$this->assertSame( array( $old ), array_column( $stale, 'seq' ), 'the fresh pending row and the settled row are both excluded' );
 	}
+
+	public function test_stale_pending_reads_the_rows_above_the_floor_in_one_statement(): void {
+		// It used to walk floor()+1 .. highest_row_seq() with one get_option()
+		// per number — on EVERY /status poll, on a site whose ack is behind by
+		// a thousand entries. The option cache answers those reads without
+		// ever reaching $wpdb, so the cost is invisible in $_db_queries: the
+		// SHAPE is what this pins.
+		for ( $i = 0; $i < 5; $i++ ) {
+			$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+			$this->backdate( $seq, 3600 );
+		}
+		$GLOBALS['_db_queries'] = array();
+
+		$stale = Aura_Worker_Door_Log::stale_pending( 60000 );
+
+		$this->assertSame( array( 1, 2, 3, 4, 5 ), array_column( $stale, 'seq' ) );
+		$this->assertCount( 1, $GLOBALS['_db_queries'], 'one statement, whatever the log holds' );
+		$this->assertStringContainsString( 'SELECT option_name, option_value', $GLOBALS['_db_queries'][0] );
+		$this->assertStringContainsString( 'AS UNSIGNED) > 0', $GLOBALS['_db_queries'][0], 'bounded by the ack floor in SQL' );
+	}
+
+	public function test_stale_pending_starts_above_the_ack_floor_and_skips_a_hole(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		for ( $i = 1; $i <= 3; $i++ ) {
+			Aura_Worker_Door_Log::open_pending( $this->entry() );
+			Aura_Worker_Door_Log::admit( $i );
+			Aura_Worker_Door_Log::settle( $i, array( 'result' => 'ok' ) );
+		}
+		Aura_Worker_Door_Log::ack( $epoch, 2 ); // floor 2; rows 1 and 2 gone
+		$four = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->backdate( $four, 3600 );
+		// A number with no row at all, between the floor and the top.
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::PREFIX . 3 ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::PREFIX . 3 ] );
+
+		$this->assertSame( array( $four ), array_column( Aura_Worker_Door_Log::stale_pending( 60000 ), 'seq' ) );
+	}
 }
