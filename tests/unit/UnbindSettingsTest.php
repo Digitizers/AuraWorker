@@ -141,7 +141,7 @@ final class UnbindSettingsTest extends TestCase {
 	 */
 	public function test_an_unreadable_marker_is_reported_as_unknown_not_as_four_debts(): void {
 		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
-		$this->assertCount( 5, Aura_Worker_Unbind::leftovers(), 'the gate still fails closed' );
+		$this->assertCount( 4, Aura_Worker_Unbind::leftovers(), 'the gate still fails closed' );
 
 		$html = $this->panel();
 		$this->assertStringContainsString( 'Disconnected by Aura', $html );

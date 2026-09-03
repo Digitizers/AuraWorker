@@ -38,15 +38,7 @@ class Aura_Worker_Door_Holds {
 	/** The same lease, over a log SEQ: every governed write, not only a replay (Ruling P56). */
 	const SEQ_LEASE_PREFIX = 'aura_door_seq_';
 	const LEASE_HARD_CAP_S = 86400;
-	/* wipe()'s three answers, NAMED so a caller cannot conflate them (Ruling P49'). */
-	const WIPE_DONE   = 'wiped';  // every statement ran under a lock this call held
-	const WIPE_FAILED = 'failed'; // they ran and at least one failed — the caller may still finish its own share
-	const WIPE_BUSY   = 'busy';   // nothing was attempted: no lock (P46), or a replay in flight (P50)
 	const LOCK_S  = 30;
-	/** Extra seconds a wipe waits past LOCK_S, by when any holder is stale (Ruling P46). */
-	const WIPE_GRACE_S = 3;
-	/** How long a wipe sleeps between attempts on a busy lock. */
-	const WIPE_WAIT_US = 500000;
 
 	/**
 	 * @param array $call { ability, input, touches, actor, verdict, rule }.
@@ -167,6 +159,11 @@ class Aura_Worker_Door_Holds {
 		$now = time();
 		$row = array(
 			'ref'        => $ref,
+			// WHICH BINDING queued this call (Ruling P58). A hold is a stored
+			// WordPress action waiting for somebody to approve it, and only the
+			// client that queued it may ever be shown or given it — so the
+			// generation is written here and every reader compares it.
+			'binding'    => Aura_Worker_Door_Log::binding(),
 			'ability'    => (string) $call['ability'],
 			'input'      => is_array( $call['input'] ?? null ) ? $call['input'] : array(),
 			'touches'    => is_array( $call['touches'] ?? null ) ? $call['touches'] : array(),
@@ -237,6 +234,12 @@ class Aura_Worker_Door_Holds {
 		$ref = self::clean( $ref );
 		$row = get_option( self::HELD . $ref, null );
 		if ( ! is_array( $row ) ) {
+			return null;
+		}
+		if ( ! self::row_is_current( $row ) ) {
+			// Another binding's hold: absent to every reader, and left for the
+			// sweep to remove (Ruling P58). Not deleted here — a reader has no
+			// business deleting, and the sweep already owns that decision.
 			return null;
 		}
 		if ( self::is_expired( $row, time() ) ) {
@@ -393,32 +396,14 @@ class Aura_Worker_Door_Holds {
 	 * @return array|WP_Error The claimed entry, or `not_held`.
 	 */
 	public static function claim( $ref ) {
-		// UNDER THE HOLD LOCK (Ruling P47). Only admission used to take this
-		// mutex, so a claim could complete its move in the window a
-		// changed-client connect's (or an unbind's) wipe was deleting rows in —
-		// and the replay it belongs to then ran on into the callback,
-		// recreating door state while executing the DEPARTED client's stored
-		// mutation under the replacement binding. A lock that cannot be taken
-		// answers the lost-race `not_held` this method already has: Aura
-		// retries, and finds out what happened from the hold list.
-		$token = self::take_lock();
-		if ( false === $token ) {
-			return self::not_held();
-		}
-		try {
-			return self::claim_locked( $ref );
-		} finally {
-			self::release_lock( $token );
-		}
-	}
-
-	/** The body of claim(), run only while the lock is held. */
-	private static function claim_locked( $ref ) {
 		global $wpdb;
 		$ref  = self::clean( $ref );
 		$held = self::from_db( self::HELD . $ref );
 		if ( null === $held ) {
 			return self::not_held();
+		}
+		if ( ! self::row_is_current( $held ) ) {
+			return self::not_held(); // another binding's approval is not this one's to run (Ruling P58)
 		}
 		if ( self::is_expired( $held, time() ) ) {
 			// Refused BEFORE the twin is inserted (Ruling P18): claiming an
@@ -437,7 +422,12 @@ class Aura_Worker_Door_Holds {
 		// one that approved this call. Deliberately NOT the log epoch: Aura
 		// may rotate that legitimately through `/door/rotate` on a rewind, and
 		// a rotation is not a rebind.
-		$claimed['binding']    = Aura_Worker_Door_Log::binding();
+		if ( ! isset( $claimed['binding'] ) || '' === (string) $claimed['binding'] ) {
+			// A hold carries its binding from hold() (Ruling P58); this only
+			// fills it in for a row queued by a build before that, so the P51
+			// fence has something to compare rather than waving it through.
+			$claimed['binding'] = Aura_Worker_Door_Log::binding();
+		}
 		if ( ! Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed ) ) {
 			return self::not_held(); // already claimed
 		}
@@ -497,26 +487,6 @@ class Aura_Worker_Door_Holds {
 	 * @return bool The row is held again, by this call.
 	 */
 	public static function unclaim( $ref ) {
-		// UNDER THE LOCK as well (Ruling P47), for symmetry with the wipe
-		// rather than with claim(): unclaim INSERTS a held row, and a wipe that
-		// has already run its held-prefix delete would otherwise find one
-		// afterwards — the same shape as the claim race, in the other
-		// direction. A lock it cannot take answers false, which give_back()
-		// already reads correctly: the hold is not back, so the approval is
-		// reported as not retryable rather than promised.
-		$token = self::take_lock();
-		if ( false === $token ) {
-			return false;
-		}
-		try {
-			return self::unclaim_locked( $ref );
-		} finally {
-			self::release_lock( $token );
-		}
-	}
-
-	/** The body of unclaim(), run only while the lock is held. */
-	private static function unclaim_locked( $ref ) {
 		global $wpdb;
 		$ref     = self::clean( $ref );
 		$claimed = self::from_db( self::CLAIMED . $ref );
@@ -524,7 +494,9 @@ class Aura_Worker_Door_Holds {
 			return false;
 		}
 		$held = $claimed;
-		unset( $held['claimed_at'], $held['terminal_seq'], $held['binding'] );
+		// `binding` STAYS (Ruling P58): it is the hold's own, written when the
+		// call was queued, and the row goes back to the queue it came from.
+		unset( $held['claimed_at'], $held['terminal_seq'] );
 		// The witness the sweep reads to tell this move from claim()'s
 		// (Ruling P41). Stamped BEFORE the insert, so a row that exists always
 		// carries it.
@@ -597,6 +569,9 @@ class Aura_Worker_Door_Holds {
 			return array();
 		}
 		foreach ( $held as $ref => $row ) {
+			if ( ! self::row_is_current( $row ) ) {
+				continue; // another binding's queue (Ruling P58)
+			}
 			if ( null !== self::get_claimed( $ref ) ) {
 				continue;
 			}
@@ -650,6 +625,15 @@ class Aura_Worker_Door_Holds {
 			return 0; // unreadable ⇒ nothing to sweep (Ruling P57); never delete on a guess
 		}
 		foreach ( $held as $ref => $row ) {
+			if ( ! self::row_is_current( $row ) && null === self::get_claimed( $ref ) ) {
+				// A departed binding's hold, with no replay mid-move (Ruling
+				// P58). Fenced on the bytes just read, like every other
+				// conditional delete here.
+				if ( self::delete_held_fenced( $ref, $row ) ) {
+					$gone++;
+				}
+				continue;
+			}
 			$claimed = self::get_claimed( $ref );
 			if ( null !== $claimed ) {
 				$at = strtotime( (string) ( isset( $claimed['claimed_at'] ) ? $claimed['claimed_at'] : '' ) );
@@ -729,99 +713,6 @@ class Aura_Worker_Door_Holds {
 		wp_cache_delete( self::CLAIMED . $ref, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		return true;
-	}
-
-	/**
-	 * Remove this binding's whole QUEUE on unbind, and the log with it
-	 * (Ruling P44).
-	 *
-	 * A hold is a stored WordPress action — an ability, its input, and the
-	 * ACTOR to run it as — waiting for somebody to approve it. It outlived the
-	 * binding that created it: `Aura_Worker_Unbind::cleanup()` removed the
-	 * dashboard options, the ruleset, the grant key and the token, but not
-	 * this. A site later connected to a DIFFERENT Aura client was served the
-	 * departed client's holds through `/status` and could approve one through
-	 * `elementor_replay_ability`, running the old client's input as the old
-	 * client's actor. So an unbind takes the queue.
-	 *
-	 * Under the hold LOCK, because a hold() racing the wipe would otherwise
-	 * insert into a queue that is being emptied — the same mutex hold() itself
-	 * serialises on. The lock row is released, never deleted, by
-	 * release_lock()'s own fence.
-	 *
-	 * KEPT deliberately: the snapshot envelopes (this site's own content
-	 * history, blog-scoped and grant-gated, restorable by whoever the site is
-	 * bound to next) and the door's 30-day counter buckets (this site's audit
-	 * history). Neither is transactional state of the departed binding.
-	 *
-	 * @param string $claim The site-claim option name.
-	 * @param string $fence This caller's claim fence.
-	 * @return string One of self::WIPE_DONE, self::WIPE_FAILED, self::WIPE_BUSY.
-	 *                Named constants rather than true/false/null (Ruling P49'):
-	 *                the three answers are three different instructions to the
-	 *                caller — you are done, finish your own share, touch
-	 *                nothing — and a boolean conflates the last two, which is
-	 *                the difference between deleting the creation mutex under a
-	 *                live replay and leaving it alone.
-	 */
-	public static function wipe( $claim, $fence ) {
-		global $wpdb;
-		// ONLY UNDER A LOCK THIS CALL ACTUALLY TOOK (Ruling P46). take_lock()
-		// answers false when another request owns the mutex, and entering the
-		// deletes anyway was worse than not wiping at all: the old binding's
-		// hold() resumes inside hold_locked() and INSERTS its held row after
-		// the prefix deletes have run, so a changed-client reconnect finished
-		// with a departed client's stored mutation sitting in the new
-		// binding's queue, visible through `/status` and replayable.
-		$token = self::take_wipe_lock();
-		if ( false === $token ) {
-			// BUSY, not FAILED: nothing was attempted, so the caller must not
-			// go on to delete its own share either (Ruling P46). FAILED means
-			// the statements RAN and some of them failed, which is a different
-			// instruction — carry on and let the verification decide.
-			return self::WIPE_BUSY;
-		}
-		try {
-			// NO WIPE ACROSS A LIVE REPLAY (Ruling P50). This is the mechanism
-			// the previous three rounds kept patching around: a replay that has
-			// CLAIMED its hold is between the claim and its callback, and
-			// nothing the wipe deletes can make that request stop. So the wipe
-			// does not start.
-			//
-			// A claimed row younger than CLAIM_STALE_MS is a replay in flight;
-			// anything older is a died request the reconciler owns, and waiting
-			// for it would block a rebind for ever. Because claim() takes this
-			// same lock (Ruling P47a), a claim cannot begin while this check
-			// and the deletes below are running — so after a successful wipe
-			// there is no replay in flight, and none can start: the held rows
-			// it would claim from are gone.
-			//
-			// COST, stated: a replay that died mid-flight blocks a rebind for
-			// at most CLAIM_STALE_MS, until `/status` reconciles it. The unbind
-			// marks `door` a leftover and retries; the changed-binding connect
-			// answers `aura_door_busy` and Aura retries.
-			if ( self::a_replay_is_in_flight() ) {
-				return self::WIPE_BUSY; // nothing attempted, like a lock that could not be taken
-			}
-			// EVERY result counted (Ruling P49). A transient database error on
-			// the held-prefix delete used to be invisible: the later statements
-			// succeeded, the wipe reported true, and a changed-client connect
-			// persisted the new binding over an old client's held mutation that
-			// was still there — visible and replayable by the new client. `&&`
-			// AFTER the call on purpose, never before: every statement runs, so
-			// a partial wipe leaves as little behind as it can and the next
-			// pass finishes it.
-			$ok = Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::HELD ) . '%', $claim, $fence );
-			$ok = Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::CLAIMED ) . '%', $claim, $fence ) && $ok;
-			// The log is emptied inside the same lock: a hold admitted between
-			// the two would otherwise leave an entry for a hold that is gone.
-			$ok = Aura_Worker_Door_Log::wipe( $claim, $fence ) && $ok;
-			wp_cache_delete( 'notoptions', 'options' );
-			wp_cache_delete( 'alloptions', 'options' );
-			return $ok ? self::WIPE_DONE : self::WIPE_FAILED;
-		} finally {
-			self::release_lock( $token );
-		}
 	}
 
 	/**
@@ -961,77 +852,6 @@ class Aura_Worker_Door_Holds {
 	 */
 	public static function lease_is_held( $ref ) {
 		return self::lock_is_used( self::lease_name( $ref ) );
-	}
-
-	/**
-	 * Is any replay between its claim and its callback right now (Ruling P50)?
-	 *
-	 * The EXECUTION LEASE decides first (Ruling P52): a claimed row whose
-	 * named lock is held belongs to a request that is demonstrably still
-	 * alive, however long it has been running — age is not death, and an
-	 * approved callback may legitimately run for longer than CLAIM_STALE_MS.
-	 * Only when no lease is held does the age rule apply: younger than
-	 * CLAIM_STALE_MS is in flight, older is a died request somebody else owns.
-	 * A claim whose stamp cannot be read is treated as IN FLIGHT — an
-	 * unreadable stamp is not evidence of staleness, the same rule `sweep()`
-	 * applies in the other direction — and so is a claimed-row READ that
-	 * failed outright (Ruling P49').
-	 *
-	 * @return bool
-	 */
-	private static function a_replay_is_in_flight() {
-		global $wpdb;
-		$ms               = class_exists( 'Aura_Worker_Elementor_Door' ) ? (int) Aura_Worker_Elementor_Door::CLAIM_STALE_MS : 600000;
-		$cut              = time() - (int) floor( $ms / 1000 );
-		$wpdb->last_error = '';
-		$rows             = self::rows( self::CLAIMED );
-		if ( null === $rows || '' !== (string) $wpdb->last_error ) {
-			// A READ THAT FAILED IS NOT AN EMPTY SET (Ruling P49'). The whole
-			// point of this check is to refuse while a replay MAY be running,
-			// and "may" is exactly what an unreadable answer leaves.
-			return true;
-		}
-		$cap = time() - self::LEASE_HARD_CAP_S;
-		foreach ( $rows as $ref => $row ) {
-			// THE shared predicate (Ruling P54) — the same one the reconciler
-			// and `/status` are filtered by, so a claim cannot be alive for one
-			// of them and dead for another.
-			if ( self::claim_is_alive( (string) $ref, (array) $row, $cut, $cap ) ) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	/**
-	 * take_lock() with the patience a wipe can afford (Ruling P46).
-	 *
-	 * hold()'s own three tries are right for a WRITE that a caller can simply
-	 * retry — but a wipe that gives up silently leaves the departed client's
-	 * approvals in the new binding's queue, so it waits instead. The budget is
-	 * LOCK_S plus a small grace: any holder older than LOCK_S is stale by
-	 * take_lock()'s own rule and gets taken over, so a live holder is the only
-	 * thing that can outlast this, and a live holder finishes in milliseconds.
-	 *
-	 * The suite must not sleep for half a minute to prove a busy lock, so the
-	 * wait is skippable through `$GLOBALS['_sa_door_wipe_no_wait']` — read
-	 * only, never written by production code, and the tests' bootstrap turns
-	 * it ON by default so no test can sleep by accident.
-	 *
-	 * @return string|false The lock's fence value, or false.
-	 */
-	private static function take_wipe_lock() {
-		$deadline = microtime( true ) + (float) ( self::LOCK_S + self::WIPE_GRACE_S );
-		while ( true ) {
-			$token = self::take_lock();
-			if ( false !== $token ) {
-				return $token;
-			}
-			if ( ! empty( $GLOBALS['_sa_door_wipe_no_wait'] ) || microtime( true ) >= $deadline ) {
-				return false;
-			}
-			usleep( self::WIPE_WAIT_US );
-		}
 	}
 
 	/**
@@ -1185,13 +1005,70 @@ class Aura_Worker_Door_Holds {
 		if ( null === $claimed || null === $held ) {
 			return null;
 		}
-		$refs = array_keys( $claimed );
+		$refs = array();
+		foreach ( $claimed as $ref => $row ) {
+			if ( self::row_is_current( $row ) ) {
+				$refs[] = $ref;
+			}
+		}
 		foreach ( $held as $ref => $row ) {
+			// Only THIS binding's rows charge a slot (Ruling P58): a departed
+			// client's queue must not keep the current one out of its own.
+			if ( ! self::row_is_current( $row ) ) {
+				continue;
+			}
 			if ( ! self::is_expired( $row, $now ) || in_array( $ref, $refs, true ) ) {
 				$refs[] = $ref;
 			}
 		}
 		return count( array_unique( $refs ) );
+	}
+
+	/**
+	 * Delete one held row while it still carries the bytes just read.
+	 *
+	 * @param string $ref Ref.
+	 * @param array  $row The row as it was read.
+	 * @return bool One row removed.
+	 */
+	private static function delete_held_fenced( $ref, array $row ) {
+		global $wpdb;
+		$option = self::HELD . self::clean( $ref );
+		$gone   = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+				$option,
+				maybe_serialize( $row )
+			)
+		);
+		wp_cache_delete( $option, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return 1 === (int) $gone;
+	}
+
+	/**
+	 * Is this row THIS binding's (Ruling P58)?
+	 *
+	 * A hold is a stored WordPress action with the actor to run it as, so only
+	 * the client that queued it may be shown it or given it. Rather than
+	 * DELETING a departed client's queue — six review rounds' worth of races
+	 * between that delete and a replay already running — every row records the
+	 * generation it was queued under and every reader compares it. A row from
+	 * another generation is simply invisible: not listed, not claimable, not
+	 * counted against the cap, and swept when the reconciler next runs.
+	 *
+	 * A row with NO binding predates the rule and is treated as ours: refusing
+	 * it would strand approvals nobody can re-issue across an upgrade.
+	 *
+	 * @param array $row The held or claimed row.
+	 * @return bool
+	 */
+	public static function row_is_current( array $row ) {
+		$was = (string) ( isset( $row['binding'] ) ? $row['binding'] : '' );
+		if ( '' === $was ) {
+			return true; // queued before the generation existed
+		}
+		return $was === Aura_Worker_Door_Log::binding();
 	}
 
 	/**

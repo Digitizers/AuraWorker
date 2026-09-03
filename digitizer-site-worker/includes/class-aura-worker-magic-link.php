@@ -520,34 +520,35 @@ class Aura_Worker_Magic_Link {
 		// An unbind still wipes unconditionally; this condition is the
 		// connect's alone.
 		//
-		// BEFORE the token write, not after (Ruling P46): the wipe can refuse
-		// — another request may hold the hold queue's mutex — and a refusal
-		// must leave this site exactly as it was. Nothing of the install has
-		// happened yet, so the old binding is still whole and Aura simply
-		// retries in a few seconds.
+		// A NEW GENERATION, not a wipe (Ruling P58). Nothing is deleted: every
+		// held, claimed and log row the departed binding wrote keeps its own
+		// `binding`, and from this moment the queue's readers cannot see them
+		// — `listing()` omits them, `claim()` answers `not_held`, the cap does
+		// not charge for them, and the reconciler's sweep removes the held ones
+		// in its own time. The log stays and is still served: it is the SITE's
+		// audit trail, each entry carrying the binding that wrote it, and the
+		// new client drains it by acking.
+		//
+		// So this cannot refuse, cannot wait on a lock, and has nothing to undo
+		// if a later write in this handler fails — which is what six rounds of
+		// racing a delete against a live replay were trying and failing to buy.
 		$same_binding = '' !== $prev_client
 			&& '' !== $client
 			&& hash_equals( $prev_client, $client )
 			&& '' !== $prev_dashboard
 			&& $prev_dashboard === $dashboard_url;
 		if ( ! $same_binding && class_exists( 'Aura_Worker_Elementor_Door' ) ) {
-			if ( ! Aura_Worker_Elementor_Door::wipe_for_unbind( $site_claim_key, $site_fence ) ) {
-				$release();
-				return new WP_Error(
-					'aura_door_busy',
-					__( 'This site is admitting an Elementor call for approval and could not clear the previous binding\'s queue; retry.', 'digitizer-site-worker' ),
-					array( 'status' => 503, 'retry_after' => 5 )
-				);
-			}
+			Aura_Worker_Elementor_Door::rebind();
 		}
 		// THE CONNECT USER, after the wipe and not before it (Ruling P48). This
 		// used to be the handler's first persistent write, so the retryable
-		// `aura_door_busy` path above left the OLD token, dashboard and client
-		// active while token-only requests started running as the NEW
-		// administrator — and releasing the site claim restores nothing. The
-		// wipe is now the first persistent effect of a connect, so a refusal
-		// has nothing to undo. Phase B step (2) deletes exactly this option,
-		// which is why it still comes after finish_before_rebind() above.
+		// refusal path above left the OLD token, dashboard and client active
+		// while token-only requests started running as the NEW administrator —
+		// and releasing the site claim restores nothing. Under Ruling P58 the
+		// rebind cannot refuse at all, so the ordering is no longer load
+		// bearing for that reason; it is kept because Phase B step (2) deletes
+		// exactly this option, which is why it comes after
+		// finish_before_rebind() above.
 		if ( ! empty( $stored['connect_user_id'] ) ) {
 			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
 		}

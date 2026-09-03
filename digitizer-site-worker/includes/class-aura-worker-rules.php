@@ -1669,48 +1669,6 @@ class Aura_Worker_Rules {
 	}
 
 	/**
-	 * delete_option_if_claimed()'s PREFIX sibling: every row whose name matches
-	 * `$like`, deleted only while the site claim still carries `$fence`.
-	 *
-	 * The Elementor door's state is not a fixed set of option names — one row
-	 * per hold, one per claim, one per log seq — so an unbind cannot enumerate
-	 * it into per-name deletes without issuing thousands of statements. The
-	 * fence is identical: the same JOIN on the claim row, so a caller that
-	 * lost the site mid-cleanup deletes nothing at all.
-	 *
-	 * `$like` is passed through verbatim (the caller builds it with
-	 * `$wpdb->esc_like()`), and the option cache is not consulted — these
-	 * statements go round it, so callers evict what they must.
-	 *
-	 * A TRUTHFUL BOOL, not a row count (Ruling P49). Deleting zero rows is a
-	 * legitimate success — there was nothing there — and a caller reading `0`
-	 * as failure, or reading a count as success, gets the answer backwards.
-	 * The only failure is the statement itself: `false` from `$wpdb`, or a
-	 * `last_error` beside a count.
-	 *
-	 * @param string $like  The LIKE pattern for option_name.
-	 * @param string $claim The site-claim option name.
-	 * @param string $fence This caller's claim fence.
-	 * @return bool The statement ran.
-	 */
-	public static function delete_options_like_if_claimed( $like, $claim, $fence ) {
-		global $wpdb;
-		if ( '' === (string) $fence || '' === (string) $claim || '' === (string) $like ) {
-			return false;
-		}
-		$wpdb->last_error = '';
-		$rows             = $wpdb->query(
-			$wpdb->prepare(
-				"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name LIKE %s",
-				$claim,
-				$wpdb->esc_like( $fence . '|' ) . '%',
-				$like
-			)
-		);
-		return false !== $rows && '' === (string) $wpdb->last_error;
-	}
-
-	/**
 	 * One raw options-table read for callers outside this class — the row, not
 	 * the option cache. Used to VERIFY a claim-conditional write landed
 	 * (round-18): those statements go round the cache, and a write that failed

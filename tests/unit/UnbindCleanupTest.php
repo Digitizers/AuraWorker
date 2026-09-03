@@ -194,7 +194,7 @@ final class UnbindCleanupTest extends TestCase {
 		$left = Aura_Worker_Unbind::leftovers();
 
 		$GLOBALS['_sa_option_read_fail'] = array();
-		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' ), $left );
+		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ), $left );
 	}
 
 	public function test_leftovers_names_every_pending_step_and_nothing_else(): void {
@@ -950,51 +950,7 @@ final class UnbindCleanupTest extends TestCase {
 	 * client's holds through `/status` and could approve one through
 	 * `elementor_replay_ability`.
 	 */
-	public function test_cleanup_takes_the_doors_queue_and_log_and_keeps_the_history(): void {
-		$door  = $this->seedDoor();
-		$this->assertNotEmpty( Aura_Worker_Door_Holds::listing(), 'the queue is there to begin with' );
-		$fence = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-
-		$this->assertSame( array(), $this->doorRows(), 'no held, claimed, log, floor, marker, counter, epoch, mutex or throttle row survives' );
-		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'the creation mutex is not inherited' );
-		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::PRUNED_AT, false ), 'nor the retention throttle' );
-		$this->assertFalse( get_option( Aura_Worker_Door_Log::BINDING, false ), 'nor the binding generation' );
-		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $door['held'] ) );
-		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $door['claimed'] ) );
-		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
-		$this->assertSame( 0, Aura_Worker_Door_Log::floor() );
-		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
-		$this->assertFalse( Aura_Worker_Elementor_Door::present(), 'and the site reports no door at all' );
-		$this->assertNull( Aura_Worker_Elementor_Door::status_fragment( 0, '' ) );
-
-		// KEPT: this SITE's history, not the departed binding's state.
-		$this->assertSame( 4, (int) get_option( $door['bucket'], 0 ), 'the 30-day counter bucket survives' );
-		$this->assertNotNull( ( new Aura_Worker_Snapshots() )->get( $door['env'] ), 'and so does the snapshot envelope' );
-	}
-
 	/** …and the next binding starts a FRESH epoch at cursor 0. */
-	public function test_the_next_binding_starts_a_new_epoch_with_an_empty_log(): void {
-		$door   = $this->seedDoor();
-		$before = Aura_Worker_Door_Log::epoch();
-		$fence  = Aura_Worker_Magic_Link::claim_site();
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-
-		$GLOBALS['_sa_force_door'] = true; // the next binding's site has Elementor
-		Aura_Worker_Elementor_Door::reset_for_tests();
-		$frag = Aura_Worker_Elementor_Door::status_fragment( 0, '' );
-
-		$this->assertIsArray( $frag );
-		$this->assertNotSame( $before, $frag['epoch'], 'a fresh epoch, not the departed client\'s' );
-		$this->assertSame( array(), $frag['log'] );
-		$this->assertSame( array(), $frag['held'] );
-		$this->assertSame( 0, $frag['log_floor'] );
-		$this->assertSame( 0, $frag['log_unacked'] );
-		$this->assertNull( $frag['log_full'] );
-	}
-
 	/** Backdate a claimed row past CLAIM_STALE_MS, in the database and the cache alike. */
 	private function ageClaim( string $ref, int $extra_s = 60 ): void {
 		$name = Aura_Worker_Door_Holds::CLAIMED . $ref;
@@ -1030,57 +986,12 @@ final class UnbindCleanupTest extends TestCase {
 	 * the prefix deletes have run, so a changed-client reconnect finished with
 	 * a departed client's stored mutation in the new binding's queue.
 	 */
-	public function test_a_wipe_that_cannot_take_the_hold_lock_deletes_nothing(): void {
-		$this->seedDoor();
-		$lock   = $this->holdTheLock();
-		$before = $this->doorRows(); // the lock row included: it must survive too
-		$fence  = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-
-		$this->assertSame( $before, $this->doorRows(), 'every row survives' );
-		$this->assertSame( $lock, get_option( Aura_Worker_Door_Holds::LOCK ), "and the holder's lock is untouched" );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/** A STALE holder is taken over by take_lock()'s own rule, and the wipe runs. */
-	public function test_a_wipe_takes_over_a_stale_hold_lock_and_wipes(): void {
-		$this->seedDoor();
-		$this->holdTheLock( Aura_Worker_Door_Holds::LOCK_S + 60 );
-		$fence = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-
-		$this->assertSame( array(), $this->doorRows() );
-		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ), 'and the wipe released the lock it took' );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/**
 	 * …and the unbind reports the debt rather than claiming completion: `door`
 	 * is a leftover like any other, so the token stays and the drain's next
 	 * Phase-B pass wipes for real.
 	 */
-	public function test_an_unbind_blocked_on_the_hold_lock_reports_door_and_completes_on_the_next_pass(): void {
-		$this->seedDoor();
-		$this->holdTheLock();
-		$fence = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ), 'not complete' );
-		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers() );
-		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'the token stays while anything is owed' );
-		$this->assertNotEmpty( Aura_Worker_Door_Holds::listing(), 'and the queue is still there' );
-
-		// The holder finishes; the drain calls cleanup() again.
-		delete_option( Aura_Worker_Door_Holds::LOCK );
-		unset( $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] );
-
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertSame( array(), Aura_Worker_Unbind::leftovers() );
-		$this->assertSame( array(), $this->doorRows() );
-		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
-	}
-
 	/**
 	 * Ruling P50: a wipe does not START while a replay is in flight.
 	 *
@@ -1089,46 +1000,8 @@ final class UnbindCleanupTest extends TestCase {
 	 * and nothing the wipe deletes can make that request stop — so the wipe
 	 * refuses instead, and the caller retries.
 	 */
-	public function test_a_wipe_refuses_while_a_replay_is_in_flight(): void {
-		$door = $this->seedDoor();
-		// The claimed row is FRESH again: a live replay, not a died one.
-		$this->ageClaim( $door['claimed'], -30 ); // thirty seconds in the future of the bound
-		$before = $this->doorRows();
-		$fence  = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-
-		$this->assertSame( $before, $this->doorRows(), 'nothing was deleted' );
-		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ), 'and the lock it took was released' );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/** A claim older than CLAIM_STALE_MS is a died replay the reconciler owns: the wipe proceeds. */
-	public function test_a_wipe_proceeds_past_a_stale_claim(): void {
-		$door = $this->seedDoor(); // seedDoor() already ages its claim
-		$fence = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-
-		$this->assertSame( array(), $this->doorRows() );
-		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $door['claimed'] ) );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/** A claim whose stamp cannot be read is treated as IN FLIGHT, not as stale. */
-	public function test_a_claim_with_an_unreadable_stamp_stops_the_wipe(): void {
-		$door = $this->seedDoor();
-		$name = Aura_Worker_Door_Holds::CLAIMED . $door['claimed'];
-		$row  = get_option( $name, array() );
-		$row['claimed_at']            = '';
-		$GLOBALS['_options'][ $name ] = $row;
-		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
-		$fence                        = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/**
 	 * Ruling P49: a wipe answers true only when every statement ran AND
 	 * nothing is left.
@@ -1139,59 +1012,11 @@ final class UnbindCleanupTest extends TestCase {
 	 * held mutation that was still there, visible and replayable by the new
 	 * client.
 	 */
-	public function test_a_wipe_whose_held_delete_fails_answers_false(): void {
-		$door                                                                        = $this->seedDoor();
-		$GLOBALS['_sa_option_delete_like_fail'][ $this->heldLikePattern() ]           = true;
-		$fence                                                                       = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-
-		// The rest of the statements still RAN — a partial wipe leaves as
-		// little behind as it can, and the next pass finishes it.
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $door['held'] ), 'the family that failed is untouched' );
-		$this->assertSame( array( 'aura_worker_door_held_' . $door['held'] ), $this->doorRows(), 'and nothing else survived' );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/** …and the unbind reports it, so the drain finishes the job. */
-	public function test_a_partial_wipe_keeps_the_unbind_incomplete_until_it_finishes(): void {
-		$this->seedDoor();
-		$GLOBALS['_sa_option_delete_like_fail'][ $this->heldLikePattern() ] = true;
-		$fence                                                            = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers() );
-		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
-
-		$GLOBALS['_sa_option_delete_like_fail'] = array(); // the database recovers
-
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertSame( array(), $this->doorRows() );
-		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
-	}
-
 	/**
 	 * Every statement succeeding is not the same claim as "nothing is left":
 	 * the answer is the second one.
 	 */
-	public function test_a_wipe_answers_false_when_a_row_survives_every_successful_statement(): void {
-		$this->seedDoor();
-		$fence = Aura_Worker_Magic_Link::claim_site();
-		// A row that reappears the instant the deletes are done — the shape a
-		// racer, or a fence that stopped matching, would leave.
-		$GLOBALS['_sa_after_option_read'] = null;
-		$survivor                         = 'aura_worker_door_log_99';
-		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'a clean wipe first' );
-		$GLOBALS['_options'][ $survivor ] = array( 'seq' => 99, 'result' => 'ok', 'admitted' => true );
-		$GLOBALS['_rows'][ $survivor ]    = maybe_serialize( $GLOBALS['_options'][ $survivor ] );
-
-		$this->assertFalse(
-			Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, 'not-the-fence' ),
-			'the deletes matched nothing, so the row is still there and the answer is false'
-		);
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/**
 	 * Ruling P52: an EXECUTION LEASE, not an age guess.
 	 *
@@ -1202,22 +1027,6 @@ final class UnbindCleanupTest extends TestCase {
 	 * exactly as long as the request's database connection, so while it is
 	 * held nothing has to guess.
 	 */
-	public function test_a_wipe_refuses_while_a_lease_is_held_however_old_the_claim(): void {
-		$door = $this->seedDoor(); // its claim is already older than CLAIM_STALE_MS
-		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $door['claimed'] ) ] = true;
-		$before = $this->doorRows();
-		$fence  = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertSame(
-			Aura_Worker_Door_Holds::WIPE_BUSY,
-			Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ),
-			'age is not death: the lease says the request is alive'
-		);
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-		$this->assertSame( $before, $this->doorRows(), 'nothing was deleted' );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/** …and the reconciler leaves that claim alone rather than calling it interrupted. */
 	public function test_the_reconciler_skips_a_claim_whose_lease_is_held(): void {
 		$door = $this->seedDoor();
@@ -1230,40 +1039,11 @@ final class UnbindCleanupTest extends TestCase {
 	}
 
 	/** No lease held and the claim is stale: the unchanged rule, the wipe proceeds. */
-	public function test_a_wipe_proceeds_past_a_stale_claim_with_no_lease(): void {
-		$this->seedDoor();
-		$fence = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-		$this->assertSame( array(), $this->doorRows() );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/**
 	 * A server that cannot answer IS_USED_LOCK leaves the question UNKNOWN, so
 	 * the row counts as in flight under a 24-hour hard cap — which also bounds
 	 * a lease stranded on a persistent connection.
 	 */
-	public function test_an_unanswerable_lease_is_in_flight_under_the_hard_cap_and_not_past_it(): void {
-		$door                              = $this->seedDoor();
-		$GLOBALS['_sa_named_lock_error']   = true;
-		$fence                             = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'unknown ⇒ in flight' );
-
-		// …and past the cap the wipe proceeds, so a stranded lease cannot
-		// block a rebind for ever.
-		$name                         = Aura_Worker_Door_Holds::CLAIMED . $door['claimed'];
-		$row                          = get_option( $name, array() );
-		$row['claimed_at']            = gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 );
-		$GLOBALS['_options'][ $name ] = $row;
-		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
-
-		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-		$GLOBALS['_sa_named_lock_error'] = false;
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/**
 	 * Ruling P49': an unreadable count is not an empty door.
 	 *
@@ -1273,80 +1053,30 @@ final class UnbindCleanupTest extends TestCase {
 	 * alone let a database error report a clean wipe over a door that is still
 	 * full — the one direction this must never fail in.
 	 */
-	public function test_an_unreadable_state_count_reports_the_door_as_still_there(): void {
-		$this->seedDoor();
-		$fence                                   = Aura_Worker_Magic_Link::claim_site();
-		$GLOBALS['_sa_door_has_state_error']     = true;
-
-		$this->assertTrue( Aura_Worker_Elementor_Door::has_state(), 'a read it cannot trust answers "state remains"' );
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-
-		$GLOBALS['_sa_door_has_state_error'] = false;
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/** …and the unbind keeps the door owed, so a later pass verifies it for real. */
-	public function test_an_unreadable_state_count_keeps_the_unbind_incomplete(): void {
-		$this->seedDoor();
-		$fence                               = Aura_Worker_Magic_Link::claim_site();
-		$GLOBALS['_sa_door_has_state_error'] = true;
-
-		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers() );
-		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'the token stays while anything is owed' );
-
-		$GLOBALS['_sa_door_has_state_error'] = false; // the database recovers
-
-		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
-		$this->assertSame( array(), $this->doorRows() );
-	}
-
 	/**
 	 * The same rule for the in-flight check: a claimed-row read that FAILED is
 	 * not an empty set, so the wipe refuses rather than deleting under a replay
 	 * it could not see (Ruling P49').
 	 */
-	public function test_an_unreadable_claimed_row_read_stops_the_wipe(): void {
-		$this->seedDoor(); // its claim is stale, so only the READ failure can stop this
-		$before                                                                    = $this->doorRows();
-		$GLOBALS['_sa_rows_read_error'][ $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::CLAIMED ) ] = true;
-		$fence                                                                     = Aura_Worker_Magic_Link::claim_site();
-
-		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
-
-		$GLOBALS['_sa_rows_read_error'] = array();
-		$this->assertSame( $before, $this->doorRows(), 'nothing was deleted' );
-		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ), 'and the lock it took was released' );
-		Aura_Worker_Magic_Link::release_site( $fence );
-	}
-
 	/** wipe() answers a NAMED status, so a caller cannot conflate busy with failed. */
-	public function test_the_wipe_reports_a_named_status_for_each_outcome(): void {
-		$this->seedDoor();
-		$fence = Aura_Worker_Magic_Link::claim_site();
+	/**
+	 * Ruling P58: the unbind's door step mints a new generation. Nothing is
+	 * deleted, nothing can refuse, and `door` is not a leftover kind.
+	 */
+	public function test_the_unbind_mints_a_new_binding_generation( ): void {
+		$door   = $this->seedDoor();
+		$before = Aura_Worker_Door_Log::binding();
+		$fence  = Aura_Worker_Magic_Link::claim_site();
 
-		$token                                              = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
-		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
-		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
-		$this->assertSame( Aura_Worker_Door_Holds::WIPE_BUSY, Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'no lock: nothing attempted' );
-		delete_option( Aura_Worker_Door_Holds::LOCK );
-		unset( $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] );
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
 
-		$GLOBALS['_sa_option_delete_like_fail'][ $this->heldLikePattern() ] = true;
-		$this->assertSame( Aura_Worker_Door_Holds::WIPE_FAILED, Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'ran, and one failed' );
-		$GLOBALS['_sa_option_delete_like_fail'] = array();
-
-		$this->assertSame( Aura_Worker_Door_Holds::WIPE_DONE, Aura_Worker_Door_Holds::wipe( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'every statement ran' );
-		Aura_Worker_Magic_Link::release_site( $fence );
+		$this->assertNotSame( $before, Aura_Worker_Door_Log::binding(), 'a new generation' );
+		$this->assertNotContains( 'door', Aura_Worker_Unbind::leftovers(), 'and it can never be owed' );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'so the token still goes' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $door['held'] ), 'the departed queue is invisible' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
 	}
 
 	/** A caller that lost the site claim deletes nothing — the same fence every step uses. */
-	public function test_the_door_wipe_is_fenced_on_the_site_claim(): void {
-		$this->seedDoor();
-		$before = $this->doorRows();
-
-		Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, 'not-the-fence' );
-
-		$this->assertSame( $before, $this->doorRows(), 'a stolen claim deletes nothing at all' );
-	}
 }

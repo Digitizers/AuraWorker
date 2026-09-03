@@ -450,6 +450,49 @@ final class ConnectProvisionTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P58: a changed-binding connect mints a NEW generation and rotates
+	 * the epoch. Nothing is deleted, and it can never refuse.
+	 *
+	 * The departed client's hold is still on disk — and invisible: not listed,
+	 * not claimable, not charging the cap. Its log entries stay too, because
+	 * the log is the SITE's audit trail and the new client drains it by acking.
+	 */
+	public function test_a_changed_binding_connect_mints_a_new_generation_and_keeps_every_row(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref            = $this->seedDoorState();
+		$before_binding = Aura_Worker_Door_Log::binding();
+		$before_epoch   = Aura_Worker_Door_Log::epoch();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertNotSame( $before_binding, Aura_Worker_Door_Log::binding(), 'a new generation' );
+		$this->assertNotSame( $before_epoch, Aura_Worker_Door_Log::epoch(), 'and a new epoch' );
+		// THE ROWS ARE STILL THERE — and belong to nobody the new client can reach.
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'nothing was deleted' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the departed hold is not readable' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nor listed' );
+		$this->assertSame( 'not_held', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'], 'nor replayable' );
+		// …and the log is served regardless, each entry naming the binding that wrote it.
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertNotSame( array(), $log, "the site's audit trail is not the binding's to take" );
+		$this->assertSame( $before_binding, $log[0]['binding'], 'a departed client\'s entry, and it says so' );
+	}
+
+	/** A same-binding re-save leaves the generation, and the queue, alone. */
+	public function test_a_same_binding_reconnect_leaves_the_generation_untouched(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$ref            = $this->seedDoorState();
+		$before_binding = Aura_Worker_Door_Log::binding();
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( $before_binding, Aura_Worker_Door_Log::binding() );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the operator keeps their queue' );
+	}
+
+	/**
 	 * A token ROTATION is not a new owner. The same site reconnecting to the
 	 * same client keeps its pending approvals and its unacked log — discarding
 	 * an operator's queue because their credentials were refreshed would be a
@@ -468,47 +511,12 @@ final class ConnectProvisionTest extends TestCase {
 	}
 
 	/** A DIFFERENT client is a replacement: the departed client's queue goes. */
-	public function test_a_reconnect_under_a_different_client_wipes_the_door(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
-		$ref = $this->seedDoorState();
-
-		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
-
-		$this->assertSame( 200, $res->get_status() );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
-		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
-		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
-		$this->assertFalse( Aura_Worker_Elementor_Door::present(), 'a fresh epoch for the new client' );
-	}
-
 	/** The same client on a DIFFERENT dashboard is a different binding too. */
-	public function test_a_reconnect_to_a_different_dashboard_wipes_the_door(): void {
-		$this->seedPreviousBinding( 'c1', 'https://old-dash.example' );
-		$ref = $this->seedDoorState();
-
-		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1', 'dashboard_url' => 'https://dash.example' ) ) );
-
-		$this->assertSame( 200, $res->get_status() );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
-		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
-	}
-
 	/**
 	 * A binding that cannot be PROVEN the same is treated as replaced: the old
 	 * side names no client (an older dashboard installed it, or the store is
 	 * unbound), so the comparison fails toward the wipe.
 	 */
-	public function test_a_reconnect_over_a_binding_with_no_client_line_wipes_the_door(): void {
-		$this->seedPreviousBinding( null, 'https://dash.example' ); // nothing bound
-		$ref = $this->seedDoorState();
-
-		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1', 'dashboard_url' => 'https://dash.example' ) ) );
-
-		$this->assertSame( 200, $res->get_status() );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
-		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
-	}
-
 	/**
 	 * Ruling P46: a changed-binding connect that cannot clear the old queue
 	 * writes NOTHING and answers a retryable 503.
@@ -517,26 +525,6 @@ final class ConnectProvisionTest extends TestCase {
 	 * refusal leaves the site exactly as it was — the old binding whole, and
 	 * Aura retrying in a few seconds.
 	 */
-	public function test_a_changed_binding_connect_refuses_when_the_hold_lock_is_busy(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
-		$ref                                                 = $this->seedDoorState();
-		$token                                               = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
-		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
-		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
-		$before_token                                        = get_option( 'aura_worker_site_token' );
-
-		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
-
-		$this->assertInstanceOf( WP_Error::class, $res );
-		$this->assertSame( 'aura_door_busy', $res->get_error_code() );
-		$this->assertSame( 503, $res->get_error_data()['status'] );
-		$this->assertSame( $before_token, get_option( 'aura_worker_site_token' ), 'the old token is untouched' );
-		$this->assertSame( 'https://dash.example', get_option( 'aura_worker_dashboard_url' ), 'and the old dashboard' );
-		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client(), 'the binding did not move' );
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'and the queue is intact' );
-		$this->assertSame( $token, get_option( Aura_Worker_Door_Holds::LOCK ), "the holder's lock is untouched" );
-	}
-
 	/**
 	 * Ruling P50: a changed-binding connect during a LIVE replay is refused.
 	 *
@@ -545,20 +533,6 @@ final class ConnectProvisionTest extends TestCase {
 	 * connect answers `aura_door_busy` — the same retryable refusal a busy
 	 * hold lock gets, and Aura retries in seconds.
 	 */
-	public function test_a_changed_binding_connect_refuses_while_a_replay_is_in_flight(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
-		$ref = $this->seedDoorState();
-		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) ); // a replay is running
-		$before_token = get_option( 'aura_worker_site_token' );
-
-		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
-
-		$this->assertInstanceOf( WP_Error::class, $res );
-		$this->assertSame( 'aura_door_busy', $res->get_error_code() );
-		$this->assertSame( $before_token, get_option( 'aura_worker_site_token' ), 'nothing of the new binding was written' );
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), "and the replay's claim is untouched" );
-	}
-
 	/**
 	 * Ruling P48: the busy path leaves NOTHING of the new binding behind.
 	 *
@@ -568,31 +542,6 @@ final class ConnectProvisionTest extends TestCase {
 	 * and releasing the site claim restores nothing. The wipe is now the first
 	 * persistent effect of a connect, so a refusal has nothing to undo.
 	 */
-	public function test_a_busy_changed_binding_connect_writes_no_option_at_all(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
-		update_option( 'aura_worker_connect_user_id', 41 ); // the OLD binding's administrator
-		update_option( 'aura_worker_grant_pubkey', 'the-old-key' );
-		$this->seedDoorState();
-		$token                                               = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
-		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
-		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
-		$before                                              = array(
-			'aura_worker_connect_user_id' => get_option( 'aura_worker_connect_user_id' ),
-			'aura_worker_site_token'      => get_option( 'aura_worker_site_token' ),
-			'aura_worker_dashboard_url'   => get_option( 'aura_worker_dashboard_url' ),
-			'aura_worker_grant_pubkey'    => get_option( 'aura_worker_grant_pubkey' ),
-		);
-
-		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new-dash.example' ) ) );
-
-		$this->assertInstanceOf( WP_Error::class, $res );
-		$this->assertSame( 'aura_door_busy', $res->get_error_code() );
-		foreach ( $before as $option => $value ) {
-			$this->assertSame( $value, get_option( $option ), $option . ' is exactly what it was' );
-		}
-		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client(), 'and the client line did not move' );
-	}
-
 	/** …and a successful changed-binding connect still writes every one of them. */
 	public function test_a_successful_changed_binding_connect_writes_them_all(): void {
 		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
@@ -610,14 +559,4 @@ final class ConnectProvisionTest extends TestCase {
 	}
 
 	/** And the NEW side naming no client is unprovable in the same way. */
-	public function test_a_reconnect_whose_callback_names_no_client_wipes_the_door(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
-		$ref = $this->seedDoorState();
-
-		$res = $this->ml->handle_connect( $this->request( array( 'dashboard_url' => 'https://dash.example' ) ) ); // no client line
-
-		$this->assertSame( 200, $res->get_status() );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
-		$this->assertSame( array(), Aura_Worker_Door_Log::log_after( 0 ) );
-	}
 }

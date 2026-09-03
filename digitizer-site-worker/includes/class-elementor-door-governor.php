@@ -266,118 +266,37 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * An unbind takes the door's transactional state with it (Ruling P44).
+	 * A REBIND mints a new binding generation. Nothing is deleted (Ruling
+	 * P58).
 	 *
-	 * Holds, claims and log rows are the DEPARTED binding's, and they outlived
-	 * it: `Aura_Worker_Unbind::cleanup()` removed the dashboard options, the
-	 * ruleset, the grant key and the token, so a site later connected to a
-	 * different Aura client was served the old client's holds through
-	 * `/status` and could approve one through `elementor_replay_ability` —
-	 * executing the departed client's stored input as its stored WordPress
-	 * actor.
+	 * This replaces the wipe, and six review rounds of races with it. Deleting
+	 * a departed client's queue meant racing every request that might already
+	 * be holding, claiming or replaying one of those rows — a lock, a lease, an
+	 * in-flight check, each fixing the last one's edge. None of it was
+	 * necessary: a hold is only ever readable by the client that queued it, and
+	 * that is a question every reader can ask for itself.
 	 *
-	 * The epoch goes too, so the next binding starts at cursor 0 with a fresh
-	 * epoch rather than inheriting one it never agreed to. `present()` is
-	 * therefore false afterwards, and `/status` carries no `door` fragment
-	 * until this site is governed again.
+	 * So the generation moves and the rows stay. From here, a row stamped with
+	 * the old generation is another client's: `listing()` omits it,
+	 * `get_held()` and `claim()` answer as if it were absent, `count()` does
+	 * not charge the cap for it, and the reconciler's sweep removes it in its
+	 * own time. The LOG is untouched and still served — it is the SITE's audit
+	 * trail, and each entry carries the binding that wrote it, so a reader can
+	 * see a departed client's entries for what they are and the new binding
+	 * drains them by acking.
 	 *
-	 * The creation mutex and the retention throttle go too: working state of
-	 * the binding that is leaving, not history of the site.
+	 * The log EPOCH rotates with it, through the same `rotate_epoch()` Aura
+	 * uses on a rewind: the new binding starts at cursor 0 rather than
+	 * inheriting one it never agreed to.
 	 *
-	 * KEPT: the snapshot envelopes and the 30-day counter buckets — this
-	 * SITE's content and audit history, neither of them the binding's
-	 * transaction state.
+	 * NEVER busy, and nothing to undo — which is why the connect can call it
+	 * before its own writes and never has to answer a refusal for it.
 	 *
-	 * @param string $claim The site-claim option name.
-	 * @param string $fence This caller's claim fence.
-	 * @return bool TRUE only when the whole wipe ran under a held hold lock,
-	 *              every statement reported success, and nothing is left.
+	 * @return string The new generation.
 	 */
-	public static function wipe_for_unbind( $claim, $fence ) {
-		// The queue and the log go first, under the hold lock — and NOTHING
-		// goes if that lock could not be taken (Ruling P46), because a holder
-		// resuming afterwards would insert into a queue this call had already
-		// emptied. Its answer is CARRIED rather than returned on (Ruling P49):
-		// a partial wipe still deletes everything else it can, so the next
-		// pass has less to finish, and the verification below is what decides
-		// what this call reports.
-		$status = Aura_Worker_Door_Holds::wipe( $claim, $fence );
-		if ( Aura_Worker_Door_Holds::WIPE_BUSY === $status ) {
-			// Nothing was attempted — the lock could not be taken (P46), or a
-			// replay is in flight (P50) — so nothing here may be deleted
-			// either. The caller retries.
-			return false;
-		}
-		// Anything that is not an explicit WIPE_DONE is a failure. An answer
-		// this caller does not recognise can only ever mean "do not report
-		// success" (Ruling P49').
-		$ok = ( Aura_Worker_Door_Holds::WIPE_DONE === $status );
-		// The creation mutex and the retention throttle are this binding's
-		// working state too, and a fresh binding should inherit neither: an
-		// inherited mutex would refuse the new client's first creation until
-		// the reconciler cleared it, and an inherited throttle would skip its
-		// first prune. The mutex is fenced BY VALUE everywhere it is released,
-		// so deleting it here cannot disturb a creation that is still running —
-		// that request's own release simply matches no row, which is already
-		// how it behaves when the reconciler clears a stale one.
-		foreach ( array( self::CREATING, self::PRUNED_AT ) as $option ) {
-			$ok = ( false !== Aura_Worker_Rules::delete_option_if_claimed( $option, $claim, $fence ) ) && $ok;
-			wp_cache_delete( $option, 'options' );
-		}
-		wp_cache_delete( 'notoptions', 'options' );
-		// AND THEN LOOK (Ruling P49). Every statement reporting success is not
-		// the same claim as "nothing is left" — a row inserted between two of
-		// them, or a delete whose fence stopped matching, would pass the first
-		// test and fail the second. The caller's contract is the second one:
-		// answer true only when this site holds no transactional door state at
-		// all. A partial wipe answers false, the unbind marks `door` a
-		// leftover, and the next pass finishes it.
-		return $ok && ! self::has_state();
-	}
-
-	/**
-	 * Is any of the door's transactional state still here (Ruling P46)?
-	 *
-	 * The question `leftovers()` asks about every other kind, asked of the
-	 * door: not "did my delete return true" but "is it gone". A wipe that
-	 * could not take the hold lock leaves everything behind, and the unbind
-	 * must not report `cleanup_complete` until a later Phase-B pass wipes for
-	 * real.
-	 *
-	 * The 30-day counter buckets are excluded — this site's audit history, not
-	 * the binding's state — and so is the hold-queue LOCK itself, which is a
-	 * mutex somebody may be holding for milliseconds, not something a binding
-	 * owns.
-	 *
-	 * FAILS CLOSED (Ruling P49'): a read that cannot be trusted answers TRUE.
-	 * Every consequence of this method points one way — a `false` lets a wipe
-	 * report success and lets the unbind drop `door` from its leftovers, and
-	 * both are irreversible for the departed client's approvals. A spurious
-	 * `true` only costs another pass.
-	 *
-	 * @return bool
-	 */
-	public static function has_state() {
-		global $wpdb;
-		$wpdb->last_error = '';
-		$n                = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name NOT LIKE %s AND option_name != %s",
-				$wpdb->esc_like( 'aura_worker_door_' ) . '%',
-				$wpdb->esc_like( self::COUNTER_PREFIX ) . '%',
-				Aura_Worker_Door_Holds::LOCK
-			)
-		);
-		// AN UNREADABLE COUNT IS NOT A ZERO (Ruling P49'). This answer decides
-		// whether a wipe may report success and whether the unbind may drop
-		// `door` from its leftovers, so the one direction it must never fail
-		// in is "nothing left". get_var() answers null both for a broken
-		// statement and — on a real wpdb — for one that never ran at all, so
-		// the error flag is consulted beside the value.
-		if ( null === $n || false === $n || '' !== (string) $wpdb->last_error ) {
-			return true;
-		}
-		return (int) $n > 0;
+	public static function rebind() {
+		Aura_Worker_Door_Log::rotate_epoch( Aura_Worker_Door_Log::epoch() );
+		return Aura_Worker_Door_Log::rotate_binding();
 	}
 
 	/**
@@ -1961,14 +1880,12 @@ class Aura_Worker_Elementor_Door {
 
 		// IS THIS STILL THE BINDING THAT APPROVED THE CALL?
 		//
-		// DEFENCE IN DEPTH, not the protection itself (Ruling P50). The
-		// protection is that a wipe REFUSES TO START while any claimed row is
-		// younger than CLAIM_STALE_MS, and `claim()` takes the same lock the
-		// wipe does — so a replay in flight and a wipe cannot overlap at all.
-		// This check remains because it is cheap and because it is the only
-		// thing that would notice a wipe reaching the door by some route
-		// nobody has thought of: an operator deleting options by hand, a
-		// migration, a future caller that forgets the rule.
+		// THE FENCE (Ruling P51, kept by P58). A rebind mints a new generation
+		// while this replay is mid-flight — a changed-client connect, or an
+		// unbind — and the claim this request owns was stamped with the old
+		// one. Nothing was deleted out from under it, so there is no race to
+		// lose; what there IS, is a call approved by a client that no longer
+		// governs this site, and it must not run.
 		//
 		// The BINDING GENERATION is the witness (Ruling P51): only a wipe
 		// deletes it and the next binding mints a fresh one, so the value
@@ -2523,11 +2440,11 @@ class Aura_Worker_Elementor_Door {
 			$entry  = $seq > 0 ? Aura_Worker_Door_Log::get( $seq ) : null;
 			$code   = is_wp_error( $result ) ? $result->get_error_code() : '';
 
-			// The site was rebound under this replay (Ruling P47). The hold is
-			// NOT given back: it belonged to the departed binding, and whatever
-			// the wipe left of it is the wipe's to have left. Answered before
-			// every other rule below, because none of them applies to a call
-			// whose owner no longer exists.
+			// The site was rebound under this replay (Rulings P51/P58). The
+			// hold is NOT given back: it belonged to the departed binding, and
+			// every reader now treats it as absent anyway — the sweep removes
+			// it in its own time. Answered before every other rule below,
+			// because none of them applies to a call whose owner is gone.
 			if ( 'aura_binding_changed' === $code ) {
 				return array(
 					'ok'     => false,

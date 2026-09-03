@@ -2106,14 +2106,6 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// same one every other door branch reads.
 			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name NOT LIKE '([^']*)' AND option_name != '([^']*)'$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
-				// The COUNT failing at the driver: null answer, last_error set —
-				// what a broken statement leaves, which must not read as zero
-				// (Ruling P49'). Scoped to this shape so a test can break the
-				// door's verification without breaking every get_var().
-				if ( ! empty( $GLOBALS['_sa_door_has_state_error'] ) ) {
-					$this->last_error = 'count failed';
-					return null;
-				}
 				$keep = sa_like_to_regex( stripslashes( $m[1] ) );
 				$skip = sa_like_to_regex( stripslashes( $m[2] ) );
 				$lock = stripslashes( $m[3] );
@@ -2509,35 +2501,6 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
-			// delete_option_if_claimed()'s PREFIX sibling (Ruling P44): the same
-			// claim JOIN, matching option_name by LIKE rather than by name, so
-			// an unbind can take the Elementor door's whole queue and log —
-			// one row per hold, per claim and per log seq — without issuing
-			// thousands of per-name statements.
-			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name LIKE '([^']*)'$/s", $query, $m ) ) {
-				list( , $claim, $like, $names ) = array_map( 'stripslashes', $m );
-				// The statement itself failing at the driver — NOT "no row
-				// matched". Keyed by the LIKE PATTERN, so a test can break one
-				// family of door rows and let the rest through (Ruling P49).
-				if ( ! empty( $GLOBALS['_sa_option_delete_like_fail'][ $names ] ) ) {
-					$this->last_error = 'delete failed';
-					return false;
-				}
-				if ( ! sa_claim_like_matches( $claim, $like ) ) {
-					return 0;
-				}
-				$re   = sa_like_to_regex( $names );
-				$gone = 0;
-				foreach ( array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) ) as $name ) {
-					if ( ! preg_match( $re, (string) $name ) || null === sa_read_option_uncached( (string) $name ) ) {
-						continue;
-					}
-					unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
-					$GLOBALS['_option_writes'][] = array( 'delete', $name );
-					++$gone;
-				}
-				return $gone;
-			}
 			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
 				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
 				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {
@@ -2919,8 +2882,6 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
-	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
-	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
@@ -2944,10 +2905,6 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
-	// The Elementor door wipe's lock wait (Ruling P46): ON by default so no
-	// test can sleep for LOCK_S proving a busy lock. A test that wants the
-	// retry itself unsets it.
-	$GLOBALS['_sa_door_wipe_no_wait'] = true;
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
@@ -4174,8 +4131,6 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
-	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
-	$GLOBALS['_sa_door_has_state_error'] = false;   // has_state()'s COUNT fails at the driver (Ruling P49').
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
@@ -4199,10 +4154,6 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
-	// The Elementor door wipe's lock wait (Ruling P46): ON by default so no
-	// test can sleep for LOCK_S proving a busy lock. A test that wants the
-	// retry itself unsets it.
-	$GLOBALS['_sa_door_wipe_no_wait'] = true;
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).

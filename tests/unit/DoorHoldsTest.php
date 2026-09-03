@@ -87,6 +87,77 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'never delete on a guess' );
 	}
 
+	/* ------------------------------------------------------------------ */
+	/* Ruling P58: holds are BINDING-SCOPED, and a rebind mints a generation */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * A departed client's hold is invisible, not deleted.
+	 *
+	 * Six review rounds went into racing a DELETE of that queue against every
+	 * request that might already be holding, claiming or replaying one of its
+	 * rows. None of it was needed: the row records the generation that queued
+	 * it, and every reader asks.
+	 */
+	public function test_a_hold_from_another_binding_is_invisible_to_every_reader(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+
+		Aura_Worker_Door_Log::rotate_binding(); // a changed-binding connect, or an unbind
+
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'not readable' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'not listed' );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::count(), 'and not charging the cap' );
+		$this->assertInstanceOf( WP_Error::class, Aura_Worker_Door_Holds::claim( $ref ) );
+		$this->assertSame( 'not_held', Aura_Worker_Door_Holds::claim( $ref )->get_error_code(), 'and not claimable' );
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'the row itself is still on disk' );
+	}
+
+	/** …and the sweep is what finally removes it. */
+	public function test_the_sweep_removes_a_hold_from_another_binding(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		Aura_Worker_Door_Log::rotate_binding();
+
+		$this->assertSame( 1, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+
+		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'] );
+	}
+
+	/** A hold of the CURRENT binding is untouched by all of that. */
+	public function test_a_hold_of_the_current_binding_is_listed_claimable_and_counted(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$this->assertSame( array( $ref ), array_column( Aura_Worker_Door_Holds::listing(), 'ref' ) );
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count() );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+	}
+
+	/** A hold queued before the generation existed is treated as ours. */
+	public function test_a_hold_with_no_binding_is_treated_as_the_current_one(): void {
+		$ref  = Aura_Worker_Door_Holds::hold( $this->call() );
+		$name = 'aura_worker_door_held_' . $ref;
+		$row  = $GLOBALS['_options'][ $name ];
+		unset( $row['binding'] ); // a row from a build before Ruling P58
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+
+		Aura_Worker_Door_Log::rotate_binding();
+
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'never strand an approval nobody can re-issue' );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+	}
+
+	/** rotate_binding() mints a value nothing older can match. */
+	public function test_rotate_binding_mints_a_new_generation(): void {
+		$before = Aura_Worker_Door_Log::binding();
+		$after  = Aura_Worker_Door_Log::rotate_binding();
+
+		$this->assertMatchesRegularExpression( '/^[0-9a-f-]{36}$/', $after );
+		$this->assertNotSame( $before, $after );
+		$this->assertSame( $after, Aura_Worker_Door_Log::binding(), 'and it sticks' );
+	}
+
 	public function test_a_claimed_ref_still_holds_a_slot(): void {
 		for ( $i = 0; $i < 49; $i++ ) {
 			Aura_Worker_Door_Holds::hold( $this->call() );
@@ -252,41 +323,7 @@ final class DoorHoldsTest extends TestCase {
 	 * executing the DEPARTED client's stored mutation under the replacement
 	 * binding.
 	 */
-	public function test_a_claim_that_cannot_take_the_lock_is_a_lost_race_and_moves_nothing(): void {
-		$ref   = Aura_Worker_Door_Holds::hold( $this->call() );
-		$token = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
-		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
-		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
-
-		$out = Aura_Worker_Door_Holds::claim( $ref );
-
-		$this->assertInstanceOf( WP_Error::class, $out );
-		$this->assertSame( 'not_held', $out->get_error_code() );
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the held row is untouched' );
-		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and no twin was inserted' );
-		$this->assertSame( $token, get_option( Aura_Worker_Door_Holds::LOCK ), "the holder's lock is untouched" );
-
-		// …and it works the moment the holder is done.
-		delete_option( Aura_Worker_Door_Holds::LOCK );
-		unset( $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] );
-		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
-		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ), 'and released the lock it took' );
-	}
-
 	/** unclaim() takes it too — it INSERTS a held row, which a wipe must not meet. */
-	public function test_an_unclaim_that_cannot_take_the_lock_restores_nothing(): void {
-		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
-		Aura_Worker_Door_Holds::claim( $ref );
-		$token = time() . '|ffffffff-ffff-4fff-8fff-ffffffffffff';
-		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $token;
-		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = maybe_serialize( $token );
-
-		$this->assertFalse( Aura_Worker_Door_Holds::unclaim( $ref ) );
-
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row still stands' );
-	}
-
 	/** The claimed row records the BINDING it was claimed under (Ruling P51). */
 	public function test_a_claim_records_the_binding_it_was_taken_under(): void {
 		$ref     = Aura_Worker_Door_Holds::hold( $this->call() );
@@ -297,9 +334,10 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertSame( $binding, Aura_Worker_Door_Holds::claimed_binding( $ref ) );
 		$this->assertSame( $binding, Aura_Worker_Door_Holds::get_claimed( $ref )['binding'] );
 		$this->assertArrayNotHasKey( 'epoch', Aura_Worker_Door_Holds::get_claimed( $ref ), 'the log epoch is not the fence' );
-		// …and it does not follow the row back to the queue.
+		// …and it STAYS on the row all the way back to the queue (Ruling P58):
+		// the hold carries its own binding from the moment it was queued.
 		Aura_Worker_Door_Holds::unclaim( $ref );
-		$this->assertArrayNotHasKey( 'binding', Aura_Worker_Door_Holds::get_held( $ref ) );
+		$this->assertSame( $binding, Aura_Worker_Door_Holds::get_held( $ref )['binding'] );
 		$this->assertNull( Aura_Worker_Door_Holds::claimed_binding( $ref ), 'and a ref with no claimed row has none' );
 	}
 

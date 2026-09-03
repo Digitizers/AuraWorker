@@ -158,6 +158,11 @@ class Aura_Worker_Door_Log {
 				array(
 					'seq'      => $seq,
 					'at'       => gmdate( 'c' ),
+					// WHICH BINDING wrote this entry (Ruling P58). The log is
+					// the SITE's audit trail and is served whatever the current
+					// binding is, so a reader has to be able to see that an
+					// entry belongs to a client that has since gone.
+					'binding'  => self::binding(),
 					'result'   => 'pending',
 					'admitted' => false,
 				)
@@ -319,47 +324,27 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * Remove this binding's whole LOG on unbind (Ruling P44).
+	 * Mint a NEW binding generation (Ruling P58).
 	 *
-	 * Every numeric row, the ack floor, the closure marker and its refusal
-	 * counter all share the `PREFIX`, so one fenced prefix delete takes them
-	 * — and the epoch goes with them, which is the point: the next binding
-	 * starts a FRESH epoch at cursor 0 rather than inheriting a cursor the
-	 * departed client established. The BINDING generation goes too (Ruling
-	 * P51), which is what a replay in flight is fenced to.
+	 * This is what a rebind does now, in place of deleting the door. Nothing
+	 * is removed: every held, claimed and log row keeps its own `binding`, and
+	 * from this moment the ones stamped with the old value are another
+	 * client's — invisible to the queue's readers, swept when the reconciler
+	 * next runs, and still readable in the log, which is the SITE's audit
+	 * trail rather than any one binding's.
 	 *
-	 * The 30-day counter buckets (`COUNTER_PREFIX`) are NOT touched: they are
-	 * this SITE's audit history, not the binding's transaction state.
+	 * Delete-then-insert rather than a CAS: a concurrent minter loses the
+	 * conditional INSERT and reads the winner's value, which is the same
+	 * property epoch() relies on, and either winner is a generation nothing
+	 * older can match.
 	 *
-	 * Fenced on the site claim exactly as every other unbind step is, so a
-	 * caller that lost the site mid-cleanup deletes nothing.
-	 *
-	 * EVERY statement is checked (Ruling P49): a transient database error on
-	 * one of them used to be invisible, and the caller reported a clean wipe
-	 * over rows that are still there.
-	 *
-	 * @param string $claim The site-claim option name.
-	 * @param string $fence This caller's claim fence.
-	 * @return bool Every statement ran.
+	 * @return string The new generation.
 	 */
-	public static function wipe( $claim, $fence ) {
-		global $wpdb;
-		$ok = Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::PREFIX ) . '%', $claim, $fence );
-		// `false` is the only failure for these two: 0 rows means the option
-		// was not there, which is the state being asked for.
-		$ok = ( false !== Aura_Worker_Rules::delete_option_if_claimed( self::EPOCH, $claim, $fence ) ) && $ok;
-		// The binding generation goes with it: a replay fenced to it can never
-		// mistake the next binding's door for its own (Ruling P51).
-		$ok = ( false !== Aura_Worker_Rules::delete_option_if_claimed( self::BINDING, $claim, $fence ) ) && $ok;
-		// These statements go round the option cache, so evict by hand what
-		// delete_option() would have maintained. The numeric rows are read
-		// through row_from_db()/rows(), which never consult it.
-		foreach ( array( self::EPOCH, self::BINDING, self::FLOOR, self::FULL_MARKER, self::FULL_COUNTER ) as $name ) {
-			wp_cache_delete( $name, 'options' );
-		}
+	public static function rotate_binding() {
+		delete_option( self::BINDING );
+		wp_cache_delete( self::BINDING, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
-		wp_cache_delete( 'alloptions', 'options' );
-		return $ok;
+		return self::binding();
 	}
 
 	/** @param int $seq Seq. @return array|null */
