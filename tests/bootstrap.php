@@ -2641,14 +2641,16 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return $n;
 			}
 
-			// Aura_Worker_Door_Holds::take_lock()'s stale-lock replacement
-			// (round-1 finding on task 4's review): a DELETE fenced on the
-			// exact bytes the caller read as stale, byte-for-byte like the
-			// UPDATE CAS branches above — never the LIKE-prefix fence below,
-			// which matches on a PREFIX of the value rather than all of it.
-			// Scoped to the lock name only, the same way is_door_log_insert
-			// is scoped above: a second exact-value fence elsewhere would
-			// want its own seam rather than borrowing this one.
+			// A DELETE fenced on the exact bytes the caller read: a
+			// byte-for-byte predicate, like the UPDATE CAS branches above and
+			// unlike the LIKE-prefix fence below, which matches on a PREFIX of
+			// the value rather than all of it. Aura_Worker_Door_Holds issues it
+			// at both ends of the hold-queue lock's life (take_lock()'s
+			// stale-lock replacement — the round-1 finding on task 4's review —
+			// and hold()'s own release), and the Elementor door's reconciler
+			// issues it for the creation mutex. Each arms its racer by OPTION
+			// NAME, so one test's seam can never fire inside another caller's
+			// statement.
 			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
 				list( , $name, $expected ) = array_map( 'stripslashes', $m );
 				// A racer replacing the lock's value in the window between
@@ -2662,9 +2664,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// this fence protects — round-2 finding: a test built on the
 				// shared seam passed identically against the pre-round-1,
 				// unconditional-delete take_lock(), proving nothing.
-				if ( 'aura_worker_door_hold_lock' === $name && isset( $GLOBALS['_sa_before_lock_delete'] ) && is_callable( $GLOBALS['_sa_before_lock_delete'] ) ) {
-					$racer                             = $GLOBALS['_sa_before_lock_delete'];
-					$GLOBALS['_sa_before_lock_delete'] = null; // fires once
+				if ( isset( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) && is_callable( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) ) {
+					$racer = $GLOBALS['_sa_before_fenced_delete'][ $name ];
+					unset( $GLOBALS['_sa_before_fenced_delete'][ $name ] ); // fires once
 					$racer();
 				}
 				if ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $expected ) {
@@ -2773,7 +2775,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
-	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
+	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
@@ -3986,7 +3988,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
-	$GLOBALS['_sa_before_lock_delete'] = null; // Runs between take_lock()'s stale-lock read and its fenced delete (round-2, task 4) — scoped to the lock name only, unlike _sa_before_swap.
+	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active

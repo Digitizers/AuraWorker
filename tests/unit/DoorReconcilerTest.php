@@ -433,6 +433,26 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'a mutex older than the stale bound is nobody\'s' );
 	}
 
+	public function test_the_stale_mutex_clear_never_removes_a_creation_that_took_the_row_after_it_read(): void {
+		// The reconciler reads the mutex, judges it stale, and deletes. A
+		// creation starting in between takes the row for itself — and an
+		// unconditional delete_option() there closes a live creation's mutex,
+		// letting a second creation run beside it. The delete is fenced on the
+		// bytes the read returned, so it matches nothing (Ruling P5).
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => gmdate( 'c' ) ) );
+		$this->patchOption( Aura_Worker_Elementor_Door::CREATING, array( 'started_at' => $this->longAgo() ) );
+		$fresh = array( 'seq' => 10, 'started_at' => gmdate( 'c' ) );
+		$GLOBALS['_sa_before_fenced_delete'][ Aura_Worker_Elementor_Door::CREATING ] = static function () use ( $fresh ) {
+			$GLOBALS['_options'][ Aura_Worker_Elementor_Door::CREATING ] = $fresh;
+			$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::CREATING ]    = maybe_serialize( $fresh );
+		};
+
+		Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( $fresh, get_option( Aura_Worker_Elementor_Door::CREATING, null ), 'the fresh creation still owns the site' );
+		$this->assertSame( maybe_serialize( $fresh ), $GLOBALS['_rows'][ Aura_Worker_Elementor_Door::CREATING ] ?? null );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (i) the fragment's shape, and reconcile() running before it         */
 	/* ------------------------------------------------------------------ */

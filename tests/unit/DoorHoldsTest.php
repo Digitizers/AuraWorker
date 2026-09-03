@@ -77,7 +77,7 @@ final class DoorHoldsTest extends TestCase {
 		// finding). B deletes the stale row and installs its OWN fresh lock,
 		// exactly as a real racer's insert_unique() would leave things.
 		$racers_lock = time();
-		$GLOBALS['_sa_before_lock_delete'] = static function () use ( $racers_lock ) {
+		$GLOBALS['_sa_before_fenced_delete'][ Aura_Worker_Door_Holds::LOCK ] = static function () use ( $racers_lock ) {
 			unset( $GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ], $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ] );
 			$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $racers_lock;
 			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = (string) $racers_lock;
@@ -98,7 +98,7 @@ final class DoorHoldsTest extends TestCase {
 		// exercised directly against the fenced-DELETE SQL shape itself
 		// rather than through take_lock()'s retry loop.
 		$fresh = time();
-		$GLOBALS['_sa_before_lock_delete'] = static function () use ( $fresh ) {
+		$GLOBALS['_sa_before_fenced_delete'][ Aura_Worker_Door_Holds::LOCK ] = static function () use ( $fresh ) {
 			$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ] = $fresh;
 			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]    = (string) $fresh;
 		};

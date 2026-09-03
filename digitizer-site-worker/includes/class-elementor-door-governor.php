@@ -589,16 +589,32 @@ class Aura_Worker_Elementor_Door {
 	 * cleared by AGE, which is what `started_at` is for, and a stamp that
 	 * cannot be read is not evidence of freshness either.
 	 *
+	 * The clear is a DELETE FENCED on the bytes this call read — the shape
+	 * Aura_Worker_Door_Holds uses at both ends of its own mutex's life, and
+	 * the rule for every mutex delete that is not the owner's own release
+	 * (Ruling P5). Judging staleness and then deleting unconditionally is two
+	 * statements with a window between them, and a creation starting in that
+	 * window takes the row for itself: an unconditional delete then closes a
+	 * LIVE creation's mutex, and a second creation runs beside it. The row is
+	 * read RAW, never through get_option(), because the fence compares bytes.
+	 *
 	 * @param int $now Unix time.
 	 */
 	private static function clear_stale_creation_mutex( $now ) {
-		$mutex = get_option( self::CREATING, null );
+		global $wpdb;
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::CREATING ) );
+		if ( null === $raw ) {
+			return;
+		}
+		$mutex = maybe_unserialize( $raw );
 		if ( ! is_array( $mutex ) ) {
 			return;
 		}
 		$started = strtotime( (string) ( isset( $mutex['started_at'] ) ? $mutex['started_at'] : '' ) );
 		if ( false === $started || $started <= $now - (int) floor( self::CLAIM_STALE_MS / 1000 ) ) {
-			delete_option( self::CREATING );
+			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::CREATING, (string) $raw ) );
+			wp_cache_delete( self::CREATING, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
 		}
 	}
 
