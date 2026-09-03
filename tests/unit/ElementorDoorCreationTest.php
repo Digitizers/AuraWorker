@@ -341,9 +341,14 @@ final class ElementorDoorCreationTest extends TestCase {
 			}
 		);
 
-		$this->assertSame( 'aura_governor_error', $out->get_error_code() );
+		// Ruling P33: the throw came before the callback was entered, so this
+		// is a SETUP failure — refused, not failed, and provably not run.
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertFalse( $out->get_error_data()['may_have_run'] );
 		$row = $this->row( 1 );
-		$this->assertSame( array(), $row['created_post_ids'] );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'setup_failed', $row['reason'] );
+		$this->assertArrayNotHasKey( 'created_post_ids', $row, 'a creation that never began attributes nothing' );
 		$this->assertArrayNotHasKey( 'compensated', $row );
 		$this->assertSame( 'publish', get_post( 60 )->post_status, 'nothing of this user\'s was touched' );
 		$this->assertSame( 'publish', get_post( 61 )->post_status );
@@ -1222,10 +1227,11 @@ final class ElementorDoorCreationTest extends TestCase {
 
 		$out = $this->createPage( function () { return array( 'ok' => true ); } );
 
-		$this->assertSame( 'aura_governor_error', $out->get_error_code() );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() ); // setup, not the write (Ruling P33)
 		$this->assertArrayNotHasKey( 'elementor/create-page', $this->ran );
 		$this->assertSame( 99, get_option( Aura_Worker_Elementor_Door::CREATING )['seq'], "the holder's mutex is still there" );
-		$this->assertSame( 'failed', $this->row( 1 )['result'] );
+		$this->assertSame( 'refused', $this->row( 1 )['result'] );
+		$this->assertSame( 'setup_failed', $this->row( 1 )['reason'] );
 	}
 
 }

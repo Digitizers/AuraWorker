@@ -208,7 +208,7 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
 		Aura_Worker_Elementor_Door::set_snapshotter_for_tests( static function () { throw new RuntimeException( 'boom' ); } );
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
-		$this->assertSame( 'aura_governor_error', $out->get_error_code() );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() ); // a SETUP throw (Ruling P33)
 		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
 	}
 
@@ -589,22 +589,62 @@ final class ElementorDoorGovernorTest extends TestCase {
 	}
 
 	/**
-	 * A throw AFTER the row was admitted settles that row rather than leaving
-	 * it pending: `log_after` stops at a pending row, so every later entry
-	 * would wait for the reconciler to call a KNOWN failure "interrupted".
+	 * A throw after admission but BEFORE the callback was entered settles the
+	 * row — `log_after` stops at a pending row — and settles it honestly
+	 * (Ruling P33): `refused` / `setup_failed`, may_have_run FALSE.
+	 *
+	 * `seq > 0` used to stand in for "it ran", which it never was: a seq means
+	 * ADMITTED, and the snapshot, the mutex, the watermark and the `ran`
+	 * witness all sit between admission and the callback. Calling a setup
+	 * failure `failed` cost a replay its approval for a write that provably
+	 * never happened.
 	 */
-	public function test_a_throw_after_admission_settles_the_row_failed_and_may_have_run(): void {
+	public function test_a_setup_throw_after_admission_is_refused_and_did_not_run(): void {
 		$this->registerAll();
 		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
 		Aura_Worker_Elementor_Door::set_snapshotter_for_tests( static function () { throw new RuntimeException( 'boom' ); } );
+
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertFalse( $out->get_error_data()['may_have_run'] );
+		$this->assertStringContainsString( 'it was not run', $out->get_error_message() );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'setup_failed', $row['reason'] );
+		$this->assertFalse( $row['may_have_run'] );
+		$this->assertArrayNotHasKey( 'ran', $row, 'the witness was never written' );
+		$this->assertCount( 1, Aura_Worker_Door_Log::log_after( 0 ), 'settled, so the log is served past it' );
+	}
+
+	/**
+	 * The other side of Ruling P33: the callback WAS entered and threw from
+	 * inside. That is unchanged — `failed`, `exception`, may_have_run TRUE.
+	 */
+	public function test_a_throw_from_inside_the_callback_still_failed_and_may_have_run(): void {
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		sa_register_ability(
+			'elementor/publish-document',
+			array(
+				'execute_callback'    => static function () {
+					throw new RuntimeException( 'boom' );
+				},
+				'permission_callback' => '__return_true',
+				'meta'                => array(),
+			)
+		);
+		do_action( 'wp_abilities_api_init' );
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
 		$this->assertSame( 'aura_governor_error', $out->get_error_code() );
 		$this->assertStringContainsString( 'may have run', $out->get_error_message() );
 		$row = Aura_Worker_Door_Log::get( 1 );
 		$this->assertSame( 'failed', $row['result'] );
 		$this->assertSame( 'exception', $row['reason'] );
 		$this->assertTrue( $row['may_have_run'] );
-		$this->assertCount( 1, Aura_Worker_Door_Log::log_after( 0 ), 'settled, so the log is served past it' );
 	}
 
 	/* --------------------------------------------------------------- */

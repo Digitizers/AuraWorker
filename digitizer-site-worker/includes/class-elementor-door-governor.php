@@ -1250,7 +1250,56 @@ class Aura_Worker_Elementor_Door {
 			// evidence the row already carries (created ids, collateral ids
 			// were patched in as they happened), release the creation mutex,
 			// and say honestly that the call may have run.
-			$seq = isset( self::$request['seq'] ) ? (int) self::$request['seq'] : 0;
+			$seq     = isset( self::$request['seq'] ) ? (int) self::$request['seq'] : 0;
+			$entered = ! empty( self::$request['entered'] );
+			if ( $seq > 0 && ! $entered ) {
+				// SETUP failed (Ruling P33): admitted, but the throw came
+				// before the callback was entered — reading a target for the
+				// snapshot, stamping the watermark, anything in between. The
+				// row's `ran` witness was never written and Elementor was
+				// never called, so the mutation PROVABLY did not happen.
+				//
+				// Calling that `failed` cost a replay its approval for
+				// nothing: replay() releases a claimed hold on `failed`, so an
+				// operator's one approval was consumed by a write that never
+				// ran. `refused` + no `ran` + the retryable `aura_log_failed`
+				// is the shape replay() gives the hold back for — the same
+				// shape `snapshot_id_unrecorded` already uses.
+				//
+				// Nothing can have been inserted, so a creation only needs its
+				// mutex released; finish_creation() would write an envelope
+				// for a creation that never began.
+				if ( ! empty( self::$request['creating'] ) ) {
+					self::release_creation_mutex();
+				}
+				if ( ! Aura_Worker_Door_Log::settle(
+					$seq,
+					array(
+						'result'       => 'refused',
+						'reason'       => 'setup_failed',
+						'error'        => $e->getMessage(),
+						'may_have_run' => false,
+					)
+				) ) {
+					// Already terminal (another request's reconciler, say):
+					// the result stands, the throw is recorded beside it.
+					Aura_Worker_Door_Log::annotate(
+						$seq,
+						array(
+							'setup_error' => $e->getMessage(),
+						)
+					);
+				}
+				self::$request = null;
+				return new WP_Error(
+					'aura_log_failed',
+					'Aura\'s governor failed before this call ran; it was not run. ' . $e->getMessage(),
+					array(
+						'status'       => 503,
+						'may_have_run' => false,
+					)
+				);
+			}
 			$ran = $seq > 0;
 			if ( $ran ) {
 				$fields = array(
@@ -1563,6 +1612,14 @@ class Aura_Worker_Elementor_Door {
 			return new WP_Error( 'aura_log_failed', 'The door log could not record that this call was about to run; it was not run.', array( 'status' => 503 ) );
 		}
 
+		// THE CALLBACK IS ABOUT TO BE ENTERED (Ruling P33). The `ran` witness
+		// above is the DURABLE record, for a replay reading the row in a later
+		// request; this is the IN-MEMORY one, for the catch below in THIS
+		// request — and it exists because `seq > 0` is not it. A seq means
+		// admitted, and everything between admission and this line (the
+		// snapshot, the mutex, the watermark, the witness patch) can throw
+		// without the callback ever being reached.
+		self::$request['entered'] = true;
 		$result = is_callable( $inner ) ? call_user_func( $inner, $input ) : new WP_Error( 'ability_invalid_execute_callback', 'no callback' );
 		do_action( 'sa_test_inner_ran', $slug ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- test seam only (ordering: snapshot before the write); no listener in production.
 

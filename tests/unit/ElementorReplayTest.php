@@ -545,6 +545,55 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
 	}
 
+	/**
+	 * Ruling P33: a SETUP failure under a replay gives the approval back.
+	 *
+	 * `snapshot_for()` THROWING (rather than answering `success: false`) took
+	 * the governor's \Throwable catch, which read `seq > 0` as "it may have
+	 * run" and settled the entry `failed`. replay() releases a claimed hold on
+	 * `failed`, so an operator's one approval was permanently consumed by a
+	 * write that never happened — the callback was not even reached, and the
+	 * row's `ran` witness is patched a few lines after the snapshot.
+	 */
+	public function test_a_snapshot_that_throws_under_a_replay_gives_the_approval_back(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref    = $this->holdCall();
+		$before = Aura_Worker_Door_Holds::get_held( $ref );
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				throw new RuntimeException( 'the reader exploded' );
+			}
+		);
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'retry_later', $out['reason'], 'the approval is not spent on a call that never ran' );
+		$this->assertSame( 'aura_log_failed', $out['code'] );
+		$this->assertSame( array(), $this->ran, 'the write never happened' );
+		$this->assertSame( $before, Aura_Worker_Door_Holds::get_held( $ref ), 'the hold is back, byte for byte' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertSame( 'setup_failed', $log[1]['reason'] );
+		$this->assertFalse( $log[1]['may_have_run'] );
+		$this->assertArrayNotHasKey( 'ran', $log[1] );
+
+		// …and the same approval still works once the site can read again.
+		Aura_Worker_Elementor_Door::set_snapshotter_for_tests(
+			static function () {
+				return array(
+					'success'  => true,
+					'snapshot' => array( 'id' => 'snap_test' ),
+				);
+			}
+		);
+		$second = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$this->assertTrue( $second['ok'] );
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+	}
+
 	public function test_a_move_back_that_cannot_insert_keeps_the_claimed_row_and_says_so(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );
