@@ -521,6 +521,44 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'the restore is itself reversible' );
 	}
 
+	/**
+	 * Ruling P65 (F2): a restore is a governed mutation, and it is fenced.
+	 *
+	 * `open_restore_entry()` admits, then the pre-restore capture and the
+	 * patch run, and only then is the site written — a gap a rebind can land
+	 * in exactly as it can land in `execute()`'s. The rebind is written with
+	 * raw SQL, past every cache, because that is what another PHP process's
+	 * rebind looks like from inside this one.
+	 */
+	public function test_a_rebind_between_admission_and_the_write_refuses_the_restore(): void {
+		$env = $this->pageEnvelope();
+
+		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () {
+			$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] = maybe_serialize(
+				array(
+					'gen'       => 'gen-from-another-process',
+					'state'     => 'bound',
+					'client'    => 'c2',
+					'dashboard' => 'https://new.example',
+				)
+			);
+		};
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_65' ) ) );
+
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_binding_changed', $res->data['code'] );
+		$this->assertFalse( $res->data['success'] );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
+
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'binding_changed', $row['reason'] );
+		$this->assertFalse( $row['may_have_run'] );
+		$this->assertNotSame( '', (string) $row['snapshot_id'], 'the captured pre-restore envelope is still named' );
+	}
+
 	public function test_a_closed_log_refuses_the_restore_before_anything_is_captured(): void {
 		$env = $this->pageEnvelope();
 		$before = $this->envelopeCount();

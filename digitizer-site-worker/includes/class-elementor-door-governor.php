@@ -992,10 +992,15 @@ class Aura_Worker_Elementor_Door {
 	 * A row with NO binding predates the stamp and is accepted, the same
 	 * allowance every other reader of this field makes.
 	 *
+	 * PUBLIC because `execute()` is not the only post-admission mutation the
+	 * door governs (Ruling P65): a snapshot restore reserves its entry, then
+	 * captures, then writes the site, and the same rebind can land in that gap.
+	 * It fences with THIS predicate rather than one of its own.
+	 *
 	 * @param int $seq The log seq.
 	 * @return bool
 	 */
-	private static function binding_unchanged_for_row( $seq ) {
+	public static function binding_unchanged_for_row( $seq ) {
 		$row = Aura_Worker_Door_Log::get( (int) $seq );
 		$was = is_array( $row ) && isset( $row['binding'] ) ? (string) $row['binding'] : '';
 		if ( '' === $was ) {
@@ -3359,6 +3364,39 @@ class Aura_Worker_Elementor_Door {
 			return new WP_Error( 'aura_log_failed', 'The door log could not record this restore; it was not run.', array( 'status' => 503 ) );
 		}
 		return $seq;
+	}
+
+	/**
+	 * Settle a reserved restore entry that the FENCE refused (Ruling P65).
+	 *
+	 * The same terminus `execute()`'s fence writes, for the same reason and in
+	 * the same words: `refused` / `binding_changed` / `may_have_run: false` —
+	 * the restore provably did not touch the site, so the row must not leave
+	 * Aura wondering whether it did. The pre-restore envelope is named all the
+	 * same when one was captured: it EXISTS on the site, and a row that hid it
+	 * would leave it orphaned.
+	 *
+	 * The seq lease is released here, as it is on every other terminus.
+	 *
+	 * @param int        $seq The reserved entry.
+	 * @param array|null $pre Pre-restore envelope (or null).
+	 * @return bool The entry is terminal.
+	 */
+	public static function refuse_restore_entry( $seq, $pre ) {
+		$settled = Aura_Worker_Door_Log::settle(
+			(int) $seq,
+			array(
+				'result'       => 'refused',
+				'reason'       => 'binding_changed',
+				'may_have_run' => false,
+				'snapshot_id'  => is_array( $pre ) ? (string) $pre['id'] : null,
+			)
+		);
+		if ( ! $settled ) {
+			self::bump_counter( 'log_ungoverned' );
+		}
+		self::release_seq_lease();
+		return $settled;
 	}
 
 	/**

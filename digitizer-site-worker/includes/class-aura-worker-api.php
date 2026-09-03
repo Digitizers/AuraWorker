@@ -1356,6 +1356,29 @@ class Aura_Worker_API {
 			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array( 'success' => false, 'error' => 'Snapshot not found.' ) ), 404 );
 		}
 
+		// THE SITE IS ABOUT TO BE WRITTEN (Ruling P65). A restore is a governed
+		// mutation like any other, and everything between its admission above
+		// and this line — the pre-restore capture, the patch — takes time a
+		// rebind can land in. `execute()`'s callback fence catches that for an
+		// ability call; this is the same fence, on the same predicate, for the
+		// path that does not go through a callback at all. Read UNCACHED, so a
+		// rebind another PHP process completed is seen (Ruling P64).
+		if ( null !== $seq && ! Aura_Worker_Elementor_Door::binding_unchanged_for_row( $seq ) ) {
+			if ( ! Aura_Worker_Elementor_Door::refuse_restore_entry( $seq, $pre ) ) {
+				return self::restore_unsettled( $seq, false );
+			}
+			return new WP_REST_Response(
+				Aura_Worker_Rules::with_warnings(
+					array(
+						'success' => false,
+						'code'    => 'aura_binding_changed',
+						'error'   => 'This site was rebound to another Aura client while this restore was being admitted; nothing was restored.',
+					)
+				),
+				409
+			);
+		}
+
 		$result = $snapshots->restore( $id );
 		if ( null !== $seq && ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, $result ) ) {
 			// The restore RAN — succeeded or failed, it touched the site — and
