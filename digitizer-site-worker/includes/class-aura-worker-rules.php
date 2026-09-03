@@ -1682,15 +1682,21 @@ class Aura_Worker_Rules {
 	 * `$wpdb->esc_like()`), and the option cache is not consulted — these
 	 * statements go round it, so callers evict what they must.
 	 *
+	 * A TRUTHFUL BOOL, not a row count (Ruling P49). Deleting zero rows is a
+	 * legitimate success — there was nothing there — and a caller reading `0`
+	 * as failure, or reading a count as success, gets the answer backwards.
+	 * The only failure is the statement itself: `false` from `$wpdb`, or a
+	 * `last_error` beside a count.
+	 *
 	 * @param string $like  The LIKE pattern for option_name.
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
-	 * @return int|false Rows deleted, or false on a database error.
+	 * @return bool The statement ran.
 	 */
 	public static function delete_options_like_if_claimed( $like, $claim, $fence ) {
 		global $wpdb;
 		if ( '' === (string) $fence || '' === (string) $claim || '' === (string) $like ) {
-			return 0;
+			return false;
 		}
 		$wpdb->last_error = '';
 		$rows             = $wpdb->query(
@@ -1701,10 +1707,7 @@ class Aura_Worker_Rules {
 				$like
 			)
 		);
-		if ( false === $rows || '' !== (string) $wpdb->last_error ) {
-			return false;
-		}
-		return (int) $rows;
+		return false !== $rows && '' === (string) $wpdb->last_error;
 	}
 
 	/**

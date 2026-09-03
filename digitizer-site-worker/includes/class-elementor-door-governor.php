@@ -279,15 +279,20 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
-	 * @return bool TRUE only when the whole wipe ran under a held hold lock.
+	 * @return bool TRUE only when the whole wipe ran under a held hold lock,
+	 *              every statement reported success, and nothing is left.
 	 */
 	public static function wipe_for_unbind( $claim, $fence ) {
 		// The queue and the log go first, under the hold lock — and NOTHING
 		// goes if that lock could not be taken (Ruling P46), because a holder
 		// resuming afterwards would insert into a queue this call had already
-		// emptied. The caller is told, and decides.
-		if ( ! Aura_Worker_Door_Holds::wipe( $claim, $fence ) ) {
-			return false;
+		// emptied. Its answer is CARRIED rather than returned on (Ruling P49):
+		// a partial wipe still deletes everything else it can, so the next
+		// pass has less to finish, and the verification below is what decides
+		// what this call reports.
+		$ok = Aura_Worker_Door_Holds::wipe( $claim, $fence );
+		if ( null === $ok ) {
+			return false; // the lock was never taken: nothing was deleted, and nothing may be
 		}
 		// The creation mutex and the retention throttle are this binding's
 		// working state too, and a fresh binding should inherit neither: an
@@ -298,11 +303,18 @@ class Aura_Worker_Elementor_Door {
 		// that request's own release simply matches no row, which is already
 		// how it behaves when the reconciler clears a stale one.
 		foreach ( array( self::CREATING, self::PRUNED_AT ) as $option ) {
-			Aura_Worker_Rules::delete_option_if_claimed( $option, $claim, $fence );
+			$ok = ( false !== Aura_Worker_Rules::delete_option_if_claimed( $option, $claim, $fence ) ) && $ok;
 			wp_cache_delete( $option, 'options' );
 		}
 		wp_cache_delete( 'notoptions', 'options' );
-		return true;
+		// AND THEN LOOK (Ruling P49). Every statement reporting success is not
+		// the same claim as "nothing is left" — a row inserted between two of
+		// them, or a delete whose fence stopped matching, would pass the first
+		// test and fail the second. The caller's contract is the second one:
+		// answer true only when this site holds no transactional door state at
+		// all. A partial wipe answers false, the unbind marks `door` a
+		// leftover, and the next pass finishes it.
+		return $ok && ! self::has_state();
 	}
 
 	/**

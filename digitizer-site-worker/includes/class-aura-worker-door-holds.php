@@ -723,7 +723,9 @@ class Aura_Worker_Door_Holds {
 	 *
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
-	 * @return bool TRUE only when every delete ran under a lock this call held.
+	 * @return bool|null TRUE when every statement ran under a lock this call
+	 *                   held; FALSE when they ran and one failed; NULL when the
+	 *                   lock could not be taken and nothing was attempted.
 	 */
 	public static function wipe( $claim, $fence ) {
 		global $wpdb;
@@ -736,17 +738,29 @@ class Aura_Worker_Door_Holds {
 		// binding's queue, visible through `/status` and replayable.
 		$token = self::take_wipe_lock();
 		if ( false === $token ) {
-			return false; // nothing deleted; the caller decides what that means
+			// NULL, not false: nothing was attempted, so the caller must not
+			// go on to delete its own share either (Ruling P46). A `false`
+			// means the statements RAN and some of them failed, which is a
+			// different instruction — carry on and let the verification decide.
+			return null;
 		}
 		try {
-			Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::HELD ) . '%', $claim, $fence );
-			Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::CLAIMED ) . '%', $claim, $fence );
+			// EVERY result counted (Ruling P49). A transient database error on
+			// the held-prefix delete used to be invisible: the later statements
+			// succeeded, the wipe reported true, and a changed-client connect
+			// persisted the new binding over an old client's held mutation that
+			// was still there — visible and replayable by the new client. `&&`
+			// AFTER the call on purpose, never before: every statement runs, so
+			// a partial wipe leaves as little behind as it can and the next
+			// pass finishes it.
+			$ok = Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::HELD ) . '%', $claim, $fence );
+			$ok = Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::CLAIMED ) . '%', $claim, $fence ) && $ok;
 			// The log is emptied inside the same lock: a hold admitted between
 			// the two would otherwise leave an entry for a hold that is gone.
-			Aura_Worker_Door_Log::wipe( $claim, $fence );
+			$ok = Aura_Worker_Door_Log::wipe( $claim, $fence ) && $ok;
 			wp_cache_delete( 'notoptions', 'options' );
 			wp_cache_delete( 'alloptions', 'options' );
-			return true;
+			return $ok;
 		} finally {
 			self::release_lock( $token );
 		}

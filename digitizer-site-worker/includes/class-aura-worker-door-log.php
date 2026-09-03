@@ -334,17 +334,23 @@ class Aura_Worker_Door_Log {
 	 * Fenced on the site claim exactly as every other unbind step is, so a
 	 * caller that lost the site mid-cleanup deletes nothing.
 	 *
+	 * EVERY statement is checked (Ruling P49): a transient database error on
+	 * one of them used to be invisible, and the caller reported a clean wipe
+	 * over rows that are still there.
+	 *
 	 * @param string $claim The site-claim option name.
 	 * @param string $fence This caller's claim fence.
-	 * @return void
+	 * @return bool Every statement ran.
 	 */
 	public static function wipe( $claim, $fence ) {
 		global $wpdb;
-		Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::PREFIX ) . '%', $claim, $fence );
-		Aura_Worker_Rules::delete_option_if_claimed( self::EPOCH, $claim, $fence );
+		$ok = Aura_Worker_Rules::delete_options_like_if_claimed( $wpdb->esc_like( self::PREFIX ) . '%', $claim, $fence );
+		// `false` is the only failure for these two: 0 rows means the option
+		// was not there, which is the state being asked for.
+		$ok = ( false !== Aura_Worker_Rules::delete_option_if_claimed( self::EPOCH, $claim, $fence ) ) && $ok;
 		// The binding generation goes with it: a replay fenced to it can never
 		// mistake the next binding's door for its own (Ruling P51).
-		Aura_Worker_Rules::delete_option_if_claimed( self::BINDING, $claim, $fence );
+		$ok = ( false !== Aura_Worker_Rules::delete_option_if_claimed( self::BINDING, $claim, $fence ) ) && $ok;
 		// These statements go round the option cache, so evict by hand what
 		// delete_option() would have maintained. The numeric rows are read
 		// through row_from_db()/rows(), which never consult it.
@@ -353,6 +359,7 @@ class Aura_Worker_Door_Log {
 		}
 		wp_cache_delete( 'notoptions', 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
+		return $ok;
 	}
 
 	/** @param int $seq Seq. @return array|null */

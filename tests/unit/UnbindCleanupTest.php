@@ -992,6 +992,11 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertNull( $frag['log_full'] );
 	}
 
+	/** The LIKE pattern the held-prefix delete actually carries (underscores escaped). */
+	private function heldLikePattern(): string {
+		return $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD ) . '%';
+	}
+
 	/** Somebody else owns the hold-queue mutex, and their lock is FRESH. */
 	private function holdTheLock( int $age_s = 0 ): string {
 		$token                                                    = ( time() - $age_s ) . '|' . 'ffffffff-ffff-4fff-8fff-ffffffffffff';
@@ -1058,6 +1063,69 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertSame( array(), Aura_Worker_Unbind::leftovers() );
 		$this->assertSame( array(), $this->doorRows() );
 		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	/**
+	 * Ruling P49: a wipe answers true only when every statement ran AND
+	 * nothing is left.
+	 *
+	 * A transient database error on the held-prefix delete used to be
+	 * invisible — the later statements succeeded, the wipe reported true, and
+	 * a changed-client connect persisted the new binding over an old client's
+	 * held mutation that was still there, visible and replayable by the new
+	 * client.
+	 */
+	public function test_a_wipe_whose_held_delete_fails_answers_false(): void {
+		$door                                                                        = $this->seedDoor();
+		$GLOBALS['_sa_option_delete_like_fail'][ $this->heldLikePattern() ]           = true;
+		$fence                                                                       = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		// The rest of the statements still RAN — a partial wipe leaves as
+		// little behind as it can, and the next pass finishes it.
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $door['held'] ), 'the family that failed is untouched' );
+		$this->assertSame( array( 'aura_worker_door_held_' . $door['held'] ), $this->doorRows(), 'and nothing else survived' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** …and the unbind reports it, so the drain finishes the job. */
+	public function test_a_partial_wipe_keeps_the_unbind_incomplete_until_it_finishes(): void {
+		$this->seedDoor();
+		$GLOBALS['_sa_option_delete_like_fail'][ $this->heldLikePattern() ] = true;
+		$fence                                                            = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertFalse( Aura_Worker_Unbind::cleanup( true, $fence ) );
+		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers() );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
+
+		$GLOBALS['_sa_option_delete_like_fail'] = array(); // the database recovers
+
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
+		$this->assertSame( array(), $this->doorRows() );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
+	}
+
+	/**
+	 * Every statement succeeding is not the same claim as "nothing is left":
+	 * the answer is the second one.
+	 */
+	public function test_a_wipe_answers_false_when_a_row_survives_every_successful_statement(): void {
+		$this->seedDoor();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		// A row that reappears the instant the deletes are done — the shape a
+		// racer, or a fence that stopped matching, would leave.
+		$GLOBALS['_sa_after_option_read'] = null;
+		$survivor                         = 'aura_worker_door_log_99';
+		$this->assertTrue( Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, $fence ), 'a clean wipe first' );
+		$GLOBALS['_options'][ $survivor ] = array( 'seq' => 99, 'result' => 'ok', 'admitted' => true );
+		$GLOBALS['_rows'][ $survivor ]    = maybe_serialize( $GLOBALS['_options'][ $survivor ] );
+
+		$this->assertFalse(
+			Aura_Worker_Elementor_Door::wipe_for_unbind( Aura_Worker_Magic_Link::SITE_CLAIM, 'not-the-fence' ),
+			'the deletes matched nothing, so the row is still there and the answer is false'
+		);
+		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
 	/** A caller that lost the site claim deletes nothing — the same fence every step uses. */

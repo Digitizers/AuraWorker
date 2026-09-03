@@ -2450,6 +2450,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// thousands of per-name statements.
 			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name LIKE '([^']*)'$/s", $query, $m ) ) {
 				list( , $claim, $like, $names ) = array_map( 'stripslashes', $m );
+				// The statement itself failing at the driver — NOT "no row
+				// matched". Keyed by the LIKE PATTERN, so a test can break one
+				// family of door rows and let the rest through (Ruling P49).
+				if ( ! empty( $GLOBALS['_sa_option_delete_like_fail'][ $names ] ) ) {
+					$this->last_error = 'delete failed';
+					return false;
+				}
 				if ( ! sa_claim_like_matches( $claim, $like ) ) {
 					return 0;
 				}
@@ -2846,6 +2853,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
@@ -4095,6 +4103,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_option_delete_like_fail'] = array(); // LIKE patterns the claim-conditional prefix DELETE must fail on (Ruling P49).
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
