@@ -897,8 +897,8 @@ final class UnbindCleanupTest extends TestCase {
 		$held    = Aura_Worker_Door_Holds::hold( $call );
 		$claimed = Aura_Worker_Door_Holds::hold( $call );
 		Aura_Worker_Door_Holds::claim( $claimed );
-		// A DIED replay, not a live one: a claim younger than CLAIM_STALE_MS
-		// stops the wipe outright (Ruling P50), which is its own test below.
+		// A DIED replay, not a live one: the reconciler settles a claim only
+		// once it is older than CLAIM_STALE_MS and holds no execution lease.
 		$this->ageClaim( $claimed );
 		for ( $i = 0; $i < 3; $i++ ) {
 			$seq = Aura_Worker_Door_Log::open_pending( $call );
@@ -943,14 +943,6 @@ final class UnbindCleanupTest extends TestCase {
 		return $out;
 	}
 
-	/**
-	 * A hold is a stored WordPress action — an ability, its input, and the
-	 * ACTOR to run it as. It used to survive every cleanup step, so a site
-	 * later connected to a DIFFERENT Aura client was served the departed
-	 * client's holds through `/status` and could approve one through
-	 * `elementor_replay_ability`.
-	 */
-	/** …and the next binding starts a FRESH epoch at cursor 0. */
 	/** Backdate a claimed row past CLAIM_STALE_MS, in the database and the cache alike. */
 	private function ageClaim( string $ref, int $extra_s = 60 ): void {
 		$name = Aura_Worker_Door_Holds::CLAIMED . $ref;
@@ -960,73 +952,6 @@ final class UnbindCleanupTest extends TestCase {
 		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
 	}
 
-	/**
-	 * The LIKE pattern the held-prefix delete actually carries (underscores
-	 * escaped). The prefix READ seam is keyed the same way — see
-	 * test_an_unreadable_claimed_row_read_stops_the_wipe.
-	 */
-	private function heldLikePattern(): string {
-		return $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD ) . '%';
-	}
-
-	/** Somebody else owns the hold-queue mutex, and their lock is FRESH. */
-	private function holdTheLock( int $age_s = 0 ): string {
-		$token                                                    = ( time() - $age_s ) . '|' . 'ffffffff-ffff-4fff-8fff-ffffffffffff';
-		$GLOBALS['_options'][ Aura_Worker_Door_Holds::LOCK ]      = $token;
-		$GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ]         = maybe_serialize( $token );
-		unset( $GLOBALS['_notoptions'][ Aura_Worker_Door_Holds::LOCK ] );
-		return $token;
-	}
-
-	/**
-	 * Ruling P46: a wipe that cannot take the mutex deletes NOTHING.
-	 *
-	 * Entering the deletes on a failed `take_lock()` was worse than not wiping:
-	 * the holder resumes inside `hold_locked()` and inserts its held row AFTER
-	 * the prefix deletes have run, so a changed-client reconnect finished with
-	 * a departed client's stored mutation in the new binding's queue.
-	 */
-	/** A STALE holder is taken over by take_lock()'s own rule, and the wipe runs. */
-	/**
-	 * …and the unbind reports the debt rather than claiming completion: `door`
-	 * is a leftover like any other, so the token stays and the drain's next
-	 * Phase-B pass wipes for real.
-	 */
-	/**
-	 * Ruling P50: a wipe does not START while a replay is in flight.
-	 *
-	 * This is the mechanism the previous three rounds kept patching around. A
-	 * replay that has CLAIMED its hold is between the claim and its callback,
-	 * and nothing the wipe deletes can make that request stop — so the wipe
-	 * refuses instead, and the caller retries.
-	 */
-	/** A claim older than CLAIM_STALE_MS is a died replay the reconciler owns: the wipe proceeds. */
-	/** A claim whose stamp cannot be read is treated as IN FLIGHT, not as stale. */
-	/**
-	 * Ruling P49: a wipe answers true only when every statement ran AND
-	 * nothing is left.
-	 *
-	 * A transient database error on the held-prefix delete used to be
-	 * invisible — the later statements succeeded, the wipe reported true, and
-	 * a changed-client connect persisted the new binding over an old client's
-	 * held mutation that was still there, visible and replayable by the new
-	 * client.
-	 */
-	/** …and the unbind reports it, so the drain finishes the job. */
-	/**
-	 * Every statement succeeding is not the same claim as "nothing is left":
-	 * the answer is the second one.
-	 */
-	/**
-	 * Ruling P52: an EXECUTION LEASE, not an age guess.
-	 *
-	 * An approved Elementor callback may legitimately run for longer than
-	 * CLAIM_STALE_MS. The age rule called that death and let a concurrent
-	 * unbind or changed-client connect wipe the claim, log and binding while
-	 * the callback was still mutating the site. A MySQL named lock lives
-	 * exactly as long as the request's database connection, so while it is
-	 * held nothing has to guess.
-	 */
 	/** …and the reconciler leaves that claim alone rather than calling it interrupted. */
 	public function test_the_reconciler_skips_a_claim_whose_lease_is_held(): void {
 		$door = $this->seedDoor();
@@ -1038,28 +963,6 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $door['claimed'] ) );
 	}
 
-	/** No lease held and the claim is stale: the unchanged rule, the wipe proceeds. */
-	/**
-	 * A server that cannot answer IS_USED_LOCK leaves the question UNKNOWN, so
-	 * the row counts as in flight under a 24-hour hard cap — which also bounds
-	 * a lease stranded on a persistent connection.
-	 */
-	/**
-	 * Ruling P49': an unreadable count is not an empty door.
-	 *
-	 * `has_state()` decides whether a wipe may report success and whether the
-	 * unbind may drop `door` from its leftovers. `get_var()` answers null for a
-	 * broken statement as readily as for a real zero, so reading the value
-	 * alone let a database error report a clean wipe over a door that is still
-	 * full — the one direction this must never fail in.
-	 */
-	/** …and the unbind keeps the door owed, so a later pass verifies it for real. */
-	/**
-	 * The same rule for the in-flight check: a claimed-row read that FAILED is
-	 * not an empty set, so the wipe refuses rather than deleting under a replay
-	 * it could not see (Ruling P49').
-	 */
-	/** wipe() answers a NAMED status, so a caller cannot conflate busy with failed. */
 	/**
 	 * Ruling P58: the unbind's door step mints a new generation. Nothing is
 	 * deleted, nothing can refuse, and `door` is not a leftover kind.

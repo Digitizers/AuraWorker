@@ -449,18 +449,6 @@ final class ElementorReplayTest extends TestCase {
 	}
 
 	/**
-	 * Ruling P40: a permission callback that THROWS is refused with a record,
-	 * not left to the reconciler.
-	 *
-	 * The check runs after the claim — deliberately: the claim is what makes
-	 * the actor switch safe against a concurrent replay — and `replay()` had
-	 * only a `finally`, so a throw from Elementor's callback (or from whatever
-	 * a plugin filtered onto it) escaped the whole method. The request died
-	 * with an uncaught error, the CLAIMED row survived, and ten minutes later
-	 * the reconciler called the attempt `interrupted` and spent the operator's
-	 * approval on a callback that never ran.
-	 */
-	/**
 	 * Ruling P52: the lease is taken for the replay and released after it,
 	 * on the normal path and on a throwing one alike.
 	 */
@@ -619,15 +607,14 @@ final class ElementorReplayTest extends TestCase {
 	}
 
 	/**
-	 * Ruling P47: a replay whose site was REBOUND mid-flight does not run.
+	 * Rulings P51/P58: a replay whose site was REBOUND mid-flight does not run.
 	 *
-	 * The claim is now taken under the hold lock, so it cannot land inside a
-	 * wipe's deletes. This is the other order: the claim was already ours and
-	 * the wipe happened afterwards — a changed-client connect, or an unbind,
-	 * taking the departed binding's door away while the approval was running.
-	 * Without the fence the callback went on to execute the departed client's
-	 * stored mutation under the replacement binding, and recreated door state
-	 * doing it.
+	 * A changed-binding connect, or an unbind, mints a new binding generation
+	 * while this approval is between its claim and its callback. Nothing is
+	 * deleted out from under it — the claim is still on disk — but it names a
+	 * generation that is no longer current, and without the fence the callback
+	 * went on to execute the departed client's stored mutation under the
+	 * replacement binding.
 	 */
 	public function test_a_replay_refuses_when_the_site_is_rebound_mid_flight(): void {
 		$this->registerAll();
@@ -640,9 +627,10 @@ final class ElementorReplayTest extends TestCase {
 				++$inner_ran;
 			}
 		);
-		// The wipe lands after the claim (its terminal_seq stamp is the first
-		// swap on the claimed row) and before the callback: the binding
-		// generation and the claimed row are exactly what it takes.
+		// The rebind lands after the claim (its terminal_seq stamp is the first
+		// swap on the claimed row) and before the callback — the window the
+		// fence exists for. Deleting the generation option is what a mint
+		// looks like to this claim: whatever is current is no longer its own.
 		$this->afterSwapOn(
 			Aura_Worker_Door_Holds::CLAIMED . $ref,
 			static function () {

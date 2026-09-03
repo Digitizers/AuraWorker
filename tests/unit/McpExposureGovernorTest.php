@@ -57,8 +57,8 @@ final class McpExposureGovernorTest extends TestCase {
 	/**
 	 * The throwing $wpdb this file installs is a GLOBAL, and sa_reset_state()
 	 * does not replace it — so it leaked into every later test in the run that
-	 * issues an `aura_worker_door_` query. Nothing did until the unbind's door
-	 * wipe (Ruling P44), which then exploded on a stand-in this file left
+	 * issues an `aura_worker_door_` query. Nothing did until the unbind grew a
+	 * door step (Ruling P44), which then exploded on a stand-in this file left
 	 * behind. Put back a working one after every test here.
 	 */
 	protected function tearDown(): void {

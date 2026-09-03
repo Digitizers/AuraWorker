@@ -517,8 +517,8 @@ class Aura_Worker_Magic_Link {
 		// whose token no longer matches) is a binding that cannot be PROVEN the
 		// same, and an unprovable binding is treated as replaced — the safe
 		// direction is always the departed client's approvals not surviving.
-		// An unbind still wipes unconditionally; this condition is the
-		// connect's alone.
+		// An unbind rebinds unconditionally; this condition is the connect's
+		// alone.
 		//
 		// A NEW GENERATION, not a wipe (Ruling P58). Nothing is deleted: every
 		// held, claimed and log row the departed binding wrote keeps its own
@@ -540,7 +540,7 @@ class Aura_Worker_Magic_Link {
 		if ( ! $same_binding && class_exists( 'Aura_Worker_Elementor_Door' ) ) {
 			Aura_Worker_Elementor_Door::rebind();
 		}
-		// THE CONNECT USER, after the wipe and not before it (Ruling P48). This
+		// THE CONNECT USER, after the rebind and not before it (Ruling P48). This
 		// used to be the handler's first persistent write, so the retryable
 		// refusal path above left the OLD token, dashboard and client active
 		// while token-only requests started running as the NEW administrator —

@@ -415,13 +415,14 @@ class Aura_Worker_Door_Holds {
 		}
 		$claimed               = $held;
 		$claimed['claimed_at'] = gmdate( 'c' );
-		// The BINDING this claim belongs to (Rulings P47/P51). ONLY a wipe
-		// deletes this value, and the next binding mints a fresh one, so it
-		// can never be equal across a rebind — which is exactly what the
-		// wrapper re-reads before the callback to prove the site is still the
-		// one that approved this call. Deliberately NOT the log epoch: Aura
-		// may rotate that legitimately through `/door/rotate` on a rewind, and
-		// a rotation is not a rebind.
+		// The BINDING this claim belongs to (Rulings P51/P58). The generation
+		// moves only when a changed-binding connect or an unbind MINTS a new
+		// one, so a value stamped here can never equal the current generation
+		// across a rebind — which is exactly what the wrapper re-reads before
+		// the callback to prove the site is still the one that approved this
+		// call. Deliberately NOT the log epoch: Aura may rotate that
+		// legitimately through `/door/rotate` on a rewind, and a rotation is
+		// not a rebind.
 		if ( ! isset( $claimed['binding'] ) || '' === (string) $claimed['binding'] ) {
 			// A hold carries its binding from hold() (Ruling P58); this only
 			// fills it in for a row queued by a build before that, so the P51

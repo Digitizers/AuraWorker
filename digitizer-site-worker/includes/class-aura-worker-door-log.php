@@ -22,7 +22,7 @@ class Aura_Worker_Door_Log {
 	const PREFIX       = 'aura_worker_door_log_';
 	const FLOOR        = 'aura_worker_door_log_acked';
 	const EPOCH        = 'aura_worker_door_epoch';
-	/** The BINDING generation (Ruling P51): minted like the epoch, deleted ONLY by a wipe. */
+	/** The BINDING generation (Rulings P51/P58): minted like the epoch, rotated ONLY by a rebind. */
 	const BINDING      = 'aura_worker_door_binding';
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
@@ -87,8 +87,9 @@ class Aura_Worker_Door_Log {
 	 * The BINDING generation: which Aura binding this site's door belongs to
 	 * (Ruling P51).
 	 *
-	 * Minted lazily, exactly like the epoch, and deleted by ONE thing — the
-	 * wipe. That is the whole difference, and the reason it exists. The epoch
+	 * Minted lazily, exactly like the epoch, and rotated by ONE thing — a
+	 * rebind (a changed-binding connect, or an unbind). That is the whole
+	 * difference, and the reason it exists. The epoch
 	 * is the LOG's identity and Aura may legitimately rotate it through the
 	 * grant-gated `POST /aura/v1/door/rotate` (Ruling P20) whenever a rewind is
 	 * detected; a replay in flight would then have seen its fence move for a

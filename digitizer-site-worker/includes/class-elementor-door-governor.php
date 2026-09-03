@@ -959,13 +959,15 @@ class Aura_Worker_Elementor_Door {
 
 	/**
 	 * Is the claimed row still ours, under the BINDING it was claimed in
-	 * (Rulings P47/P51)?
+	 * (Rulings P51/P58)?
 	 *
-	 * FALSE when the claimed row is gone (a wipe took it) or when the site's
-	 * binding generation has moved (a wipe deleted it and a new binding minted
-	 * another). NOT the log epoch: `/door/rotate` may rotate that legitimately
-	 * on a rewind, which is not a rebind, and answering `binding_changed`
-	 * there would spend an approval for nothing (Ruling P51).
+	 * FALSE when the claimed row is gone (the reconciler's sweep reached it
+	 * after this site was rebound) or when the binding GENERATION has moved —
+	 * a changed-binding connect, or an unbind, minted a new one, so the value
+	 * stamped on this claim now names a departed binding. NOT the log epoch:
+	 * `/door/rotate` may rotate that legitimately on a rewind, which is not a
+	 * rebind, and answering `binding_changed` there would spend an approval
+	 * for nothing (Ruling P51).
 	 *
 	 * A claimed row carrying NO binding — claimed by a build before this rule —
 	 * is accepted: it predates the fence and refusing it would strand an
@@ -1887,13 +1889,13 @@ class Aura_Worker_Elementor_Door {
 		// lose; what there IS, is a call approved by a client that no longer
 		// governs this site, and it must not run.
 		//
-		// The BINDING GENERATION is the witness (Ruling P51): only a wipe
-		// deletes it and the next binding mints a fresh one, so the value
-		// stamped on the claimed row can never survive a rebind — and, unlike
-		// the log epoch, `/door/rotate` never moves it, so a legitimate rewind
-		// rotation does not read as a rebind. Read RAW — never binding(),
-		// which MINTS one and would quietly manufacture agreement on a site
-		// whose binding was just deleted.
+		// The BINDING GENERATION is the witness (Rulings P51/P58): it moves
+		// only when a changed-binding connect or an unbind mints a new one, so
+		// the value stamped on the claimed row can never survive a rebind —
+		// and, unlike the log epoch, `/door/rotate` never moves it, so a
+		// legitimate rewind rotation does not read as a rebind. Read RAW —
+		// never binding(), which MINTS one and would quietly manufacture
+		// agreement on a site whose generation option had gone missing.
 		//
 		if ( null !== self::$replay_ack ) {
 			$ours = self::replay_binding_unchanged( (string) self::$replay_ack['ref'] );
@@ -2350,7 +2352,7 @@ class Aura_Worker_Elementor_Door {
 			// held nothing has to GUESS whether the request is still running —
 			// which is what the CLAIM_STALE_MS age rule was doing, and why an
 			// approved callback that legitimately ran for more than ten minutes
-			// could have its claim, log and binding wiped out from under it.
+			// could be recovered out from under it by the reconciler.
 			//
 			// Taken AFTER the claim, so the row this lease names is already
 			// ours. Released in the `finally` below — and by the connection

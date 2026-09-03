@@ -510,38 +510,6 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertTrue( Aura_Worker_Elementor_Door::present() );
 	}
 
-	/** A DIFFERENT client is a replacement: the departed client's queue goes. */
-	/** The same client on a DIFFERENT dashboard is a different binding too. */
-	/**
-	 * A binding that cannot be PROVEN the same is treated as replaced: the old
-	 * side names no client (an older dashboard installed it, or the store is
-	 * unbound), so the comparison fails toward the wipe.
-	 */
-	/**
-	 * Ruling P46: a changed-binding connect that cannot clear the old queue
-	 * writes NOTHING and answers a retryable 503.
-	 *
-	 * The wipe runs before the token/dashboard/grant writes precisely so a
-	 * refusal leaves the site exactly as it was — the old binding whole, and
-	 * Aura retrying in a few seconds.
-	 */
-	/**
-	 * Ruling P50: a changed-binding connect during a LIVE replay is refused.
-	 *
-	 * A replay between its claim and its callback cannot be stopped by
-	 * deleting rows out from under it, so the wipe does not start and the
-	 * connect answers `aura_door_busy` — the same retryable refusal a busy
-	 * hold lock gets, and Aura retries in seconds.
-	 */
-	/**
-	 * Ruling P48: the busy path leaves NOTHING of the new binding behind.
-	 *
-	 * `aura_worker_connect_user_id` used to be the handler's first persistent
-	 * write, so a connect that then refused left the old token, dashboard and
-	 * client active while token-only requests ran as the NEW administrator —
-	 * and releasing the site claim restores nothing. The wipe is now the first
-	 * persistent effect of a connect, so a refusal has nothing to undo.
-	 */
 	/** …and a successful changed-binding connect still writes every one of them. */
 	public function test_a_successful_changed_binding_connect_writes_them_all(): void {
 		$this->seedPreviousBinding( 'c1', 'https://dash.example' );

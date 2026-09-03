@@ -87,10 +87,6 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'never delete on a guess' );
 	}
 
-	/* ------------------------------------------------------------------ */
-	/* Ruling P58: holds are BINDING-SCOPED, and a rebind mints a generation */
-	/* ------------------------------------------------------------------ */
-
 	/**
 	 * A departed client's hold is invisible, not deleted.
 	 *
@@ -314,16 +310,6 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
 	}
 
-	/**
-	 * Ruling P47: the claim MOVE takes the hold lock, like admission.
-	 *
-	 * Only hold() used to take it, so a claim could complete inside the window
-	 * a changed-client connect's (or an unbind's) wipe was deleting rows in —
-	 * and the replay ran on into the callback, recreating door state while
-	 * executing the DEPARTED client's stored mutation under the replacement
-	 * binding.
-	 */
-	/** unclaim() takes it too — it INSERTS a held row, which a wipe must not meet. */
 	/** The claimed row records the BINDING it was claimed under (Ruling P51). */
 	public function test_a_claim_records_the_binding_it_was_taken_under(): void {
 		$ref     = Aura_Worker_Door_Holds::hold( $this->call() );
@@ -506,10 +492,6 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayNotHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'] );
 	}
 
-	/* ------------------------------------------------------------------ */
-	/* An expired hold is not held (Ruling P18)                            */
-	/* ------------------------------------------------------------------ */
-
 	/**
 	 * listing() hides an expired hold and sweep() deletes it — but both run
 	 * on a `/status` poll, and an unpolled site can sit past a hold's seven
@@ -552,10 +534,6 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
 		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
 	}
-
-	/* ------------------------------------------------------------------ */
-	/* An expired hold does not hold a queue slot (Ruling P21)             */
-	/* ------------------------------------------------------------------ */
 
 	/** Hold $n calls and expire every one of them, without sweeping. */
 	private function expiredHolds( int $n ): array {
@@ -620,10 +598,6 @@ final class DoorHoldsTest extends TestCase {
 		Aura_Worker_Door_Holds::hold( $this->call() );
 		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'and its held twin was not purged out from under the replay' );
 	}
-
-	/* ------------------------------------------------------------------ */
-	/* Helpers                                                             */
-	/* ------------------------------------------------------------------ */
 
 	/** The reconciler's stale-claim bound, as the governor declares it. */
 	private const CLAIM_STALE_MS   = 600000;
