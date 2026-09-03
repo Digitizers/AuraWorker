@@ -853,6 +853,54 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( '[{"v":1}]', get_post_meta( 7, '_elementor_data', true ) );
 	}
 
+	/** The rolling counter bump_counter() writes. */
+	private function counter( string $name ): int {
+		return (int) get_option( 'aura_worker_door_c_' . $name . '_h' . (int) floor( time() / HOUR_IN_SECONDS ), 0 );
+	}
+
+	/**
+	 * The restore RAN and the log could not say so (Ruling P19). Answering
+	 * 200 would tell Aura the rollback is recorded while the entry sits
+	 * pending, to be reconciled `interrupted` ten minutes later.
+	 */
+	public function test_a_restore_whose_entry_cannot_be_settled_answers_may_have_run(): void {
+		$env = $this->pageEnvelope();
+		// Only the terminal settle fails; the reservation and the pre-restore
+		// patch still land.
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'settled_at' );
+		};
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_log_failed', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertTrue( $res->get_error_data()['may_have_run'] );
+		$this->assertSame( 1, $res->get_error_data()['seq'] );
+		$this->assertSame( '[{"v":1}]', get_post_meta( 7, '_elementor_data', true ), 'the content WAS restored' );
+		$this->assertSame( 'pending', Aura_Worker_Door_Log::get( 1 )['result'], 'left for the reconciler' );
+		$this->assertSame( 1, $this->counter( 'log_ungoverned' ) );
+	}
+
+	/** And a restore that never ran says THAT, rather than borrowing the doubt. */
+	public function test_a_restore_that_never_ran_and_cannot_be_settled_says_may_have_run_false(): void {
+		$env = $this->pageEnvelope();
+		// The pre-restore id cannot be recorded — and neither can the
+		// `failed` settle that refusal writes.
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false !== strpos( (string) $value, 'snapshot_id' );
+		};
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_log_failed', $res->get_error_code() );
+		$this->assertFalse( $res->get_error_data()['may_have_run'] );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
+		$this->assertSame( 1, $this->counter( 'log_ungoverned' ) );
+	}
+
 	public function test_a_missing_envelope_is_404_and_an_execution_failure_is_500(): void {
 		$res = $this->api->restore_snapshot( $this->request( array( 'id' => 'snap_nope' ) ) );
 		$this->assertSame( 404, $res->get_status() );

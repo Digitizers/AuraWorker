@@ -2219,12 +2219,20 @@ class Aura_Worker_Elementor_Door {
 	/**
 	 * Settle the reserved restore entry.
 	 *
+	 * ANSWERS whether the row is terminal (Ruling P19). The caller decides
+	 * what to tell the client — a restore whose outcome the log never learned
+	 * is not a 200 — and the counter is bumped HERE, beside every other
+	 * `log_ungoverned` bump, so the audit counts an unrecorded restore the
+	 * same way it counts an unrecorded write.
+	 *
 	 * @param int        $seq     The reserved entry.
 	 * @param array|null $pre     Pre-restore envelope (or null).
 	 * @param array      $outcome restore()'s result.
+	 * @return bool The entry is terminal. False ⇒ it is still pending, and
+	 *              the reconciler will call it `interrupted`.
 	 */
 	public static function settle_restore_entry( $seq, $pre, array $outcome ) {
-		Aura_Worker_Door_Log::settle(
+		$settled = Aura_Worker_Door_Log::settle(
 			(int) $seq,
 			array(
 				'result'      => empty( $outcome['success'] ) ? 'failed' : 'ok',
@@ -2233,6 +2241,10 @@ class Aura_Worker_Elementor_Door {
 				'error'       => isset( $outcome['error'] ) ? $outcome['error'] : null,
 			)
 		);
+		if ( ! $settled ) {
+			self::bump_counter( 'log_ungoverned' );
+		}
+		return $settled;
 	}
 
 	/* ------------------------------------------------------------------ */

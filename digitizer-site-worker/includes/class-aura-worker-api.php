@@ -1310,7 +1310,9 @@ class Aura_Worker_API {
 			}
 			$cap = Aura_Worker_Elementor_Door::pre_restore_capture( $record );
 			if ( empty( $cap['success'] ) ) {
-				Aura_Worker_Elementor_Door::settle_restore_entry( $seq, null, array( 'success' => false, 'error' => 'pre-restore capture failed: ' . (string) ( $cap['error'] ?? '' ) ) );
+				if ( ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, null, array( 'success' => false, 'error' => 'pre-restore capture failed: ' . (string) ( $cap['error'] ?? '' ) ) ) ) {
+					return self::restore_unsettled( $seq, false );
+				}
 				return new WP_REST_Response( array( 'success' => false, 'error' => 'Could not capture the current state before restoring: ' . (string) ( $cap['error'] ?? '' ) ), 503 );
 			}
 			$pre = $cap['snapshot'];
@@ -1318,7 +1320,9 @@ class Aura_Worker_API {
 			// mutates anything: an interrupted restore must still name the
 			// envelope that undoes it.
 			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'snapshot_id' => (string) $pre['id'] ) ) ) {
-				Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, array( 'success' => false, 'error' => 'could not record the pre-restore snapshot' ) );
+				if ( ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, array( 'success' => false, 'error' => 'could not record the pre-restore snapshot' ) ) ) {
+					return self::restore_unsettled( $seq, false );
+				}
 				return new WP_REST_Response( array( 'success' => false, 'error' => 'Could not record the pre-restore snapshot; nothing was restored.' ), 503 );
 			}
 		}
@@ -1328,8 +1332,12 @@ class Aura_Worker_API {
 		}
 
 		$result = $snapshots->restore( $id );
-		if ( null !== $seq ) {
-			Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, $result );
+		if ( null !== $seq && ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, $result ) ) {
+			// The restore RAN — succeeded or failed, it touched the site — and
+			// the log could not record what came of it (Ruling P19). A 200
+			// here would tell Aura the rollback is recorded while the entry
+			// sits pending, to be reconciled `interrupted` ten minutes later.
+			return self::restore_unsettled( $seq, true );
 		}
 
 		// 200 restored; 409 a designated refusal (aura_trash_disabled); 500 an
@@ -1337,6 +1345,34 @@ class Aura_Worker_API {
 		// reads as "no longer restorable on the site".
 		$status = $result['success'] ? 200 : ( isset( $result['code'] ) ? 409 : 500 );
 		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
+	}
+
+	/**
+	 * A restore whose door entry could not be settled: the site cannot say
+	 * what happened, so neither does the response (Ruling P19). The same
+	 * shape the governor answers an unsettled write with — `may_have_run`
+	 * and the `seq` to look the entry up by — so one reader handles both.
+	 *
+	 * The row is deliberately LEFT pending: the reconciler calls it
+	 * `interrupted`, which is the honest terminal state for an outcome
+	 * nothing recorded.
+	 *
+	 * @param int  $seq The reserved entry.
+	 * @param bool $ran Whether the restore itself ran.
+	 * @return WP_Error
+	 */
+	private static function restore_unsettled( $seq, $ran ) {
+		return new WP_Error(
+			'aura_log_failed',
+			$ran
+				? 'The restore ran but this site could not record its outcome; check the site before retrying.'
+				: 'This site could not record the outcome of this restore; nothing was restored.',
+			array(
+				'status'       => 503,
+				'may_have_run' => (bool) $ran,
+				'seq'          => (int) $seq,
+			)
+		);
 	}
 
 	/**
