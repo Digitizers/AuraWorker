@@ -84,6 +84,14 @@ class Aura_Worker_Door_Log {
 	/**
 	 * Allocate the next seq by inserting the row that owns it.
 	 *
+	 * Entry fields: `ability`, `actor` (WHOSE call this is — under a replay
+	 * the actor stored on the hold, verbatim, never the approver's identity;
+	 * Ruling P36), `touches`, `verdict`, `rule_key`, and — on a replay —
+	 * `ref`, `ruleset_seq` and `approved_by` (WHO approved it: the replay
+	 * request's own actor, or null when it carries no identifiable user).
+	 * Later writers add `snapshot_id`, `ran`, `result`, `reason`, `error`,
+	 * `may_have_run`, the creation and collateral evidence, and `settled_at`.
+	 *
 	 * @param array $entry Fields (ability, actor, touches, verdict, …).
 	 * @return int|WP_Error seq, or `aura_log_failed`.
 	 */

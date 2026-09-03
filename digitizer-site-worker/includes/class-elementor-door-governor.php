@@ -1358,9 +1358,29 @@ class Aura_Worker_Elementor_Door {
 	 * @return mixed
 	 */
 	private static function govern_and_run( $slug, $inner, array $input ) {
-		$actor = self::actor();
-		if ( is_wp_error( $actor ) ) {
-			return $actor;
+		// Under a replay the entry's actor is the HELD actor, verbatim
+		// (Ruling P36): the mutation is the one that was queued, and the
+		// approver is a different identity with a different credential and
+		// often a different transport. Recording the approver's uuid/route
+		// against the held user's id corrupted the audit trail with a person
+		// who never existed.
+		//
+		// The approving identity is recorded BESIDE it as `approved_by` —
+		// captured by replay() above its own wp_set_current_user(), because
+		// by the time this runs the current user IS the held actor — and it
+		// never gates the replay: the approval was already authorised by
+		// Aura's grant, so an unidentifiable approver (a cron-driven replay,
+		// a transport that carries no user) leaves the field null rather than
+		// refusing a call the operator has agreed to.
+		$approved_by = null;
+		if ( null !== self::$replay_ack && isset( self::$replay_ack['actor'] ) ) {
+			$actor       = (array) self::$replay_ack['actor'];
+			$approved_by = isset( self::$replay_ack['approved_by'] ) ? self::$replay_ack['approved_by'] : null;
+		} else {
+			$actor = self::actor();
+			if ( is_wp_error( $actor ) ) {
+				return $actor;
+			}
 		}
 		$touches = self::touches_for( $slug, $input );
 		if ( is_wp_error( $touches ) ) {
@@ -1412,6 +1432,10 @@ class Aura_Worker_Elementor_Door {
 		if ( null !== self::$replay_ack ) {
 			$entry['ref']         = self::$replay_ack['ref'];
 			$entry['ruleset_seq'] = isset( self::$pinned_ruleset['seq'] ) ? (int) self::$pinned_ruleset['seq'] : null;
+			// WHO APPROVED it, beside WHOSE call it is (Ruling P36). Null when
+			// the replay request carries no identifiable user — the grant, not
+			// this field, is what authorised it.
+			$entry['approved_by'] = $approved_by;
 		}
 		$seq = Aura_Worker_Door_Log::open_pending( $entry );
 		if ( is_wp_error( $seq ) ) {
@@ -1867,6 +1891,14 @@ class Aura_Worker_Elementor_Door {
 		self::$pinned_ruleset = $rec;
 		self::$memo           = array();
 		$prev_user            = get_current_user_id();
+		// WHO IS APPROVING — read NOW, before wp_set_current_user() below
+		// switches this request to the held actor (Ruling P36). Afterwards
+		// actor() would answer with the held user's id wearing this request's
+		// credential and route, which is the hybrid identity this exists to
+		// prevent. Null when the approving request carries no identifiable
+		// user: the grant authorised it, not this field, so it never refuses.
+		$approver             = self::actor();
+		$approved_by          = is_wp_error( $approver ) ? null : $approver;
 		try {
 			// RE-JUDGE THE CURRENT TOUCHES, NOT THE STORED ONES (Ruling P34).
 			// `$held['touches']` is what the OPERATOR saw when the call was
@@ -2008,8 +2040,17 @@ class Aura_Worker_Elementor_Door {
 				);
 			}
 			self::$replay_ack = array(
-				'ref' => $ref,
-				'ack' => $ack,
+				'ref'         => $ref,
+				'ack'         => $ack,
+				// The actor whose call this IS (Ruling P36). replay() switches
+				// the current user, but actor() reads more than the user id —
+				// the Application Password uuid this REQUEST authenticated
+				// with, and the route it arrived on — so rebuilding it in the
+				// wrapper produced a hybrid: the held user's mutation
+				// attributed to the approver's credential and transport.
+				'actor'       => (array) $held['actor'],
+				// …and who approved it, captured above the user switch.
+				'approved_by' => $approved_by,
 			);
 			$result = $ability->execute( $input );
 			$stamp  = Aura_Worker_Door_Holds::get_claimed( $ref );

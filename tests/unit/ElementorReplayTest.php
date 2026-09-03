@@ -1158,4 +1158,77 @@ final class ElementorReplayTest extends TestCase {
 			$touches
 		);
 	}
+
+	// -----------------------------------------------------------------------
+	// Ruling P36: the entry's actor is WHOSE call it is, not who approved it
+	// -----------------------------------------------------------------------
+
+	/**
+	 * The approval arrives on a different credential and a different
+	 * transport from the call it releases — which is the normal case: the
+	 * held call came from an assistant's Application Password over Elementor's
+	 * abilities route, and the approval comes from Aura's gateway.
+	 *
+	 * `replay()` switches the current USER, but `actor()` also reads the
+	 * Application Password uuid THIS request authenticated with and the route
+	 * it arrived on. Rebuilding it in the wrapper therefore minted a person
+	 * who never existed: the held user's id and login, wearing the approver's
+	 * credential and transport, recorded as the author of the mutation.
+	 */
+	public function test_a_replay_records_the_held_actor_and_names_the_approver_beside_it(): void {
+		Aura_Worker_Security::init();
+		$GLOBALS['_user_logins'][3]   = 'assistant';
+		$GLOBALS['_user_logins'][9]   = 'operator';
+		$GLOBALS['_app_passwords'][3] = array( array( 'uuid' => 'uuid-assistant', 'name' => 'Studio assistant', 'created' => time() ) );
+		$GLOBALS['_app_passwords'][9] = array( array( 'uuid' => 'uuid-operator', 'name' => 'Aura gateway', 'created' => time() ) );
+		$this->registerAll();
+		$this->installRuleset( array() );
+
+		// The held call: user 3, uuid-assistant, over the abilities REST route.
+		sa_authenticate_app_password( 3, 'uuid-assistant' );
+		Aura_Worker_Call_Context::set_rest_route_for_tests( '/wp-abilities/v1/abilities/elementor/publish-document' );
+		$ref   = $this->holdCall();
+		$stored = Aura_Worker_Door_Holds::get_held( $ref )['actor'];
+		$this->assertSame( 'uuid-assistant', $stored['app_password_uuid'] );
+		$this->assertSame( 'rest', $stored['via'] );
+
+		// The approval: user 9, uuid-operator, over SiteAgent's own transport.
+		$GLOBALS['_current_user_id'] = 9;
+		sa_authenticate_app_password( 9, 'uuid-operator' );
+		Aura_Worker_Call_Context::set_rest_route_for_tests( '/aura/v1/tools/elementor_replay_ability' );
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertTrue( $out['ok'] );
+		$log   = Aura_Worker_Door_Log::log_after( 0 );
+		$entry = end( $log );
+		$this->assertSame( $stored, $entry['actor'], 'the held actor, verbatim — no hybrid identity' );
+		$this->assertSame( 'uuid-operator', $entry['approved_by']['app_password_uuid'] );
+		$this->assertSame( 9, $entry['approved_by']['user_id'] );
+		$this->assertSame( 'operator', $entry['approved_by']['login'] );
+		$this->assertSame( 'mcp', $entry['approved_by']['via'] );
+		$this->assertSame( 3, $this->seen['elementor/publish-document'], 'and it still RAN as the held actor' );
+	}
+
+	/**
+	 * An approval that carries no identifiable user does NOT refuse the
+	 * replay — the grant already authorised it — it just leaves `approved_by`
+	 * null (Ruling P36).
+	 */
+	public function test_an_unidentifiable_approver_leaves_approved_by_null_without_refusing(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		$GLOBALS['_current_user_id'] = 0; // e.g. a cron-driven replay
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertTrue( $out['ok'] );
+		$log   = Aura_Worker_Door_Log::log_after( 0 );
+		$entry = end( $log );
+		$this->assertSame( 3, $entry['actor']['user_id'], 'the call is still the held actor\'s' );
+		$this->assertArrayHasKey( 'approved_by', $entry, 'the field is always present on a replay entry' );
+		$this->assertNull( $entry['approved_by'] );
+	}
 }
