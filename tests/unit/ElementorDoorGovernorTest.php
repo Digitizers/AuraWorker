@@ -340,6 +340,44 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
 	}
 
+	/**
+	 * Codex round-10 P2: a transiently failed admission SETTLES its
+	 * reservation before backing out.
+	 *
+	 * The row was left `pending` with `admitted: false` — and `log_after()`
+	 * stops at exactly that — so every later terminal entry stayed hidden
+	 * from Aura until the ten-minute reconciler eventually discarded it, for
+	 * a callback that provably never ran. `discarded` is the honest result
+	 * now, written the same moment the call is refused.
+	 */
+	public function test_a_failed_admission_discards_its_reservation_rather_than_blocking_the_log(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		// ONLY the admission fails; the discard that follows it carries
+		// `settled_at`, so it lands.
+		$GLOBALS['_sa_option_cas_fail']['aura_worker_door_log_1'] = static function ( $value ) {
+			return false === strpos( (string) $value, 'settled_at' );
+		};
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran, 'the callback provably never ran' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'discarded', $row['result'] );
+		$this->assertTrue( $row['admitted'], 'discard() goes through settle(), which admits in the same write' );
+
+		// And the next call's terminal entry is served — it used to wait
+		// behind the pending row for ten minutes.
+		wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+		$this->assertSame( array( 1, 2 ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ) );
+		$this->assertSame( array( 'discarded', 'ok' ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'result' ) );
+	}
+
 	/** §3.9-a: a pending entry that cannot be written refuses the call. */
 	public function test_a_pending_entry_that_cannot_be_written_refuses_before_the_write(): void {
 		$this->registerAll();

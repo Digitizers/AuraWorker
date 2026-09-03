@@ -1241,6 +1241,15 @@ class Aura_Worker_Elementor_Door {
 			return self::log_full_error();
 		}
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
+			// Settle the reservation before backing out (Codex round-10 P2).
+			// A transiently failed CAS leaves a `pending`, un-admitted row —
+			// and `log_after()` stops at one, so every later terminal entry
+			// stayed hidden from Aura until the ten-minute reconciler got to
+			// it. This callback PROVABLY never ran, so `discarded` is the
+			// honest result now; discard() goes through settle(), which sets
+			// `admitted` in the same write. A discard that fails too changes
+			// nothing: the reconciler discards the row later, as today.
+			Aura_Worker_Door_Log::discard( $seq );
 			return new WP_Error( 'aura_log_failed', 'The door log could not record this call; it was not run.', array( 'status' => 503 ) );
 		}
 		if ( null !== self::$replay_ack ) {
@@ -2443,6 +2452,10 @@ class Aura_Worker_Elementor_Door {
 			return self::log_full_error();
 		}
 		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
+			// Same rule as execute()'s admission (Codex round-10 P2): the
+			// restore provably never ran, so the reservation is discarded
+			// rather than left pending for `log_after()` to stop at.
+			Aura_Worker_Door_Log::discard( $seq );
 			return new WP_Error( 'aura_log_failed', 'The door log could not record this restore; it was not run.', array( 'status' => 503 ) );
 		}
 		return $seq;
