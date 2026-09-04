@@ -768,6 +768,48 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P90 (F1): an ack that crosses a rotation advances nothing.
+	 *
+	 * The epoch check at the top of `ack()` reads the epoch and lets go of it,
+	 * so a `/door/rotate` or a rebind installing a new one in between still had
+	 * this ack advance the SHARED floor. After a rewind that is destructive: an
+	 * old, high cursor from epoch A is clamped against epoch B's freshly
+	 * written rows, and the purge then removes entries Aura has never seen.
+	 */
+	public function test_an_ack_that_crosses_a_rotation_raises_nothing_and_deletes_nothing(): void {
+		$a = Aura_Worker_Door_Log::epoch();
+		$seq = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$floor = Aura_Worker_Door_Log::floor();
+		// The rotation lands between this ack's own epoch check and its floor
+		// raise — the window the join closes.
+		$GLOBALS['_sa_before_ack_floor_raise'] = static function () {
+			$GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ] = 'epoch-b';
+			$GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ]    = 'epoch-b';
+		};
+
+		$out = Aura_Worker_Door_Log::ack( $a, $seq );
+
+		$GLOBALS['_sa_before_ack_floor_raise'] = null;
+		$this->assertSame( 0, $out['acked'] );
+		$this->assertSame( $floor, Aura_Worker_Door_Log::floor(), 'the shared floor never moved' );
+		$this->assertNotNull( Aura_Worker_Door_Log::get( $seq ), "and the new epoch's rows are still there" );
+	}
+
+	/** …and an ordinary ack under a steady epoch is unchanged. */
+	public function test_an_ordinary_ack_raises_the_floor_and_purges(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$seq   = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+
+		$out = Aura_Worker_Door_Log::ack( $epoch, $seq );
+
+		$this->assertSame( 1, $out['acked'] );
+		$this->assertSame( $seq, $out['floor'] );
+		$this->assertNull( Aura_Worker_Door_Log::get( $seq ), 'the acked row is gone' );
+	}
+
+	/**
 	 * Ruling P86 (F2): an entry the reconciler cannot READ retains the claim.
 	 *
 	 * `get()` answers null for a row that is absent and for a read that failed

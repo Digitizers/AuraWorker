@@ -1254,25 +1254,50 @@ class Aura_Worker_Door_Log {
 		// (Codex round-5 P2).
 		self::insert_unique( self::FLOOR, 0 );
 		$prev_floor_before_raise = self::floor();
-		$wpdb->query(
+		// JOINED TO THE EPOCH ROW (Ruling P90). The check at the top of this
+		// method reads the epoch and then lets go of it, so a `/door/rotate` or
+		// a rebind installing a new epoch in between still had this ack advance
+		// the SHARED floor — and after a rewind that is destructive: an old,
+		// high cursor from epoch A is clamped against epoch B's freshly written
+		// rows, and the delete below then removes entries Aura has never seen.
+		//
+		// The epoch row is a condition of the statement itself, so the ack
+		// linearises before or after a rotation and never across one.
+		$raised = (int) $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$wpdb->prepare(
-				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND CAST(option_value AS UNSIGNED) < %d",
+				"UPDATE {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x SET f.option_value = %s WHERE f.option_name = %s AND x.e = %s AND CAST(f.option_value AS UNSIGNED) < %d",
+				self::EPOCH,
 				(string) $seq,
 				self::FLOOR,
+				(string) $epoch,
 				$seq
 			)
 		);
 		wp_cache_delete( self::FLOOR, 'options' );
+		if ( $raised < 1 && (string) $epoch !== self::epoch_raw() ) {
+			// Zero rows AND the epoch has moved: this ack crossed a rotation
+			// and owns nothing here. Zero rows with the epoch UNCHANGED is the
+			// ordinary idempotent repeat — the floor is already at or above
+			// this cursor — and still falls through to the delete, which is how
+			// a previous ack's unfinished purge is completed.
+			return array( 'acked' => 0, 'floor' => self::floor() );
+		}
 		$floor = self::floor();
 		$acked = 0;
 		if ( $floor > 0 ) {
 			$prev_floor = $prev_floor_before_raise; // read BEFORE the raise, below
 			$like  = $wpdb->esc_like( self::PREFIX ) . '%';
-			$acked = (int) $wpdb->query(
+			// Joined to the epoch row as well (Ruling P90): the purge is the
+			// destructive half, and it must not run under an epoch this ack
+			// was never for — including one installed between the raise above
+			// and this statement.
+			$acked = (int) $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->prepare(
-					"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name REGEXP %s AND CAST(SUBSTRING(option_name, %d) AS UNSIGNED) <= %d",
+					"DELETE f FROM {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x WHERE f.option_name LIKE %s AND f.option_name REGEXP %s AND x.e = %s AND CAST(SUBSTRING(f.option_name, %d) AS UNSIGNED) <= %d",
+					self::EPOCH,
 					$like,
 					self::ROW_REGEXP,
+					(string) $epoch,
 					strlen( self::PREFIX ) + 1,
 					$floor
 				)

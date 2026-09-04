@@ -2839,6 +2839,51 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// Aura_Worker_Door_Log::ack()'s floor raise: upward-only, via a
 			// numeric-cast predicate rather than a byte-exact one (the floor's
 			// stored value is compared as a number, not matched verbatim).
+			// Aura_Worker_Door_Log::ack()'s floor raise, JOINED to the epoch row
+			// (Ruling P90): the raise happens only while the epoch still holds
+			// the value the ack named, so an ack can never cross a rotation.
+			if ( preg_match( "/^UPDATE \S+ f JOIN \( SELECT option_value AS e FROM \S+ WHERE option_name = '([^']+)' \) x SET f\.option_value = '([^']*)' WHERE f\.option_name = '([^']+)' AND x\.e = '(.*)' AND CAST\(f\.option_value AS UNSIGNED\) < (\d+)$/s", $query, $m ) ) {
+				list( , $epoch_name, $new, $name, $expect_epoch, $bound ) = array_map( 'stripslashes', $m );
+				$bound = (int) $bound;
+				// The window between this ack's own epoch check and this
+				// statement, in which a rotation lands. Fires once.
+				if ( isset( $GLOBALS['_sa_before_ack_floor_raise'] ) && is_callable( $GLOBALS['_sa_before_ack_floor_raise'] ) ) {
+					$racer = $GLOBALS['_sa_before_ack_floor_raise'];
+					$GLOBALS['_sa_before_ack_floor_raise'] = null;
+					$racer();
+				}
+				$epoch_now = sa_read_option_uncached( $epoch_name );
+				if ( null === $epoch_now || (string) $epoch_now !== $expect_epoch ) {
+					return 0; // the epoch moved: this ack owns nothing here
+				}
+				$cur = sa_read_option_uncached( $name );
+				if ( null === $cur || (int) $cur >= $bound ) {
+					return 0;
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
+			// …and its row purge, joined the same way.
+			if ( preg_match( "/^DELETE f FROM \S+ f JOIN \( SELECT option_value AS e FROM \S+ WHERE option_name = '([^']+)' \) x WHERE f\.option_name LIKE '([^']*)' AND f\.option_name REGEXP '([^']*)' AND x\.e = '(.*)' AND CAST\(SUBSTRING\(f\.option_name, \d+\) AS UNSIGNED\) <= (\d+)$/s", $query, $m ) ) {
+				list( , $epoch_name, $like, $regexp, $expect_epoch, $bound ) = array_map( 'stripslashes', $m );
+				$epoch_now = sa_read_option_uncached( $epoch_name );
+				if ( null === $epoch_now || (string) $epoch_now !== $expect_epoch ) {
+					return 0;
+				}
+				$bound = (int) $bound;
+				$n     = 0;
+				foreach ( sa_door_log_rows_matching( $like, $regexp ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) && (int) $mm[1] <= $bound ) {
+						unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+						$GLOBALS['_notoptions'][ $name ] = true;
+						$GLOBALS['_option_writes'][]     = array( 'delete', $name );
+						++$n;
+					}
+				}
+				return $n;
+			}
 			if ( preg_match( "/^UPDATE \S+ SET option_value = '([^']*)' WHERE option_name = '([^']+)' AND CAST\(option_value AS UNSIGNED\) < (\d+)$/s", $query, $m ) ) {
 				list( , $new, $name, $bound ) = array_map( 'stripslashes', $m );
 				$bound = (int) $bound;
@@ -3033,6 +3078,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
+	$GLOBALS['_sa_before_ack_floor_raise'] = null; // Runs inside ack()'s floor raise, before it evaluates (Ruling P90).
 	$GLOBALS['_sa_after_claimed_write'] = array(); // Runs after one claim-conditional write, by option name (Ruling P78).
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
@@ -4296,6 +4342,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
+	$GLOBALS['_sa_before_ack_floor_raise'] = null; // Runs inside ack()'s floor raise, before it evaluates (Ruling P90).
 	$GLOBALS['_sa_after_claimed_write'] = array(); // Runs after one claim-conditional write, by option name (Ruling P78).
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
