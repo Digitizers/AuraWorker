@@ -1579,6 +1579,42 @@ class Aura_Worker_Door_Log {
 		self::$int_size_override_for_tests = $bytes;
 	}
 
+	/** @var bool|null Cached once per request (Ruling S13): is wp_options a transactional (InnoDB) table? */
+	private static $engine_transactional = null;
+
+	/** @param bool|null $value Test seam: overrides engine_is_transactional()'s answer. Never set by production code. */
+	public static function set_engine_transactional_for_tests( $value ) {
+		self::$engine_transactional = $value;
+	}
+
+	/**
+	 * Is `wp_options` a TRANSACTIONAL table (Ruling S13, Codex round-5 P2 on
+	 * #88)? `START TRANSACTION`/`ROLLBACK` are silent no-ops on a
+	 * non-transactional engine such as MyISAM — the writes inside `versioned()`
+	 * would still land, immediately and unconditionally, and a "rollback"
+	 * would fail to undo them without saying so. Checked ONCE per request via
+	 * `SHOW TABLE STATUS` and cached — a real second query every mutation
+	 * would cost more than the whole point of batching state and the version
+	 * bump into one round trip. An UNREADABLE answer counts as
+	 * NON-transactional: a table this method cannot PROVE supports rollback
+	 * is treated as one that does not, the fail-closed direction — assuming
+	 * the opposite is exactly what would silently lose writes on an engine
+	 * that cannot honour them.
+	 *
+	 * @return bool
+	 */
+	private static function engine_is_transactional() {
+		if ( null !== self::$engine_transactional ) {
+			return self::$engine_transactional;
+		}
+		global $wpdb;
+		$wpdb->last_error = '';
+		$row    = $wpdb->get_row( $wpdb->prepare( 'SHOW TABLE STATUS LIKE %s', $wpdb->options ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
+		$engine = ( is_object( $row ) && isset( $row->Engine ) ) ? strtoupper( (string) $row->Engine ) : '';
+		self::$engine_transactional = ( '' === (string) $wpdb->last_error && 'INNODB' === $engine );
+		return self::$engine_transactional;
+	}
+
 	/**
 	 * Bump the per-site DOOR VERSION atomically and hand back the value THIS
 	 * call produced — a counter Aura orders overlapping `/status` polls by
@@ -1716,6 +1752,12 @@ class Aura_Worker_Door_Log {
 	 * @return int|null
 	 */
 	private static function bump_door_version_read_back() {
+		if ( ! self::engine_is_transactional() ) {
+			// Ruling S13: no witness at all on a non-transactional engine —
+			// nothing here can prove state and the bump moved together, or
+			// that either moved at all if something failed partway.
+			return null;
+		}
 		global $wpdb;
 		$wpdb->last_error = '';
 		$id                = $wpdb->get_var( 'SELECT LAST_INSERT_ID()' );
@@ -1786,7 +1828,6 @@ class Aura_Worker_Door_Log {
 	 * mutation is ALREADY durable, so `committed: true` stays honest even
 	 * when the witness could not be proven.
 	 *
-	 *
 	 * EVERY EVICTION IS REPEATED AFTER COMMIT (Ruling S11, Codex round-5 P1
 	 * on #88). `$writes()` still evicts the option cache the moment it
 	 * writes, exactly as before — later reads in the SAME request (this
@@ -1798,6 +1839,20 @@ class Aura_Worker_Door_Log {
 	 * method deletes each one from the cache a second time once the write is
 	 * durable, closing that window. `self::OBSERVATION` is always included,
 	 * since the bump touches it on every call.
+	 *
+	 * NON-TRANSACTIONAL ENGINES GET NO ATOMICITY AND NO WITNESS (Ruling S13,
+	 * Codex round-5 P2 on #88). `START TRANSACTION`/`ROLLBACK` are silent
+	 * no-ops on a table like MyISAM — the writes land immediately and
+	 * unconditionally regardless of what this method does, and a "rollback"
+	 * would not undo them. `engine_is_transactional()` is checked first; when
+	 * it is false, no transaction is opened or rolled back — `$writes()` runs
+	 * exactly as it always would have (today's pre-2.16.2 behaviour), the
+	 * version bump is still ATTEMPTED (it is one upsert, harmless on any
+	 * engine), but its read-back is never even attempted, because
+	 * `door_version_raw()`/`bump_door_version_read_back()` both refuse to
+	 * report a witness for such a site regardless (see their own docblocks)
+	 * — nothing here could prove state and version moved together, or that
+	 * either moved at all if something failed partway.
 	 *
 	 * @param callable $writes Returns array{ mutated: bool, result: mixed,
 	 *                         evict?: string[] } or array{ rollback: true,
@@ -1821,28 +1876,46 @@ class Aura_Worker_Door_Log {
 	 * @return array{ committed: bool, result: mixed, observation: int|null }
 	 *         `committed` is false when $writes() asked for a rollback, or
 	 *         reported a mutation whose version bump then failed its own
-	 *         WRITE — either way the WHOLE unit rolls back, including every
-	 *         statement $writes() itself ran, so the caller must treat this
-	 *         exactly like $writes() failing outright. `observation` is the
-	 *         witness THIS call produced — null whenever it could not be
+	 *         WRITE — either way the WHOLE unit rolls back (on a
+	 *         transactional engine only — see Ruling S13 above), including
+	 *         every statement $writes() itself ran, so the caller must treat
+	 *         this exactly like $writes() failing outright. `observation` is
+	 *         the witness THIS call produced — null whenever it could not be
 	 *         proven, which can happen even while `committed` is true (Ruling
-	 *         S10): a reconnect between the COMMIT and the read-back.
+	 *         S10): a reconnect between the COMMIT and the read-back, or a
+	 *         non-transactional engine, or 32-bit PHP.
 	 */
 	public static function versioned( callable $writes ) {
 		global $wpdb;
-		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		$transactional = self::engine_is_transactional();
+		if ( $transactional ) {
+			$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		}
 		try {
 			$outcome = $writes();
 		} catch ( \Throwable $e ) {
-			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			if ( $transactional ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			}
 			throw $e;
 		}
 		$outcome = is_array( $outcome ) ? $outcome : array();
 		if ( ! empty( $outcome['rollback'] ) ) {
 			// Ruling S12: $writes() itself demands the unit fail.
-			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			if ( $transactional ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				return array(
+					'committed' => false,
+					'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
+				);
+			}
+			// Ruling S13: nothing CAN be rolled back here — whatever
+			// $writes() already ran landed the moment it ran. The most
+			// honest answer left is that the unit "committed", exactly as
+			// every other statement on this engine always has; $writes()'s
+			// own `result` already reflects what it could prove happened.
 			return array(
-				'committed' => false,
+				'committed' => true,
 				'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
 			);
 		}
@@ -1850,14 +1923,16 @@ class Aura_Worker_Door_Log {
 		$result  = array_key_exists( 'result', $outcome ) ? $outcome['result'] : null;
 		$evict   = isset( $outcome['evict'] ) && is_array( $outcome['evict'] ) ? $outcome['evict'] : array();
 		if ( ! $mutated ) {
-			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			if ( $transactional ) {
+				$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			}
 			return array(
 				'committed' => true,
 				'result'    => $result,
 			);
 		}
 		$bump_ok = self::bump_door_version_write();
-		if ( ! $bump_ok ) {
+		if ( ! $bump_ok && $transactional ) {
 			// Ruling S8: the bump's own WRITE failed, so the mutation must
 			// not land either — every statement $writes() ran is undone.
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -1866,18 +1941,26 @@ class Aura_Worker_Door_Log {
 				'result'    => $result,
 			);
 		}
-		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
+		// Ruling S13: on a non-transactional engine the state write already
+		// landed, durably, whatever the bump did — there is no rollback to
+		// perform, so execution simply continues to the shared tail below.
+		if ( $transactional ) {
+			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
+		}
 		// Ruling S11: repeat every eviction $writes() performed, now that
 		// the write is durable.
 		foreach ( $evict as $name ) {
 			wp_cache_delete( $name, 'options' );
 		}
 		wp_cache_delete( self::OBSERVATION, 'options' ); // the bump's own row
-		// Ruling S10: best-effort, deliberately AFTER commit — a reconnect
-		// between the bump and this SELECT lands on a session that never
-		// assigned anything and answers 0 (Ruling S5 ⇒ null), but the
-		// mutation is ALREADY committed, so `committed: true` stays honest.
-		$observation = self::bump_door_version_read_back();
+		$observation = null;
+		if ( $transactional && $bump_ok ) {
+			// Ruling S10: best-effort, deliberately AFTER commit. Ruling
+			// S13: skipped on a non-transactional engine — the witness is
+			// disabled there regardless (see this method's own docblock),
+			// so reading it back would only prove what nothing may report.
+			$observation = self::bump_door_version_read_back();
+		}
 		return array(
 			'committed'   => true,
 			'result'      => $result,
@@ -1903,7 +1986,34 @@ class Aura_Worker_Door_Log {
 	 *
 	 * @return int|null
 	 */
+	/**
+	 * Why the observation witness is PERMANENTLY unsupported for this site,
+	 * if it is (Ruling S13, Codex round-5 P2 on #88) — unifying Ruling S7's
+	 * 32-bit reason into the same key, since both describe the identical
+	 * shape of fact: "this build/host can never report a witness", not a
+	 * transient miss. `governor_block()` carries it as
+	 * `observation_unsupported` beside `observation` itself, which is null
+	 * either way; a transient null (an unproven read, a torn poll) is NOT
+	 * unsupported and answers null here too — this is only for a reason a
+	 * caller could act on (upgrade PHP, migrate the table to InnoDB).
+	 *
+	 * @return string|null 'engine'|'php32'|null
+	 */
+	public static function observation_unsupported_reason() {
+		if ( ! self::engine_is_transactional() ) {
+			return 'engine';
+		}
+		$int_size = null !== self::$int_size_override_for_tests ? self::$int_size_override_for_tests : PHP_INT_SIZE;
+		if ( $int_size < 8 ) {
+			return 'php32';
+		}
+		return null;
+	}
+
 	public static function door_version_raw() {
+		if ( ! self::engine_is_transactional() ) {
+			return null; // Ruling S13 — see versioned()'s own docblock
+		}
 		$read = self::raw_option_read( self::OBSERVATION );
 		if ( ! $read['ok'] ) {
 			return null;

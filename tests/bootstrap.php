@@ -2455,6 +2455,20 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
 			}
+			// Aura_Worker_Door_Log::engine_is_transactional()'s own probe
+			// (Ruling S13, 2.16.2): SHOW TABLE STATUS LIKE 'wp_options'.
+			// Answers InnoDB by default — a test arms
+			// $GLOBALS['_sa_table_engine'] to model a different engine (or
+			// an unreadable answer, via $GLOBALS['_sa_wpdb_error'] above,
+			// which this branch never reaches).
+			if ( preg_match( "/^SHOW TABLE STATUS LIKE '([^']*)'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$engine                   = isset( $GLOBALS['_sa_table_engine'] ) ? (string) $GLOBALS['_sa_table_engine'] : 'InnoDB';
+				return (object) array(
+					'Name'   => stripslashes( $m[1] ),
+					'Engine' => $engine,
+				);
+			}
 			// The one shape app_password_row_state() issues (#434 N1): the
 			// call's own nonce as a `probe` column, beside that user's
 			// Application Passwords meta row read straight from the
@@ -4654,7 +4668,11 @@ function sa_reset_state(): void {
 		// to clear it would otherwise poison every later test's door version
 		// with a permanent `null` witness.
 		Aura_Worker_Door_Log::set_int_size_for_tests( null );
+		// Ruling S13's test seam: same reasoning, for the cached
+		// transactional-engine answer.
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
 	}
+	$GLOBALS['_sa_table_engine'] = null; // engine_is_transactional()'s SHOW TABLE STATUS answer (Ruling S13); null ⇒ the stub's own InnoDB default.
 	// Update-tool fixtures: a test that seeds these and forgets to clear them
 	// would otherwise leak into every later test's get_plugins()/
 	// get_core_updates()/wp_get_theme() stub, in place of the intended

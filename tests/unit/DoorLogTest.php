@@ -1023,4 +1023,72 @@ final class DoorLogTest extends TestCase {
 		$this->assertSame( $before, $out['epoch'] );
 		$this->assertSame( $before, Aura_Worker_Door_Log::epoch_raw() );
 	}
+
+	/**
+	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
+	 * `SHOW TABLE STATUS LIKE 'wp_options'` ONCE per request and caches the
+	 * answer — a second call must not re-issue the probe.
+	 */
+	public function test_the_engine_detection_reads_show_table_status_once_and_caches_it(): void {
+		$GLOBALS['_sa_table_engine'] = 'MyISAM';
+		$GLOBALS['_db_queries']      = array();
+
+		$first = Aura_Worker_Door_Log::bump_door_version();
+		$this->assertNull( $first, 'MyISAM is not transactional, so the read-back refuses to report a witness' );
+		$this->assertContains( "SHOW TABLE STATUS LIKE 'wp_options'", $GLOBALS['_db_queries'] );
+
+		$probes = static function ( array $log ): int {
+			return count(
+				array_filter(
+					$log,
+					static function ( $q ) {
+						return false !== strpos( (string) $q, 'SHOW TABLE STATUS' );
+					}
+				)
+			);
+		};
+		$before_second_call = $probes( $GLOBALS['_db_queries'] );
+
+		Aura_Worker_Door_Log::bump_door_version();
+
+		$this->assertSame( $before_second_call, $probes( $GLOBALS['_db_queries'] ), 'checked once per request, then cached' );
+	}
+
+	/**
+	 * Ruling S13: on a non-transactional engine, versioned() skips
+	 * START TRANSACTION/COMMIT entirely and runs the writes exactly as it
+	 * always would have — the state still lands — but the version bump's
+	 * witness is never reported for this site, by ANY route.
+	 */
+	public function test_a_non_transactional_engine_still_writes_but_never_reports_a_witness(): void {
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+
+		$GLOBALS['_db_queries'] = array();
+		$seq                    = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq, 'the state write itself still lands' );
+		$this->assertArrayHasKey( 'aura_worker_door_log_' . $seq, $GLOBALS['_options'] );
+		$this->assertNotContains( 'START TRANSACTION', $GLOBALS['_db_queries'], 'no transaction opens on a non-transactional engine' );
+		$this->assertNotContains( 'COMMIT', $GLOBALS['_db_queries'] );
+		$this->assertNull( Aura_Worker_Door_Log::door_version_raw(), 'no witness is ever reported for this site' );
+		$this->assertSame( 'engine', Aura_Worker_Door_Log::observation_unsupported_reason() );
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+	}
+
+	/** A transactional engine (the default this whole suite otherwise runs under) is unaffected. */
+	public function test_a_transactional_engine_opens_and_commits_a_real_transaction(): void {
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( true );
+
+		$GLOBALS['_db_queries'] = array();
+		$seq                    = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq );
+		$this->assertContains( 'START TRANSACTION', $GLOBALS['_db_queries'] );
+		$this->assertContains( 'COMMIT', $GLOBALS['_db_queries'] );
+		$this->assertIsInt( Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertNull( Aura_Worker_Door_Log::observation_unsupported_reason() );
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+	}
 }

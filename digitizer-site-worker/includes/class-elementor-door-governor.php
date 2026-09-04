@@ -3193,7 +3193,7 @@ class Aura_Worker_Elementor_Door {
 	 * `unchecked` when that has not run in this request is an honest answer,
 	 * not a gap; the audit never forces a coverage check of its own.
 	 *
-	 * @return array { active, epoch, binding, observation, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full }
+	 * @return array { active, epoch, binding, observation, observation_unsupported, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full }
 	 */
 	public static function governor_block() {
 		if ( ! self::present() ) {
@@ -3217,6 +3217,10 @@ class Aura_Worker_Elementor_Door {
 			// poll, and must not itself advance the counter Aura orders
 			// `/status` polls by. Null when the row cannot be proven read.
 			'observation'         => Aura_Worker_Door_Log::door_version_raw(),
+			// null when 'observation' is null for an ORDINARY (transient)
+			// reason; 'engine' or 'php32' when it is null for good — this
+			// site can never report a witness (Ruling S13).
+			'observation_unsupported' => Aura_Worker_Door_Log::observation_unsupported_reason(),
 			'seam'                => self::$seam,
 			'door'                => self::door_state(),
 			'held_count'          => $held,
