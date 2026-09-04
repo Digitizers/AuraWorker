@@ -700,8 +700,21 @@ class Aura_Worker_Door_Holds {
 		if ( null === $held ) {
 			return 0; // unreadable ⇒ nothing to sweep (Ruling P57); never delete on a guess
 		}
+		// THE GENERATION THIS SWEEP JUDGES BY, READ ONCE AND RAW (Ruling P85).
+		// The cached reader is populated at authentication, so a `/status`
+		// request that authenticated under generation A and then paused while
+		// an unbind and a connect installed B would call B's brand-new hold
+		// foreign and DELETE it. A read may be a moment old; a delete may not.
+		//
+		// '' is "cannot establish" — the row is absent, or the read failed —
+		// and the sweep deletes nothing on a guess, the same shape an
+		// unreadable queue takes above.
+		$current = Aura_Worker_Door_Log::binding_raw();
+		if ( '' === $current ) {
+			return 0;
+		}
 		foreach ( $held as $ref => $row ) {
-			if ( ! self::row_is_current( $row ) && null === self::get_claimed( $ref ) ) {
+			if ( ! self::row_is_current_against( $row, $current ) && null === self::get_claimed( $ref ) ) {
 				// A departed binding's hold, with no replay mid-move (Ruling
 				// P58). Fenced on the bytes just read, like every other
 				// conditional delete here.
@@ -1218,6 +1231,31 @@ class Aura_Worker_Door_Holds {
 	 * @return bool
 	 */
 	public static function row_is_current( array $row ) {
+		return self::row_is_current_against( $row, null );
+	}
+
+	/**
+	 * The same question, asked against a generation the CALLER established —
+	 * for a decision that DELETES (Ruling P85).
+	 *
+	 * `row_is_current()` reads the binding record through the option cache, and
+	 * that cache is populated at AUTHENTICATION. A `/status` request that
+	 * authenticated under generation A and then paused while an unbind and a
+	 * connect installed B would judge B's brand-new hold against A, call it
+	 * foreign, and delete it — permanently, and for the client that had just
+	 * queued it.
+	 *
+	 * A read is allowed to be a moment old; a DELETE is not. So the sweep reads
+	 * the generation itself, once, straight from the database, and passes it
+	 * here. Null means "use the cached reader", which is what every
+	 * non-destructive caller wants.
+	 *
+	 * @param array       $row     The held or claimed row.
+	 * @param string|null $current The generation to judge against, or null for
+	 *                             the cached reader.
+	 * @return bool
+	 */
+	public static function row_is_current_against( array $row, $current ) {
 		$was = (string) ( isset( $row['binding'] ) ? $row['binding'] : '' );
 		if ( '' === $was ) {
 			// NEVER CURRENT (Ruling P72). No hold predates the generation —
@@ -1228,6 +1266,9 @@ class Aura_Worker_Door_Holds {
 			// previous client's stored mutation. The sweep removes such a row
 			// like any other foreign one.
 			return false;
+		}
+		if ( null !== $current ) {
+			return '' !== (string) $current && $was === (string) $current;
 		}
 		return Aura_Worker_Door_Log::generation_is_live( $was );
 	}

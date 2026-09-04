@@ -402,6 +402,59 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P85 (F1): the sweep's DELETE reads the generation from the
+	 * database, not from this process's cache.
+	 *
+	 * The option cache is populated at AUTHENTICATION. A `/status` request that
+	 * authenticated under generation A and then paused while an unbind and a
+	 * connect installed B would judge B's brand-new hold against A, call it
+	 * foreign, and delete it — permanently, for the client that had just queued
+	 * it. A read may be a moment old; a delete may not.
+	 */
+	public function test_the_sweep_judges_against_the_database_not_a_cached_generation(): void {
+		sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
+		$a = Aura_Worker_Door_Log::binding_raw();
+		// This request's cache, primed the way authentication primes it.
+		$this->assertSame( $a, Aura_Worker_Door_Log::binding_record()['gen'] );
+
+		// ANOTHER process rebinds — the row moves, this cache does not — and
+		// the new binding queues a hold of its own.
+		$b   = array( 'gen' => 'generation-b', 'state' => 'bound', 'client' => 'c2', 'dashboard' => 'https://dash.example' );
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] = maybe_serialize( $b );
+		$row = array(
+			'ref'        => 'door_fresh',
+			'ability'    => 'elementor/publish-document',
+			'actor'      => array( 'user_id' => 3, 'login' => 'bot' ),
+			'touches'    => array(),
+			'verdict'    => 'none',
+			'created_at' => gmdate( 'c' ),
+			'expires_at' => gmdate( 'c', time() + 3600 ),
+			'binding'    => 'generation-b',
+		);
+		$GLOBALS['_options'][ 'aura_worker_door_held_door_fresh' ] = $row;
+		$GLOBALS['_rows'][ 'aura_worker_door_held_door_fresh' ]    = maybe_serialize( $row );
+		Aura_Worker_Door_Holds::forget_held();
+
+		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+
+		$this->assertArrayHasKey( 'aura_worker_door_held_door_fresh', $GLOBALS['_rows'], "the new binding's own hold survives" );
+	}
+
+	/** …and a generation it cannot read at all deletes nothing (P57 shape). */
+	public function test_a_sweep_that_cannot_read_the_generation_deletes_nothing(): void {
+		sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsString( $ref );
+		// The record is gone from under the sweep: nothing to judge by.
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] );
+		Aura_Worker_Door_Holds::forget_held();
+
+		$this->assertSame( 0, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
+
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'] );
+	}
+
+	/**
 	 * Ruling P83 (F1): the epoch rotation is claim-conditioned too.
 	 *
 	 * The record's compare-and-swap joins the claim row; the epoch rotation
