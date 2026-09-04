@@ -2228,6 +2228,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// the same one get_results()'s LIKE branch and get_col() already read.
 			if ( preg_match( "/^SELECT MAX\(CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\)\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)'$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				// The log's TOP failing at the driver (Ruling P77): null answer,
+				// last_error set — which must NOT cast to a valid top of zero.
+				// Scoped to this shape so a test can break the top without
+				// breaking every get_var() in the request.
+				if ( ! empty( $GLOBALS['_sa_door_top_error'] ) ) {
+					$this->last_error = 'top read failed';
+					return null;
+				}
 				$max = 0;
 				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
 					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) ) {
@@ -2934,6 +2942,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
@@ -4195,6 +4204,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).

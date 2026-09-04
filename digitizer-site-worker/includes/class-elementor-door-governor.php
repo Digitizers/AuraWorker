@@ -383,11 +383,19 @@ class Aura_Worker_Elementor_Door {
 		$after  = (int) $after;
 		$site   = Aura_Worker_Door_Log::epoch();
 		$rewind = null;
+		// AN UNREADABLE TOP SUPPRESSES REWIND DETECTION (Ruling P77). A failed
+		// MAX used to cast to 0, so any cursor above the floor read as a rewind:
+		// Aura rotated a healthy epoch, invalidated an in-flight ack and
+		// resynchronised the log with nothing having been rewound. Reported as
+		// `log_top_unreadable` instead, and the cursor is served as given.
+		$top_unreadable = false;
 		if ( (string) $epoch !== $site ) {
 			$after = 0;
 		} else {
-			$top = max( Aura_Worker_Door_Log::highest_row_seq(), Aura_Worker_Door_Log::floor() );
-			if ( $after > $top ) {
+			$max = Aura_Worker_Door_Log::highest_row_seq();
+			$top_unreadable = ( null === $max );
+			$top = $top_unreadable ? 0 : max( $max, Aura_Worker_Door_Log::floor() );
+			if ( ! $top_unreadable && $after > $top ) {
 				$rewind = array(
 					'detected' => true,
 					'top'      => (int) $top,
@@ -440,6 +448,10 @@ class Aura_Worker_Elementor_Door {
 			// Aura answers a detection by calling POST /aura/v1/door/rotate
 			// with a grant, then re-fetching under the new epoch.
 			'rewind'      => $rewind,
+			// TRUE when the log's top could not be read (Ruling P77), so
+			// `rewind` is null because nothing could be established — never
+			// because nothing was rewound. Aura must not rotate on this.
+			'log_top_unreadable' => $top_unreadable,
 			'log'         => Aura_Worker_Door_Log::log_after( $after ),
 			'log_floor'   => Aura_Worker_Door_Log::floor(),
 			// NULL when the backlog could not be counted (Ruling P53): Aura is

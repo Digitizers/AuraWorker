@@ -418,7 +418,15 @@ class Aura_Worker_Door_Log {
 			return new WP_Error( 'aura_log_failed', 'This site could not establish which Aura binding this call belongs to; it was not run.', array( 'status' => 503 ) );
 		}
 		for ( $try = 0; $try < self::ALLOC_TRIES; $try++ ) {
-			$seq = max( self::highest_row_seq(), self::floor() ) + 1;
+			// CANNOT READ THE TOP, CANNOT ALLOCATE (Ruling P77). A null top used
+			// to cast to 0, so the next seq was computed from the floor alone —
+			// and on a site whose floor read was ALSO stale that hands out a
+			// number a row already owns. Retryable: nothing has been reserved.
+			$top = self::highest_row_seq();
+			if ( null === $top ) {
+				return new WP_Error( 'aura_log_failed', 'The door log could not be read; this call was not run.', array( 'status' => 503 ) );
+			}
+			$seq = max( $top, self::floor() ) + 1;
 			$row = array_merge(
 				$entry,
 				array(
@@ -994,12 +1002,25 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * The highest seq that has a row.
+	 * The highest seq that has a row — or NULL when that cannot be established
+	 * (Ruling P77).
 	 *
-	 * @return int
+	 * `get_var()` answers null both for "no rows" and for a statement that
+	 * failed at the driver, and `(int)` turned both into 0 — a valid-looking
+	 * top. A legitimate `door_after` above the ack floor then read as a REWIND:
+	 * `/status` reported one, Aura rotated a healthy epoch, invalidated an
+	 * in-flight ack and resynchronised the whole log, with nothing having been
+	 * rewound at all. `open_pending()` allocated from a top of 0, and `ack()`
+	 * clamped a real cursor down to the floor.
+	 *
+	 * Not knowing is not zero. An empty log IS zero — a null with no
+	 * `last_error` — and that is the only thing that answers 0.
+	 *
+	 * @return int|null
 	 */
 	public static function highest_row_seq() {
 		global $wpdb;
+		$wpdb->last_error = '';
 		$like = $wpdb->esc_like( self::PREFIX ) . '%';
 		// The NUMERIC rows only: the floor, the closure marker and the refusal
 		// counter share this prefix and a non-numeric suffix casts to 0
@@ -1013,6 +1034,9 @@ class Aura_Worker_Door_Log {
 				self::ROW_REGEXP
 			)
 		);
+		if ( false === $n || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
 		return (int) $n;
 	}
 
@@ -1115,7 +1139,15 @@ class Aura_Worker_Door_Log {
 		if ( ! is_string( $epoch ) || $epoch !== self::epoch() ) {
 			return array( 'acked' => 0, 'floor' => self::floor() );
 		}
-		$top = max( self::highest_row_seq(), self::floor() );
+		// AN UNREADABLE TOP CLAMPS NOTHING (Ruling P77). It used to cast to 0,
+		// so `$top` fell back to the floor and a legitimate cursor above it was
+		// clamped down — acking rows Aura had not acked and deleting them. The
+		// ack simply does not happen; Aura repeats it.
+		$max = self::highest_row_seq();
+		if ( null === $max ) {
+			return array( 'acked' => 0, 'floor' => self::floor() );
+		}
+		$top = max( $max, self::floor() );
 		if ( $seq > $top ) {
 			$seq = $top;
 		}
@@ -1179,8 +1211,12 @@ class Aura_Worker_Door_Log {
 		$after = max( (int) $after, self::floor() );
 		$out   = array();
 		$seq   = $after;
-		$top   = self::highest_row_seq();
-		while ( count( $out ) < $limit && $seq < $top ) {
+		// An unreadable top does not bound the walk (Ruling P77) — the hole
+		// check below and $limit already do, and stopping at a top of 0 would
+		// serve an empty page for a log that is simply unreadable at the top.
+		$top       = self::highest_row_seq();
+		$unbounded = ( null === $top );
+		while ( count( $out ) < $limit && ( $unbounded || $seq < $top ) ) {
 			$seq++;
 			$row = self::get( $seq );
 			if ( null === $row ) {

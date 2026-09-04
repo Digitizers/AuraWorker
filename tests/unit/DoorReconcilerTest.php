@@ -706,6 +706,67 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( 'interrupted', $this->row( $seq )['result'] );
 	}
 
+	/**
+	 * Ruling P77 (F2): an unreadable log top is not a top of zero.
+	 *
+	 * `get_var()` answers null for "no rows" and for a broken statement alike,
+	 * and the `(int)` cast made both a valid-looking 0 — so any legitimate
+	 * `door_after` above the ack floor read as a REWIND. Aura answers a rewind
+	 * by rotating the epoch, which invalidates an in-flight ack and
+	 * resynchronises the whole log, with nothing having been rewound.
+	 */
+	public function test_an_unreadable_log_top_reports_no_rewind_and_says_so(): void {
+		$seq = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$GLOBALS['_sa_door_top_error'] = true;
+
+		// A cursor well above anything this site has: the shape that used to
+		// read as a rewind the moment the top could not be established.
+		$frag = Aura_Worker_Elementor_Door::status_fragment( 999, $epoch );
+
+		$GLOBALS['_sa_door_top_error'] = false;
+		$this->assertNull( $frag['rewind'], 'nothing was established, so nothing is reported' );
+		$this->assertTrue( $frag['log_top_unreadable'], 'and Aura is told why' );
+	}
+
+	/** …and a readable top still detects a real rewind. */
+	public function test_a_readable_top_still_detects_a_rewind(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment( 999, $epoch );
+
+		$this->assertSame( true, $frag['rewind']['detected'] );
+		$this->assertFalse( $frag['log_top_unreadable'] );
+	}
+
+	/** A write cannot allocate a seq it cannot bound: retryable 503. */
+	public function test_a_write_refuses_retryably_when_the_log_top_cannot_be_read(): void {
+		$GLOBALS['_sa_door_top_error'] = true;
+
+		$out = Aura_Worker_Door_Log::open_pending( array( 'ability' => 'elementor/publish-document' ) );
+
+		$GLOBALS['_sa_door_top_error'] = false;
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+	}
+
+	/** …and an ack clamps nothing and writes nothing. */
+	public function test_an_ack_acks_nothing_when_the_log_top_cannot_be_read(): void {
+		$seq = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$floor = Aura_Worker_Door_Log::floor();
+		$GLOBALS['_sa_door_top_error'] = true;
+
+		$out = Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), $seq );
+
+		$GLOBALS['_sa_door_top_error'] = false;
+		$this->assertSame( array( 'acked' => 0, 'floor' => $floor ), $out );
+		$this->assertSame( $floor, Aura_Worker_Door_Log::floor(), 'the floor never moved' );
+		$this->assertNotNull( Aura_Worker_Door_Log::get( $seq ), 'and the row is still there' );
+	}
+
 	/** The same mutex with no lease held is cleared by age, exactly as before. */
 	public function test_an_old_mutex_with_no_seq_lease_is_still_cleared(): void {
 		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => $this->longAgo() ) );
