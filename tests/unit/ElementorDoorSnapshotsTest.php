@@ -559,6 +559,36 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertNotSame( '', (string) $row['snapshot_id'], 'the captured pre-restore envelope is still named' );
 	}
 
+	/**
+	 * Ruling P76 (F1), on the restore path: a restore authenticated under a
+	 * departed binding is refused too.
+	 *
+	 * The restore reserves its entry through the same `open_pending()`, so it
+	 * inherits the same baseline — the generation this request was let in
+	 * under, not whichever one is current by the time the entry is opened.
+	 */
+	public function test_a_restore_authenticated_under_a_departed_binding_is_refused(): void {
+		$env = $this->pageEnvelope();
+		$a   = Aura_Worker_Door_Log::binding();
+		Aura_Worker_Call_Context::capture_authenticated_binding();
+
+		// The unbind lands between authentication and the restore's admission.
+		$rec = array( 'gen' => 'gen-after-the-unbind', 'state' => 'unbound', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_76' ) ) );
+
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_binding_changed', $res->data['code'] );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( $a, $row['binding'], 'stamped with the generation it authenticated under' );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'binding_changed', $row['reason'] );
+	}
+
 	public function test_a_closed_log_refuses_the_restore_before_anything_is_captured(): void {
 		$env = $this->pageEnvelope();
 		$before = $this->envelopeCount();

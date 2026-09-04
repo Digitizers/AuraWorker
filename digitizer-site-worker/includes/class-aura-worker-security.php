@@ -215,6 +215,11 @@ class Aura_Worker_Security {
 		// Paired: an item with no readable uuid names no password, so the user
 		// beside it identifies nothing either.
 		self::$authenticating_user   = ( null !== $uuid && $user instanceof WP_User && (int) $user->ID > 0 ) ? (int) $user->ID : null;
+		// The binding this credential was let in under (Ruling P76) — the
+		// baseline every governed write of this request is fenced against.
+		if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
+			Aura_Worker_Call_Context::capture_authenticated_binding();
+		}
 	}
 
 	/**
@@ -229,6 +234,10 @@ class Aura_Worker_Security {
 	 */
 	public static function capture_token_auth( string $hash ) {
 		self::$auth_token_hash = '' === $hash ? null : $hash;
+		// The other door into this plugin, and the same baseline (Ruling P76).
+		if ( '' !== $hash && class_exists( 'Aura_Worker_Call_Context' ) ) {
+			Aura_Worker_Call_Context::capture_authenticated_binding();
+		}
 	}
 
 	/**

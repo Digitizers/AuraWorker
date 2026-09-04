@@ -67,6 +67,19 @@ class Aura_Worker_Call_Context {
 	private static $verified = array();
 
 	/**
+	 * The binding generation this request AUTHENTICATED under (Ruling P76).
+	 *
+	 * Captured where WordPress decides the request is who it says it is — the
+	 * Application Password hook, and the site-token check `/aura/v1` runs — and
+	 * read again at the fence, so a governed write is judged against the
+	 * binding whose credentials let it in rather than whichever binding happens
+	 * to be current by the time it reaches the log.
+	 *
+	 * @var string|null
+	 */
+	private static $authenticated_binding = null;
+
+	/**
 	 * Start recording the dispatching route.
 	 */
 	public static function init() {
@@ -129,11 +142,55 @@ class Aura_Worker_Call_Context {
 	}
 
 	/**
+	 * RECORD THE BINDING THIS REQUEST AUTHENTICATED UNDER (Ruling P76).
+	 *
+	 * A request passes authentication and permission under binding A; an
+	 * unbind — or the connect that follows it — completes before the request
+	 * reaches `open_pending()`; the row is then stamped with the CURRENT
+	 * generation B, and the fence compares B with B and lets the write through.
+	 * The credentials that opened the door had already been revoked.
+	 *
+	 * So the baseline is taken at the door: whatever generation stood when
+	 * this request was let in is what its rows are stamped with, and the fence
+	 * compares that against the generation standing now.
+	 *
+	 * Read RAW and never minted — a fence wants the database's answer or
+	 * nothing (`binding_raw()`), and a capture that finds no record leaves the
+	 * baseline null, which means "no capture" and falls back to today's read at
+	 * admission. Adoption (Ruling P73) may run here; it does not rotate, so the
+	 * generation it leaves is the one that was already standing.
+	 *
+	 * @return void
+	 */
+	public static function capture_authenticated_binding() {
+		if ( null !== self::$authenticated_binding || ! class_exists( 'Aura_Worker_Door_Log' ) ) {
+			return; // the FIRST authentication of the request is the one that counts
+		}
+		$gen = (string) Aura_Worker_Door_Log::binding_raw();
+		if ( '' !== $gen ) {
+			self::$authenticated_binding = $gen;
+		}
+	}
+
+	/**
+	 * The generation this request authenticated under, or null when nothing
+	 * captured one — WP-CLI, cron, and any context with no authentication hook
+	 * to hang the capture on. A null baseline means "read the generation at
+	 * admission", which is what every writer did before Ruling P76.
+	 *
+	 * @return string|null
+	 */
+	public static function authenticated_binding() {
+		return self::$authenticated_binding;
+	}
+
+	/**
 	 * Forget any recorded route.
 	 */
 	public static function reset() {
-		self::$rest_route = null;
-		self::$verified   = array();
+		self::$rest_route            = null;
+		self::$verified              = array();
+		self::$authenticated_binding = null;
 	}
 
 	/**

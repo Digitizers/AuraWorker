@@ -481,6 +481,63 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertFalse( $row['may_have_run'] );
 	}
 
+	/**
+	 * Ruling P76 (F1): the fence's baseline is the AUTHENTICATED generation.
+	 *
+	 * A request passes authentication and permission under binding A; an
+	 * unbind — or the connect after it — completes before it reaches
+	 * `open_pending()`; the row is stamped with the CURRENT generation B, and
+	 * the fence compares B with B and lets the write through. The credentials
+	 * that opened the door had already been revoked.
+	 *
+	 * The baseline is taken at the door instead: whatever stood when this
+	 * request was let in is what its rows carry.
+	 */
+	public function test_a_write_authenticated_under_a_departed_binding_is_refused(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$inner_ran = 0;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$inner_ran ) {
+				++$inner_ran;
+			}
+		);
+		// AUTHENTICATED under A — the capture the app-password and site-token
+		// hooks both make.
+		$a = Aura_Worker_Door_Log::binding();
+		Aura_Worker_Call_Context::capture_authenticated_binding();
+		$this->assertSame( $a, Aura_Worker_Call_Context::authenticated_binding() );
+
+		// …and the unbind lands before this request reaches the log. Raw SQL:
+		// that is what another process's rotation looks like from in here.
+		$rec = array( 'gen' => 'gen-after-the-unbind', 'state' => 'unbound', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_binding_changed', $out->get_error_code() );
+		$this->assertSame( 0, $inner_ran, 'the write path was never entered' );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( $a, $row['binding'], 'stamped with the generation it authenticated under' );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'binding_changed', $row['reason'] );
+	}
+
+	/** With NO capture — WP-CLI, cron — the stamp is the record as it stands. */
+	public function test_a_write_with_no_captured_binding_stamps_the_current_generation(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$this->assertNull( Aura_Worker_Call_Context::authenticated_binding(), 'nothing authenticated' );
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertIsArray( $out );
+		$this->assertSame( Aura_Worker_Door_Log::binding_raw(), Aura_Worker_Door_Log::get( 1 )['binding'] );
+	}
+
 	/** An unchanged generation runs exactly as before. */
 	public function test_a_direct_write_under_an_unchanged_binding_still_runs(): void {
 		$this->registerAll();

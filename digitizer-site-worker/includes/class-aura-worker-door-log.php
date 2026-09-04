@@ -147,6 +147,20 @@ class Aura_Worker_Door_Log {
 	 * @return string
 	 */
 	public static function binding() {
+		// THE AUTHENTICATED GENERATION WINS (Ruling P76). A request that passed
+		// authentication under binding A must have its rows stamped A, even if
+		// an unbind completed while it was between the permission callback and
+		// here — otherwise the row carries the CURRENT generation, the fence
+		// compares it with itself, and a write whose credentials were revoked
+		// before it started is waved through. A context with no capture
+		// (WP-CLI, cron, direct PHP) falls through to the record as it stands,
+		// which is what every writer did before.
+		if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
+			$authed = Aura_Worker_Call_Context::authenticated_binding();
+			if ( null !== $authed && '' !== (string) $authed ) {
+				return (string) $authed;
+			}
+		}
 		$rec = self::binding_record();
 		$gen = (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' );
 		// NULL, NOT '' (Ruling P72). A real record always carries a generation,
