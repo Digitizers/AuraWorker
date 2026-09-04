@@ -607,6 +607,42 @@ final class ElementorReplayTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P88 (F1): the ruleset a replay is pinned to is read from the
+	 * DATABASE.
+	 *
+	 * `execute_tool()` calls `enforce()` on its way in, which warms this
+	 * request's option cache with the ruleset as it stood then. A `/rules`
+	 * request committing a new BLOCK while the replay is being dispatched
+	 * changed the row and nothing this request could see — so the approval the
+	 * new rule should have stopped ran under the superseded ruleset.
+	 */
+	public function test_a_replay_sees_a_block_pushed_while_it_was_dispatching(): void {
+		$this->registerAll();
+		$this->installRuleset( array() ); // permissive, and now warm in the cache
+		$ref = $this->holdCall();
+		Aura_Worker_Rules::current(); // the enforce() guard on the way in
+		// A `/rules` push COMMITS a block — the row changes; this request's
+		// warm option cache does not, because another process wrote it.
+		$blocking = array(
+			'envelope'    => 'x.y',
+			'seq'         => 9,
+			'issued_at'   => '2026-09-03T00:00:00Z',
+			'received_at' => time(),
+			'rules'       => array(
+				array( 'key' => 'rule/pushed', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'frozen mid-flight' ),
+			),
+		);
+		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ] = maybe_serialize( $blocking );
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'refused_by_current_rule', $out['reason'] );
+		$this->assertSame( 'rule/pushed', $out['rule_key'] );
+		$this->assertSame( array(), $this->ran, 'nothing ran' );
+	}
+
+	/**
 	 * Ruling P64 (F1): the fence reads the database, not this process's caches.
 	 *
 	 * By the time a replay reaches its fence, `get_held()` has already

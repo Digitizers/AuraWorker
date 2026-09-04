@@ -1536,6 +1536,40 @@ class Aura_Worker_Rules {
 	}
 
 	/**
+	 * The same record, read from the DATABASE — for a judgement that GATES a
+	 * mutation (Ruling P88).
+	 *
+	 * `current()` goes through the option cache, and by the time a door
+	 * judgement runs that cache is already warm: `Aura_Worker_Tools::execute_tool()`
+	 * calls `enforce()` on its way in, which reads the ruleset and caches it
+	 * for the rest of the request. A `/rules` push committing a new BLOCK in
+	 * between then changed nothing this request could see, and the approval it
+	 * should have stopped ran under the superseded ruleset.
+	 *
+	 * The caches are evicted first — the row may have been written by another
+	 * process, which invalidates nothing here — and the row is read directly.
+	 * `stored_uncached()` already reports a failed read as a `WP_Error`; that
+	 * collapses to null, which every caller of this reads as
+	 * `rules_unavailable` and answers with its own consequence: a write is
+	 * HELD, a restore is refused retryably. Never as permission.
+	 *
+	 * Non-gating readers keep the cached form. This one costs a query, and it
+	 * is asked once per judgement.
+	 *
+	 * @since 2.16.0
+	 *
+	 * @return array|null
+	 */
+	public static function current_uncached() {
+		self::forget_option_cache( self::OPTION );
+		$rec = self::stored_uncached();
+		if ( is_wp_error( $rec ) || null === $rec || self::is_sentinel( $rec ) ) {
+			return null;
+		}
+		return $rec;
+	}
+
+	/**
 	 * Is this value a stored record? One definition, used by stored() and by
 	 * swap() on a value read straight from the database.
 	 *

@@ -661,6 +661,34 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( Aura_Worker_Door_Log::binding_raw(), Aura_Worker_Door_Log::get( 1 )['binding'] );
 	}
 
+	/**
+	 * Ruling P88 (F1), on the direct-write path: the judgement that gates a
+	 * mutation reads the ruleset from the database.
+	 */
+	public function test_a_direct_write_sees_a_block_pushed_while_it_was_dispatching(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		Aura_Worker_Rules::current(); // the enforce() guard on the way in warms the cache
+		// A `/rules` push COMMITS a block — the row changes; this request's
+		// warm option cache does not, because another process wrote it.
+		$blocking = array(
+			'envelope'    => 'x.y',
+			'seq'         => 9,
+			'issued_at'   => '2026-09-03T00:00:00Z',
+			'received_at' => time(),
+			'rules'       => array(
+				array( 'key' => 'rule/pushed', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'frozen mid-flight' ),
+			),
+		);
+		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ] = maybe_serialize( $blocking );
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_rule_blocked', $out->get_error_code() );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran, 'nothing ran' );
+	}
+
 	/** An unchanged generation runs exactly as before. */
 	public function test_a_direct_write_under_an_unchanged_binding_still_runs(): void {
 		$this->registerAll();

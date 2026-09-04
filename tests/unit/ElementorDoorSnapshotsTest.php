@@ -596,6 +596,32 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P88 (F1), on the restore path: the same judgement, the same read.
+	 */
+	public function test_a_restore_sees_a_block_pushed_while_it_was_dispatching(): void {
+		$env = $this->pageEnvelope();
+		Aura_Worker_Rules::current(); // the guard on the way in warms the cache
+		// A `/rules` push COMMITS a block — the row changes; this request's
+		// warm option cache does not, because another process wrote it.
+		$blocking = array(
+			'envelope'    => 'x.y',
+			'seq'         => 9,
+			'issued_at'   => '2026-09-03T00:00:00Z',
+			'received_at' => time(),
+			'rules'       => array(
+				array( 'key' => 'rule/pushed', 'effect' => 'block', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'frozen mid-flight' ),
+			),
+		);
+		$GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ] = maybe_serialize( $blocking );
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_88' ) ) );
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
+	}
+
+	/**
 	 * Ruling P87 (F3): rules this site cannot READ refuse the restore.
 	 *
 	 * `Rules::current()` collapses an unreadable store to null and `govern()`

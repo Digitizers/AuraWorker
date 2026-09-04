@@ -1406,7 +1406,13 @@ class Aura_Worker_Elementor_Door {
 		if ( isset( self::$memo[ $key ] ) ) {
 			return self::$memo[ $key ];
 		}
-		$rec = null !== self::$pinned_ruleset ? self::$pinned_ruleset : Aura_Worker_Rules::current();
+		// UNCACHED (Ruling P88). This verdict is what stands between a caller
+		// and a mutation, and by the time it runs `execute_tool()`'s own
+		// `enforce()` has already warmed the option cache — so a `/rules` push
+		// committing a new BLOCK a moment ago was invisible, and the write it
+		// should have stopped went through. A judgement that GATES reads the
+		// row; the guards on the way in do not have to.
+		$rec = null !== self::$pinned_ruleset ? self::$pinned_ruleset : Aura_Worker_Rules::current_uncached();
 		if ( null === $rec || ! isset( $rec['rules'] ) || ! is_array( $rec['rules'] ) ) {
 			$out = array(
 				'effect'  => 'hold',
@@ -2434,7 +2440,12 @@ class Aura_Worker_Elementor_Door {
 		}
 		$slug                 = (string) $held['ability'];
 		$input                = (array) $held['input'];
-		$rec                  = Aura_Worker_Rules::current();
+		// THE RULESET THIS REPLAY IS PINNED TO, READ FROM THE DATABASE (Ruling
+		// P88). A `/rules` request installing a block while this approval is
+		// being dispatched must be seen: the cache was warmed by the
+		// `enforce()` guard on the way in, and pinning that value ran the
+		// operator's approval under a ruleset the site had already replaced.
+		$rec                  = Aura_Worker_Rules::current_uncached();
 		self::$pinned_ruleset = $rec;
 		self::$memo           = array();
 		$prev_user            = get_current_user_id();
@@ -3829,7 +3840,9 @@ class Aura_Worker_Elementor_Door {
 	 * @throws Aura_Worker_Door_Blocked_Exception When a block rule names one of them, or a warn rule names one this call never declared.
 	 */
 	private static function judge_collateral( array $ids ) {
-		$rec   = null !== self::$pinned_ruleset ? self::$pinned_ruleset : Aura_Worker_Rules::current();
+		// The same rule as govern()'s (Ruling P88): nothing pinned means this
+		// judgement is the one gating the write, so it reads the row.
+		$rec   = null !== self::$pinned_ruleset ? self::$pinned_ruleset : Aura_Worker_Rules::current_uncached();
 		$rules = ( is_array( $rec ) && isset( $rec['rules'] ) && is_array( $rec['rules'] ) ) ? $rec['rules'] : array();
 		if ( empty( $rules ) ) {
 			return;
