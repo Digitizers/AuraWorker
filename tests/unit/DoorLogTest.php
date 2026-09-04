@@ -1100,6 +1100,59 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S16 (Codex round-6 P1 on #88): a per-unit session nonce, set as
+	 * the FIRST statement after START TRANSACTION, proves the final COMMIT
+	 * ran on the SAME session that opened the transaction — not a fresh one
+	 * WordPress transparently reconnected onto after a drop between the
+	 * version bump and the COMMIT. A reconnect there lands on a session
+	 * with no transaction open, so the COMMIT that runs is a harmless no-op
+	 * that still returns success; the nonce read-back (which does not
+	 * survive a reconnect) is what catches it.
+	 */
+	public function test_a_reconnect_between_the_bump_and_commit_reports_committed_false(): void {
+		$name = 'aura_worker_door_s16_test';
+
+		$GLOBALS['_sa_reconnect_before_commit'] = true;
+		$outcome                                = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_commit'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'the COMMIT that ran could not be proven to be on the transaction\'s own session' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'MySQL itself rolled the old session\'s transaction back the moment it was lost' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_rows'] );
+	}
+
+	/** The normal path: no reconnect, the nonce matches, committed stays true. */
+	public function test_the_normal_commit_path_still_proves_the_session_and_reports_committed_true(): void {
+		$name    = 'aura_worker_door_s16_normal_test';
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$this->assertTrue( $outcome['committed'] );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+	}
+
+	/**
 	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
 	 * `SHOW TABLE STATUS LIKE 'wp_options'` ONCE per request and caches the
 	 * answer — a second call must not re-issue the probe.

@@ -1958,6 +1958,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		private $sa_txn_stack = array();
 		/**
+		 * MySQL session (user) variables (Ruling S16, 2.16.2) — PER INSTANCE,
+		 * exactly like `sa_last_insert_id` above: a real reconnect lands on a
+		 * fresh session where none of these exist, which is the whole point of
+		 * `versioned()`'s post-COMMIT nonce check. Cleared whenever a COMMIT
+		 * is modelled as landing on a reconnected session (see `query()`'s
+		 * `_sa_reconnect_before_commit` seam) and by `sa_forget_last_result()`
+		 * between tests.
+		 *
+		 * @var array<string, string>
+		 */
+		private $sa_session_vars = array();
+		/**
 		 * The same thing for get_row(). wpdb keeps ONE $last_result; modelling
 		 * the two separately is the harsher choice, because it means the stale
 		 * answer a probe can meet is always another PROBE's row — the most
@@ -2303,6 +2315,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return null === $this->sa_last_insert_id ? null : (string) $this->sa_last_insert_id;
 			}
+			// Aura_Worker_Door_Log::versioned()'s post-COMMIT session-nonce
+			// read-back (Ruling S16, 2.16.2): a MySQL session (user) variable,
+			// scoped to THIS connection exactly like LAST_INSERT_ID() above —
+			// absent (null) on a fresh session, which is what a reconnect
+			// between the SET and this SELECT models.
+			if ( preg_match( '/^SELECT @(\w+)$/', (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return $this->sa_session_vars[ $m[1] ] ?? null;
+			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				$name = stripslashes( $m[1] );
@@ -2573,6 +2594,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// test, or a test that forgot to let versioned() finish) must not
 			// strand the NEXT test believing one is already open (Ruling S8).
 			$this->sa_txn_stack       = array();
+			// Session variables are per-connection too (Ruling S16) — a fresh
+			// test must not inherit another test's nonce.
+			$this->sa_session_vars    = array();
 		}
 
 		/**
@@ -2737,7 +2761,38 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				);
 				return true;
 			}
+			// A MySQL session (user) variable assignment (Ruling S16,
+			// 2.16.2) — `versioned()`'s per-unit nonce, set as the first
+			// statement after START TRANSACTION so a later reconnect can be
+			// told apart from the session that opened the transaction.
+			if ( preg_match( "/^SET @(\w+) = '(.*)'$/s", $query, $m ) ) {
+				$this->sa_session_vars[ $m[1] ] = stripslashes( $m[2] );
+				return true;
+			}
 			if ( 'COMMIT' === trim( $query ) ) {
+				if ( ! empty( $GLOBALS['_sa_reconnect_before_commit'] ) ) {
+					// Ruling S16: models a reconnect landing between the version
+					// bump and this COMMIT. WordPress can transparently
+					// reconnect on a dropped connection, and MySQL rolls back
+					// whatever transaction the OLD session had open the instant
+					// it is lost — so the "database" this call's writes landed
+					// in unwinds here, exactly as a real disconnect would do it.
+					// The fresh session this COMMIT actually runs on has no
+					// transaction open at all, so the statement itself is a
+					// harmless no-op that still returns success — trusting that
+					// success without the nonce check is the bug this ruling
+					// closes. Session variables do not survive the reconnect
+					// either, which is what lets the read-back catch it.
+					$GLOBALS['_sa_reconnect_before_commit'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						$snap                   = array_pop( $this->sa_txn_stack );
+						$GLOBALS['_rows']       = $snap['rows'];
+						$GLOBALS['_options']    = $snap['options'];
+						$GLOBALS['_notoptions'] = $snap['notoptions'];
+					}
+					$this->sa_session_vars = array();
+					return true;
+				}
 				if ( empty( $this->sa_txn_stack ) ) {
 					throw new RuntimeException( 'wpdb stub: COMMIT with no open transaction on this connection' );
 				}
@@ -3311,6 +3366,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
+	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
@@ -4577,6 +4633,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
+	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).

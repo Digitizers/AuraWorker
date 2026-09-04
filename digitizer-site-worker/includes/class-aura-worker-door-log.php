@@ -1886,6 +1886,25 @@ class Aura_Worker_Door_Log {
 	 * answer (typically by re-reading the now-unwound state) rather than
 	 * ever trust `result` without having checked it.
 	 *
+	 * THE FINAL COMMIT IS PROVEN, NOT ASSUMED (Ruling S16, Codex round-6 P1
+	 * on #88). A connection can drop AFTER the version bump's write but
+	 * WHILE this method's own `COMMIT` is being issued; WordPress can
+	 * transparently reconnect and run that `COMMIT` on a brand-new session —
+	 * one with no transaction open at all, on which `COMMIT` is a harmless
+	 * no-op that still returns success — while the OLD session's real,
+	 * uncommitted transaction was rolled back by MySQL itself the instant
+	 * the connection was lost. A `COMMIT` that merely returns without error
+	 * cannot tell those two cases apart. A per-unit session (user) variable
+	 * closes the gap: set as the FIRST statement after `START TRANSACTION`
+	 * (so it exists on this session before `$writes()` runs anything), it
+	 * does not survive a reconnect — session variables are scoped to the
+	 * connection — so reading it back immediately after `COMMIT` and
+	 * comparing it to the value this call set proves the COMMIT that just
+	 * ran was issued on the SAME session that opened the transaction. NULL
+	 * or any other value means a reconnect happened somewhere in between,
+	 * the real transaction is gone, and this method answers `committed:
+	 * false` — accurately: nothing landed.
+	 *
 	 * @param callable $writes Returns array{ mutated: bool, result: mixed,
 	 *                         evict?: string[] } or array{ rollback: true,
 	 *                         result: mixed }. `mutated` false ⇒ an
@@ -1906,9 +1925,11 @@ class Aura_Worker_Door_Log {
 	 *                         `result` is handed back to the CALLER of
 	 *                         versioned().
 	 * @return array{ committed: bool, result?: mixed, observation?: int|null }
-	 *         `committed` is false when $writes() asked for a rollback, or
+	 *         `committed` is false when $writes() asked for a rollback,
 	 *         reported a mutation whose version bump then failed its own
-	 *         WRITE — either way the WHOLE unit rolls back (on a
+	 *         WRITE, or when the final COMMIT could not be PROVEN to have run
+	 *         on the session that opened the transaction (Ruling S16) —
+	 *         every one of those rolls the WHOLE unit back (on a
 	 *         transactional engine only — see Ruling S13 above), including
 	 *         every statement $writes() itself ran, so the caller must treat
 	 *         this exactly like $writes() failing outright — and `result` is
@@ -1923,8 +1944,16 @@ class Aura_Worker_Door_Log {
 	public static function versioned( callable $writes ) {
 		global $wpdb;
 		$transactional = self::engine_is_transactional();
+		$tx_nonce      = null;
 		if ( $transactional ) {
 			$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// Ruling S16 (Codex round-6 P1 on #88): the FIRST statement after
+			// START TRANSACTION, so it is set on THIS session before anything
+			// else runs — the proof the final COMMIT below checks before this
+			// method ever reports `committed: true`. See that COMMIT's own
+			// comment for what it proves and why.
+			$tx_nonce = wp_generate_uuid4();
+			$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 		}
 		try {
 			$outcome = $writes();
@@ -1991,6 +2020,34 @@ class Aura_Worker_Door_Log {
 		// perform, so execution simply continues to the shared tail below.
 		if ( $transactional ) {
 			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
+			// Ruling S16 (Codex round-6 P1 on #88): PROVE this COMMIT ran on
+			// the SAME session that opened the transaction and set the nonce
+			// above — not a fresh session WordPress transparently reconnected
+			// onto after the real one dropped mid-flight. A reconnect at any
+			// point between the SET and here lands on a session with no
+			// transaction open at all, so the COMMIT just issued is a
+			// harmless no-op that STILL returns success; trusting that
+			// success is exactly the gap this closes. Session (user)
+			// variables do not survive a reconnect — MySQL scopes them to
+			// the connection — so reading the nonce back and comparing tells
+			// the two apart without needing COMMIT's own return value to be
+			// honest about which session it ran on (its return/last_error
+			// are still consulted below, for the ordinary case where the
+			// statement itself simply fails).
+			$commit_ok = ( '' === (string) $wpdb->last_error );
+			if ( $commit_ok ) {
+				$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
+			}
+			if ( ! $commit_ok ) {
+				// Ruling S15: no callback result — see the bump-failure
+				// branch above for why. The mutation this call thought it
+				// just committed was rolled back by MySQL itself the moment
+				// the original session was lost; nothing here landed.
+				return array(
+					'committed' => false,
+				);
+			}
 		}
 		// Ruling S11: repeat every eviction $writes() performed, now that
 		// the write is durable.
