@@ -3541,6 +3541,25 @@ class Aura_Worker_Elementor_Door {
 		$ref        = '' === (string) $aura_ref ? null : preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $aura_ref );
 		$touches    = self::restore_touches( $record );
 		$verdict    = self::govern( 'aura/restore', $touches, array( 'restore_of' => $restore_of ) );
+		// RULES IT CANNOT READ REFUSE THE RESTORE (Ruling P87). `current()`
+		// collapses an unreadable ruleset store to null and `govern()` reports
+		// `rules_unavailable`, and this judgement rejected only an OBSERVED
+		// `block` — so a restore went ahead and overwrote a page, or the whole
+		// design system, while a live freeze rule said it must not. A restore
+		// is a write, and a write this site cannot prove is permitted does not
+		// happen.
+		//
+		// BEFORE anything is reserved or captured, so it costs nothing and is
+		// retryable: the next poll with a readable store judges it properly.
+		// `none`, `allow` and `warn` proceed as they always did — the operator
+		// initiated this restore, and only a rule naming its target stops one.
+		if ( 'rules_unavailable' === (string) $verdict['verdict'] ) {
+			return new WP_Error(
+				'aura_rules_unavailable',
+				__( "This site could not read its Aura rules, so it cannot prove this restore is permitted; nothing was restored — retry.", 'digitizer-site-worker' ),
+				array( 'status' => 503 )
+			);
+		}
 		if ( 'block' === $verdict['effect'] ) {
 			Aura_Worker_Rules::record_block( 'aura/restore', $verdict['rule'] );
 			self::record_terminal_only(

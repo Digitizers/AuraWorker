@@ -29,6 +29,12 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$GLOBALS['_options']['aura_worker_site_token'] = Aura_Worker_Security::hash_token( 'tok' );
 		$this->api = new Aura_Worker_API( new Aura_Worker_Security() );
 		$this->ran = array();
+		// A ruleset this site can READ, with nothing in it (Ruling P87). A
+		// restore is a write, and a write whose rules cannot be read is
+		// refused retryably — so "no ruleset at all" is no longer a state a
+		// restore runs in, and every test here that is about the restore's
+		// own mechanics starts from rules that simply say nothing.
+		$this->installRuleset( array() );
 	}
 
 	protected function tearDown(): void {
@@ -509,7 +515,7 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( $env['id'], $row['restore_of'] );
 		$this->assertSame( 'act_42', $row['ref'] );
 		$this->assertSame( array( array( 'type' => 'page', 'id' => '7' ) ), $row['touches'], 'the envelope\'s own target, not an empty set' );
-		$this->assertSame( 'rules_unavailable', $row['verdict'], 'no ruleset is stored on this site, and the entry says so' );
+		$this->assertSame( 'none', $row['verdict'], 'the rules were read and none of them matched' );
 
 		// The pre-restore envelope is a same-kind capture of what was there.
 		$snaps = new Aura_Worker_Snapshots();
@@ -587,6 +593,34 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( $a, $row['binding'], 'stamped with the generation it authenticated under' );
 		$this->assertSame( 'refused', $row['result'] );
 		$this->assertSame( 'binding_changed', $row['reason'] );
+	}
+
+	/**
+	 * Ruling P87 (F3): rules this site cannot READ refuse the restore.
+	 *
+	 * `Rules::current()` collapses an unreadable store to null and `govern()`
+	 * reports `rules_unavailable` — and the restore's judgement rejected only
+	 * an OBSERVED `block`, so the restore went ahead and overwrote the page
+	 * while a live freeze rule said it must not. A restore is a write, and a
+	 * write this site cannot prove is permitted does not happen.
+	 */
+	public function test_a_restore_whose_rules_cannot_be_read_is_refused_before_anything_is_reserved(): void {
+		$env    = $this->pageEnvelope();
+		$before = $this->envelopeCount();
+		// The store cannot be read: `current()` sees null, exactly as it does
+		// for a freeze rule it cannot fetch.
+		$GLOBALS['_sa_option_cache'][ Aura_Worker_Rules::OPTION ] = null;
+		unset( $GLOBALS['_options'][ Aura_Worker_Rules::OPTION ], $GLOBALS['_rows'][ Aura_Worker_Rules::OPTION ] );
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_87' ) ) );
+
+		$GLOBALS['_sa_option_cache'] = array();
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_rules_unavailable', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'], 'retryable: nothing was reserved' );
+		$this->assertNull( Aura_Worker_Door_Log::get( 1 ), 'no entry' );
+		$this->assertSame( $before, $this->envelopeCount(), 'nothing was captured' );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'and nothing was restored' );
 	}
 
 	public function test_a_closed_log_refuses_the_restore_before_anything_is_captured(): void {
