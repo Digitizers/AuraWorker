@@ -701,6 +701,73 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertFalse( Aura_Worker_Door_Holds::seq_lease_is_held( 1 ) );
 	}
 
+	/**
+	 * Ruling P94 (F1): the seq lease is released by ONE funnel, so the exits
+	 * that reach no terminus release it too.
+	 *
+	 * A fence answering `missing` deliberately settles nothing — there is no
+	 * row to settle — and the termini were the only things releasing the lease,
+	 * so that exit left the named lock held. On a persistent database
+	 * connection a lock outlives the request that took it, and once that seq is
+	 * allocated again the reconciler reads the row as RUNNING until the hard
+	 * cap.
+	 */
+	public function test_a_missing_row_at_the_fence_still_releases_the_lease(): void {
+		$env = $this->pageEnvelope();
+		// The row disappears after the pre-restore patch lands — the second
+		// compare-and-swap this restore makes on it, the first being admit().
+		$swaps = 0;
+		$arm   = static function ( $name ) use ( &$swaps, &$arm ) {
+			if ( Aura_Worker_Door_Log::PREFIX . '1' === (string) $name ) {
+				++$swaps;
+				if ( 2 === $swaps ) {
+					unset( $GLOBALS['_rows'][ Aura_Worker_Door_Log::PREFIX . '1' ], $GLOBALS['_options'][ Aura_Worker_Door_Log::PREFIX . '1' ] );
+					return;
+				}
+			}
+			$GLOBALS['_sa_after_swap'] = $arm; // not this one: wait for the next
+		};
+		$GLOBALS['_sa_after_swap'] = $arm;
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$GLOBALS['_sa_after_swap'] = null;
+		$this->assertInstanceOf( WP_REST_Response::class, $res );
+		$this->assertSame( 503, $res->get_status() );
+		$this->assertSame( 'aura_log_failed', $res->data['code'] );
+		$this->assertSame( array(), $GLOBALS['_sa_named_locks'], 'the lease is not left held' );
+		$this->assertFalse( Aura_Worker_Door_Holds::seq_lease_is_held( 1 ) );
+	}
+
+	/** The REFUSED path releases it too — exactly once, and a second call is a no-op. */
+	public function test_a_refused_fence_releases_the_lease_exactly_once(): void {
+		$env = $this->pageEnvelope();
+		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () {
+			$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] = maybe_serialize(
+				array( 'gen' => 'gen-from-another-process', 'state' => 'bound', 'client' => 'c2', 'dashboard' => 'https://new.example' )
+			);
+		};
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_binding_changed', $res->data['code'] );
+		$this->assertSame( array(), $GLOBALS['_sa_named_locks'], 'released' );
+		Aura_Worker_Elementor_Door::release_seq_lease(); // idempotent: no throw, nothing to release
+		$this->assertSame( array(), $GLOBALS['_sa_named_locks'] );
+	}
+
+	/** …and so does a restore that actually ran. */
+	public function test_a_completed_restore_releases_the_lease(): void {
+		$env = $this->pageEnvelope();
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$this->assertSame( array(), $GLOBALS['_sa_named_locks'], 'the lease went with the terminus' );
+		$this->assertFalse( Aura_Worker_Door_Holds::seq_lease_is_held( 1 ) );
+	}
+
 	public function test_a_creation_restore_through_rest_captures_the_created_posts_first(): void {
 		$this->seedPost( 511, 'page' );
 		update_post_meta( 511, '_elementor_data', '[{"made":true}]' );

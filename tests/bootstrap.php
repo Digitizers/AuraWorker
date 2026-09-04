@@ -2836,9 +2836,6 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return 1;
 			}
 
-			// Aura_Worker_Door_Log::ack()'s floor raise: upward-only, via a
-			// numeric-cast predicate rather than a byte-exact one (the floor's
-			// stored value is compared as a number, not matched verbatim).
 			// The binding record's EPOCH WITNESS re-stamp, joined to the epoch
 			// row (Ruling P92): it lands only while the live epoch is still the
 			// one being stamped, so a rotation superseded mid-flight cannot
@@ -2861,9 +2858,12 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_option_writes'][]  = array( 'set', $name );
 				return 1;
 			}
-			// Aura_Worker_Door_Log::ack()'s floor raise, JOINED to the epoch row
-			// (Ruling P90): the raise happens only while the epoch still holds
-			// the value the ack named, so an ack can never cross a rotation.
+			// Aura_Worker_Door_Log::ack()'s floor raise: upward-only, via a
+			// numeric-cast predicate rather than a byte-exact one (the floor's
+			// stored value is compared as a number, not matched verbatim) — and
+			// JOINED to the epoch row (Ruling P90), so the raise happens only
+			// while the epoch still holds the value the ack named and an ack can
+			// never cross a rotation.
 			if ( preg_match( "/^UPDATE \S+ f JOIN \( SELECT option_value AS e FROM \S+ WHERE option_name = '([^']+)' \) x SET f\.option_value = '([^']*)' WHERE f\.option_name = '([^']+)' AND x\.e = '(.*)' AND CAST\(f\.option_value AS UNSIGNED\) < (\d+)$/s", $query, $m ) ) {
 				list( , $epoch_name, $new, $name, $expect_epoch, $bound ) = array_map( 'stripslashes', $m );
 				$bound = (int) $bound;

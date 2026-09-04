@@ -1729,8 +1729,20 @@ class Aura_Worker_Elementor_Door {
 		}
 	}
 
-	/** Release this request's seq lease, if it took one (Ruling P56). */
-	private static function release_seq_lease() {
+	/**
+	 * Release this request's seq lease, if it took one (Ruling P56).
+	 *
+	 * PUBLIC and idempotent (Ruling P94). `execute()` releases its own in a
+	 * `finally`, but the restore path's lease is handed OUT of the governor —
+	 * `open_restore_entry()` returns a seq and `restore_snapshot()` drives
+	 * everything after it — so the release belongs to the caller's own funnel,
+	 * where every exit of that path passes through it. The two restore termini
+	 * no longer release it: one owner, one release. The null guard makes a
+	 * second call harmless, which is what lets the funnel be unconditional.
+	 *
+	 * @return void
+	 */
+	public static function release_seq_lease() {
 		if ( null === self::$seq_lease ) {
 			return;
 		}
@@ -3682,18 +3694,21 @@ class Aura_Worker_Elementor_Door {
 			);
 			return new WP_Error( 'aura_log_failed', 'This site could not take an execution lease for the restore; it was not run.', array( 'status' => 503 ) );
 		}
-		// THE LEASE OUTLIVES EVERY EXIT BUT THE ONE THAT HANDS IT ON (Ruling
-		// P93). `settle_restore_entry()` and `refuse_restore_entry()` are the
-		// only callers of `release_seq_lease()` on this path, so a failed
-		// `admit()` returned past both of them and left the named lock held —
-		// and on a persistent database connection a lock outlives the request
-		// that took it. If the `discard()` beside it failed too, in the same
-		// fault, the pending row blocked log delivery and the reconciler called
-		// it RUNNING until the 24-hour hard cap instead of recovering it at the
-		// ten-minute one.
+		// THE LEASE OUTLIVES EVERY EXIT BUT THE ONE THAT HANDS IT ON (Rulings
+		// P93/P94). A failed `admit()` used to return past every release on
+		// this path and leave the named lock held — and on a persistent
+		// database connection a lock outlives the request that took it. If the
+		// `discard()` beside it failed too, in the same fault, the pending row
+		// blocked log delivery and the reconciler called it RUNNING until the
+		// 24-hour hard cap instead of recovering it at the ten-minute one.
 		//
-		// `execute()` and `replay()` already do this with their own `finally`
-		// blocks; this path was the one without one.
+		// Returning a seq HANDS the lease to `restore_snapshot()`, whose own
+		// `finally` releases it however that path ends. Everything else here
+		// keeps it and releases it below.
+		//
+		// `execute()` and `replay()` each own their whole lease lifetime in a
+		// `finally` of their own; this is the one lease that crosses out of the
+		// governor, so its funnel is on the other side.
 		$handed = false;
 		try {
 			if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
@@ -3746,7 +3761,9 @@ class Aura_Worker_Elementor_Door {
 		if ( ! $settled ) {
 			self::bump_counter( 'log_ungoverned' );
 		}
-		self::release_seq_lease();
+		// The lease is NOT released here (Ruling P94): `restore_snapshot()`'s
+		// own funnel owns it, and every exit of that path — including the ones
+		// that never reach a terminus at all — passes through it.
 		return $settled;
 	}
 
@@ -3778,10 +3795,8 @@ class Aura_Worker_Elementor_Door {
 		if ( ! $settled ) {
 			self::bump_counter( 'log_ungoverned' );
 		}
-		// The restore's terminus releases its lease (Ruling P56). A restore
-		// that never reaches here leaves it to the connection, which is the
-		// same guarantee every other lease rests on.
-		self::release_seq_lease();
+		// The lease is NOT released here (Ruling P94) — see
+		// `refuse_restore_entry()`: `restore_snapshot()`'s funnel owns it.
 		return $settled;
 	}
 

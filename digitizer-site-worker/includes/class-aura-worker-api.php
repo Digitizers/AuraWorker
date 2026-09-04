@@ -1333,6 +1333,41 @@ class Aura_Worker_API {
 			if ( is_wp_error( $seq ) ) {
 				return $seq;
 			}
+		}
+		// ONE RELEASE FUNNEL FOR THE SEQ LEASE (Ruling P94).
+		// `open_restore_entry()` HANDS the lease out of the governor when it
+		// returns a seq, and the two restore termini no longer release it — so
+		// every exit of the path below passes through here: the ones that reach
+		// a terminus, and the ones that do not (a MISSING row has nothing to
+		// settle, a rules refusal answers before it captures, a throw answers
+		// nothing at all). It used to be released only by the termini, so those
+		// other exits left the named lock held — and on a persistent database
+		// connection a lock outlives the request that took it.
+		try {
+			return self::restore_after_admission( $snapshots, $record, $id, $seq, $aura_ref );
+		} finally {
+			if ( null !== $seq ) {
+				Aura_Worker_Elementor_Door::release_seq_lease();
+			}
+		}
+	}
+
+	/**
+	 * Everything a restore does once its door entry (if any) is reserved.
+	 *
+	 * Extracted so `restore_snapshot()` can wrap it in the single `finally`
+	 * that owns the seq lease (Ruling P94); the body itself is unchanged.
+	 *
+	 * @param Aura_Worker_Snapshots $snapshots The snapshot store.
+	 * @param array|null            $record    The envelope, or null when absent.
+	 * @param string                $id        The envelope id.
+	 * @param int|null              $seq       The reserved door entry, or null.
+	 * @param string                $aura_ref  Aura's correlation id.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	private static function restore_after_admission( Aura_Worker_Snapshots $snapshots, $record, $id, $seq, $aura_ref ) {
+		$pre = null;
+		if ( null !== $seq ) {
 			$cap = Aura_Worker_Elementor_Door::pre_restore_capture( $record, $seq, $aura_ref );
 			if ( empty( $cap['success'] ) ) {
 				if ( ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, null, array( 'success' => false, 'error' => 'pre-restore capture failed: ' . (string) ( $cap['error'] ?? '' ) ) ) ) {
@@ -1410,7 +1445,7 @@ class Aura_Worker_API {
 		// execution failure of an envelope that IS here — never 404, which Aura
 		// reads as "no longer restorable on the site".
 		$status = $result['success'] ? 200 : ( isset( $result['code'] ) ? 409 : 500 );
-		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
 	}
 
 	/**
