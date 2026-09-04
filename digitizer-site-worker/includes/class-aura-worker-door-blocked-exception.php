@@ -59,18 +59,58 @@ class Aura_Worker_Door_Blocked_Exception extends RuntimeException {
 	private $verdict;
 
 	/**
+	 * Whether this refusal is retryable — a ruleset that could not be read
+	 * rather than a rule that said no (Ruling P89).
+	 *
+	 * @var bool
+	 */
+	private $retryable = false;
+
+	/**
 	 * @param array  $rule    The rule that refused.
 	 * @param int[]  $ids     The refused resource ids.
 	 * @param string $message Message.
 	 * @param string $reason  Entry reason: collateral_blocked|collateral_unacknowledged.
 	 * @param string $verdict Entry verdict: block|warn.
 	 */
-	public function __construct( array $rule, array $ids, $message = '', $reason = 'collateral_blocked', $verdict = 'block' ) {
+	public function __construct( array $rule, array $ids, $message = '', $reason = 'collateral_blocked', $verdict = 'block', $retryable = false ) {
 		parent::__construct( (string) $message );
-		$this->rule    = $rule;
-		$this->ids     = array_values( array_map( 'intval', $ids ) );
-		$this->reason  = (string) $reason;
-		$this->verdict = (string) $verdict;
+		$this->rule      = $rule;
+		$this->ids       = array_values( array_map( 'intval', $ids ) );
+		$this->reason    = (string) $reason;
+		$this->verdict   = (string) $verdict;
+		$this->retryable = (bool) $retryable;
+	}
+
+	/**
+	 * The refusal for a ruleset the site could not READ at the collateral
+	 * judgement (Ruling P89).
+	 *
+	 * It names no rule, because none was matched — the site simply cannot
+	 * prove these pages are not protected — so the catch answers
+	 * `aura_rules_unavailable` 503 rather than the 403 a matched rule gets.
+	 * Everything else is identical: the class row is already gone, so the
+	 * refusal is `may_have_run` and names the envelope it can be undone from.
+	 *
+	 * @param int[]  $ids     The pages Elementor was about to rewrite.
+	 * @param string $message Message.
+	 * @return self
+	 */
+	public static function rules_unreadable( array $ids, $message = '' ) {
+		return new self( array(), $ids, $message, 'collateral_rules_unreadable', 'rules_unavailable', true );
+	}
+
+	/**
+	 * Is this a refusal the caller may simply RETRY (Ruling P89)?
+	 *
+	 * A matched rule is a decision and repeating the call changes nothing; a
+	 * ruleset that could not be read is a transient failure and the next
+	 * attempt may well read it.
+	 *
+	 * @return bool
+	 */
+	public function is_retryable() {
+		return $this->retryable;
 	}
 
 	/**

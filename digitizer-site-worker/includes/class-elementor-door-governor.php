@@ -1577,14 +1577,29 @@ class Aura_Worker_Elementor_Door {
 						'result'       => 'refused',
 						'reason'       => $e->reason(),
 						'verdict'      => $e->verdict(),
-						'rule_key'     => $e->rule_key(),
-						'rule'         => self::rule_evidence( $e->rule() ),
+						'rule_key'     => '' === $e->rule_key() ? null : $e->rule_key(),
+						'rule'         => array() === $e->rule() ? null : self::rule_evidence( $e->rule() ),
 						$e->reason()   => $e->ids(),
 						'may_have_run' => true,
 						'snapshot_id'  => '' === $snap ? null : $snap,
 					)
 				);
 				self::$request = null;
+			}
+			if ( $e->is_retryable() ) {
+				// No rule was matched — the site could not READ its rules
+				// (Ruling P89) — so this is not a 403 anybody can act on. It is
+				// retryable, and the next attempt may well read them. The
+				// half that already happened is named all the same.
+				return new WP_Error(
+					'aura_rules_unavailable',
+					__( "This site could not read its Aura rules, so it cannot prove the pages this cleanup would rewrite are permitted; the cleanup was stopped — retry.", 'digitizer-site-worker' ),
+					array(
+						'status'          => 503,
+						'may_have_run'    => true,
+						'restorable_from' => '' === $snap ? null : $snap,
+					)
+				);
 			}
 			$blocked = Aura_Worker_Rules::blocked_result( $slug, $e->rule() );
 			return new WP_Error(
@@ -3837,13 +3852,37 @@ class Aura_Worker_Elementor_Door {
 	 * already admitted on that same silence.
 	 *
 	 * @param int[] $ids The pages Elementor named.
-	 * @throws Aura_Worker_Door_Blocked_Exception When a block rule names one of them, or a warn rule names one this call never declared.
+	 * @throws Aura_Worker_Door_Blocked_Exception When a block rule names one of them, a warn rule names one this call never declared, or the ruleset could not be read at all (Ruling P89).
 	 */
 	private static function judge_collateral( array $ids ) {
 		// The same rule as govern()'s (Ruling P88): nothing pinned means this
 		// judgement is the one gating the write, so it reads the row.
 		$rec   = null !== self::$pinned_ruleset ? self::$pinned_ruleset : Aura_Worker_Rules::current_uncached();
-		$rules = ( is_array( $rec ) && isset( $rec['rules'] ) && is_array( $rec['rules'] ) ) ? $rec['rules'] : array();
+		// A RULESET IT CANNOT READ ABORTS THE CLEANUP (Ruling P89). This is
+		// the last policy check before Elementor rewrites these pages, and
+		// they may never have been judged at all — the relations lookup can
+		// fail, or the index can move between the touches and the hook. A null
+		// record collapsed an unreadable store into "no rules", so a block or
+		// an unacknowledged warn on one of those pages was bypassed by a
+		// database blip.
+		//
+		// Readable-and-empty is a different answer and still proceeds: a store
+		// that says nothing protects nothing, and the call was admitted on that
+		// same silence. `current_uncached()` keeps `current()`'s shape — a
+		// record with `rules: []` for a readable empty store, null only for
+		// unreadable, absent, or the connect sentinel — so the two cases stay
+		// apart here.
+		//
+		// A replay never reaches this: its ruleset is pinned, and a replay that
+		// could not read one was held by `govern()` long before.
+		if ( null === $rec ) {
+			$why = sprintf(
+				'this site could not read its Aura rules, so it cannot prove page(s) %s may be rewritten',
+				implode( ', ', array_map( 'intval', $ids ) )
+			);
+			throw Aura_Worker_Door_Blocked_Exception::rules_unreadable( $ids, esc_html( $why ) ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- the message is escaped; the id list is structured evidence the catch reads, never rendered.
+		}
+		$rules = ( isset( $rec['rules'] ) && is_array( $rec['rules'] ) ) ? $rec['rules'] : array();
 		if ( empty( $rules ) ) {
 			return;
 		}

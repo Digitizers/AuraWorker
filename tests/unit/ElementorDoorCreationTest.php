@@ -1124,6 +1124,105 @@ final class ElementorDoorCreationTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P89: a ruleset the site cannot READ at the collateral judgement
+	 * aborts the cleanup, retryably.
+	 *
+	 * This is the last policy check before Elementor rewrites these pages, and
+	 * they may never have been judged at all — the relations lookup can fail,
+	 * or the index can move between the touches and the hook. A null record
+	 * collapsed an unreadable store into "no rules", so a block on one of
+	 * those pages was bypassed by a database blip.
+	 */
+	public function test_a_ruleset_that_cannot_be_read_at_the_collateral_judgement_stops_the_cleanup(): void {
+		$this->seedPost( 7 );
+		update_post_meta( 7, '_elementor_data', '[{"class":"a"}]' );
+		$elementor_ran = 0;
+		add_action(
+			'elementor/global_classes/cleanup',
+			static function () use ( &$elementor_ran ) {
+				++$elementor_ran;
+			},
+			10,
+			2
+		);
+		$this->registerClasses(
+			static function () {
+				do_action( 'elementor/global_classes/cleanup', array( 'g-a' ), array( 7 ) );
+				return array( 'ok' => true );
+			}
+		);
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/ds', 'effect' => 'allow', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are fine' ),
+			)
+		);
+		// The admission's own read succeeds; the collateral judgement's does
+		// not. That is the sequence the finding describes — the store is fine
+		// when the call is judged and broken a moment later.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Rules::OPTION ] = 1;
+
+		$out = wp_get_ability( 'elementor/manage-classes' )->execute( array() );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_rules_unavailable', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'], 'retryable: no rule said no' );
+		$this->assertTrue( $out->get_error_data()['may_have_run'], 'the class row was already deleted inside Elementor' );
+		$this->assertSame( 'snap_ds', $out->get_error_data()['restorable_from'] );
+		$this->assertSame( 0, $elementor_ran, "Elementor's own cleanup never ran, so page 7 was never rewritten" );
+		$this->assertSame( '[{"class":"a"}]', get_post_meta( 7, '_elementor_data', true ) );
+
+		$row = $this->row( 1 );
+		$this->assertSame( 'refused', $row['result'] );
+		$this->assertSame( 'collateral_rules_unreadable', $row['reason'] );
+		$this->assertSame( array( 7 ), $row['collateral_rules_unreadable'] );
+		$this->assertNull( $row['rule_key'], 'no rule was matched' );
+		$this->assertNull( $row['rule'] );
+		$this->assertSame( 'snap_ds', $row['snapshot_id'] );
+		$this->assertTrue( $row['may_have_run'] );
+	}
+
+	/**
+	 * …and a ruleset that READS fine still proceeds, however little it says.
+	 *
+	 * The distinction the abort rests on is null (unreadable, absent, or the
+	 * connect sentinel) versus a record — never "how many rules are in it". A
+	 * store with nothing to say about page 7 lets the cleanup through exactly
+	 * as it always did. (A completely EMPTY store cannot reach this hook at
+	 * all: nothing matches, so `govern()` holds the call for approval before
+	 * Elementor is ever entered.)
+	 */
+	public function test_a_readable_ruleset_that_names_no_collateral_page_lets_the_cleanup_through(): void {
+		$this->seedPost( 7 );
+		update_post_meta( 7, '_elementor_data', '[{"class":"a"}]' );
+		$elementor_ran = 0;
+		add_action(
+			'elementor/global_classes/cleanup',
+			static function () use ( &$elementor_ran ) {
+				++$elementor_ran;
+			},
+			10,
+			2
+		);
+		$this->registerClasses(
+			static function () {
+				do_action( 'elementor/global_classes/cleanup', array( 'g-a' ), array( 7 ) );
+				return array( 'ok' => true );
+			}
+		);
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/ds', 'effect' => 'allow', 'target' => array( 'type' => 'design_system' ), 'reason' => 'classes are fine' ),
+			)
+		);
+
+		$out = wp_get_ability( 'elementor/manage-classes' )->execute( array() );
+
+		$this->assertIsArray( $out );
+		$this->assertSame( 1, $elementor_ran, 'a store that says nothing about page 7 protects nothing' );
+	}
+
+	/**
 	 * Ruling P32, the DRIFT case: a warn rule names a collateral page this
 	 * call never declared, so nobody has acknowledged it — and Elementor is
 	 * stopped, exactly as a block stops it.
