@@ -1431,7 +1431,13 @@ class Aura_Worker_Door_Log {
 	 *
 	 * A bump whose statement failed, or a read-back that could not be
 	 * proven, answers null — "no witness this serve", never a stale or
-	 * guessed number a caller could mistake for this call's own.
+	 * guessed number a caller could mistake for this call's own. So does a
+	 * read-back that is not a POSITIVE integer (Ruling S5, Codex round-2 P2
+	 * on #88): the upsert can commit and the connection can then drop before
+	 * this SELECT runs, and WordPress can transparently reconnect and run it
+	 * on a FRESH session, where `LAST_INSERT_ID()` answers `0` — a value
+	 * that is `is_numeric()` and would otherwise pass as a witness this
+	 * connection never actually produced.
 	 *
 	 * @return int|null
 	 */
@@ -1462,7 +1468,14 @@ class Aura_Worker_Door_Log {
 			// the shared row's current value (Ruling S2).
 			return null;
 		}
-		return (int) $id;
+		$id = (int) $id;
+		if ( $id <= 0 ) {
+			// A reconnect-onto-a-fresh-session `0` (Ruling S5) — or, in
+			// principle, a negative value nothing here could produce. Either
+			// way this connection proved nothing about what it assigned.
+			return null;
+		}
+		return $id;
 	}
 
 	/**

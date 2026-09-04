@@ -2237,6 +2237,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// yet.
 			if ( 'SELECT LAST_INSERT_ID()' === trim( (string) $query ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				// Ruling S5 (Codex round-2 P2 on #88): the upsert can commit
+				// and the connection can then drop before THIS statement
+				// runs, and WordPress can transparently reconnect and run it
+				// on a FRESH session — one that never assigned anything, so
+				// `LAST_INSERT_ID()` genuinely answers `0` there. Modelled as
+				// a one-shot global so a test can arm exactly this reconnect
+				// without touching `sa_last_insert_id` itself, which would
+				// instead be modelling "nothing was ever assigned".
+				if ( ! empty( $GLOBALS['_sa_last_insert_id_reconnect'] ) ) {
+					$GLOBALS['_sa_last_insert_id_reconnect'] = false; // fires once
+					return '0';
+				}
 				return null === $this->sa_last_insert_id ? null : (string) $this->sa_last_insert_id;
 			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
@@ -3187,6 +3199,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_observation()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
@@ -4451,6 +4464,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_observation()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).

@@ -665,6 +665,21 @@ final class DoorLogTest extends TestCase {
 		$this->assertNull( $out );
 	}
 
+	/**
+	 * Ruling S5 (Codex round-2 P2 on #88): the upsert can commit and the
+	 * connection can then drop before this SAME request's own
+	 * `SELECT LAST_INSERT_ID()` runs — WordPress can transparently reconnect
+	 * and run it on a FRESH session, where `LAST_INSERT_ID()` genuinely
+	 * answers `0`. `0` is numeric and would otherwise pass as a witness this
+	 * connection never actually produced; it must answer null instead.
+	 */
+	public function test_bump_observation_answers_null_when_the_read_back_is_a_reconnected_zero(): void {
+		$GLOBALS['_sa_last_insert_id_reconnect'] = true;
+		$out                                     = Aura_Worker_Door_Log::bump_observation();
+		$GLOBALS['_sa_last_insert_id_reconnect'] = false;
+		$this->assertNull( $out, 'a fresh-session LAST_INSERT_ID() of 0 is not this connection\'s own witness' );
+	}
+
 	/** `observation_raw()` is READ-ONLY: it reports the current value and never advances it. */
 	public function test_observation_raw_reports_without_bumping(): void {
 		$this->assertNull( Aura_Worker_Door_Log::observation_raw(), 'no witness has ever served this site' );
