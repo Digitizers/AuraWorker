@@ -598,7 +598,22 @@ class Aura_Worker_Elementor_Door {
 				$out['settled_claims']++;
 				return;
 			}
-			$row = Aura_Worker_Door_Log::get( $seq );
+			// THE TRI-STATE READ (Ruling P86, on P74's helper): present, MISSING,
+			// or UNREADABLE. `get()` goes through `get_option()`, which answers
+			// null for a row that is absent and for a read that failed alike —
+			// and the fall-through below treats null as "no evidence, write an
+			// entry and release". A transient read failure therefore minted a
+			// SECOND `interrupted` entry for a ref that already had one, and
+			// gave the claim away.
+			//
+			// Unreadable retains the claim and writes nothing: the poll reports
+			// it under `interrupted[]` exactly as today, and the next sweep —
+			// with a working read — settles it properly.
+			$read = Aura_Worker_Door_Log::row_for_fence( $seq );
+			if ( false === $read ) {
+				return;
+			}
+			$row = is_array( $read ) ? $read : null;
 			if ( null !== $row && 'pending' !== ( isset( $row['result'] ) ? $row['result'] : 'pending' ) ) {
 				Aura_Worker_Door_Holds::release( $ref );
 				$out['settled_claims']++;

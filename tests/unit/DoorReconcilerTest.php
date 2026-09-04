@@ -768,6 +768,35 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P86 (F2): an entry the reconciler cannot READ retains the claim.
+	 *
+	 * `get()` answers null for a row that is absent and for a read that failed
+	 * alike, and the fall-through treats null as "no evidence": it minted a
+	 * SECOND `interrupted` entry for a ref that already had one, and released
+	 * the claim on the strength of a read that proved nothing.
+	 */
+	public function test_a_claim_whose_entry_cannot_be_read_is_retained(): void {
+		$seq = $this->entry( array(), true, false ); // pending, above the floor
+		$ref = $this->hold();
+		$this->claim( $ref, array( 'terminal_seq' => $seq ) );
+		// The row is unreadable BOTH ways: this request's cache answers null for
+		// it (what `get()` sees) and the raw read fails at the driver (what the
+		// tri-state read sees). Only the second can tell absent from broken.
+		$GLOBALS['_sa_option_cache'][ Aura_Worker_Door_Log::PREFIX . $seq ]     = null;
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::PREFIX . $seq ] = true;
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$GLOBALS['_sa_option_cache']     = array();
+		$this->assertSame( 0, $out['interrupted'], 'no second entry for a ref that already has one' );
+		$this->assertSame( 0, $out['settled_claims'] );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim is retained' );
+		$this->assertNull( Aura_Worker_Door_Log::get( $seq + 1 ), 'and nothing was written' );
+		$this->assertSame( 'pending', $this->row( $seq )['result'] );
+	}
+
+	/**
 	 * Ruling P84 (F2): a lease is evidence of life for LEASE_HARD_CAP_S, and
 	 * no longer.
 	 *
