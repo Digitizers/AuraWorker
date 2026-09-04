@@ -382,15 +382,16 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { active, epoch, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
+	 * @return array|null { active, epoch, binding, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::present() ) {
 			return null;
 		}
-		$after  = (int) $after;
-		$site   = Aura_Worker_Door_Log::epoch();
-		$rewind = null;
+		$after   = (int) $after;
+		$site    = Aura_Worker_Door_Log::epoch();
+		$binding = Aura_Worker_Door_Log::binding_raw();
+		$rewind  = null;
 		// AN UNREADABLE TOP SUPPRESSES REWIND DETECTION (Ruling P77). A failed
 		// MAX used to cast to 0, so any cursor above the floor read as a rewind:
 		// Aura rotated a healthy epoch, invalidated an in-flight ack and
@@ -440,6 +441,11 @@ class Aura_Worker_Elementor_Door {
 			// door reported from its own persisted state (Ruling P28).
 			'active'      => self::active(),
 			'epoch'       => $site,
+			// The current binding generation, read RAW and NEVER minted
+			// (`Aura_Worker_Door_Log::binding_raw()`) — Aura compares
+			// `entry.binding` with it to label a departed client's entries;
+			// null when the record cannot be read (Ruling A5b).
+			'binding'     => ( '' === $binding ) ? null : $binding,
 			'seam'        => self::$seam,
 			'door'        => self::door_state(),
 			'held'        => Aura_Worker_Door_Holds::listing(),
@@ -3121,13 +3127,14 @@ class Aura_Worker_Elementor_Door {
 	 * `unchecked` when that has not run in this request is an honest answer,
 	 * not a gap; the audit never forces a coverage check of its own.
 	 *
-	 * @return array
+	 * @return array { active, epoch, binding, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full }
 	 */
 	public static function governor_block() {
 		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
-		$epoch = Aura_Worker_Door_Log::epoch();
+		$epoch   = Aura_Worker_Door_Log::epoch();
+		$binding = Aura_Worker_Door_Log::binding_raw();
 		// NULL when the queue could not be read (Ruling P57) — held_count and
 		// queue_full are the same fact, so both say "unknown" together rather
 		// than one of them inventing a zero.
@@ -3135,6 +3142,11 @@ class Aura_Worker_Elementor_Door {
 		return array(
 			'active'              => self::active(),
 			'epoch'               => '' === $epoch ? null : $epoch,
+			// The current binding generation, read RAW and NEVER minted
+			// (`Aura_Worker_Door_Log::binding_raw()`) — Aura compares
+			// `entry.binding` with it to label a departed client's entries;
+			// null when the record cannot be read (Ruling A5b).
+			'binding'             => '' === $binding ? null : $binding,
 			'seam'                => self::$seam,
 			'door'                => self::door_state(),
 			'held_count'          => $held,

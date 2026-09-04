@@ -104,6 +104,7 @@ final class McpExposureGovernorTest extends TestCase {
 			array(
 				'active',
 				'epoch',
+				'binding',
 				'seam',
 				'door',
 				'held_count',
@@ -120,6 +121,7 @@ final class McpExposureGovernorTest extends TestCase {
 		$this->assertTrue( $b['active'] );
 		$this->assertIsString( $b['epoch'] );
 		$this->assertNotSame( '', $b['epoch'] );
+		$this->assertNull( $b['binding'], 'nothing has bound this site, and a read never mints one (Ruling A5b)' );
 		$this->assertSame( 'ok', $b['seam'], 'verify_coverage() ran and every registered elementor/* ability is wrapped' );
 		$this->assertSame( 'open', $b['door'] );
 		$this->assertSame( 0, $b['held_count'] );
