@@ -1202,9 +1202,29 @@ class Aura_Worker_Door_Log {
 					);
 					$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
 				}
+				if ( ! $done ) {
+					// Ruling S14 (Codex round-6 P1 on #88): by this point the
+					// epoch rotation above has ALREADY succeeded — every
+					// earlier return in this closure covers `$rot`'s own
+					// failure or no-op, so reaching here means `rotate_epoch_write()`
+					// really did replace the epoch. Answering `mutated =>
+					// false` told versioned() nothing happened and to COMMIT
+					// — which would durably publish the NEW epoch while the
+					// binding record still named the OLD one, discarding
+					// every acknowledgement in flight against it with no
+					// binding rotation to show for the churn. The whole unit
+					// rolls back instead — the epoch rotation included — so a
+					// failed record write leaves both the epoch and the
+					// binding exactly as they were, safe for the caller's
+					// retry to redo in full.
+					return array(
+						'rollback' => true,
+						'result'   => false,
+					);
+				}
 				return array(
-					'mutated' => $done,
-					'result'  => $done,
+					'mutated' => true,
+					'result'  => true,
 					// Ruling S11: repeated by versioned() after commit.
 					'evict'   => array( self::BINDING, 'notoptions', 'alloptions' ),
 				);

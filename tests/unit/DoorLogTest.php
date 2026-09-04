@@ -1025,6 +1025,36 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S14 (Codex round-6 P1 on #88): `rotate_binding()`'s epoch
+	 * rotation runs INSIDE the same closure as its own record write, both
+	 * inside the ONE transaction `versioned()` opens. When the epoch rotates
+	 * but the following record write then fails, the closure used to answer
+	 * `mutated => false` — telling `versioned()` nothing happened and to
+	 * COMMIT, which durably published the NEW epoch while the binding record
+	 * still named the OLD one. The closure now answers `rollback => true`
+	 * instead, so the whole unit — the epoch rotation included — rolls back:
+	 * a transient binding-write failure leaves the epoch AND the binding
+	 * exactly as they were, `rotated: false` in effect (the site's own
+	 * generation never moved), safe for the caller's retry to redo whole.
+	 */
+	public function test_a_transient_binding_write_failure_after_the_epoch_rotates_leaves_neither_moved(): void {
+		// An existing binding record first — a first-ever rotate_binding()
+		// call takes the "no record" claim-conditional INSERT path, which
+		// this test does not mean to exercise.
+		$this->assertTrue( sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://one.example' ) ) );
+		$epoch_before   = Aura_Worker_Door_Log::epoch();
+		$binding_before = Aura_Worker_Door_Log::binding_raw();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$out = sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://two.example' ) );
+		$GLOBALS['_sa_option_write_fail']                                 = array();
+
+		$this->assertFalse( $out, 'the record write failed, so the whole rotation reports false' );
+		$this->assertSame( $epoch_before, Aura_Worker_Door_Log::epoch_raw(), 'the epoch rotation rolled back with the failed record write' );
+		$this->assertSame( $binding_before, Aura_Worker_Door_Log::binding_raw(), 'and the OLD binding generation is untouched' );
+	}
+
+	/**
 	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
 	 * `SHOW TABLE STATUS LIKE 'wp_options'` ONCE per request and caches the
 	 * answer — a second call must not re-issue the probe.
