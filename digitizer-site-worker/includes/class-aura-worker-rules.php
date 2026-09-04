@@ -1546,8 +1546,12 @@ class Aura_Worker_Rules {
 	 * between then changed nothing this request could see, and the approval it
 	 * should have stopped ran under the superseded ruleset.
 	 *
-	 * The caches are evicted first — the row may have been written by another
-	 * process, which invalidates nothing here — and the row is read directly.
+	 * The row is read directly, and NOTHING is evicted (Ruling P88 follow-up):
+	 * a raw `$wpdb` read bypasses every cache by construction, so a flush buys
+	 * this reader nothing — and evicting `alloptions` on a site with a
+	 * persistent object cache would discard every autoloaded option, once per
+	 * judgement. The caches stay warm for the readers that legitimately want
+	 * them; this one simply does not consult them.
 	 * `stored_uncached()` already reports a failed read as a `WP_Error`; that
 	 * collapses to null, which every caller of this reads as
 	 * `rules_unavailable` and answers with its own consequence: a write is
@@ -1561,7 +1565,6 @@ class Aura_Worker_Rules {
 	 * @return array|null
 	 */
 	public static function current_uncached() {
-		self::forget_option_cache( self::OPTION );
 		$rec = self::stored_uncached();
 		if ( is_wp_error( $rec ) || null === $rec || self::is_sentinel( $rec ) ) {
 			return null;

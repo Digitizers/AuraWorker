@@ -97,9 +97,12 @@ class Aura_Worker_Door_Log {
 	 */
 	private static function reread_after_mint( $name ) {
 		global $wpdb;
-		wp_cache_delete( $name, 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
-		wp_cache_delete( 'alloptions', 'options' );
+		// NO EVICTION HERE (Ruling P88 follow-up). A raw `$wpdb` read bypasses
+		// every cache by construction, so flushing them first buys this reader
+		// nothing — and `insert_unique()`, which is the WRITE that just ran,
+		// has already evicted the name and `notoptions` for the callers that
+		// come after. Evicting `alloptions` on a site with a persistent object
+		// cache would discard every autoloaded option, per mint.
 		$wpdb->last_error = '';
 		$raw              = self::raw_option( $name );
 		if ( null === $raw || '' !== (string) $wpdb->last_error ) {
