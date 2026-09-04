@@ -3682,14 +3682,34 @@ class Aura_Worker_Elementor_Door {
 			);
 			return new WP_Error( 'aura_log_failed', 'This site could not take an execution lease for the restore; it was not run.', array( 'status' => 503 ) );
 		}
-		if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
-			// Same rule as execute()'s admission (Codex round-10 P2): the
-			// restore provably never ran, so the reservation is discarded
-			// rather than left pending for `log_after()` to stop at.
-			Aura_Worker_Door_Log::discard( $seq );
-			return new WP_Error( 'aura_log_failed', 'The door log could not record this restore; it was not run.', array( 'status' => 503 ) );
+		// THE LEASE OUTLIVES EVERY EXIT BUT THE ONE THAT HANDS IT ON (Ruling
+		// P93). `settle_restore_entry()` and `refuse_restore_entry()` are the
+		// only callers of `release_seq_lease()` on this path, so a failed
+		// `admit()` returned past both of them and left the named lock held —
+		// and on a persistent database connection a lock outlives the request
+		// that took it. If the `discard()` beside it failed too, in the same
+		// fault, the pending row blocked log delivery and the reconciler called
+		// it RUNNING until the 24-hour hard cap instead of recovering it at the
+		// ten-minute one.
+		//
+		// `execute()` and `replay()` already do this with their own `finally`
+		// blocks; this path was the one without one.
+		$handed = false;
+		try {
+			if ( ! Aura_Worker_Door_Log::admit( $seq ) ) {
+				// Same rule as execute()'s admission (Codex round-10 P2): the
+				// restore provably never ran, so the reservation is discarded
+				// rather than left pending for `log_after()` to stop at.
+				Aura_Worker_Door_Log::discard( $seq );
+				return new WP_Error( 'aura_log_failed', 'The door log could not record this restore; it was not run.', array( 'status' => 503 ) );
+			}
+			$handed = true; // the terminus owns the lease from here
+			return $seq;
+		} finally {
+			if ( ! $handed ) {
+				self::release_seq_lease();
+			}
 		}
-		return $seq;
 	}
 
 	/**

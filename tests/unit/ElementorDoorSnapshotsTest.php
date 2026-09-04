@@ -673,6 +673,34 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
 	}
 
+	/**
+	 * Ruling P93 (F2): the execution lease outlives every exit but the one
+	 * that hands it on.
+	 *
+	 * `settle_restore_entry()` and `refuse_restore_entry()` are the only
+	 * callers of `release_seq_lease()` on this path, so a failed `admit()`
+	 * returned past both of them and left the named lock HELD — and on a
+	 * persistent database connection a lock outlives the request that took it.
+	 * With the `discard()` beside it failing in the same fault, the pending row
+	 * blocked log delivery and the reconciler called it RUNNING until the
+	 * 24-hour hard cap instead of recovering it at the ten-minute one.
+	 */
+	public function test_a_restore_whose_admission_fails_releases_its_lease(): void {
+		$env = $this->pageEnvelope();
+		// Every compare-and-swap on the reserved row fails: the admit, and the
+		// discard that tries to hand the reservation back.
+		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::PREFIX . '1' ] = true;
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+
+		$GLOBALS['_sa_option_cas_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_log_failed', $res->get_error_code() );
+		$this->assertSame( '[{"v":2}]', get_post_meta( 7, '_elementor_data', true ), 'nothing was restored' );
+		$this->assertSame( array(), $GLOBALS['_sa_named_locks'], 'the lease is not left held' );
+		$this->assertFalse( Aura_Worker_Door_Holds::seq_lease_is_held( 1 ) );
+	}
+
 	public function test_a_creation_restore_through_rest_captures_the_created_posts_first(): void {
 		$this->seedPost( 511, 'page' );
 		update_post_meta( 511, '_elementor_data', '[{"made":true}]' );
