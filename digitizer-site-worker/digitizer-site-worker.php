@@ -3,7 +3,7 @@
  * Plugin Name:       SiteAgent for Aura
  * Plugin URI:        https://my-aura.app/siteagent
  * Description:       Remote site management agent for Aura dashboard. Enables secure updates, health monitoring, and maintenance operations via REST API.
- * Version:           2.15.0
+ * Version:           2.16.0
  * Requires at least: 6.2
  * Requires PHP:      7.4
  * Author:            Digitizer
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'AURA_WORKER_VERSION', '2.15.0' );
+define( 'AURA_WORKER_VERSION', '2.16.0' );
 define( 'AURA_WORKER_FILE', __FILE__ );
 define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -76,6 +76,11 @@ require_once AURA_WORKER_DIR . 'includes/class-aura-worker-grant.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-mcp.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-call-context.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-rules.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-door-log.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-door-holds.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-door-blocked-exception.php';
+require_once AURA_WORKER_DIR . 'includes/class-aura-worker-door-witness-exception.php';
+require_once AURA_WORKER_DIR . 'includes/class-elementor-door-governor.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-abilities.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-magic-link.php';
 require_once AURA_WORKER_DIR . 'includes/class-aura-worker-unbind.php';

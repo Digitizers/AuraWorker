@@ -138,7 +138,7 @@ final class UnbindAcceptTest extends TestCase {
 		$this->assertNull( Aura_Worker_Rules::stored_uncached(), 'the departed client\'s store is cleared' );
 		$this->assertFalse( get_option( 'aura_worker_grant_pubkey' ) );
 		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'and the token goes last' );
-		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'token' ), $GLOBALS['_unbind_trace'] );
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'door', 'token' ), $GLOBALS['_unbind_trace'] );
 		$m = Aura_Worker_Unbind::read();
 		$this->assertSame( $token_hash, $m['site'] );
 		$this->assertSame( 'r1', $m['site_ref'] );

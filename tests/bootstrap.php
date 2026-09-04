@@ -132,6 +132,15 @@ if ( ! function_exists( 'sanitize_text_field' ) ) {
 	}
 }
 
+if ( ! function_exists( 'sanitize_key' ) ) {
+	// Core's rule exactly: lowercase, then everything outside [a-z0-9_-] gone.
+	// The door's expected_types() runs an ability's `post_type` input through
+	// it before either creation witness compares anything against it.
+	function sanitize_key( $key ): string {
+		return preg_replace( '/[^a-z0-9_\-]/', '', strtolower( (string) $key ) );
+	}
+}
+
 if ( ! function_exists( 'sanitize_textarea_field' ) ) {
 	function sanitize_textarea_field( $str ): string {
 		return trim( strip_tags( (string) $str ) );
@@ -415,6 +424,34 @@ function sa_like_to_regex( string $like ): string {
 		$out .= preg_quote( $c, '/' );
 	}
 	return '/^' . $out . '$/s';
+}
+
+/**
+ * Option names matching a MySQL LIKE prefix pattern AND a REGEXP pattern —
+ * the door log's SELECT/DELETE filter (2.16.0). Read against the merged
+ * "database" view get_results()'s LIKE branch and get_col() already use
+ * ($GLOBALS['_rows'] ∪ $GLOBALS['_options']), so a row a test seeded
+ * directly into either global is as visible here as a real column scan
+ * would make it — never the floor, closure marker or refusal counter
+ * options, which share the prefix but fail the numeric REGEXP.
+ *
+ * @param string $like_raw   The LIKE pattern, still SQL/LIKE-escaped.
+ * @param string $regexp_raw The REGEXP pattern, raw (a PCRE body with no
+ *                            unescaped '/').
+ * @return string[]
+ */
+function sa_door_log_rows_matching( string $like_raw, string $regexp_raw ): array {
+	$like_re = sa_like_to_regex( stripslashes( $like_raw ) );
+	$row_re  = '/' . stripslashes( $regexp_raw ) . '/';
+	$names   = array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) );
+	return array_values(
+		array_filter(
+			$names,
+			static function ( $name ) use ( $like_re, $row_re ) {
+				return 1 === preg_match( $like_re, (string) $name ) && 1 === preg_match( $row_re, (string) $name );
+			}
+		)
+	);
 }
 
 /**
@@ -736,6 +773,29 @@ function sa_sign_ruleset( array $payload, ?string $secret = null ): string {
  *
  * @return string
  */
+/**
+ * Rotate the door's binding the way production does — under the site claim
+ * (Ruling P78), which every rotation now REQUIRES.
+ *
+ * Takes the claim, rotates, releases. A test that is already holding the claim
+ * passes its own fence instead.
+ *
+ * @param array       $identity { client, dashboard }.
+ * @param string|null $fence    A fence the caller already holds, or null to take one.
+ * @return bool
+ */
+function sa_rotate_binding( array $identity, ?string $fence = null ): bool {
+	$own = ( null === $fence );
+	if ( $own ) {
+		$fence = Aura_Worker_Magic_Link::claim_site();
+	}
+	$done = Aura_Worker_Door_Log::rotate_binding( $identity, Aura_Worker_Magic_Link::SITE_CLAIM, (string) $fence );
+	if ( $own ) {
+		Aura_Worker_Magic_Link::release_site( (string) $fence );
+	}
+	return $done;
+}
+
 function sa_token_hash(): string {
 	if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
 		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', SA_RAW_SITE_TOKEN );
@@ -748,6 +808,15 @@ function sa_token_hash(): string {
 	// Aura_Worker_Security::capture_token_auth() itself afterwards.
 	if ( class_exists( 'Aura_Worker_Security' ) ) {
 		Aura_Worker_Security::capture_token_auth( $hash );
+		// …but a FIXTURE is not a request (Ruling P79). capture_token_auth()
+		// now also captures the binding this request authenticated under, and
+		// a fixture that seeds the token half-way through building a site would
+		// pin (and adopt) a binding against an identity that is not finished
+		// being written. A test that means to authenticate calls
+		// Aura_Worker_Call_Context::capture_authenticated_binding() itself.
+		if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
+			Aura_Worker_Call_Context::reset();
+		}
 	}
 	return $hash;
 }
@@ -1003,8 +1072,17 @@ if ( ! function_exists( 'is_user_logged_in' ) ) {
 }
 
 if ( ! function_exists( 'wp_set_current_user' ) ) {
+	/**
+	 * Core replaces the current user, so get_current_user_id() answers the new
+	 * id from the next statement on — which is the whole point wherever
+	 * production switches user and runs something as them (the door's replay
+	 * runs a held write as its stored actor). Both globals move together:
+	 * $_current_user is what tests assert the switch itself on,
+	 * $_current_user_id is what get_current_user_id() reads.
+	 */
 	function wp_set_current_user( int $id, string $name = '' ) {
-		$GLOBALS['_current_user'] = $id;
+		$GLOBALS['_current_user']    = $id;
+		$GLOBALS['_current_user_id'] = $id;
 		return $id;
 	}
 }
@@ -1092,6 +1170,21 @@ if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 				return array();
 			}
 			return $GLOBALS['_app_passwords'][ $user_id ] ?? array();
+		}
+		/**
+		 * Core's single-password lookup (class-wp-application-passwords.php):
+		 * the item for one uuid, or NULL when this user has no such password.
+		 * The door governor reads the authenticating credential's NAME through
+		 * it (§3.2), so the same read failure that empties the list above
+		 * answers null here — never an invented name.
+		 */
+		public static function get_user_application_password( int $user_id, string $uuid ) {
+			foreach ( self::get_user_application_passwords( $user_id ) as $item ) {
+				if ( isset( $item['uuid'] ) && (string) $item['uuid'] === $uuid ) {
+					return $item;
+				}
+			}
+			return null;
 		}
 		public static function delete_application_password( int $user_id, string $uuid ) {
 			if ( ! empty( $GLOBALS['_app_passwords_delete_fail'] ) ) {
@@ -1840,6 +1933,22 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// a prefix, read against the "database" ($_rows, else $_options).
 			if ( preg_match( "/^SELECT option_name, option_value FROM \S+ WHERE option_name LIKE '([^']+)%'$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				// One prefix read failing at the driver, keyed by the PREFIX so
+				// a test can break the claimed-row scan and leave the held one
+				// working (Ruling P49'). Real wpdb answers the CLEARED
+				// last_result — an empty array — with last_error the only tell.
+				if ( ! empty( $GLOBALS['_sa_rows_read_error'][ stripslashes( $m[1] ) ] ) ) {
+					// `true` fails every read; a positive INT fails that many
+					// and then lets it through — which is how a test breaks the
+					// FIRST read of a request and leaves the second healthy,
+					// the shape Ruling P71 is about.
+					$fail = $GLOBALS['_sa_rows_read_error'][ stripslashes( $m[1] ) ];
+					if ( is_int( $fail ) ) {
+						--$GLOBALS['_sa_rows_read_error'][ stripslashes( $m[1] ) ];
+					}
+					$this->last_error = 'rows read failed';
+					return array();
+				}
 				$re    = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
 				$out   = array();
 				$names = array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) );
@@ -1850,6 +1959,29 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 							'option_value' => (string) sa_read_option_uncached( (string) $name ),
 						);
 					}
+				}
+				return $out;
+			}
+			// Aura_Worker_Door_Log::stale_pending() (2.16.0): the numeric log
+			// rows ABOVE the ack floor, names AND values, in ONE statement —
+			// count_unacked()'s predicate with the rows themselves returned
+			// instead of counted. The per-seq get_option() walk it replaced
+			// was invisible here (the option cache answers it without ever
+			// reaching $wpdb), so it is the SHAPE that is pinned, and this
+			// branch is what pins it. Read against the merged "database" view,
+			// the same one every other door-log branch reads.
+			if ( preg_match( "/^SELECT option_name, option_value FROM \\S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\\(SUBSTRING\\(option_name, \\d+\\) AS UNSIGNED\\) > (\\d+)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$floor = (int) $m[3];
+				$out   = array();
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( ! preg_match( '/_([0-9]+)$/', (string) $name, $mm ) || (int) $mm[1] <= $floor ) {
+						continue;
+					}
+					$out[] = array(
+						'option_name'  => (string) $name,
+						'option_value' => (string) sa_read_option_uncached( (string) $name ),
+					);
 				}
 				return $out;
 			}
@@ -2008,6 +2140,73 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
 			}
+			// Aura_Worker_Elementor_Door::has_state() (Ruling P46): how many
+			// door rows are left, excluding the 30-day counter buckets and the
+			// hold-queue lock. Counted over the merged "database" view, the
+			// same one every other door branch reads.
+			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name NOT LIKE '([^']*)' AND option_name != '([^']*)'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$keep = sa_like_to_regex( stripslashes( $m[1] ) );
+				$skip = sa_like_to_regex( stripslashes( $m[2] ) );
+				$lock = stripslashes( $m[3] );
+				$n    = 0;
+				foreach ( array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) ) as $name ) {
+					$name = (string) $name;
+					if ( $name !== $lock && preg_match( $keep, $name ) && ! preg_match( $skip, $name ) && null !== sa_read_option_uncached( $name ) ) {
+						++$n;
+					}
+				}
+				return (string) $n;
+			}
+			// MySQL NAMED LOCKS (Ruling P52): the Elementor door's replay
+			// execution lease. Modelled as a map of held names — this process
+			// IS the one connection, which is exactly the property the lease
+			// rests on. `_sa_named_locks` is also the seam a test uses to mark
+			// a name held by "another request", and `_sa_named_lock_error`
+			// makes IS_USED_LOCK fail the way an old server without the
+			// function would.
+			if ( preg_match( "/^SELECT GET_LOCK\('([^']*)', 0\)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$name                     = stripslashes( $m[1] );
+				if ( ! empty( $GLOBALS['_sa_named_lock_error'] ) ) {
+					$this->last_error = 'no such function';
+					return null;
+				}
+				// A TRANSIENT failure of the statement, distinct from an engine
+				// that has no named locks at all (Ruling P70): the message
+				// carries no missing-function signature, so production must
+				// refuse rather than proceed unleased.
+				if ( ! empty( $GLOBALS['_sa_named_lock_fail'] ) ) {
+					$this->last_error = 'Lost connection to MySQL server during query';
+					return null;
+				}
+				if ( ! empty( $GLOBALS['_sa_named_locks'][ $name ] ) ) {
+					return '0'; // another connection holds it
+				}
+				$GLOBALS['_sa_named_locks'][ $name ] = true;
+				return '1';
+			}
+			if ( preg_match( "/^SELECT RELEASE_LOCK\('([^']*)'\)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$name                     = stripslashes( $m[1] );
+				if ( empty( $GLOBALS['_sa_named_locks'][ $name ] ) ) {
+					return '0';
+				}
+				unset( $GLOBALS['_sa_named_locks'][ $name ] );
+				return '1';
+			}
+			if ( preg_match( "/^SELECT IS_USED_LOCK\('([^']*)'\)$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$name                     = stripslashes( $m[1] );
+				if ( ! empty( $GLOBALS['_sa_named_lock_error'] ) ) {
+					$this->last_error = 'no such function';
+					return null;
+				}
+				// A connection id when held; NULL when free — the same shape,
+				// which is why production consults last_error to tell a free
+				// lock from a broken statement.
+				return empty( $GLOBALS['_sa_named_locks'][ $name ] ) ? null : '77';
+			}
 			// The liveness probe Aura_Worker_Health::check_db_connection() issues.
 			// A reachable database answers '1' — a string, which is what the
 			// production comparison (`=== '1'`) is written against. Honouring
@@ -2027,8 +2226,21 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// otherwise a later shared failure would satisfy the assertion
 				// just as well and the test would prove nothing.
 				if ( ! empty( $GLOBALS['_sa_option_read_fail'][ $name ] ) ) {
-					$this->last_error = 'read failed';
-					return null;
+					// `true` fails every read of this name; a positive INT lets
+					// that many through FIRST and fails from then on — which is
+					// how a test breaks one specific read of a sequence that
+					// touches the same row several times (Ruling P74's fence,
+					// which comes after the watermark's own patch).
+					$fail = $GLOBALS['_sa_option_read_fail'][ $name ];
+					if ( is_int( $fail ) && $fail > 0 ) {
+						// Let this one through and count it down. -1 rather
+						// than 0 because 0 is empty(), and the guard above
+						// would then stop failing altogether.
+						$GLOBALS['_sa_option_read_fail'][ $name ] = ( $fail > 1 ) ? $fail - 1 : -1;
+					} else {
+						$this->last_error = 'read failed';
+						return null;
+					}
 				}
 				// The row, not the cache (see sa_read_option_uncached()).
 				$answer = sa_read_option_uncached( $name );
@@ -2040,6 +2252,68 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// one-shot is the listener's own business.
 				sa_after_option_read( $name );
 				return $answer;
+			}
+			// Aura_Worker_Door_Log::highest_row_seq() (2.16.0): the max numeric
+			// suffix among rows sharing the prefix — never the floor, closure
+			// marker or refusal counter, which share the prefix but fail the
+			// REGEXP. Read against the merged "database" view (sa_door_log_rows_matching()),
+			// the same one get_results()'s LIKE branch and get_col() already read.
+			if ( preg_match( "/^SELECT MAX\(CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\)\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				// The log's TOP failing at the driver (Ruling P77): null answer,
+				// last_error set — which must NOT cast to a valid top of zero.
+				// Scoped to this shape so a test can break the top without
+				// breaking every get_var() in the request.
+				if ( ! empty( $GLOBALS['_sa_door_top_error'] ) ) {
+					$this->last_error = 'top read failed';
+					return null;
+				}
+				$max = 0;
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) ) {
+						$max = max( $max, (int) $mm[1] );
+					}
+				}
+				return $max;
+			}
+			// The Elementor door's creation watermark (2.16.0): the highest post
+			// id before the write, so an insert core's hook never fired for can
+			// still be found afterwards. Read against $GLOBALS['_posts'] — the
+			// "posts table" — the way MySQL would; an empty table answers NULL,
+			// which is what the production (int) cast is written against.
+			if ( preg_match( '/^SELECT MAX\(ID\) FROM \S+$/', trim( (string) $query ) ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				// The watermark read failing at the driver (Ruling P67): null
+				// answer, last_error set — which must NOT cast to a valid mark
+				// of zero. Scoped to this shape so a test can break the
+				// watermark without breaking every get_var() in the request.
+				if ( ! empty( $GLOBALS['_sa_watermark_error'] ) ) {
+					$this->last_error = 'watermark read failed';
+					return null;
+				}
+				$ids = array_map( 'intval', array_keys( $GLOBALS['_posts'] ) );
+				return empty( $ids ) ? null : (string) max( $ids );
+			}
+			// Aura_Worker_Door_Log::count_unacked(): rows above the ack floor.
+			if ( preg_match( "/^SELECT COUNT\(\*\) FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\) > (\d+)$/", (string) $query, $m ) ) {
+				// count_unacked()'s COUNT failing at the driver (Ruling P53):
+				// null answer, last_error set — which must NOT read as an empty
+				// log. Scoped to this shape so a test can break the backlog
+				// count without breaking every get_var() in the request.
+				if ( ! empty( $GLOBALS['_sa_door_unacked_error'] ) ) {
+					$GLOBALS['_db_queries'][] = (string) $query;
+					$this->last_error         = 'count failed';
+					return null;
+				}
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$floor = (int) $m[3];
+				$n     = 0;
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) && (int) $mm[1] > $floor ) {
+						++$n;
+					}
+				}
+				return $n;
 			}
 			// app_password_row_state()'s confirming read is a get_row() now
 			// (#434 N1), so NO get_var() shape may touch this meta key except
@@ -2188,6 +2462,46 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					)
 				);
 			}
+			// The Elementor door's watermark DIFF (2.16.0): every post above the
+			// mark, of an expected type, authored by the actor — the second
+			// witness to a creation, which is how an insert the wp_insert_post
+			// hook never saw is still attributed. Modelled over
+			// $GLOBALS['_posts'] the way MySQL would run it, honouring BOTH
+			// filters: a post of another type, or another author's, is not this
+			// call's, and a fake that ignored either would let the production
+			// code claim posts it never made.
+			if ( preg_match( "/^SELECT ID FROM \S+ WHERE ID > (\d+) AND post_type IN \(([^)]*)\) AND post_author = (\d+)(?: AND post_modified_gmt <= '([^']*)')?$/", (string) $query, $m ) ) {
+				$mark   = (int) $m[1];
+				$types  = array();
+				if ( preg_match_all( "/'([^']*)'/", $m[2], $tm ) ) {
+					$types = array_map( 'stripslashes', $tm[1] );
+				}
+				$author = (int) $m[3];
+				// The reconciler's TIME bound (2.16.0, Ruling P9(b)): the live
+				// path diffs across ONE request and sends no bound; the stale
+				// path sends `started_at + CLAIM_STALE_MS`. Compared the way
+				// MySQL compares a DATETIME string — lexicographically, which
+				// for 'Y-m-d H:i:s' is chronological — so a post the same user
+				// made by hand after the window is not this call's, and a fake
+				// that ignored the clause would let the production code
+				// attribute (and trash) it.
+				$until  = isset( $m[4] ) ? stripslashes( $m[4] ) : null;
+				$out    = array();
+				foreach ( $GLOBALS['_posts'] as $id => $p ) {
+					if ( (int) $id <= $mark || ! in_array( (string) ( $p->post_type ?? '' ), $types, true ) ) {
+						continue;
+					}
+					if ( (int) ( $p->post_author ?? 0 ) !== $author ) {
+						continue;
+					}
+					if ( null !== $until && strcmp( (string) ( $p->post_modified_gmt ?? '' ), $until ) > 0 ) {
+						continue;
+					}
+					$out[] = (string) (int) $id;
+				}
+				sort( $out, SORT_NUMERIC );
+				return $out;
+			}
 			if ( preg_match( "/^SELECT option_name FROM \S+ WHERE option_name LIKE '([^']+)%' AND option_name < '([^']+)'$/", (string) $query, $m ) ) {
 				$re     = sa_like_to_regex( stripslashes( $m[1] ) . '%' );
 				$before = stripslashes( $m[2] );
@@ -2264,8 +2578,21 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
-			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
-				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
+			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'(?: AND o\.option_value = '(.*)')?$/s", $query, $m ) ) {
+				// The optional trailing `AND o.option_value = …` is the log
+				// epoch's claim-conditional fenced DELETE (Ruling P83): the
+				// claim check and the value fence in ONE statement, so a claim
+				// seized between them cannot exist.
+				$cas = isset( $m[4] ) ? stripslashes( $m[4] ) : null;
+				list( , $claim, $like, $name ) = array_map( 'stripslashes', array_slice( $m, 0, 4 ) );
+				// A racer seizing the site in the window between the caller's
+				// own claim check and this statement — the window the JOIN
+				// exists to close (Ruling P83). Fires once, by option name.
+				if ( isset( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) && is_callable( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) ) {
+					$racer = $GLOBALS['_sa_before_fenced_delete'][ $name ];
+					unset( $GLOBALS['_sa_before_fenced_delete'][ $name ] );
+					$racer();
+				}
 				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {
 					// The statement itself failing — NOT "no row matched".
 					// Kept apart from _sa_option_write_fail so a test can refuse
@@ -2276,16 +2603,26 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
 				}
+				if ( null !== $cas && ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $cas ) ) {
+					return 0; // the bytes moved under the caller
+				}
 				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
-				$GLOBALS['_option_writes'][] = array( 'delete', $name );
+				$GLOBALS['_notoptions'][ $name ] = true;
+				$GLOBALS['_option_writes'][]     = array( 'delete', $name );
 				return 1;
 			}
 			// The site token written CONDITIONALLY on the site claim (2.11.0,
 			// round-9): one UPDATE joined to the claim row, and its INSERT
 			// counterpart for a site whose token row does not exist yet. A
 			// caller that no longer owns the claim matches no row.
-			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
-				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', $m );
+			if ( preg_match( "/^UPDATE \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' SET o\.option_value = '(.*)' WHERE o\.option_name = '([^']+)'(?: AND o\.option_value = '(.*)')?$/s", $query, $m ) ) {
+				// The optional trailing `AND o.option_value = …` is the door
+				// binding's claim-conditional COMPARE-AND-SWAP (Ruling P68):
+				// the claim check and the CAS in ONE statement, so a claim
+				// seized between them cannot exist. Modelled here as MySQL
+				// would: both conditions, or no row.
+				$cas = isset( $m[5] ) ? stripslashes( $m[5] ) : null;
+				list( , $claim, $like, $value, $name ) = array_map( 'stripslashes', array_slice( $m, 0, 5 ) );
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
 					// `true` fails every write; a positive INT fails that many
 					// and then lets it through, as update_option() does; a
@@ -2304,6 +2641,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
 				}
+				if ( null !== $cas && (string) sa_read_option_uncached( $name ) !== $cas ) {
+					return 0; // the bytes moved under the caller
+				}
 				// A claimed write that REPORTS SUCCESS while the stored value
 				// diverges from what the caller asked for — a silently lost or
 				// rewritten write (a replication lag, a filter, a trigger),
@@ -2321,6 +2661,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
 				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				// The window immediately AFTER one claim-conditional write, in
+				// which another request seizes the site (Ruling P78): a test
+				// arms a callback per option name, and it fires once.
+				if ( ! empty( $GLOBALS['_sa_after_claimed_write'][ $name ] ) ) {
+					$fn = $GLOBALS['_sa_after_claimed_write'][ $name ];
+					unset( $GLOBALS['_sa_after_claimed_write'][ $name ] );
+					$fn();
+				}
 				return 1;
 			}
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM \S+ c WHERE c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' AND NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
@@ -2364,27 +2712,47 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM DUAL WHERE NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
 				list( , $name, $value, ) = array_map( 'stripslashes', $m );
 				// This exact SQL shape is also Aura_Worker_Magic_Link::claim_magic_link()'s
-				// statement (the site-wide claim, per-link claims) — and, since
-				// #434, accept() takes the site claim before it ever touches
-				// the ruleset row. A seam armed to fail/race/inspect "the
-				// ruleset's first insert" must not instead fire on an
-				// unrelated claim row that happens to be the FIRST matching
-				// statement of the request; every seam below is therefore
-				// scoped to the ruleset option specifically.
-				$is_ruleset_insert = ( Aura_Worker_Rules::OPTION === $name );
+				// statement (the site-wide claim, per-link claims) and — since
+				// 2.16.0 — Aura_Worker_Door_Log::insert_unique()'s (seq rows,
+				// the epoch, the closure marker, all sharing the
+				// 'aura_worker_door_' namespace). A seam armed to fail/race/
+				// inspect "the ruleset's first insert" must not instead fire
+				// on an unrelated claim or door-log row that happens to be
+				// the FIRST matching statement of the request; every seam
+				// below is therefore scoped by name.
+				$is_ruleset_insert  = ( Aura_Worker_Rules::OPTION === $name );
+				$is_door_log_insert = ( 0 === strpos( $name, 'aura_worker_door_' ) );
 				if ( $is_ruleset_insert && true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
 				}
-				if ( $is_ruleset_insert ) {
-					sa_before_swap();
+				// Aura_Worker_Door_Holds::hold()'s row-insert failure seam: the
+				// database refusing ONE statement inside the hold-queue mutex — a
+				// held row or a claimed twin — but never the lock itself, so a
+				// test can prove the lock is still released on this path
+				// (Aura_Worker_Door_Holds uses insert_unique() for the lock too,
+				// since add_option()'s ON DUPLICATE KEY UPDATE is not a mutex).
+				// `true` loses every insert but the hold-queue lock; a STRING
+				// loses only that one option name, which is how a test breaks a
+				// single lazy mint (Ruling P72) and leaves the rest working.
+				if ( ! empty( $GLOBALS['_sa_insert_unique_fail'] ) && 'aura_worker_door_hold_lock' !== $name ) {
+					$only = $GLOBALS['_sa_insert_unique_fail'];
+					if ( ! is_string( $only ) || $only === $name ) {
+						return 0;
+					}
+				}
+				if ( $is_ruleset_insert || $is_door_log_insert ) {
 					// A second request inserting between this caller's own
 					// existence check (there is none — that's the point of a
 					// real conditional INSERT) and this statement running.
-					if ( ! empty( $GLOBALS['_insert_racer'] ) ) {
-						$racer                    = $GLOBALS['_insert_racer'];
-						$GLOBALS['_insert_racer'] = null;
-						Aura_Worker_Rules::accept( $racer );
-					}
+					sa_before_swap();
+				}
+				// The ruleset's own nested-racer injection: door log callers
+				// have no equivalent (there is no Aura_Worker_Rules::accept()
+				// analogue to re-enter), so this stays ruleset-only.
+				if ( $is_ruleset_insert && ! empty( $GLOBALS['_insert_racer'] ) ) {
+					$racer                    = $GLOBALS['_insert_racer'];
+					$GLOBALS['_insert_racer'] = null;
+					Aura_Worker_Rules::accept( $racer );
 				}
 				// The row as the DATABASE holds it — $_rows, else an $_options
 				// value a test seeded directly (sa_read_option_uncached()).
@@ -2403,12 +2771,38 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
+				// A second request landing right AFTER this insert lands — the
+				// mirror of sa_before_swap()'s window, for a caller whose
+				// reservation IS the insert. Keyed by OPTION NAME and fired
+				// once, like _sa_before_fenced_delete: open_pending()'s
+				// post-insert floor re-check (Ruling P37) is about a racer that
+				// settles and ACKS this very row between the insert and the
+				// re-read, and no other seam can reach that window.
+				if ( isset( $GLOBALS['_sa_after_insert_unique'][ $name ] ) && is_callable( $GLOBALS['_sa_after_insert_unique'][ $name ] ) ) {
+					$racer = $GLOBALS['_sa_after_insert_unique'][ $name ];
+					unset( $GLOBALS['_sa_after_insert_unique'][ $name ] ); // fires once
+					$racer( $name );
+				}
 				return 1;
 			}
 
 			if ( preg_match( "/^UPDATE \S+ SET option_value = '(.*)' WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
 				if ( true === $GLOBALS['_db_query_error'] ) {
 					return false; // An SQL error, which is NOT a lost race.
+				}
+				// One named row's compare-and-swap refused at the driver —
+				// NOT a lost race, and not the same thing as
+				// _sa_option_write_fail, which scopes update_option() and the
+				// claim-conditional writes. Kept apart deliberately: a test
+				// arming one of those must not silently start failing every
+				// door-log patch too. `true` fails every swap of that row; a
+				// CALLABLE receives the value being written and returns true
+				// to refuse it, which is how ONE patch of a sequence (the
+				// creation watermark, say) can fail while the admission
+				// before it and the settle after it still land.
+				$cas_fail = $GLOBALS['_sa_option_cas_fail'][ stripslashes( $m[2] ) ] ?? null;
+				if ( null !== $cas_fail && ( ! is_callable( $cas_fail ) || $cas_fail( stripslashes( $m[1] ) ) ) ) {
+					return false;
 				}
 				if ( ! empty( $GLOBALS['_cas_always_lose'] ) ) {
 					return 0; // Contention that never resolves.
@@ -2439,6 +2833,169 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					$GLOBALS['_sa_after_swap'] = null;
 					$after( $name );
 				}
+				return 1;
+			}
+
+			// The binding record's EPOCH WITNESS re-stamp, joined to the epoch
+			// row (Ruling P92): it lands only while the live epoch is still the
+			// one being stamped, so a rotation superseded mid-flight cannot
+			// write its stale value over the winner's.
+			if ( preg_match( "/^UPDATE \S+ r JOIN \( SELECT option_value AS e FROM \S+ WHERE option_name = '([^']+)' \) x SET r\.option_value = '(.*)' WHERE r\.option_name = '([^']+)' AND r\.option_value = '(.*)' AND x\.e = '(.*)'$/s", $query, $m ) ) {
+				list( , $epoch_name, $new, $name, $expect_bytes, $expect_epoch ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_option_cas_fail'][ $name ] ) ) {
+					return 0;
+				}
+				$epoch_now = sa_read_option_uncached( $epoch_name );
+				if ( null === $epoch_now || (string) $epoch_now !== $expect_epoch ) {
+					return 0; // a later rotation owns the witness
+				}
+				$cur = sa_read_option_uncached( $name );
+				if ( null === $cur || (string) $cur !== $expect_bytes ) {
+					return 0; // the record moved under the caller
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
+			// Aura_Worker_Door_Log::ack()'s floor raise: upward-only, via a
+			// numeric-cast predicate rather than a byte-exact one (the floor's
+			// stored value is compared as a number, not matched verbatim) — and
+			// JOINED to the epoch row (Ruling P90), so the raise happens only
+			// while the epoch still holds the value the ack named and an ack can
+			// never cross a rotation.
+			if ( preg_match( "/^UPDATE \S+ f JOIN \( SELECT option_value AS e FROM \S+ WHERE option_name = '([^']+)' \) x SET f\.option_value = '([^']*)' WHERE f\.option_name = '([^']+)' AND x\.e = '(.*)' AND CAST\(f\.option_value AS UNSIGNED\) < (\d+)$/s", $query, $m ) ) {
+				list( , $epoch_name, $new, $name, $expect_epoch, $bound ) = array_map( 'stripslashes', $m );
+				$bound = (int) $bound;
+				// The window between this ack's own epoch check and this
+				// statement, in which a rotation lands. Fires once.
+				if ( isset( $GLOBALS['_sa_before_ack_floor_raise'] ) && is_callable( $GLOBALS['_sa_before_ack_floor_raise'] ) ) {
+					$racer = $GLOBALS['_sa_before_ack_floor_raise'];
+					$GLOBALS['_sa_before_ack_floor_raise'] = null;
+					$racer();
+				}
+				$epoch_now = sa_read_option_uncached( $epoch_name );
+				if ( null === $epoch_now || (string) $epoch_now !== $expect_epoch ) {
+					return 0; // the epoch moved: this ack owns nothing here
+				}
+				$cur = sa_read_option_uncached( $name );
+				if ( null === $cur || (int) $cur >= $bound ) {
+					return 0;
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
+			// …and its row purge, joined the same way.
+			if ( preg_match( "/^DELETE f FROM \S+ f JOIN \( SELECT option_value AS e FROM \S+ WHERE option_name = '([^']+)' \) x WHERE f\.option_name LIKE '([^']*)' AND f\.option_name REGEXP '([^']*)' AND x\.e = '(.*)' AND CAST\(SUBSTRING\(f\.option_name, \d+\) AS UNSIGNED\) <= (\d+)$/s", $query, $m ) ) {
+				list( , $epoch_name, $like, $regexp, $expect_epoch, $bound ) = array_map( 'stripslashes', $m );
+				$epoch_now = sa_read_option_uncached( $epoch_name );
+				if ( null === $epoch_now || (string) $epoch_now !== $expect_epoch ) {
+					return 0;
+				}
+				$bound = (int) $bound;
+				$n     = 0;
+				foreach ( sa_door_log_rows_matching( $like, $regexp ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) && (int) $mm[1] <= $bound ) {
+						unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+						$GLOBALS['_notoptions'][ $name ] = true;
+						$GLOBALS['_option_writes'][]     = array( 'delete', $name );
+						++$n;
+					}
+				}
+				return $n;
+			}
+			if ( preg_match( "/^UPDATE \S+ SET option_value = '([^']*)' WHERE option_name = '([^']+)' AND CAST\(option_value AS UNSIGNED\) < (\d+)$/s", $query, $m ) ) {
+				list( , $new, $name, $bound ) = array_map( 'stripslashes', $m );
+				$bound = (int) $bound;
+				$cur   = sa_read_option_uncached( $name );
+				if ( null === $cur || (int) $cur >= $bound ) {
+					return 0; // absent, or already at/above the bound — not lower.
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
+
+			// Aura_Worker_Door_Log::ack()'s row purge: every numeric row at or
+			// below the newly raised floor — never the floor/marker/counter
+			// options themselves, which the REGEXP excludes.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\(SUBSTRING\(option_name, \d+\) AS UNSIGNED\) <= (\d+)$/s", $query, $m ) ) {
+				$bound = (int) $m[3];
+				$n     = 0;
+				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
+					if ( preg_match( '/_([0-9]+)$/', $name, $mm ) && (int) $mm[1] <= $bound ) {
+						unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+						$GLOBALS['_notoptions'][ $name ] = true;
+						$GLOBALS['_option_writes'][]     = array( 'delete', $name );
+						++$n;
+					}
+				}
+				return $n;
+			}
+
+			// A DELETE fenced on the exact bytes the caller read: a
+			// byte-for-byte predicate, like the UPDATE CAS branches above and
+			// unlike the LIKE-prefix fence below, which matches on a PREFIX of
+			// the value rather than all of it. Aura_Worker_Door_Holds issues it
+			// at both ends of the hold-queue lock's life (take_lock()'s
+			// stale-lock replacement — the round-1 finding on task 4's review —
+			// and hold()'s own release), and the Elementor door's reconciler
+			// issues it for the creation mutex. Each arms its racer by OPTION
+			// NAME, so one test's seam can never fire inside another caller's
+			// statement.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)' AND option_value = '(.*)'$/s", $query, $m ) ) {
+				list( , $name, $expected ) = array_map( 'stripslashes', $m );
+				// A racer replacing the lock's value in the window between
+				// this caller's own read and this delete — the window
+				// round-1's fix exists to close. This is its OWN seam, never
+				// _sa_before_swap: that one already fires inside
+				// insert_unique()'s NOT EXISTS branch for any
+				// 'aura_worker_door_' name, including the lock, so arming it
+				// here would fire on take_lock()'s very first insert attempt
+				// (before staleness is even judged) rather than in the window
+				// this fence protects — round-2 finding: a test built on the
+				// shared seam passed identically against the pre-round-1,
+				// unconditional-delete take_lock(), proving nothing.
+				if ( isset( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) && is_callable( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) ) {
+					$racer = $GLOBALS['_sa_before_fenced_delete'][ $name ];
+					unset( $GLOBALS['_sa_before_fenced_delete'][ $name ] ); // fires once
+					$racer();
+				}
+				// The statement itself failing at the driver — NOT "no row
+				// matched" (Ruling P81, and the same seam the claim-joined
+				// delete already honours): a caller that must PROVE the row is
+				// gone has to tell the two apart.
+				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {
+					$this->last_error = 'delete failed';
+					return false;
+				}
+				if ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $expected ) {
+					return 0; // Someone else wrote (or already deleted) first.
+				}
+				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+				$GLOBALS['_notoptions'][ $name ]   = true;
+				$GLOBALS['_option_writes'][]       = array( 'delete', $name );
+				return 1;
+			}
+
+			// The bare delete Aura_Worker_Door_Holds::claim() and ::reject() issue
+			// on a held row's exact name: no fence, no LIKE — just "does this row
+			// still exist", and the row count answers it. claim() moves a hold by
+			// inserting the claimed twin FIRST and then requiring this delete to
+			// remove exactly one row; a reject or the TTL sweep that already took
+			// the row leaves this reporting 0, and the caller backs out rather
+			// than trust the twin it just wrote.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name = '([^']+)'$/", $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				if ( null === sa_read_option_uncached( $name ) ) {
+					return 0;
+				}
+				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+				$GLOBALS['_notoptions'][ $name ]   = true;
+				$GLOBALS['_option_writes'][]       = array( 'delete', $name );
 				return 1;
 			}
 
@@ -2517,9 +3074,34 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
+	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
+	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
+	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
+	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
+	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
+	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
+	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
+	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
+	// kits_manager cannot be instantiated here, so a test that needs an active
+	// kit sets this. UNSET by default so the production lookup is what runs
+	// when no test asked for one.
+	unset( $GLOBALS['_sa_kit_id'] );
+	// Elementor's class → posts reverse index and its id => label map, as the
+	// stubs in tests/elementor-class-stubs.php serve them (Ruling P32). Empty
+	// by default: a test that says nothing about classes gets an index that
+	// answers nothing, which is what every pre-P32 door test assumes.
+	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
+	$GLOBALS['_sa_class_labels']          = array(); // class id => label
+	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
+	$GLOBALS['_sa_before_ack_floor_raise'] = null; // Runs inside ack()'s floor raise, before it evaluates (Ruling P90).
+	$GLOBALS['_sa_after_claimed_write'] = array(); // Runs after one claim-conditional write, by option name (Ruling P78).
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
@@ -2650,6 +3232,7 @@ if ( ! function_exists( 'wp_insert_post' ) ) {
 			'comment_status' => $args['comment_status'] ?? 'open',
 			'ping_status'    => $args['ping_status'] ?? 'open',
 		);
+		do_action( 'wp_insert_post', $id, $GLOBALS['_posts'][ $id ], false );
 		return $id;
 	}
 }
@@ -2681,6 +3264,9 @@ if ( ! function_exists( 'wp_update_post' ) ) {
 			$GLOBALS['_posts'][ $id ]->$k = $v;
 		}
 		$GLOBALS['_mutations'][] = 'wp_update_post';
+		// Core fires this for updates too — the $update flag (true here) is what
+		// an observer keys on to tell an update apart from a fresh insert.
+		do_action( 'wp_insert_post', $id, $GLOBALS['_posts'][ $id ], true );
 		return $id;
 	}
 }
@@ -2874,6 +3460,17 @@ require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-abilities.php';
 require_once SA_PLUGIN_DIR . '/includes/credential-rules.php';
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-unbind.php';
+// The Elementor door (2.16.0): Aura_Worker::init() wires the governor, so
+// the class has to be loaded here as the plugin bootstrap loads it — the
+// door tests require these three themselves too, harmlessly (require_once).
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-log.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-holds.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-blocked-exception.php';
+// Elementor's global-classes index/repository stand-ins — what touches_for()
+// asks which pages a class deletion would rewrite (Ruling P32).
+require_once __DIR__ . '/elementor-class-stubs.php';
+require_once SA_PLUGIN_DIR . '/includes/class-aura-worker-door-witness-exception.php';
+require_once SA_PLUGIN_DIR . '/includes/class-elementor-door-governor.php';
 // The plugin's admin/settings class: registers settings and owns the token
 // regeneration handler (#67).
 require_once SA_PLUGIN_DIR . '/includes/class-aura-worker.php';
@@ -2996,6 +3593,25 @@ function sa_plugin_php_sources(): array {
 if ( ! function_exists( 'is_multisite' ) ) {
 	function is_multisite(): bool {
 		return (bool) ( $GLOBALS['_is_multisite'] ?? false );
+	}
+}
+
+if ( ! function_exists( 'get_current_blog_id' ) ) {
+	function get_current_blog_id(): int {
+		return (int) ( $GLOBALS['_current_blog_id'] ?? 1 );
+	}
+}
+
+if ( ! function_exists( 'is_main_site' ) ) {
+	// Core: always true on a single site; on a network, true only for the
+	// blog the network was created around. The Elementor door's retention
+	// sweep reads it to decide who prunes a LEGACY (unstamped) envelope.
+	function is_main_site( $blog_id = null, $network_id = null ): bool {
+		if ( ! is_multisite() ) {
+			return true;
+		}
+		$blog_id = null === $blog_id ? get_current_blog_id() : (int) $blog_id;
+		return (int) $blog_id === (int) ( $GLOBALS['_main_site_id'] ?? 1 );
 	}
 }
 
@@ -3158,28 +3774,132 @@ if ( ! function_exists( 'wp_get_abilities' ) ) {
 	}
 }
 
+if ( ! class_exists( 'WP_Ability' ) ) {
+	/**
+	 * Core's ability object, reduced to what the governor touches: the
+	 * STORED execute callback (protected, no getter — WP 7.1 shape) and
+	 * execute(). Reading it back by Reflection is the production path (R2).
+	 */
+	class WP_Ability {
+		protected $name;
+		protected $execute_callback;
+		protected $permission_callback;
+		protected $meta = array();
+		public function __construct( string $name, array $args ) {
+			$this->name                = $name;
+			$this->execute_callback    = $args['execute_callback'] ?? null;
+			$this->permission_callback = $args['permission_callback'] ?? null;
+			$this->meta                = is_array( $args['meta'] ?? null ) ? $args['meta'] : array();
+		}
+		public function get_name(): string { return $this->name; }
+		public function get_meta(): array { return $this->meta; }
+		public function execute( $input = null ) {
+			if ( ! is_callable( $this->execute_callback ) ) {
+				return new WP_Error( 'ability_invalid_execute_callback', 'no callback' );
+			}
+			return call_user_func( $this->execute_callback, $input );
+		}
+		/** Core's public permission check (class-wp-ability.php:623), reduced. */
+		public function check_permissions( $input = null ) {
+			if ( ! is_callable( $this->permission_callback ) ) {
+				return new WP_Error( 'ability_invalid_permission_callback', 'no permission callback' );
+			}
+			$r = call_user_func( $this->permission_callback, $input );
+			return is_wp_error( $r ) ? $r : ( true === $r );
+		}
+	}
+}
+
 if ( ! function_exists( 'sa_register_ability' ) ) {
 	/**
-	 * Seed one ability into the stub registry.
+	 * Core's WP_Abilities_Registry::register(), reduced: the args filter,
+	 * then the object.
+	 *
+	 * NOTE: unlike the registry-shaped array wp_register_ability() (above)
+	 * stores for AbilitiesTest/AbilitiesForeignTransportTest/
+	 * AbilitiesGrantReuseTest (which read $GLOBALS['_abilities'][...] as a
+	 * plain array — the production registration path via
+	 * Aura_Worker_Abilities::register()), this seeds a real WP_Ability OBJECT
+	 * — the shape McpExposureAuditTest's direct sa_register_ability() calls
+	 * use, and the shape the door governor's Reflection-based read (R2)
+	 * needs. Meta goes under the 'meta' key of $args, matching core's own
+	 * register() signature (execute_callback / permission_callback / meta).
 	 *
 	 * @param string $name Ability name.
-	 * @param array  $meta Ability meta (mcp.type, annotations.readonly, ...).
+	 * @param array  $args execute_callback, permission_callback, meta.
 	 */
-	function sa_register_ability( string $name, array $meta = array() ): void {
-		$GLOBALS['_abilities'][ $name ] = new class( $name, $meta ) {
-			private string $name;
-			private array $meta;
-			public function __construct( string $name, array $meta ) {
-				$this->name = $name;
-				$this->meta = $meta;
+	function sa_register_ability( string $name, array $args ): WP_Ability {
+		$args = apply_filters( 'wp_register_ability_args', $args, $name );
+		$GLOBALS['_abilities'][ $name ] = new WP_Ability( $name, $args );
+		return $GLOBALS['_abilities'][ $name ];
+	}
+}
+
+if ( ! function_exists( 'wp_get_ability' ) ) {
+	function wp_get_ability( string $name ) {
+		$a = $GLOBALS['_abilities'][ $name ] ?? null;
+		return $a instanceof WP_Ability ? $a : null;
+	}
+}
+
+if ( ! function_exists( 'get_post_type' ) ) {
+	function get_post_type( $post = null ) {
+		$p = get_post( $post );
+		return $p ? ( $p->post_type ?? false ) : false;
+	}
+}
+
+if ( ! function_exists( 'wp_get_current_user' ) ) {
+	function wp_get_current_user() {
+		$id = get_current_user_id();
+		return (object) array( 'ID' => $id, 'user_login' => $GLOBALS['_user_logins'][ $id ] ?? ( $id > 0 ? 'user' . $id : '' ) );
+	}
+}
+
+if ( ! function_exists( 'wp_trash_post' ) ) {
+	/**
+	 * Core: with EMPTY_TRASH_DAYS at 0, wp_trash_post() DELETES (post.php),
+	 * which is exactly the case the door refuses to restore through.
+	 */
+	function wp_trash_post( $post_id ) {
+		$id = (int) $post_id;
+		if ( ! isset( $GLOBALS['_posts'][ $id ] ) ) {
+			return false;
+		}
+		if ( defined( 'EMPTY_TRASH_DAYS' ) && 0 === (int) EMPTY_TRASH_DAYS ) {
+			return wp_delete_post( $id, true );
+		}
+		// The same shape as wp_delete_post's noop seam above: a pre_trash_post
+		// short-circuit (or a failing UPDATE) that returns a TRUTHY value while
+		// the post stays live — so a caller must verify by re-reading the
+		// status, never by the return value.
+		if ( ! empty( $GLOBALS['_sa_state']['wp_trash_post_noop'][ $id ] ) ) {
+			return $GLOBALS['_posts'][ $id ];
+		}
+		if ( 'trash' === ( $GLOBALS['_posts'][ $id ]->post_status ?? '' ) ) {
+			return false; // core: already trashed
+		}
+		$GLOBALS['_posts'][ $id ]->post_status = 'trash';
+		$GLOBALS['_trashed'][]                 = $id;
+		return $GLOBALS['_posts'][ $id ];
+	}
+}
+
+if ( ! function_exists( 'get_posts' ) ) {
+	function get_posts( array $args = array() ) {
+		$types  = (array) ( $args['post_type'] ?? 'post' );
+		$status = $args['post_status'] ?? 'publish';
+		$out    = array();
+		foreach ( $GLOBALS['_posts'] as $id => $p ) {
+			if ( ! in_array( $p->post_type ?? '', $types, true ) ) {
+				continue;
 			}
-			public function get_name(): string {
-				return $this->name;
+			if ( 'any' !== $status && ( $p->post_status ?? '' ) !== $status ) {
+				continue;
 			}
-			public function get_meta(): array {
-				return $this->meta;
-			}
-		};
+			$out[] = ( 'ids' === ( $args['fields'] ?? '' ) ) ? (int) $id : $p;
+		}
+		return $out;
 	}
 }
 
@@ -3545,6 +4265,28 @@ function sa_reset_state(): void {
 	if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
 		Aura_Worker_Call_Context::reset(); // the dispatching route is a static too
 	}
+	if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+		// The door's presence/seam memo is a static too (Ruling P6 memoises a
+		// POSITIVE active() answer for the rest of the process). Until Task 11
+		// nothing outside the door's own test files ever called into this
+		// class, so the leak was silent; audit_mcp_exposure's governor block
+		// now calls active() on every run, so a test file that never touches
+		// the door (McpExposureElementorTest) can otherwise inherit `true`
+		// left behind by an earlier one that does, and see a governor block
+		// where it expected none.
+		Aura_Worker_Elementor_Door::reset_for_tests();
+	}
+	if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+		// The binding's per-request decision is a static (Ruling P73): whether
+		// this "request" has already offered an `unset` record for adoption.
+		Aura_Worker_Door_Log::forget_live_identity();
+	}
+	if ( method_exists( 'Aura_Worker_Door_Holds', 'forget_lock_support' ) ) {
+		Aura_Worker_Door_Holds::forget_lock_support(); // Ruling P70's per-request memo
+	}
+	if ( method_exists( 'Aura_Worker_Door_Holds', 'forget_held' ) ) {
+		Aura_Worker_Door_Holds::forget_held(); // Ruling P71's one-read-per-request memo
+	}
 	$GLOBALS['_app_passwords']           = array();
 	$GLOBALS['_app_passwords_available'] = true;
 	$GLOBALS['_app_passwords_delete_fail'] = false;
@@ -3596,12 +4338,39 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_write_divert'] = array(); // Claimed writes that report success while the row diverges.
 	$GLOBALS['_sa_option_write_fail'] = array(); // Option names update_option() must refuse to store.
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
+	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
+	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
+	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
+	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
+	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
+	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
+	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
+	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
+	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
+	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
+	// kits_manager cannot be instantiated here, so a test that needs an active
+	// kit sets this. UNSET by default so the production lookup is what runs
+	// when no test asked for one.
+	unset( $GLOBALS['_sa_kit_id'] );
+	// Elementor's class → posts reverse index and its id => label map, as the
+	// stubs in tests/elementor-class-stubs.php serve them (Ruling P32). Empty
+	// by default: a test that says nothing about classes gets an index that
+	// answers nothing, which is what every pre-P32 door test assumes.
+	$GLOBALS['_sa_class_relations']       = array(); // class id => int[] post ids
+	$GLOBALS['_sa_class_labels']          = array(); // class id => label
+	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
+	$GLOBALS['_sa_before_ack_floor_raise'] = null; // Runs inside ack()'s floor raise, before it evaluates (Ruling P90).
+	$GLOBALS['_sa_after_claimed_write'] = array(); // Runs after one claim-conditional write, by option name (Ruling P78).
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
 	$GLOBALS['_posts']        = array();
+	$GLOBALS['_trashed']      = array(); // wp_trash_post()'s trace — see the stub above.
+	$GLOBALS['_user_logins']  = array(); // wp_get_current_user()'s user_login lookup — see the stub above.
 	$GLOBALS['_post_meta']    = array();
 	$GLOBALS['_cleaned_post_cache'] = array();
 	$GLOBALS['_did_delete_expired'] = false;
@@ -3627,6 +4396,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_state']     = array();
 	$GLOBALS['_is_admin']       = false; // is_admin() — see the stub above.
 	$GLOBALS['_is_multisite']   = false;
+	$GLOBALS['_current_blog_id'] = 1; // get_current_blog_id() — core's own default on a single site.
+	$GLOBALS['_main_site_id']  = 1; // is_main_site() — which blog of a network is the main one (Ruling P39).
 	$GLOBALS['_site_options']   = array();
 	$GLOBALS['_user_meta']      = array();
 	$GLOBALS['_cron_array']     = array();

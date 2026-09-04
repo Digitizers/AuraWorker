@@ -895,7 +895,7 @@ final class Aura_Worker_Unbind {
 	public static function leftovers(): array {
 		$m = self::read();
 		if ( is_wp_error( $m ) ) {
-			return array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' );
+			return array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' );
 		}
 		if ( null === $m ) {
 			return array(); // no marker: this site is not mid-unbind and owes nothing
@@ -930,6 +930,30 @@ final class Aura_Worker_Unbind {
 		}
 		if ( ! self::option_absent( 'aura_worker_grant_pubkey' ) ) {
 			$left[] = 'grant_pubkey';
+		}
+		// The door's binding GENERATION (Ruling P59). Asked the way every other
+		// kind is asked — is it done — not "did step (4a)'s call return true".
+		// Names ONLY that; the queue, the log and the epoch are not deleted by
+		// an unbind and are not owed.
+		//
+		// THE STATE, not the identity fields (Ruling P69). An `unset` record —
+		// the placeholder 2.16 lazily mints on a site it meets already
+		// connected — has a null client AND a null dashboard, so an identity
+		// test read it as "already unbound" and let the cleanup delete the
+		// token while the rotation's CAS had in fact failed. That is the worst
+		// possible reading: `generation_is_live()` treats an `unset` record's
+		// generation as CURRENT, so every row the departed binding stamped
+		// stayed live, on a site that could no longer be told anything.
+		//
+		// Only the explicit `unbound` constant discharges this step. `unset`
+		// and `bound` are leftovers whatever their identity fields say — the
+		// difference between "somebody stated this site is bound to nobody"
+		// and "nobody has ever stated anything".
+		if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+			$rec = Aura_Worker_Door_Log::binding_record();
+			if ( Aura_Worker_Door_Log::BINDING_UNBOUND !== ( isset( $rec['state'] ) ? (string) $rec['state'] : '' ) ) {
+				$left[] = 'door';
+			}
 		}
 		return $left;
 	}
@@ -1036,6 +1060,42 @@ final class Aura_Worker_Unbind {
 		// the TOKEN alone, before any signature work.
 		do_action( 'aura_worker_unbind_step', 'grant' );
 		Aura_Worker_Rules::delete_option_if_claimed( 'aura_worker_grant_pubkey', $claim, $fence );
+
+		// (4a) The Elementor door. A HOLD is a stored WordPress action — an
+		// ability, its input, and the ACTOR to run it as — waiting for somebody
+		// to approve it, and it used to survive every step above: a site later
+		// connected to a DIFFERENT Aura client was served the departed
+		// client's holds through `/status` and could approve one through
+		// `elementor_replay_ability`.
+		//
+		// A new binding GENERATION, not a wipe (Ruling P58). Nothing is
+		// deleted: from this moment every held, claimed and log row this
+		// binding wrote is stamped with a generation that is no longer
+		// current, so the queue's readers cannot see them, the cap does not
+		// charge for them, and the sweep removes the held ones in its own time.
+		//
+		// The identity it moves to is NOBODY (Ruling P59): an unbound site is
+		// bound to no client and no dashboard, so the next connect's own
+		// identity is necessarily a change and rotates again.
+		//
+		// VERIFIED (Ruling P59): the rotation is a compare-and-swap that must
+		// change exactly one row, and a failure is REPORTED — `door` is a
+		// leftovers() kind again, so the token stays and the drain's next
+		// Phase-B pass rotates for real.
+		// CLAIM-CONDITIONED, like every option step above it (Ruling P68).
+		// This Phase B can outlive `SITE_CLAIM_TAKEOVER_AFTER`: a replacement
+		// connect seizes the claim and completes, and a stale cleanup resuming
+		// here would rotate the WINNER's binding to `unbound` — its holds gone
+		// invisible, its governed callbacks failing the binding fence, until
+		// somebody reconnected. The claim row is joined INTO the rotation's own
+		// compare-and-swap, so there is no window between asking and acting. A
+		// lost claim rotates nothing, `door` stays a leftover, and this call
+		// answers `cleanup_complete: false` — the same outcome every other step
+		// has when the claim is gone.
+		do_action( 'aura_worker_unbind_step', 'door' );
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			Aura_Worker_Elementor_Door::rebind( array( 'client' => null, 'dashboard' => null ), $claim, $fence );
+		}
 
 		if ( array() !== self::leftovers() ) {
 			return false; // something is still owed; the token stays, and so does the retry path

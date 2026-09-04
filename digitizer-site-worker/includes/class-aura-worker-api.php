@@ -298,6 +298,12 @@ class Aura_Worker_API {
 					'sanitize_callback' => 'sanitize_text_field',
 					'description'       => __( 'Snapshot id to restore.', 'digitizer-site-worker' ),
 				),
+				'aura_ref' => array(
+					'required'          => false,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( "Aura's correlation id for this restore; echoed on the door-log entry. When sent, it is BOUND INTO THE GRANT: on a grant-enforced site the approval grant must be minted over { id, aura_ref }, not { id } alone.", 'digitizer-site-worker' ),
+				),
 			),
 		) );
 
@@ -356,6 +362,95 @@ class Aura_Worker_API {
 			),
 		) );
 
+		// v1: reject a held Elementor-door write outright — the operator's "no"
+		// (spec §3.6-3.7). The site's own approval channel for the "yes" is
+		// elementor_replay_ability; this is its refusal counterpart.
+		register_rest_route( self::NAMESPACE, '/door/reject', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'reject_door_holds' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'refs' => array(
+					'required'          => true,
+					'type'              => 'array',
+					'items'             => array( 'type' => 'string' ),
+					'sanitize_callback' => array( __CLASS__, 'sanitize_door_refs' ),
+					'description'       => __( 'Hold references (door_…) to reject.', 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
+		// v1: Aura's ack of the door log (spec §3.8, §3.10) — raises the site's
+		// ack floor and lets it drop everything at or under it.
+		register_rest_route( self::NAMESPACE, '/door/ack', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'ack_door_log' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'epoch' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( "The log epoch Aura is acking; ignored (acks nothing) when it does not match the site's current one.", 'digitizer-site-worker' ),
+				),
+				'seq' => array(
+					'required'          => true,
+					'type'              => 'integer',
+					'sanitize_callback' => 'absint',
+					'description'       => __( "Highest seq of Aura's contiguous committed prefix.", 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
+		// v1: Aura's decision to rotate the door-log epoch after `/status`
+		// reported `rewind.detected` (Ruling P20). A WRITE on the log's
+		// identity, so it is grant-gated — `/status` itself never rotates.
+		register_rest_route( self::NAMESPACE, '/door/rotate', array(
+			'methods'             => 'POST',
+			'callback'            => array( $this, 'rotate_door_epoch' ),
+			'permission_callback' => array( $this->security, 'check_admin_permission' ),
+			'args'                => array(
+				'epoch' => array(
+					'required'          => true,
+					'type'              => 'string',
+					'sanitize_callback' => 'sanitize_text_field',
+					'description'       => __( "The log epoch Aura saw the rewind under; the site rotates only when it is still the current one, so a retry of a rotation that already happened changes nothing.", 'digitizer-site-worker' ),
+				),
+			),
+		) );
+
+	}
+
+	/**
+	 * The `refs` sanitize_callback for POST /aura/v1/door/reject, and the same
+	 * pass the handler re-applies to whatever it reads off the request — one
+	 * source of truth for both the registered pipeline and a direct call that
+	 * bypasses it (the pattern is_allowed_self_update_url() already uses).
+	 * Non-string entries are dropped (no result entry is owed for a value that
+	 * was never a ref); survivors are sanitize_text_field()d and the list is
+	 * capped at 50. A survivor that sanitizes to something no hold ever used —
+	 * garbage characters, or simply unknown — is not special-cased here: it is
+	 * answered `not_held` downstream by Aura_Worker_Door_Holds::reject() itself,
+	 * exactly like any other ref nothing is held under.
+	 *
+	 * @param mixed $value Raw `refs` value.
+	 * @return string[]
+	 */
+	public static function sanitize_door_refs( $value ) {
+		if ( ! is_array( $value ) ) {
+			return array();
+		}
+		$out = array();
+		foreach ( $value as $item ) {
+			if ( ! is_string( $item ) ) {
+				continue;
+			}
+			$out[] = sanitize_text_field( $item );
+			if ( count( $out ) >= 50 ) {
+				break;
+			}
+		}
+		return $out;
 	}
 
 	/**
@@ -444,6 +539,28 @@ class Aura_Worker_API {
 		$probe = Aura_Worker_Magic_Link::probe_unproven_report();
 		if ( null !== $probe ) {
 			$status['app_password_probe_unproven'] = (object) $probe;
+		}
+
+		// The Elementor door (2.16.0, spec §3.10). The reconciler runs FIRST,
+		// so what a died request left behind is settled in the very response
+		// that reports it: `/status` is the only clock this site has. An
+		// OBJECT on the wire, like `unbound` above, and ABSENT on a site with
+		// no door AND no persisted door state — Aura keys on its presence to
+		// decide whether this site is governed at all.
+		//
+		// present(), not active() (Ruling P28): deactivating Elementor after
+		// the governor stored holds, unacked rows or an in-flight claim used
+		// to drop the fragment AND skip the reconciler on the next request,
+		// so Aura lost sight of outstanding approvals and terminal results
+		// while nothing settled them. Persisted door state is enough to keep
+		// reporting and reconciling; the fragment's own `active` says whether
+		// Elementor is still there.
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) && Aura_Worker_Elementor_Door::present() ) {
+			Aura_Worker_Elementor_Door::reconcile();
+			$status['door'] = (object) Aura_Worker_Elementor_Door::status_fragment(
+				(int) $request->get_param( 'door_after' ),
+				(string) $request->get_param( 'door_epoch' ) // the epoch the cursor belongs to; '' ⇒ served from 0
+			);
 		}
 
 		return rest_ensure_response( $status );
@@ -1142,29 +1259,221 @@ class Aura_Worker_API {
 	 *
 	 * Restore state captured by a prior snapshot (undo a power write).
 	 *
+	 * GRANT BINDING: `aura_ref` is bound into the grant whenever the request
+	 * carries one, so Aura MUST mint the grant over `{ id, aura_ref }` when
+	 * it sends a correlation id — a grant over `{ id }` alone is refused for
+	 * such a request. The ref is written as the door-log entry's `ref`, which
+	 * is how ingestion associates the terminal result with an AgentAction; a
+	 * grant that did not cover it let anyone able to replay a valid restore
+	 * grant substitute a different correlation id (Ruling P13). A request
+	 * with NO `aura_ref` still binds `{ id }` alone, so legacy callers are
+	 * unchanged.
+	 *
 	 * @param WP_REST_Request $request The request object.
 	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
 	 */
 	public function restore_snapshot( $request ) {
 		$id = $request->get_param( 'id' );
+		// Sanitised HERE as well as by the route's own callback: the value
+		// bound into the grant, echoed onto the log entry, must be one
+		// string read once, whatever dispatched the request.
+		$raw_ref  = $request->get_param( 'aura_ref' );
+		$aura_ref = is_string( $raw_ref ) ? sanitize_text_field( $raw_ref ) : '';
 
-		$guard = Aura_Worker_Grant::require_for( $request, 'wp.snapshot.restore', array( 'id' => $id ) );
+		$guard = Aura_Worker_Grant::require_for(
+			$request,
+			'wp.snapshot.restore',
+			'' === $aura_ref ? array( 'id' => $id ) : array(
+				'id'       => $id,
+				'aura_ref' => $aura_ref,
+			)
+		);
 		if ( is_wp_error( $guard ) ) {
 			return $guard;
 		}
 
-		// No narrower resource in the vocabulary: a freeze catches this, and
-		// nothing else can. (Spec §11 keeps theme/db types out until asked for.)
+		// The envelope is not read yet, so this guard can only declare the
+		// site: a freeze catches it, and nothing narrower can. A DOOR
+		// envelope names what it covers, and is judged again on THOSE
+		// touches inside open_restore_entry() below — a rule protecting one
+		// page refuses a restore that would roll that page back, with the
+		// same `aura_rule_blocked` 403 this guard returns (Ruling P12).
+		// (Spec §11 keeps theme/db types out until asked for.)
 		$rule = Aura_Worker_Rules::guard_rest( array( array( 'type' => 'site', 'id' => '*' ) ), 'wp.snapshot.restore' );
 		if ( is_wp_error( $rule ) ) {
 			return $rule;
 		}
 
 		$snapshots = new Aura_Worker_Snapshots();
-		$result    = $snapshots->restore( $id );
+		$record    = $snapshots->get( $id );
+		$pre       = null;
+		$seq       = null;
+		if ( is_array( $record ) && ! Aura_Worker_Snapshots::belongs_to_current_blog( $record ) ) {
+			// Answered HERE, before the door branch opens an entry or captures
+			// anything: a foreign envelope is refused, not attempted, so this
+			// blog's state is never captured for a restore that cannot run
+			// (Ruling P15). restore() refuses it too — this is the early exit,
+			// not the only guard.
+			return new WP_REST_Response(
+				Aura_Worker_Rules::with_warnings(
+					array(
+						'success' => false,
+						'code'    => 'aura_foreign_blog',
+						'error'   => Aura_Worker_Snapshots::FOREIGN_BLOG_ERROR,
+					)
+				),
+				409
+			);
+		}
+		if ( is_array( $record ) && in_array( (string) ( $record['door_kind'] ?? '' ), Aura_Worker_Snapshots::DOOR_KINDS, true ) ) {
+			// A door restore is itself a governed write: RESERVE the log entry
+			// first (a closed or failing log refuses the restore, as it refuses
+			// any other write), then capture, then restore, then settle.
+			$seq = Aura_Worker_Elementor_Door::open_restore_entry( $record, $aura_ref );
+			if ( is_wp_error( $seq ) ) {
+				return $seq;
+			}
+		}
+		// ONE RELEASE FUNNEL FOR THE SEQ LEASE (Ruling P94).
+		// `open_restore_entry()` HANDS the lease out of the governor when it
+		// returns a seq, and the two restore termini no longer release it — so
+		// every exit of the path below passes through here: the ones that reach
+		// a terminus, and the ones that do not (a MISSING row has nothing to
+		// settle, a rules refusal answers before it captures, a throw answers
+		// nothing at all). It used to be released only by the termini, so those
+		// other exits left the named lock held — and on a persistent database
+		// connection a lock outlives the request that took it.
+		try {
+			return self::restore_after_admission( $snapshots, $record, $id, $seq, $aura_ref );
+		} finally {
+			if ( null !== $seq ) {
+				Aura_Worker_Elementor_Door::release_seq_lease();
+			}
+		}
+	}
 
-		$status = $result['success'] ? 200 : 404;
-		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
+	/**
+	 * Everything a restore does once its door entry (if any) is reserved.
+	 *
+	 * Extracted so `restore_snapshot()` can wrap it in the single `finally`
+	 * that owns the seq lease (Ruling P94); the body itself is unchanged.
+	 *
+	 * @param Aura_Worker_Snapshots $snapshots The snapshot store.
+	 * @param array|null            $record    The envelope, or null when absent.
+	 * @param string                $id        The envelope id.
+	 * @param int|null              $seq       The reserved door entry, or null.
+	 * @param string                $aura_ref  Aura's correlation id.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	private static function restore_after_admission( Aura_Worker_Snapshots $snapshots, $record, $id, $seq, $aura_ref ) {
+		$pre = null;
+		if ( null !== $seq ) {
+			$cap = Aura_Worker_Elementor_Door::pre_restore_capture( $record, $seq, $aura_ref );
+			if ( empty( $cap['success'] ) ) {
+				if ( ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, null, array( 'success' => false, 'error' => 'pre-restore capture failed: ' . (string) ( $cap['error'] ?? '' ) ) ) ) {
+					return self::restore_unsettled( $seq, false );
+				}
+				return new WP_REST_Response( array( 'success' => false, 'error' => 'Could not capture the current state before restoring: ' . (string) ( $cap['error'] ?? '' ) ), 503 );
+			}
+			$pre = $cap['snapshot'];
+			// The pre-restore id lands on the pending row BEFORE the restore
+			// mutates anything: an interrupted restore must still name the
+			// envelope that undoes it.
+			if ( ! Aura_Worker_Door_Log::patch_pending( $seq, array( 'snapshot_id' => (string) $pre['id'] ) ) ) {
+				if ( ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, array( 'success' => false, 'error' => 'could not record the pre-restore snapshot' ) ) ) {
+					return self::restore_unsettled( $seq, false );
+				}
+				return new WP_REST_Response( array( 'success' => false, 'error' => 'Could not record the pre-restore snapshot; nothing was restored.' ), 503 );
+			}
+		}
+		if ( ! is_array( $record ) ) {
+			// 404 means ONE thing: the envelope is not on this site.
+			return new WP_REST_Response( Aura_Worker_Rules::with_warnings( array( 'success' => false, 'error' => 'Snapshot not found.' ) ), 404 );
+		}
+
+		// THE SITE IS ABOUT TO BE WRITTEN (Ruling P65). A restore is a governed
+		// mutation like any other, and everything between its admission above
+		// and this line — the pre-restore capture, the patch — takes time a
+		// rebind can land in. `execute()`'s callback fence catches that for an
+		// ability call; this is the same fence, on the same predicate, for the
+		// path that does not go through a callback at all. Read UNCACHED, so a
+		// rebind another PHP process completed is seen (Ruling P64).
+		$fence = ( null === $seq ) ? 'ok' : Aura_Worker_Elementor_Door::binding_unchanged_for_row( $seq );
+		if ( 'ok' !== $fence ) {
+			// A MISSING row has nothing to settle (Ruling P74); an UNREADABLE
+			// one is attempted, and says which fact it is refusing on.
+			if ( 'missing' !== $fence
+				&& ! Aura_Worker_Elementor_Door::refuse_restore_entry( $seq, $pre, ( 'unreadable' === $fence ) ? 'fence_unreadable' : 'binding_changed' ) ) {
+				return self::restore_unsettled( $seq, false );
+			}
+			if ( 'changed' === $fence ) {
+				return new WP_REST_Response(
+					Aura_Worker_Rules::with_warnings(
+						array(
+							'success' => false,
+							'code'    => 'aura_binding_changed',
+							'error'   => 'This site was rebound to another Aura client while this restore was being admitted; nothing was restored.',
+						)
+					),
+					409
+				);
+			}
+			// Not a proven rebind: the fence could not be established.
+			// Retryable, and nothing was restored.
+			return new WP_REST_Response(
+				Aura_Worker_Rules::with_warnings(
+					array(
+						'success' => false,
+						'code'    => 'aura_log_failed',
+						'error'   => 'This site could not establish which Aura binding this restore belongs to; nothing was restored.',
+					)
+				),
+				503
+			);
+		}
+
+		$result = $snapshots->restore( $id );
+		if ( null !== $seq && ! Aura_Worker_Elementor_Door::settle_restore_entry( $seq, $pre, $result ) ) {
+			// The restore RAN — succeeded or failed, it touched the site — and
+			// the log could not record what came of it (Ruling P19). A 200
+			// here would tell Aura the rollback is recorded while the entry
+			// sits pending, to be reconciled `interrupted` ten minutes later.
+			return self::restore_unsettled( $seq, true );
+		}
+
+		// 200 restored; 409 a designated refusal (aura_trash_disabled); 500 an
+		// execution failure of an envelope that IS here — never 404, which Aura
+		// reads as "no longer restorable on the site".
+		$status = $result['success'] ? 200 : ( isset( $result['code'] ) ? 409 : 500 );
+		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );		return new WP_REST_Response( Aura_Worker_Rules::with_warnings( $result ), $status );
+	}
+
+	/**
+	 * A restore whose door entry could not be settled: the site cannot say
+	 * what happened, so neither does the response (Ruling P19). The same
+	 * shape the governor answers an unsettled write with — `may_have_run`
+	 * and the `seq` to look the entry up by — so one reader handles both.
+	 *
+	 * The row is deliberately LEFT pending: the reconciler calls it
+	 * `interrupted`, which is the honest terminal state for an outcome
+	 * nothing recorded.
+	 *
+	 * @param int  $seq The reserved entry.
+	 * @param bool $ran Whether the restore itself ran.
+	 * @return WP_Error
+	 */
+	private static function restore_unsettled( $seq, $ran ) {
+		return new WP_Error(
+			'aura_log_failed',
+			$ran
+				? 'The restore ran but this site could not record its outcome; check the site before retrying.'
+				: 'This site could not record the outcome of this restore; nothing was restored.',
+			array(
+				'status'       => 503,
+				'may_have_run' => (bool) $ran,
+				'seq'          => (int) $seq,
+			)
+		);
 	}
 
 	/**
@@ -1183,6 +1492,146 @@ class Aura_Worker_API {
 			'snapshots' => $list,
 			'count'     => count( $list ),
 		) );
+	}
+
+	/**
+	 * POST /aura/v1/door/reject
+	 *
+	 * The operator's refusal of a held Elementor-door write (spec §3.6-3.7):
+	 * removes the held row so the call can never be replayed. Not itself a
+	 * site mutation — deliberately EXEMPT from the rule-guard invariant
+	 * (RulesRestCoverageTest): it can only PREVENT a write from ever running,
+	 * never cause one, so a freeze refusing it would strand exactly the calls
+	 * an operator most wants to clear while frozen.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
+	 */
+	public function reject_door_holds( $request ) {
+		$refs = self::sanitize_door_refs( $request->get_param( 'refs' ) );
+
+		$guard = Aura_Worker_Grant::require_for( $request, 'door.reject', array( 'refs' => $refs ) );
+		if ( is_wp_error( $guard ) ) {
+			return $guard;
+		}
+
+		$results = array();
+		foreach ( $refs as $ref ) {
+			$results[ $ref ] = Aura_Worker_Door_Holds::reject( $ref );
+		}
+
+		return new WP_REST_Response( array( 'results' => $results ), 200 );
+	}
+
+	/**
+	 * POST /aura/v1/door/ack
+	 *
+	 * Aura's ack of the door log (spec §3.8, §3.10): raises the site's ack
+	 * floor so it can drop everything at or under it. Transport only — every
+	 * rule (epoch match, floor-only-rises, reopen-under-the-bound) lives in
+	 * Aura_Worker_Door_Log::ack(). Deliberately EXEMPT from the rule-guard
+	 * invariant (RulesRestCoverageTest): this is governance-plane bookkeeping
+	 * on Aura's OWN log, not a site mutation, and a freeze blocking it could
+	 * starve the log toward its MAX_UNACKED bound and close the door — during
+	 * exactly the window an operator most wants visibility into it.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
+	 */
+	public function ack_door_log( $request ) {
+		$epoch = (string) $request->get_param( 'epoch' );
+		$seq   = (int) $request->get_param( 'seq' );
+
+		$guard = Aura_Worker_Grant::require_for( $request, 'door.ack', array( 'epoch' => $epoch, 'seq' => $seq ) );
+		if ( is_wp_error( $guard ) ) {
+			return $guard;
+		}
+
+		$result = Aura_Worker_Door_Log::ack( $epoch, $seq );
+
+		$body = array(
+			'acked'   => (int) $result['acked'],
+			'floor'   => (int) $result['floor'],
+			'epoch'   => Aura_Worker_Door_Log::epoch(),
+			'unacked' => Aura_Worker_Door_Log::count_unacked(),
+			'door'    => Aura_Worker_Elementor_Door::door_state(),
+		);
+		// STALE: the cursor named rows this log does not have (Ruling P95).
+		// Nothing was written — not the floor, not the purge — because such an
+		// ack comes from a log that was rewound out from under Aura, and
+		// clamping it to the current top would delete rows Aura never received.
+		// Aura re-reads `/status` rather than assuming its ack landed.
+		if ( ! empty( $result['stale'] ) ) {
+			$body['stale'] = true;
+		}
+
+		return new WP_REST_Response( $body, 200 );
+	}
+
+	/**
+	 * POST /aura/v1/door/rotate
+	 *
+	 * Aura's decision to rotate the door-log epoch (Ruling P20). `/status`
+	 * REPORTS a rewound log — a cursor from this epoch that is above every
+	 * row and above the ack floor, which only a restore or a `wp_options`
+	 * roll-back can produce — as `rewind.detected`; acting on it is a WRITE
+	 * on the log's durable identity and lives here, behind a grant.
+	 *
+	 * It used to happen inside `/status`, where a holder of a leaked site
+	 * token could trigger it at will: every rotation invalidates the ack
+	 * Aura is about to send, so repeating it between the poll and
+	 * `/door/ack` starved the log to MAX_UNACKED and closed the write door.
+	 *
+	 * IDEMPOTENT: the rotation happens only when the epoch named is still
+	 * the current one, so a retry (or a second Aura instance answering the
+	 * same report) answers the epoch now in force with `rotated: false`
+	 * rather than minting another.
+	 *
+	 * Deliberately EXEMPT from the rule-guard invariant
+	 * (RulesRestCoverageTest), for the same reason as `door.ack`: this is
+	 * governance-plane bookkeeping on Aura's own log, not a site mutation,
+	 * and a freeze blocking it would strand a rewound log — no ack can ever
+	 * match again — until the door closed itself.
+	 *
+	 * @param WP_REST_Request $request The request object.
+	 * @return WP_REST_Response|WP_Error Result, or WP_Error(403) if a grant is required.
+	 */
+	public function rotate_door_epoch( $request ) {
+		$epoch = (string) $request->get_param( 'epoch' );
+
+		$guard = Aura_Worker_Grant::require_for( $request, 'door.rotate', array( 'epoch' => $epoch ) );
+		if ( is_wp_error( $guard ) ) {
+			return $guard;
+		}
+
+		// No read-compare here: rotate_epoch() IS the compare, fenced on the
+		// epoch named, so two granted rotations answering the same rewind
+		// cannot both mint one (Ruling P23).
+		$out = Aura_Worker_Door_Log::rotate_epoch( $epoch );
+
+		// A LEGITIMATE ROTATION SAYS SO ON THE BINDING RECORD (Ruling P91).
+		// The record names the epoch it was written with, and P81's repair
+		// reads a disagreement as a half-done rebind — so without this the next
+		// same-identity connect performed a FULL rebind: a new generation for
+		// an identity that never changed, holds queued since the rotation gone
+		// foreign, in-flight writes failing their fence. A rewind cost the site
+		// its queue.
+		//
+		// Only the witness moves; the generation, the state and the identity
+		// are untouched, so this hands the site to nobody and needs no site
+		// claim. A stamp that will not land is reported rather than refused —
+		// the rotation itself succeeded, and P81's repair on the next connect
+		// is the fallback.
+		$body = array(
+			'rotated' => (bool) $out['rotated'],
+			'epoch'   => (string) $out['epoch'],
+			'floor'   => Aura_Worker_Door_Log::floor(),
+		);
+		if ( ! empty( $out['rotated'] ) && ! Aura_Worker_Door_Log::restamp_binding_epoch( (string) $out['epoch'] ) ) {
+			$body['witness_stale'] = true;
+		}
+
+		return new WP_REST_Response( $body, 200 );
 	}
 
 	/**

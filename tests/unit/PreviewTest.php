@@ -123,4 +123,27 @@ final class PreviewTest extends TestCase {
 			return 'aura_worker_rule_blocked' === $a['tag'];
 		} ), 'a preview fired the block hook' );
 	}
+
+	public function test_preview_reports_no_rule_for_an_allow_winner_because_execution_ignores_it(): void {
+		// `allow` speaks only at the Elementor door: Aura_Worker_Rules::enforce()
+		// nulls an allow winner, so the tools path runs the call with no rule at
+		// all. A preview that named the rule anyway would warn the operator about
+		// a verdict the very next request does not apply.
+		$GLOBALS['_options'][ Aura_Worker_Rules::OPTION ] = array(
+			'envelope'    => 'x.y',
+			'seq'         => 1,
+			'issued_at'   => '',
+			'received_at' => time(),
+			'rules'       => array(
+				array( 'key' => 'rule/press-ok', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'the press page is agent-owned' ),
+			),
+		);
+		$tools = new Aura_Worker_Tools();
+		$res   = $tools->preview_tool( 'test_double_tool', array( 'target' => 'x' ) );
+
+		$this->assertTrue( $res['success'] );
+		$this->assertNotNull( Aura_Worker_Rules::match( $res['touches'], Aura_Worker_Rules::rules(), null, Aura_Worker_Rules::site_ref() ), 'the rule really does match this call — match() is not the question' );
+		$this->assertNull( $res['rule_match'], 'the preview reports what enforcement would apply, and enforcement applies nothing' );
+		$this->assertSame( array( 'effect' => null ), Aura_Worker_Rules::enforce( $res['touches'], 'test_double_tool' ), 'the two agree about the same call' );
+	}
 }

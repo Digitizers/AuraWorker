@@ -159,6 +159,11 @@ final class UnbindRefusalTest extends TestCase {
 			'/aura/v2/rollback/akismet',
 			'/aura/v2/snapshot',
 			'/aura/v2/snapshot/restore',
+			// The door's three operator/Aura routes, all POST on
+			// check_admin_permission — a marked site refuses every one.
+			'/aura/v1/door/reject',
+			'/aura/v1/door/ack',
+			'/aura/v1/door/rotate',
 		);
 		$seen = array_column( array_values( self::mutating_routes() ), 1 );
 		foreach ( $known as $route ) {
@@ -303,6 +308,15 @@ final class UnbindRefusalTest extends TestCase {
 		if ( $scanned < 30 ) {
 			throw new RuntimeException( "the source scan found only {$scanned} files — is SA_PLUGIN_DIR right?" );
 		}
+		// SORTED BY PATH, because RecursiveDirectoryIterator's order is the
+		// FILESYSTEM's and nothing else. Callers assert with assertSame, which
+		// compares key order, and the two-entry pin below went red on CI's PHP
+		// 8.2 runner purely because that machine yielded
+		// `includes/class-aura-worker.php` before `includes/aaa_legacy/…`. The
+		// scan's guarantee is about WHAT it finds, never about what order the
+		// disk hands it over in, so the order is made deterministic here rather
+		// than worked around in each assertion.
+		ksort( $found );
 		return $found;
 	}
 

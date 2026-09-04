@@ -67,7 +67,13 @@ final class UnbindRebindTest extends TestCase {
 		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( SA_RAW_SITE_TOKEN ) );
 		update_option( 'aura_worker_connect_user_id', self::ADMIN );
 		update_option( 'aura_worker_dashboard_url', 'https://departed.example' );
-		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		// The CLIENT before the token AUTHENTICATION (Ruling P79): capturing an
+		// authentication now also establishes the binding record, adopting an
+		// upgraded site's placeholder to whatever identity is live at that
+		// instant. Binding c1 first is the order a real site is in by the time
+		// any request authenticates against it.
+		Aura_Worker_Rules::bind( 'c1', Aura_Worker_Security::hash_token( SA_RAW_SITE_TOKEN ) );
+		sa_token_hash();
 		sa_set_managed_app_password( self::ADMIN, self::OLD_UUID );
 		sa_set_marker(
 			array(
@@ -429,10 +435,34 @@ final class UnbindRebindTest extends TestCase {
 		$this->assertLessThan( $cleared, $record, 'the install\'s last fallible write precedes the release' );
 	}
 
-	/** A site that was never unbound connects exactly as it did before. */
-	public function test_a_connect_at_a_bound_site_is_unchanged(): void {
+	/**
+	 * Ruling P75: a site that was never unbound REFUSES a connect from another
+	 * client, and writes nothing.
+	 *
+	 * This fixture is the upgraded case too: no binding record exists, so the
+	 * first read mints an `unset` placeholder and ADOPTS it to the identity the
+	 * site is demonstrably live under (Ruling P73) — c1 — and the connect from
+	 * c2 then meets a live foreign binding.
+	 */
+	public function test_a_connect_from_another_client_at_a_bound_site_is_refused(): void {
 		sa_clear_marker();
-		$res = $this->ml->handle_connect( $this->connectRequest() );
+		$before_token = $this->tokenRow();
+
+		$res = $this->ml->handle_connect( $this->connectRequest( 'the-new-token', 'c2' ) );
+
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_site_bound', $res->get_data()['code'] );
+		$this->assertSame( $before_token, $this->tokenRow(), 'the token is untouched' );
+		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client(), 'and so is the client sentinel' );
+		$this->assertSame( 'https://departed.example', get_option( 'aura_worker_dashboard_url' ) );
+		$this->assertSame( 'bound', Aura_Worker_Door_Log::binding_record()['state'] );
+		$this->assertSame( 'c1', Aura_Worker_Door_Log::binding_record()['client'] );
+	}
+
+	/** …and the SAME client re-saving is the connect it always was. */
+	public function test_a_connect_from_the_same_client_at_a_bound_site_is_unchanged(): void {
+		sa_clear_marker();
+		$res = $this->ml->handle_connect( $this->connectRequest( 'the-new-token', 'c1' ) );
 		$this->assertSame( 200, $res->get_status() );
 		$this->assertNull( $this->markerRow() );
 		$this->assertSame( Aura_Worker_Security::hash_token( 'the-new-token' ), $this->tokenRow() );

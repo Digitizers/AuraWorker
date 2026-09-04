@@ -1,0 +1,1615 @@
+<?php
+/**
+ * The Elementor door's log: one option row per entry, retained until Aura
+ * acknowledges it (spec §3.8, §3.10).
+ *
+ * Every number is allocated by the row's own INSERT above an ack floor that
+ * only rises — there is no counter option to leak, and a number exists only
+ * once its row does, so a contiguous-prefix ack never meets a hole. Nothing
+ * but an ack deletes a row; a request that backs out settles its row
+ * `discarded` instead.
+ *
+ * @package Aura_Worker
+ * @since 2.16.0
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+class Aura_Worker_Door_Log {
+
+	const PREFIX       = 'aura_worker_door_log_';
+	const FLOOR        = 'aura_worker_door_log_acked';
+	const EPOCH        = 'aura_worker_door_epoch';
+	/** The BINDING generation (Rulings P51/P58): minted like the epoch, rotated ONLY by a rebind. */
+	const BINDING      = 'aura_worker_door_binding';
+	/* The binding record's STATE (Ruling P61) — a lazy mint is never a stated identity. */
+	const BINDING_UNSET   = 'unset';
+	const BINDING_BOUND   = 'bound';
+	const BINDING_UNBOUND = 'unbound';
+
+	/** @var bool Whether this request has already tried to adopt an `unset` record (Ruling P73). */
+	private static $binding_adopt_tried = false;
+	const FULL_MARKER  = 'aura_worker_door_log_full_since';
+	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
+	const MAX_UNACKED  = 2000;
+	const PAGE         = 100;
+	/** How many INSERT collisions to ride through before giving up. */
+	const ALLOC_TRIES  = 8;
+	/** A log ROW: the prefix followed by digits only — never the floor, marker or counter options that share the prefix. */
+	const ROW_REGEXP   = '^aura_worker_door_log_[0-9]+$';
+
+	const TERMINAL = array( 'ok', 'refused', 'failed', 'interrupted', 'discarded', 'held' );
+
+	/**
+	 * Creates an option row only when none exists — a real mutex, unlike
+	 * add_option(), whose INSERT … ON DUPLICATE KEY UPDATE lets a racer that
+	 * passed the cached existence check overwrite and still return true.
+	 * The shape is the one Aura_Worker_Magic_Link::claim_magic_link() uses
+	 * (class-aura-worker-magic-link.php), and every door-side "INSERT" goes
+	 * through this one primitive so seq allocation, the epoch and the
+	 * closure marker cannot lose a race to a silent overwrite.
+	 *
+	 * @param string $name  Option name.
+	 * @param mixed  $value Value; serialized like an option.
+	 * @return bool True only when exactly one row was inserted.
+	 */
+	public static function insert_unique( $name, $value ) {
+		global $wpdb;
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+				$name,
+				maybe_serialize( $value ),
+				'no',
+				$name
+			)
+		);
+		// EVICTED ON BOTH OUTCOMES (Ruling P72). A LOST insert means somebody
+		// else's row is under this name RIGHT NOW — and this request has very
+		// likely just cached the name as absent (`notoptions`) on the read that
+		// decided to mint. Leaving that negative in place made the loser read
+		// `null` for a row that demonstrably exists, and a lazy mint then
+		// answered '' for a generation the winner had already installed.
+		wp_cache_delete( $name, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		return ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+	}
+
+	/**
+	 * Re-read a name from the DATABASE after a lost mint (Ruling P72).
+	 *
+	 * The caches are gone by the time this runs (insert_unique() evicts them
+	 * either way), but a cache eviction is not a read: the value has to come
+	 * from the row the winner wrote, and `get_option()` on a busy site can
+	 * still be served a negative another code path re-primed. So this asks
+	 * `$wpdb` directly, with `last_error` cleared first.
+	 *
+	 * NULL means UNREADABLE — the row is genuinely absent, or the read failed.
+	 * Neither is a value a writer may stamp: an empty stamp used to read as
+	 * "queued before the generation existed", i.e. permanently current, so a
+	 * replacement client could claim and run the previous client's mutation.
+	 *
+	 * @param string $name Option name.
+	 * @return mixed|null The unserialised value, or null when unreadable.
+	 */
+	private static function reread_after_mint( $name ) {
+		global $wpdb;
+		// NO EVICTION HERE (Ruling P88 follow-up). A raw `$wpdb` read bypasses
+		// every cache by construction, so flushing them first buys this reader
+		// nothing — and `insert_unique()`, which is the WRITE that just ran,
+		// has already evicted the name and `notoptions` for the callers that
+		// come after. Evicting `alloptions` on a site with a persistent object
+		// cache would discard every autoloaded option, per mint.
+		$wpdb->last_error = '';
+		$raw              = self::raw_option( $name );
+		if ( null === $raw || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		return maybe_unserialize( $raw );
+	}
+
+	/**
+	 * The site's log epoch — minted once, new only when the option store is
+	 * gone (a reinstall). A credential re-save or a reconnect never moves it.
+	 *
+	 * @return string
+	 */
+	public static function epoch() {
+		$cur = get_option( self::EPOCH, '' );
+		if ( is_string( $cur ) && '' !== $cur ) {
+			return $cur;
+		}
+		if ( self::insert_unique( self::EPOCH, wp_generate_uuid4() ) ) {
+			$cur = get_option( self::EPOCH, '' );
+			return is_string( $cur ) ? $cur : '';
+		}
+		// LOST the mint (Ruling P72): the winner's row exists, and this
+		// request's own negative cache must not be what it reads back.
+		$cur = self::reread_after_mint( self::EPOCH );
+		return is_string( $cur ) ? $cur : '';
+	}
+
+	/**
+	 * The BINDING generation: which Aura binding this site's door belongs to
+	 * (Ruling P51).
+	 *
+	 * Minted lazily, exactly like the epoch, and rotated by ONE thing — a
+	 * rebind (a changed-binding connect, or an unbind). That is the whole
+	 * difference, and the reason it exists. The epoch
+	 * is the LOG's identity and Aura may legitimately rotate it through the
+	 * grant-gated `POST /aura/v1/door/rotate` (Ruling P20) whenever a rewind is
+	 * detected; a replay in flight would then have seen its fence move for a
+	 * reason that has nothing to do with the binding, be told
+	 * `binding_changed`, and lose an approval the reconciler only reclaims ten
+	 * minutes later. A rotation never touches this value, so the fence answers
+	 * the question it is actually asking.
+	 *
+	 * @return string
+	 */
+	public static function binding() {
+		// THE AUTHENTICATED GENERATION WINS (Ruling P76). A request that passed
+		// authentication under binding A must have its rows stamped A, even if
+		// an unbind completed while it was between the permission callback and
+		// here — otherwise the row carries the CURRENT generation, the fence
+		// compares it with itself, and a write whose credentials were revoked
+		// before it started is waved through. A context with no capture
+		// (WP-CLI, cron, direct PHP) falls through to the record as it stands,
+		// which is what every writer did before.
+		if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
+			$authed = Aura_Worker_Call_Context::authenticated_binding();
+			if ( Aura_Worker_Call_Context::BINDING_UNREADABLE === $authed ) {
+				// This request authenticated and its binding could not be
+				// established (Ruling P79). Falling back to the record as it
+				// stands is the bug: an unbind minting or rotating it in
+				// between would be compared with itself. Null refuses every
+				// admission — nothing written, nothing run.
+				return null;
+			}
+			if ( null !== $authed && '' !== (string) $authed ) {
+				return (string) $authed;
+			}
+		}
+		$rec = self::binding_record();
+		$gen = (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' );
+		// NULL, NOT '' (Ruling P72). A real record always carries a generation,
+		// so an empty one means the mint could not be established — the row
+		// could not be read, or the lost-insert re-read failed. Stamping ''
+		// on a hold, a claim or a log row wrote something every reader treated
+		// as permanently current: after a rebind the replacement client could
+		// claim and execute the previous client's stored mutation. A writer
+		// that cannot name its binding refuses instead.
+		return '' === $gen ? null : $gen;
+	}
+
+	/**
+	 * The whole binding record — `{ gen, client, dashboard }` (Ruling P59).
+	 *
+	 * The generation carries the IDENTITY it belongs to, which is what makes
+	 * the rotation idempotent: a connect states the identity it is installing
+	 * and the rotation is a no-op when the record already names it. That, and
+	 * nothing else, is why a rotation that failed can simply be retried by the
+	 * next connect rather than needing to be undone.
+	 *
+	 * The record carries a STATE, and that is what tells a lazy mint apart from
+	 * a real one (Ruling P61). A site that 2.16 meets already connected has no
+	 * record, so the first reader mints one — and a null identity on that
+	 * placeholder used to be indistinguishable from "this site is unbound", so
+	 * a later unbind saw its own target already in place, rotated nothing, and
+	 * callbacks waiting at the generation fence walked through after the site
+	 * had been unbound. `unset` is never equal to anything: it always rotates.
+	 *
+	 * A record written before this rule has no `state` and reads as `unset`,
+	 * which is exactly right — nobody ever stated whose it was.
+	 *
+	 * THE STATE IS WHAT THE CONNECT ASKS (Ruling P75). A connect meeting a
+	 * record that says `bound` to a DIFFERENT client refuses outright
+	 * (`aura_site_bound`) and writes nothing, so the identity on this record
+	 * cannot change while the generation stands: a rebind is an unbind — which
+	 * rotates to `unbound` — followed by a connect. That is why every
+	 * currentness test is now generation equality alone; nothing has to
+	 * re-compare the identity, because nothing can move it.
+	 *
+	 * @return array{ gen: string, state: string, client: string|null, dashboard: string|null }
+	 */
+	public static function binding_record() {
+		$cur = get_option( self::BINDING, null );
+		if ( is_array( $cur ) && isset( $cur['gen'] ) && '' !== (string) $cur['gen'] ) {
+			return self::adopt_if_unset( self::normalise_binding( $cur ) );
+		}
+		$won = self::insert_unique(
+			self::BINDING,
+			array(
+				'gen'       => wp_generate_uuid4(),
+				'state'     => self::BINDING_UNSET,
+				'client'    => null,
+				'dashboard' => null,
+			)
+		);
+		// A LOST mint reads the WINNER's row from the database, never this
+		// request's negative cache (Ruling P72). An unreadable answer is
+		// reported as an empty generation, which `binding()` turns into null
+		// and every writer refuses to stamp.
+		$cur = $won ? get_option( self::BINDING, null ) : self::reread_after_mint( self::BINDING );
+		return is_array( $cur ) && isset( $cur['gen'] )
+			? self::adopt_if_unset( self::normalise_binding( $cur ) )
+			: array( 'gen' => '', 'state' => self::BINDING_UNSET, 'client' => null, 'dashboard' => null );
+	}
+
+	/**
+	 * ADOPT an `unset` record for the identity this site is demonstrably live
+	 * under (Ruling P73).
+	 *
+	 * A site 2.16 meets already connected has no record, so the first reader
+	 * mints a placeholder — `unset`, naming nobody. Rows queued and written
+	 * afterwards carry that placeholder's generation, and `unset` used to be a
+	 * BYPASS: the generation was live without the identity ever being compared.
+	 *
+	 * That bypass is a window, and a replacement connect walks straight
+	 * through it. A connect publishes the new token, the client sentinel and
+	 * the dashboard URL BEFORE it rotates the generation, so between those two
+	 * writes a request authenticating with the NEW credentials met an `unset`
+	 * record, was told the departed binding's generation was live, and could
+	 * claim and execute the previous client's stored mutation.
+	 *
+	 * Adoption closes it by making the record STATE what everything else can
+	 * already see. It is not a rotation: the generation is unchanged, so the
+	 * site's own rows stay current and no approval is stranded. From that
+	 * moment the record says `bound` and P62's identity comparison applies to
+	 * every reader — so the same replacement connect's identity writes make
+	 * the departed rows foreign the instant they land, rotation or no
+	 * rotation.
+	 *
+	 * A site with NO live identity — never connected — keeps `unset`, and
+	 * nothing is bound there to be protected.
+	 *
+	 * Once per request: a CAS that loses re-reads and uses whatever won.
+	 *
+	 * @param array      $rec  The normalised record.
+	 * @param array|null $live { client, dashboard } — the fence supplies its own
+	 *                         uncached read; everyone else uses the per-request one.
+	 * @return array The record as it now stands.
+	 */
+	private static function adopt_if_unset( array $rec, $live = null ) {
+		if ( self::BINDING_UNSET !== $rec['state'] || '' === (string) $rec['gen'] || self::$binding_adopt_tried ) {
+			return $rec;
+		}
+		$live = is_array( $live ) ? $live : self::live_identity();
+		$client    = isset( $live['client'] ) && '' !== (string) $live['client'] ? (string) $live['client'] : null;
+		$dashboard = isset( $live['dashboard'] ) && '' !== (string) $live['dashboard'] ? (string) $live['dashboard'] : null;
+		if ( null === $client && null === $dashboard ) {
+			return $rec; // never connected: there is nothing to adopt it for
+		}
+		self::$binding_adopt_tried = true;
+
+		global $wpdb;
+		$raw = self::raw_option( self::BINDING );
+		$cur = null === $raw ? null : maybe_unserialize( $raw );
+		if ( ! is_array( $cur ) || ! isset( $cur['gen'] ) ) {
+			return $rec;
+		}
+		$cur = self::normalise_binding( $cur );
+		if ( self::BINDING_UNSET !== $cur['state'] ) {
+			return $cur; // somebody stated it first — theirs stands
+		}
+		$next = array(
+			'gen'       => $cur['gen'], // THE SAME generation: this is not a rotation
+			'state'     => self::BINDING_BOUND,
+			'client'    => $client,
+			'dashboard' => $dashboard,
+		);
+		$wpdb->last_error = '';
+		$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				maybe_serialize( $next ),
+				self::BINDING,
+				$raw
+			)
+		);
+		wp_cache_delete( self::BINDING, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		// Win or lose, the answer is whatever the row says NOW.
+		$after = self::raw_option( self::BINDING );
+		$after = null === $after ? null : maybe_unserialize( $after );
+		return is_array( $after ) && isset( $after['gen'] ) ? self::normalise_binding( $after ) : $next;
+	}
+
+	/**
+	 * Fill in what an older record does not carry: no `state` means nobody
+	 * ever stated whose this door is (Ruling P61).
+	 *
+	 * @param array $rec Raw record.
+	 * @return array
+	 */
+	private static function normalise_binding( array $rec ) {
+		$state = isset( $rec['state'] ) ? (string) $rec['state'] : '';
+		if ( ! in_array( $state, array( self::BINDING_BOUND, self::BINDING_UNBOUND ), true ) ) {
+			$state = self::BINDING_UNSET;
+		}
+		return array(
+			'gen'       => (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' ),
+			'state'     => $state,
+			'client'    => isset( $rec['client'] ) && null !== $rec['client'] ? (string) $rec['client'] : null,
+			'dashboard' => isset( $rec['dashboard'] ) && null !== $rec['dashboard'] ? (string) $rec['dashboard'] : null,
+			// The epoch this record was written WITH (Ruling P81). Absent on a
+			// record written before that rule, which reads as '' and therefore
+			// as "differs" — so the next same-identity connect repairs it.
+			'epoch'     => isset( $rec['epoch'] ) ? (string) $rec['epoch'] : '',
+		);
+	}
+
+	/**
+	 * The identity this site is bound to RIGHT NOW, as the connect stores it.
+	 *
+	 * `client` comes from the ruleset store's binding sentinel through
+	 * `Aura_Worker_Rules::bound_client()` (which proves it against the site's
+	 * current token), and `dashboard` from the `aura_worker_dashboard_url`
+	 * option. Those are the two things a connect writes to say whose site this
+	 * is.
+	 *
+	 * NO LONGER CACHED (Ruling P75). It used to be read once per request and
+	 * held in a static, because every currentness test compared against it. It
+	 * has ONE reader now — the adoption of an `unset` record, which itself runs
+	 * at most once per request — so a cache would be a second copy of a value
+	 * nothing else asks for. Currentness is generation equality alone.
+	 *
+	 * @return array{ client: string|null, dashboard: string|null }
+	 */
+	public static function live_identity() {
+		$client    = class_exists( 'Aura_Worker_Rules' ) ? (string) Aura_Worker_Rules::bound_client() : '';
+		$dashboard = (string) get_option( 'aura_worker_dashboard_url', '' );
+		return array(
+			'client'    => '' === $client ? null : $client,
+			'dashboard' => '' === $dashboard ? null : $dashboard,
+		);
+	}
+
+	/**
+	 * Forget what this request has already decided about the binding.
+	 *
+	 * Since Ruling P75 that is one thing: whether the `unset` record has been
+	 * offered for adoption. A rotation calls it (the record it would adopt is
+	 * gone), and so does the test harness between cases.
+	 *
+	 * @return void
+	 */
+	public static function forget_live_identity() {
+		self::$binding_adopt_tried = false;
+	}
+
+	/**
+	 * Allocate the next seq by inserting the row that owns it.
+	 *
+	 * Entry fields: `ability`, `actor` (WHOSE call this is — under a replay
+	 * the actor stored on the hold, verbatim, never the approver's identity;
+	 * Ruling P36), `touches`, `verdict`, `rule_key`, and — on a replay —
+	 * `ref`, `ruleset_seq` and `approved_by` (WHO approved it: the replay
+	 * request's own actor, or null when it carries no identifiable user).
+	 * Later writers add `snapshot_id`, `ran`, `result`, `reason`, `error`,
+	 * `may_have_run`, the creation and collateral evidence, and `settled_at`.
+	 *
+	 * WHY THE FLOOR IS RE-CHECKED **AFTER** THE INSERT (Ruling P37). The
+	 * INSERT is the reservation — before it, this writer owns nothing, and a
+	 * floor read a moment earlier says nothing about the number it is about to
+	 * take. Between computing N and inserting it, another writer can insert
+	 * AND settle N, and `/door/ack` can raise the floor to N and delete that
+	 * row; the conditional INSERT then succeeds by RECREATING N at or below
+	 * the floor. Such a row is admitted and its callback runs, but
+	 * `log_after()` and `count_unacked()` both start above the floor, so Aura
+	 * never sees it and it is never acked — a governed write with no record,
+	 * for ever. Only a reservation can be compared against a floor that moved,
+	 * so the order is: insert, re-read the floor, and give the row back if it
+	 * lost.
+	 *
+	 * The give-back is a DELETE fenced on the exact bytes this call wrote —
+	 * never `delete_option()`, which would remove whatever now stands under
+	 * that name, including a racer's fresh reservation. Same shape as the
+	 * hold-queue lock's and the creation mutex's releases.
+	 *
+	 * @param array $entry Fields (ability, actor, touches, verdict, …).
+	 * @return int|WP_Error seq, or `aura_log_failed`.
+	 */
+	public static function open_pending( array $entry ) {
+		// The epoch is minted the moment door state first EXISTS, not the
+		// first time somebody reports it (Ruling P35). `present()` reads the
+		// epoch option as the single witness that this site has a door, and
+		// until now only `status_fragment()` minted one — so a write or a hold
+		// followed by Elementor being disabled BEFORE the first `/status`
+		// poll left rows nothing would ever report or reconcile. Minting here
+		// costs one conditional INSERT on the first row of a site's life and
+		// nothing after it.
+		//
+		// AND ITS ANSWER IS A CONDITION OF THE WRITE (Ruling P96). The mint's
+		// result was ignored, so a transient failure to insert or read the
+		// epoch left it empty while the row insert below went on to succeed —
+		// and if Elementor was disabled before anything else minted one,
+		// `present()` saw neither an active module nor its sole persisted
+		// witness. `/status` then omitted the outstanding row for ever and no
+		// reconciler ever swept it. Door state is never stored without the
+		// witness that makes it findable.
+		if ( '' === (string) self::epoch() ) {
+			return new WP_Error( 'aura_log_failed', 'This site could not establish its door log epoch; the call was not run.', array( 'status' => 503 ) );
+		}
+		// WHOSE ENTRY THIS IS, BEFORE ANY NUMBER IS TAKEN (Ruling P72). A row
+		// stamped with an empty binding read as "written before the generation
+		// existed" and was therefore current for ever — so a write admitted
+		// during a first-reader race stayed runnable after a rebind. Nothing
+		// has been reserved yet, so refusing here is retryable and free.
+		$binding = self::binding();
+		if ( null === $binding ) {
+			return new WP_Error( 'aura_log_failed', 'This site could not establish which Aura binding this call belongs to; it was not run.', array( 'status' => 503 ) );
+		}
+		for ( $try = 0; $try < self::ALLOC_TRIES; $try++ ) {
+			// CANNOT READ THE TOP, CANNOT ALLOCATE (Ruling P77). A null top used
+			// to cast to 0, so the next seq was computed from the floor alone —
+			// and on a site whose floor read was ALSO stale that hands out a
+			// number a row already owns. Retryable: nothing has been reserved.
+			$top = self::highest_row_seq();
+			if ( null === $top ) {
+				return new WP_Error( 'aura_log_failed', 'The door log could not be read; this call was not run.', array( 'status' => 503 ) );
+			}
+			$seq = max( $top, self::floor() ) + 1;
+			$row = array_merge(
+				$entry,
+				array(
+					'seq'      => $seq,
+					'at'       => gmdate( 'c' ),
+					// WHICH BINDING wrote this entry (Ruling P58). The log is
+					// the SITE's audit trail and is served whatever the current
+					// binding is, so a reader has to be able to see that an
+					// entry belongs to a client that has since gone.
+					'binding'  => $binding,
+					'result'   => 'pending',
+					'admitted' => false,
+				)
+			);
+			if ( self::insert_unique( self::PREFIX . $seq, $row ) ) {
+				// The ack raises the floor with raw SQL, so this request's
+				// option cache can still hold the value from before it.
+				wp_cache_delete( self::FLOOR, 'options' );
+				if ( $seq > self::floor() ) {
+					return $seq;
+				}
+				// Acked out from under this reservation: hand the number back
+				// and allocate above the floor that moved.
+				self::delete_row_fenced( self::PREFIX . $seq, $row );
+				continue;
+			}
+			// Unique-name collision: a concurrent writer took this number.
+		}
+		return new WP_Error( 'aura_log_failed', 'The door log could not record this call; it was not run.', array( 'status' => 503 ) );
+	}
+
+	/**
+	 * Delete a row ONLY while it still carries the bytes this request wrote.
+	 *
+	 * The predicate is the value, byte for byte, exactly as the hold-queue
+	 * lock and the creation mutex release themselves. A bare `delete_option()`
+	 * would remove whatever stands under that name now — including the
+	 * reservation a racer took after this one lost its number.
+	 *
+	 * @param string $option Option name.
+	 * @param mixed  $value  The value this request inserted.
+	 * @return bool One row removed.
+	 */
+	private static function delete_row_fenced( $option, $value ) {
+		global $wpdb;
+		$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+				$option,
+				maybe_serialize( $value )
+			)
+		);
+		wp_cache_delete( $option, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return 1 === (int) $gone;
+	}
+
+	/** @param int $seq Seq. @return bool */
+	public static function admit( $seq ) {
+		return self::patch( (int) $seq, array( 'admitted' => true ) );
+	}
+
+	/**
+	 * Settle a row terminally — ONCE. PENDING-ONLY (Ruling P27).
+	 *
+	 * A seq must never change meaning. `/status` can read a row as stale
+	 * while the request that owns it is still finishing, so both sides end up
+	 * holding a terminal verdict for the same number: the owner would
+	 * overwrite the reconciler's `interrupted` with `ok`, or the reconciler
+	 * would overwrite an `ok` with the verdict its earlier read implied — and
+	 * Aura may already have consumed the first. The first terminal writer
+	 * wins; everyone after it is told `false` and writes nothing.
+	 *
+	 * A caller that needs to ADD evidence to a row somebody else settled uses
+	 * annotate(), which cannot touch the result.
+	 *
+	 * @param int   $seq      Seq.
+	 * @param array $terminal Must carry `result` in TERMINAL.
+	 * @return bool The row is terminal BECAUSE OF THIS CALL. Use is_terminal()
+	 *              to tell "somebody settled it first" from "the write failed".
+	 */
+	public static function settle( $seq, array $terminal ) {
+		if ( ! isset( $terminal['result'] ) || ! in_array( $terminal['result'], self::TERMINAL, true ) ) {
+			return false;
+		}
+		$option = self::PREFIX . (int) $seq;
+		$before = self::row_from_db( $option );
+		if ( null === $before || 'pending' !== ( isset( $before['result'] ) ? $before['result'] : '' ) ) {
+			return false;
+		}
+		$terminal['settled_at'] = gmdate( 'c' );
+		// A terminal row is SERVED, so it is admitted in the same write
+		// (Codex round-6 P1 on #499): an `admit()` that failed a moment before
+		// a `settle()` that succeeded would otherwise leave a terminal row
+		// `log_after` stops at and the reconciler never revisits.
+		$terminal['admitted'] = true;
+		return self::write_option_where( $option, array_merge( $before, $terminal ), $before );
+	}
+
+	/**
+	 * Has this row reached a terminal result?
+	 *
+	 * Read from the DATABASE, not the option cache: the writer that beat this
+	 * one is another request. Terminal is final, so the answer cannot go
+	 * stale in the direction that matters.
+	 *
+	 * @param int $seq Seq.
+	 * @return bool
+	 */
+	public static function is_terminal( $seq ) {
+		$row = self::row_from_db( self::PREFIX . (int) $seq );
+		return null !== $row && 'pending' !== ( isset( $row['result'] ) ? $row['result'] : 'pending' );
+	}
+
+	/**
+	 * Add evidence to a row that is ALREADY terminal, without touching what
+	 * it says happened.
+	 *
+	 * The first terminal writer decides the RESULT (Ruling P27); a later
+	 * writer in the same request may still explain it — the throw that
+	 * followed a compensation, say — but never change it. `result` and
+	 * `settled_at` are dropped from the fields for exactly that reason.
+	 *
+	 * @param int   $seq    Seq.
+	 * @param array $fields Evidence.
+	 * @return bool
+	 */
+	public static function annotate( $seq, array $fields ) {
+		unset( $fields['result'], $fields['settled_at'] );
+		if ( empty( $fields ) ) {
+			return false;
+		}
+		$option = self::PREFIX . (int) $seq;
+		$before = self::row_from_db( $option );
+		if ( null === $before || 'pending' === ( isset( $before['result'] ) ? $before['result'] : 'pending' ) ) {
+			return false; // a pending row is settled, not annotated
+		}
+		return self::write_option_where( $option, array_merge( $before, $fields ), $before );
+	}
+
+	/**
+	 * A discarded row is ADMITTED in the same write (Codex round-5 P1 on
+	 * #499): `log_after` stops at an un-admitted row, and a discard that left
+	 * `admitted: false` would hide every later entry for ever.
+	 *
+	 * @param int $seq Seq. @return bool
+	 */
+	public static function discard( $seq ) {
+		return self::settle( $seq, array( 'result' => 'discarded' ) ); // settle() admits
+	}
+
+	/**
+	 * Patch a row that is still pending — the durable in-flight writes
+	 * (snapshot id, watermark, created ids, collateral ids). Never changes
+	 * `result`; never touches a row that already settled.
+	 *
+	 * @param int   $seq    Seq.
+	 * @param array $fields Fields (without `result`).
+	 * @return bool
+	 */
+	public static function patch_pending( $seq, array $fields ) {
+		unset( $fields['result'] );
+		$option = self::PREFIX . (int) $seq;
+		$before = self::row_from_db( $option );
+		if ( null === $before || 'pending' !== ( $before['result'] ?? '' ) ) {
+			return false;
+		}
+		return self::write_option_where( $option, array_merge( $before, $fields ), $before );
+	}
+
+	/**
+	 * The fence's own read: the binding GENERATION, taken from the DATABASE
+	 * past every cache (Ruling P64).
+	 *
+	 * The caches are the bug it was written for. By the time a replay reaches
+	 * its fence it has already been through `get_held()`, which populated
+	 * WordPress's option cache for the binding record — and a rebind completing
+	 * in ANOTHER PHP process invalidates it, because it lives in this process's
+	 * memory. The fence would then compare the claim against a generation that
+	 * was current when this request started and has not been since.
+	 *
+	 * ONE ROW (Ruling P75). It used to read the live identity as well and
+	 * compare it with the record's, because a connect could publish a new
+	 * identity over a live binding and the generation would not move until the
+	 * rotation landed. A connect cannot do that any more — it refuses
+	 * (`aura_site_bound`) — so the identity cannot change under a live binding,
+	 * and generation equality is the whole test.
+	 *
+	 * FAILS CLOSED: a read error answers `ok: false`, and the fence refuses. A
+	 * door that cannot prove whose it is does not run a mutation.
+	 *
+	 * @return array{ ok: bool, gen: string }
+	 */
+	public static function fence_identity() {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$raw              = self::raw_option( self::BINDING );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return array( 'ok' => false, 'gen' => '' );
+		}
+		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		// No record at all is not a failure — it is a site nobody has stated
+		// anything about — but it matches no stamped row, and an EMPTY stamp is
+		// never current either (Ruling P72).
+		$gen = is_array( $rec ) && isset( $rec['gen'] ) ? (string) $rec['gen'] : '';
+		return array( 'ok' => true, 'gen' => $gen );
+	}
+
+	/**
+	 * Is a stated identity PROVABLE — i.e. does it name a client (Ruling P66)?
+	 *
+	 * The callback URL a legacy dashboard signs carries no `client` line, so
+	 * the identity such a connect states is nothing but a dashboard base URL —
+	 * and two distinct Aura customers routinely share one. Comparing those two
+	 * identities for equality answered "same binding" for what is in fact a
+	 * different customer's site: reconnecting with a new token left the old
+	 * generation current, and the replacement client could then see, approve
+	 * and replay the departed client's held mutations.
+	 *
+	 * A dashboard URL alone is not an identity. It cannot be proven the same,
+	 * so it is never treated as the same.
+	 *
+	 * @param string|null $client The record's or the target's client.
+	 * @return bool
+	 */
+	private static function identity_is_provable( $client ) {
+		return null !== $client && '' !== (string) $client;
+	}
+
+	/**
+	 * `generation_is_live()` asked of the DATABASE, for the fences (Ruling
+	 * P64). A read it cannot trust answers false: the mutation does not run.
+	 *
+	 * @param string $gen The generation stamped on a row or a claim.
+	 * @return bool
+	 */
+	public static function generation_is_live_uncached( $gen ) {
+		$f = self::fence_identity();
+		if ( ! $f['ok'] ) {
+			return false;
+		}
+		// GENERATION EQUALITY IS THE WHOLE TEST (Ruling P75) — and an EMPTY
+		// stamp is never current (Ruling P72).
+		return '' !== (string) $gen && (string) $gen === $f['gen'];
+	}
+
+	/**
+	 * Is this generation the CURRENT one (Ruling P75)?
+	 *
+	 * It used to ask a second question as well — whether the record still
+	 * described the identity the site is live under — because a connect could
+	 * publish a new client over a live binding while the generation stayed put
+	 * until its rotation landed. A connect refuses that outright now
+	 * (`aura_site_bound`), so a rebind is an unbind followed by a connect and
+	 * no identity can move under a live generation. What is left is the
+	 * comparison the generation exists for.
+	 *
+	 * @param string $gen The generation stamped on a row.
+	 * @return bool
+	 */
+	public static function generation_is_live( $gen ) {
+		$rec = self::binding_record();
+		// GENERATION EQUALITY IS THE WHOLE TEST (Ruling P75) — and an EMPTY
+		// stamp is never current (Ruling P72).
+		return '' !== (string) $gen && (string) $gen === (string) $rec['gen'];
+	}
+
+	/**
+	 * The current generation, read RAW from the database and NEVER minted
+	 * (Rulings P51/P59).
+	 *
+	 * `binding()` mints when the record is absent, which is right for a writer
+	 * stamping a row and wrong for a FENCE: on a site whose record had gone
+	 * missing it would quietly manufacture agreement. A fence wants the
+	 * database's answer or nothing.
+	 *
+	 * @return string '' when there is no record.
+	 */
+	/**
+	 * Re-stamp the binding record's EPOCH witness, and nothing else (Ruling
+	 * P91).
+	 *
+	 * The grant-gated `/door/rotate` moves the log cursor legitimately and
+	 * touches no binding — but the record still names the epoch it was written
+	 * with, and P81's repair reads a disagreement as a half-done rebind. So the
+	 * next same-identity connect performed a FULL rebind: a new generation for
+	 * an identity that never changed, holds queued since the rotation gone
+	 * foreign, in-flight writes failing their fence. A rewind cost the site its
+	 * queue.
+	 *
+	 * This is the other half of that rule: a rotation that legitimately moves
+	 * the cursor says so on the record. The compare-and-swap is fenced on the
+	 * bytes just read and changes ONLY `epoch` — never the generation, the
+	 * state or the identity — so it cannot hand the site to anybody, which is
+	 * why it needs no site claim (the route holds none: it is Aura moving the
+	 * cursor it owns, not a rebind).
+	 *
+	 * JOINED TO THE EPOCH ROW (Ruling P92). Fencing on the record's bytes
+	 * alone was not enough: this rotation can pause after minting B while a
+	 * concurrent rotation or rebind installs C and stamps the record with it,
+	 * and the resumed call would then overwrite C's witness with a stale B —
+	 * manufacturing exactly the disagreement it exists to prevent, and costing
+	 * the site its queue on the next connect. The stamp lands only while the
+	 * LIVE epoch is still the one being stamped.
+	 *
+	 * Zero rows has two meanings and they are told apart by re-reading the
+	 * epoch: if it is no longer ours, a LATER rotation owns the witness now and
+	 * there is nothing left for this call to do — true, nothing owed. If it is
+	 * still ours, the record's bytes moved underneath, so re-read and try once
+	 * more (the winner may be a rebind that stamped it already). Still failing
+	 * with the epoch ours is the genuinely stale case — not fatal, since P81's
+	 * repair on the next connect is the documented fallback, so the caller is
+	 * told rather than refused.
+	 *
+	 * @param string $epoch The epoch the record should now name.
+	 * @return bool The record names it, or a later rotation owns it.
+	 */
+	public static function restamp_binding_epoch( $epoch ) {
+		global $wpdb;
+		$epoch = (string) $epoch;
+		if ( '' === $epoch ) {
+			return false;
+		}
+		for ( $try = 0; $try < 2; $try++ ) {
+			if ( $epoch !== self::epoch_raw() ) {
+				return true; // a later rotation owns the witness; this call owes nothing
+			}
+			$raw = self::raw_option( self::BINDING );
+			$rec = null === $raw ? null : maybe_unserialize( $raw );
+			if ( ! is_array( $rec ) || ! isset( $rec['gen'] ) ) {
+				return false; // no record to stamp; the next reader mints one with the current epoch
+			}
+			if ( isset( $rec['epoch'] ) && $epoch === (string) $rec['epoch'] ) {
+				return true;
+			}
+			$next             = $rec;
+			$next['epoch']    = $epoch;
+			$wpdb->last_error = '';
+			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} r JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x SET r.option_value = %s WHERE r.option_name = %s AND r.option_value = %s AND x.e = %s",
+					self::EPOCH,
+					maybe_serialize( $next ),
+					self::BINDING,
+					$raw,
+					$epoch
+				)
+			);
+			wp_cache_delete( self::BINDING, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			if ( 1 === (int) $rows && '' === (string) $wpdb->last_error ) {
+				return true;
+			}
+		}
+		// Still not stamped, and the epoch is still ours: genuinely stale.
+		return $epoch !== self::epoch_raw();
+	}
+
+	/**
+	 * The log epoch as the DATABASE has it, never minted (Ruling P81).
+	 *
+	 * `epoch()` mints when the row is absent, which is right for a reader and
+	 * wrong for the comparison that decides whether an earlier rebind finished:
+	 * a minted epoch would agree with nothing and read as a repair that is not
+	 * needed.
+	 *
+	 * @return string '' when there is no epoch row.
+	 */
+	public static function epoch_raw() {
+		$raw = self::raw_option( self::EPOCH );
+		$val = null === $raw ? null : maybe_unserialize( $raw );
+		return is_string( $val ) ? $val : '';
+	}
+
+	public static function binding_raw() {
+		$raw = self::raw_option( self::BINDING );
+		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		return is_array( $rec ) && isset( $rec['gen'] ) ? (string) $rec['gen'] : '';
+	}
+
+	/**
+	 * Move the binding to a new IDENTITY, minting a generation (Rulings
+	 * P58/P59).
+	 *
+	 * This is what a rebind does, in place of deleting the door. Nothing is
+	 * removed: every held, claimed and log row keeps its own `binding`, and
+	 * from this moment the ones stamped with the old generation are another
+	 * client's — invisible to the queue's readers, swept when the reconciler
+	 * next runs, and still readable in the log, which is the SITE's audit trail
+	 * rather than any one binding's.
+	 *
+	 * IDEMPOTENT and VERIFIED. Idempotent because the record names the identity
+	 * it belongs to, so a connect that changes nothing rotates nothing — which
+	 * is what lets a FAILED rotation simply be retried by the next connect
+	 * instead of needing to be undone. Verified because the swap is a
+	 * compare-and-swap on the bytes just read and exactly one row must change:
+	 * a transient failure used to be indistinguishable from a rotation that
+	 * happened, and a changed-client connect would complete with the departed
+	 * client's holds still current (F1).
+	 *
+	 * CLAIM-CONDITIONED, ALWAYS (Ruling P78). The claim key and fence are
+	 * REQUIRED — there is no unconditional form, because every caller that has
+	 * one is in the middle of a lifecycle operation that another request can
+	 * take the site away from mid-flight, and the one caller that forgot to
+	 * pass them (the connect) is exactly how the winner's generation got
+	 * rotated by a stale handler.
+	 *
+	 * TWO checks, not one. `holds_site_claim()` immediately before the write
+	 * so a caller that has already lost the site does not even try, and the
+	 * claim row JOINED INTO the statement so the answer cannot go stale
+	 * between asking and acting.
+	 *
+	 * CLAIM-CONDITIONAL (Ruling P68). An unbind's
+	 * Phase B can run long enough for `SITE_CLAIM_TAKEOVER_AFTER` to elapse and
+	 * a replacement connect to seize the site claim; a stale cleanup resuming
+	 * afterwards would rotate the WINNER's binding to `unbound`, and every hold
+	 * the new client queued would go invisible while its governed callbacks
+	 * failed the binding fence until somebody reconnected. Every other Phase-B
+	 * step is joined to the claim row; so is this one now — and joined in the
+	 * SAME statement as the compare-and-swap, so there is no window between
+	 * checking the claim and acting on it.
+	 *
+	 * @param array  $identity { client: string|null, dashboard: string|null }.
+	 * @param string $claim    Site-claim option name. REQUIRED.
+	 * @param string $fence    The caller's claim fence. REQUIRED.
+	 * @return bool The record now names this identity.
+	 */
+	public static function rotate_binding( array $identity, $claim, $fence ) {
+		global $wpdb;
+		$claim = (string) $claim;
+		$fence = (string) $fence;
+		if ( '' === $claim || '' === $fence ) {
+			return false; // a rotation with nothing holding the site is not one
+		}
+		// The claim as it stands NOW, before anything is read or written. The
+		// join below is what makes the answer binding; this is what stops a
+		// caller that already knows it lost the site from doing the work.
+		if ( class_exists( 'Aura_Worker_Magic_Link' ) && ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			return false;
+		}
+		$claimed = true;
+		$client    = isset( $identity['client'] ) && '' !== (string) $identity['client'] ? (string) $identity['client'] : null;
+		$dashboard = isset( $identity['dashboard'] ) && '' !== (string) $identity['dashboard'] ? (string) $identity['dashboard'] : null;
+
+		$raw = self::raw_option( self::BINDING );
+		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		$rec = is_array( $rec ) && isset( $rec['gen'] ) ? $rec : null;
+
+		// The TARGET state: an unbind states nobody, everything else states a
+		// binding (a keyless connect is still `bound` — it names a dashboard).
+		$target = ( null === $client && null === $dashboard ) ? self::BINDING_UNBOUND : self::BINDING_BOUND;
+
+		// ALREADY THIS IDENTITY ⇒ nothing to do (Ruling P59). This is what
+		// makes the rotation safe to retry: every connect calls it, and only a
+		// connect that actually CHANGES the binding moves the generation.
+		//
+		// STATE FIRST (Ruling P61). A lazily-minted `unset` record has a null
+		// identity and is NOT an unbound site — it is a site nobody has stated
+		// anything about, typically one 2.16 met already connected. Treating it
+		// as equal to an unbind meant the unbind rotated nothing and callbacks
+		// waiting at the generation fence walked through after the site had
+		// been unbound. `unset` always rotates.
+		//
+		// A CLIENTLESS CONNECT ALWAYS ROTATES (Ruling P66). The legacy connect
+		// callback signs no `client` line, so both sides of this comparison
+		// state nothing but a dashboard base URL — which two different Aura
+		// customers commonly share. Treating those as the same binding meant a
+		// site reconnected to a DIFFERENT customer on the same dashboard kept
+		// the departed client's generation current, and the replacement could
+		// receive and approve mutations that were never theirs. An identity
+		// that cannot be proven the same is not the same.
+		//
+		// THE COST, stated plainly: a legacy dashboard re-saving the same
+		// site's token rotates the generation every time, which retires that
+		// site's outstanding holds and moves its epoch even though nothing
+		// about the site changed. An unnecessary rotation costs a queue; a
+		// missed one hands one customer's writes to another.
+		//
+		// An UNBIND is exempt, and is the only exemption: `unbound` states
+		// nobody at all, which is fully determined and cannot be confused with
+		// another customer's claim on the same dashboard. Its idempotence is
+		// load-bearing — the unbind step is retried until every kind reports
+		// clean, and a second pass must not keep minting generations.
+		$provable = self::BINDING_UNBOUND === $target || self::identity_is_provable( $client );
+		if ( null !== $rec && $provable ) {
+			$state = self::normalise_binding( $rec );
+			if ( self::BINDING_UNSET !== $state['state']
+				&& $state['state'] === $target
+				&& ( self::BINDING_UNBOUND === $target || self::identity_is_provable( $state['client'] ) )
+				&& $state['client'] === $client
+				&& $state['dashboard'] === $dashboard
+				// …AND THE EPOCH IT WAS WRITTEN WITH IS STILL THE SITE'S
+				// (Ruling P81). A rebind whose record CAS failed after the
+				// epoch had already rotated leaves the two disagreeing, and the
+				// identity-equal shortcut used to declare that finished: the new
+				// binding stayed on the PREVIOUS epoch, and a previously
+				// authenticated ack carrying it could advance the floor over
+				// the new binding's own entries. When they differ the rotation
+				// runs again — a retry repairs it, which is the whole point of
+				// the shortcut being idempotent rather than merely fast.
+				//
+				// A record with no `epoch` predates this rule and reads as
+				// differing exactly once, which repairs it too.
+				&& '' !== (string) $state['epoch']
+				&& (string) $state['epoch'] === self::epoch_raw()
+			) {
+				return true;
+			}
+		}
+
+		// THE EPOCH MOVES FIRST, AND ITS SUCCESS IS PART OF THE REBIND (Ruling
+		// P81). It used to follow the record's compare-and-swap with its answer
+		// ignored: a failed rotation left the NEW binding sitting on the
+		// PREVIOUS epoch and the rebind still reported success. Nothing
+		// repaired it either — the next connect states the same identity, the
+		// shortcut above declared it done — so an ack authenticated under the
+		// old binding, carrying that same epoch, could advance the floor over
+		// the new binding's log entries.
+		//
+		// Rotating first makes the failure harmless: nothing else has changed,
+		// so the record still names the old binding and the caller's retry
+		// simply does the whole thing again.
+		$was = self::epoch(); // read BEFORE the rotation, which fences on it
+		// The claim, again, immediately before the epoch moves (Ruling P83).
+		// The read above and the identity comparison take time, and a handler
+		// that has lost the site in the meantime must not move the winner's
+		// cursor — the join below is the binding answer, this is the one that
+		// stops the work being done at all.
+		if ( class_exists( 'Aura_Worker_Magic_Link' ) && ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			return false;
+		}
+		$rot       = self::rotate_epoch( $was, $claim, $fence );
+		$new_epoch = (string) ( isset( $rot['epoch'] ) ? $rot['epoch'] : '' );
+		if ( empty( $rot['rotated'] ) || '' === $new_epoch || $new_epoch === $was ) {
+			return false; // the record is untouched; the retry starts over
+		}
+		$next = array(
+			'gen'       => wp_generate_uuid4(),
+			'state'     => $target,
+			'client'    => $client,
+			'dashboard' => $dashboard,
+			// WHICH EPOCH THIS BINDING BELONGS TO: the witness the shortcut
+			// above compares, so a half-done rebind is visible to the retry.
+			'epoch'     => $new_epoch,
+		);
+
+		$like = $claimed ? $wpdb->esc_like( $fence . '|' ) . '%' : '';
+		if ( null === $rec ) {
+			// No record at all: a real conditional INSERT, so a concurrent
+			// minter cannot be overwritten blind. Under a claim it is the same
+			// INSERT with the claim row as its source, so a caller whose claim
+			// was taken over mints nothing either.
+			if ( $claimed ) {
+				$wpdb->last_error = '';
+				$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->prepare(
+						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, 'yes' FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+						self::BINDING,
+						maybe_serialize( $next ),
+						$claim,
+						$like,
+						self::BINDING
+					)
+				);
+				$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+			} else {
+				$done = self::insert_unique( self::BINDING, $next );
+			}
+		} elseif ( $claimed ) {
+			// The compare-and-swap AND the claim check, in one statement
+			// (Ruling P68): a claim seized by a replacement connect between the
+			// two would otherwise let a stale cleanup rotate the winner's
+			// record out from under it.
+			$wpdb->last_error = '';
+			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s AND o.option_value = %s",
+					$claim,
+					$like,
+					maybe_serialize( $next ),
+					self::BINDING,
+					$raw
+				)
+			);
+			$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+		} else {
+			// COMPARE-AND-SWAP on the bytes just read (F1): a transient failure
+			// must not read as a rotation that happened, or a changed-client
+			// connect would complete with the departed client's holds still
+			// current and replayable by the replacement.
+			$wpdb->last_error = '';
+			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+					maybe_serialize( $next ),
+					self::BINDING,
+					$raw
+				)
+			);
+			$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+		}
+		wp_cache_delete( self::BINDING, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		self::forget_live_identity();
+		// The epoch has already moved, so a failed record write leaves the site
+		// on a fresh cursor with the OLD binding — visible to the retry as an
+		// epoch the record does not name, and repaired by it.
+		return $done;
+	}
+
+	/**
+	 * One option's raw, still-serialised bytes from the DATABASE — never this
+	 * request's cache. The predicate a compare-and-swap fences on.
+	 *
+	 * @param string $name Option name.
+	 * @return string|null
+	 */
+	private static function raw_option( $name ) {
+		global $wpdb;
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ) );
+		return null === $raw ? null : (string) $raw;
+	}
+
+	/** @param int $seq Seq. @return array|null */
+	public static function get( $seq ) {
+		$row = get_option( self::PREFIX . (int) $seq, null );
+		return is_array( $row ) ? $row : null;
+	}
+
+	/**
+	 * Conditional in-place update: compare-and-set on the bytes read a moment
+	 * ago, so a row another writer deleted is never recreated and a row it
+	 * changed is never overwritten blind.
+	 *
+	 * @param int   $seq    Seq.
+	 * @param array $fields Fields to merge.
+	 * @return bool ONE row changed.
+	 */
+	private static function patch( $seq, array $fields ) {
+		$option = self::PREFIX . $seq;
+		$before = self::row_from_db( $option );
+		if ( null === $before ) {
+			return false;
+		}
+		$after = array_merge( $before, $fields );
+		return self::write_option_where( $option, $after, $before );
+	}
+
+	/**
+	 * `UPDATE … SET option_value = %s WHERE option_name = %s AND option_value = %s`.
+	 * Public: the holds store and the governor use the same primitive.
+	 *
+	 * @param string $option Option name.
+	 * @param array  $after  New value.
+	 * @param array  $before The value the caller read (the predicate).
+	 * @return bool
+	 */
+	public static function write_option_where( $option, array $after, array $before ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$n                = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				maybe_serialize( $after ),
+				$option,
+				maybe_serialize( $before )
+			)
+		);
+		wp_cache_delete( $option, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return 1 === (int) $n && '' === (string) $wpdb->last_error;
+	}
+
+	/**
+	 * The row as the DATABASE holds it — never this request's option cache.
+	 *
+	 * @param string $option Option name.
+	 * @return array|null
+	 */
+	private static function row_from_db( $option ) {
+		global $wpdb;
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		if ( null === $raw ) {
+			return null;
+		}
+		$val = maybe_unserialize( $raw );
+		return is_array( $val ) ? $val : null;
+	}
+
+	/**
+	 * One log row, read for a FENCE (Ruling P74).
+	 *
+	 * `get()` goes through `get_option()`, which answers null for a missing row
+	 * and for a read that failed alike — and the fence used to read that null
+	 * as "no stamp, carry on". A rebind landing while the call was admitted
+	 * then let the old request enter its mutation at precisely the moment
+	 * nothing could prove which binding owned it.
+	 *
+	 * Three answers, because there are three facts: the row, NULL for a row
+	 * that is genuinely absent, and FALSE for a read that failed. The fence
+	 * refuses on both of the last two, and tells them apart because only one
+	 * of them has anything to record.
+	 *
+	 * @param int $seq Log seq.
+	 * @return array|null|false
+	 */
+	public static function row_for_fence( $seq ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$raw              = self::raw_option( self::PREFIX . (int) $seq );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return false;
+		}
+		if ( null === $raw ) {
+			return null;
+		}
+		$val = maybe_unserialize( $raw );
+		return is_array( $val ) ? $val : false;
+	}
+
+	/** @return int */
+	public static function floor() {
+		return (int) get_option( self::FLOOR, 0 );
+	}
+
+	/**
+	 * The highest seq that has a row — or NULL when that cannot be established
+	 * (Ruling P77).
+	 *
+	 * `get_var()` answers null both for "no rows" and for a statement that
+	 * failed at the driver, and `(int)` turned both into 0 — a valid-looking
+	 * top. A legitimate `door_after` above the ack floor then read as a REWIND:
+	 * `/status` reported one, Aura rotated a healthy epoch, invalidated an
+	 * in-flight ack and resynchronised the whole log, with nothing having been
+	 * rewound at all. `open_pending()` allocated from a top of 0, and `ack()`
+	 * clamped a real cursor down to the floor.
+	 *
+	 * Not knowing is not zero. An empty log IS zero — a null with no
+	 * `last_error` — and that is the only thing that answers 0.
+	 *
+	 * @return int|null
+	 */
+	public static function highest_row_seq() {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$like = $wpdb->esc_like( self::PREFIX ) . '%';
+		// The NUMERIC rows only: the floor, the closure marker and the refusal
+		// counter share this prefix and a non-numeric suffix casts to 0
+		// (Codex round-4 P1 on #499 — an ack that deleted the floor would
+		// restart numbering at 1 under Aura's cursor).
+		$n = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT MAX(CAST(SUBSTRING(option_name, %d) AS UNSIGNED)) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name REGEXP %s",
+				strlen( self::PREFIX ) + 1,
+				$like,
+				self::ROW_REGEXP
+			)
+		);
+		if ( false === $n || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		return (int) $n;
+	}
+
+	/**
+	 * How many rows Aura has not acknowledged — or NULL when that cannot be
+	 * read (Ruling P53).
+	 *
+	 * `get_var()` answers null for a broken statement exactly as it does for a
+	 * real zero, and `(int) null` is 0 — so a COUNT that failed while ordinary
+	 * option writes still worked reported an EMPTY log. Every admission check
+	 * compares this against MAX_UNACKED, so a false zero admitted writes past
+	 * the bound for as long as the failure lasted, and `ack()` deleted the
+	 * closure marker over a backlog that was still full.
+	 *
+	 * Null is therefore its own answer, and every caller has to decide what to
+	 * do about not knowing. None of them may treat it as zero.
+	 *
+	 * @return int|null
+	 */
+	public static function count_unacked() {
+		global $wpdb;
+		$like             = $wpdb->esc_like( self::PREFIX ) . '%';
+		$wpdb->last_error = '';
+		$n                = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name REGEXP %s AND CAST(SUBSTRING(option_name, %d) AS UNSIGNED) > %d",
+				$like,
+				self::ROW_REGEXP,
+				strlen( self::PREFIX ) + 1,
+				self::floor()
+			)
+		);
+		if ( null === $n || false === $n || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		return (int) $n;
+	}
+
+	/** @return bool */
+	public static function is_closed() {
+		return false !== get_option( self::FULL_MARKER, false );
+	}
+
+	/** One owner: the INSERT. */
+	public static function close() {
+		if ( self::insert_unique( self::FULL_MARKER, gmdate( 'c' ) ) ) {
+			return true;
+		}
+		// A LOST insert is a closure too — somebody else's marker is under that
+		// name — but a FAILED one is not (Ruling P82), and `insert_unique()`
+		// answers false to both. Ask the row: the marker is either there or it
+		// is not, and a closure nobody can prove is not one.
+		return null !== self::raw_option( self::FULL_MARKER );
+	}
+
+	/** Atomic increment, no row per refusal. */
+	public static function bump_refused() {
+		global $wpdb;
+		$wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+				self::FULL_COUNTER
+			)
+		);
+		wp_cache_delete( self::FULL_COUNTER, 'options' );
+	}
+
+	/**
+	 * @return array{ since: string|null, refused: int }|null
+	 */
+	public static function full_report() {
+		if ( ! self::is_closed() ) {
+			return null;
+		}
+		return array(
+			'since'   => (string) get_option( self::FULL_MARKER, '' ),
+			'refused' => (int) get_option( self::FULL_COUNTER, 0 ),
+		);
+	}
+
+	/**
+	 * Aura committed everything up to $seq: raise the floor (upward only,
+	 * BEFORE the delete), delete the rows, reopen if under the bound.
+	 *
+	 * $seq is CLAMPED to the top of the log — the highest seq that exists,
+	 * or the floor when the ack emptied it, which is exactly the ceiling
+	 * open_pending() allocates above. An ack is a caller's assertion about
+	 * numbers this site issued, and a nonsense one (PHP_INT_MAX, a cursor
+	 * from a different site) must not become the site's own floor: the next
+	 * open_pending() would compute PHP_INT_MAX + 1 as a FLOAT, mint option
+	 * names like `aura_worker_door_log_9.2233720368548E+18` that the row
+	 * REGEXP never matches again, and the log would never allocate a
+	 * readable number afterwards.
+	 *
+	 * The purge is bounded by the FLOOR the raise settled on, never by $seq:
+	 * a stale ack below a floor that is already higher would otherwise leave
+	 * the rows in `($seq, $floor]` behind — under the floor, so never served,
+	 * never acked and never deleted.
+	 *
+	 * A SEQ ABOVE THE TOP ACKNOWLEDGES NOTHING (Ruling P95). It used to be
+	 * CLAMPED down to the top, which is exactly wrong after an options-table
+	 * rewind: between the rewind and `/status` detecting it, an in-flight ack
+	 * from the pre-rewind log still carries the CURRENT epoch, and if a new
+	 * write has already reused the next number, clamping that old, higher
+	 * cursor raises the floor straight through the new row and deletes an entry
+	 * Aura never received. Such an ack is stale by construction — it names rows
+	 * this log does not have — and it is answered `stale: true` with nothing
+	 * written at all. The overflow the clamp guarded against cannot happen
+	 * without it: the floor is only ever raised to a cursor at or below the
+	 * top.
+	 *
+	 * @param string $epoch The epoch Aura is acking.
+	 * @param int    $seq   Highest seq of its contiguous committed prefix.
+	 * @return array{ acked: int, floor: int, stale?: bool }
+	 */
+	public static function ack( $epoch, $seq ) {
+		global $wpdb;
+		$seq = (int) $seq;
+		if ( ! is_string( $epoch ) || $epoch !== self::epoch() ) {
+			return array( 'acked' => 0, 'floor' => self::floor() );
+		}
+		// AN UNREADABLE TOP CLAMPS NOTHING (Ruling P77). It used to cast to 0,
+		// so `$top` fell back to the floor and a legitimate cursor above it was
+		// clamped down — acking rows Aura had not acked and deleting them. The
+		// ack simply does not happen; Aura repeats it.
+		$max = self::highest_row_seq();
+		if ( null === $max ) {
+			return array( 'acked' => 0, 'floor' => self::floor() );
+		}
+		$top = max( $max, self::floor() );
+		if ( $seq > $top ) {
+			// Above everything this log has: a cursor from a log that was
+			// rewound out from under Aura (Ruling P95). Nothing is written —
+			// not the floor's insert, not its raise, not the purge — and the
+			// answer says why, so Aura re-reads rather than assuming its ack
+			// landed.
+			return array(
+				'acked' => 0,
+				'floor' => self::floor(),
+				'stale' => true,
+			);
+		}
+		if ( $seq < 1 ) {
+			return array( 'acked' => 0, 'floor' => self::floor() );
+		}
+		// Floor: INSERT if absent, else raise only when lower. The floor as it
+		// stood BEFORE the raise bounds the cache invalidation below to the
+		// newly acked range — never 1..seq on a site with a long history
+		// (Codex round-5 P2).
+		self::insert_unique( self::FLOOR, 0 );
+		$prev_floor_before_raise = self::floor();
+		// JOINED TO THE EPOCH ROW (Ruling P90). The check at the top of this
+		// method reads the epoch and then lets go of it, so a `/door/rotate` or
+		// a rebind installing a new epoch in between still had this ack advance
+		// the SHARED floor — and after a rewind that is destructive: an old,
+		// high cursor from epoch A is clamped against epoch B's freshly written
+		// rows, and the delete below then removes entries Aura has never seen.
+		//
+		// The epoch row is a condition of the statement itself, so the ack
+		// linearises before or after a rotation and never across one.
+		$raised = (int) $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x SET f.option_value = %s WHERE f.option_name = %s AND x.e = %s AND CAST(f.option_value AS UNSIGNED) < %d",
+				self::EPOCH,
+				(string) $seq,
+				self::FLOOR,
+				(string) $epoch,
+				$seq
+			)
+		);
+		wp_cache_delete( self::FLOOR, 'options' );
+		if ( $raised < 1 && (string) $epoch !== self::epoch_raw() ) {
+			// Zero rows AND the epoch has moved: this ack crossed a rotation
+			// and owns nothing here. Zero rows with the epoch UNCHANGED is the
+			// ordinary idempotent repeat — the floor is already at or above
+			// this cursor — and still falls through to the delete, which is how
+			// a previous ack's unfinished purge is completed.
+			return array( 'acked' => 0, 'floor' => self::floor() );
+		}
+		$floor = self::floor();
+		$acked = 0;
+		if ( $floor > 0 ) {
+			$prev_floor = $prev_floor_before_raise; // read BEFORE the raise, below
+			$like  = $wpdb->esc_like( self::PREFIX ) . '%';
+			// Joined to the epoch row as well (Ruling P90): the purge is the
+			// destructive half, and it must not run under an epoch this ack
+			// was never for — including one installed between the raise above
+			// and this statement.
+			$acked = (int) $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"DELETE f FROM {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x WHERE f.option_name LIKE %s AND f.option_name REGEXP %s AND x.e = %s AND CAST(SUBSTRING(f.option_name, %d) AS UNSIGNED) <= %d",
+					self::EPOCH,
+					$like,
+					self::ROW_REGEXP,
+					(string) $epoch,
+					strlen( self::PREFIX ) + 1,
+					$floor
+				)
+			);
+			for ( $i = $prev_floor + 1; $i <= $floor; $i++ ) {
+				wp_cache_delete( self::PREFIX . $i, 'options' );
+			}
+		}
+		// Reopened only on a READABLE count under the bound (Ruling P53). An
+		// unreadable one used to cast to 0 and delete the marker over a
+		// backlog that was still full — the door open again with nothing
+		// having been acked.
+		$unacked = self::count_unacked();
+		if ( self::is_closed() && null !== $unacked && $unacked < self::MAX_UNACKED ) {
+			delete_option( self::FULL_MARKER );
+			delete_option( self::FULL_COUNTER );
+		}
+		return array( 'acked' => $acked, 'floor' => $floor );
+	}
+
+	/**
+	 * Terminal entries with seq > $after, ascending, stopping at the first
+	 * pending or un-admitted row — the site-side contiguous prefix.
+	 *
+	 * @param int $after Aura's cursor.
+	 * @param int $limit Page size.
+	 * @return array[]
+	 */
+	public static function log_after( $after, $limit = self::PAGE ) {
+		$after = max( (int) $after, self::floor() );
+		$out   = array();
+		$seq   = $after;
+		// An unreadable top does not bound the walk (Ruling P77) — the hole
+		// check below and $limit already do, and stopping at a top of 0 would
+		// serve an empty page for a log that is simply unreadable at the top.
+		$top       = self::highest_row_seq();
+		$unbounded = ( null === $top );
+		while ( count( $out ) < $limit && ( $unbounded || $seq < $top ) ) {
+			$seq++;
+			$row = self::get( $seq );
+			if ( null === $row ) {
+				break; // a number with no row is a hole — cannot happen by construction; stop rather than skip
+			}
+			if ( empty( $row['admitted'] ) || 'pending' === ( $row['result'] ?? 'pending' ) ) {
+				break;
+			}
+			$out[] = $row;
+		}
+		return $out;
+	}
+
+	/**
+	 * Mints a new epoch, clears the closure state, and leaves every log row
+	 * — and the ACK FLOOR — in place: the recovery from a rewound log, which
+	 * `/status` REPORTS (`rewind.detected`) and Aura DECIDES, through the
+	 * grant-gated `POST /aura/v1/door/rotate` (Ruling P20). It is never a
+	 * side effect of a read: a rotation invalidates every ack in flight, so
+	 * an unauthenticated-by-grant caller who could trigger one could starve
+	 * the log to MAX_UNACKED and close the write door.
+	 *
+	 * The floor is RETAINED, and that is the whole of the rule. It is not
+	 * Aura's cursor, which the new epoch invalidates anyway; it is this
+	 * site's record of which numbers no longer have rows. Deleting it made
+	 * `log_after(0)` walk from 1 on any site that had ever acked, where it
+	 * met the first deleted number, read it as a hole, and stopped — for
+	 * ever. The log then served `[]` on every poll while `count_unacked()`
+	 * climbed to MAX_UNACKED and closed the door (Ruling P2').
+	 *
+	 * A COMPARE-AND-SWAP on the epoch it was asked to replace (Ruling P23).
+	 * Two separately granted rotations answering the SAME rewind both pass
+	 * the caller's current-epoch check before either writes; an
+	 * unconditional delete then removed the epoch the winner had just
+	 * minted and rotated a second time — invalidating an ack already in
+	 * flight against the winner's, which is the very starvation rotation
+	 * exists to end. The delete is FENCED on `$expected`, the same shape
+	 * every other mutex delete in the door uses, and a 0-row delete means
+	 * somebody else got there first: the epoch now in force is answered,
+	 * and nothing is written.
+	 *
+	 * The closure state is cleared only by the winner — a loser that
+	 * cleared it would be reopening a log the winner's own rotation has
+	 * already accounted for.
+	 *
+	 * @param string $expected The epoch the caller means to replace.
+	 * @return array{ rotated: bool, epoch: string } `epoch` is the one now in force either way.
+	 */
+	public static function rotate_epoch( $expected, $claim = '', $fence = '' ) {
+		global $wpdb;
+		$expected = (string) $expected;
+		$claim    = (string) $claim;
+		$fence    = (string) $fence;
+		if ( '' === $expected ) {
+			return array(
+				'rotated' => false,
+				'epoch'   => self::epoch(),
+			);
+		}
+		// CLAIM-CONDITIONED WHEN A REBIND ASKS (Ruling P83). A connect or unbind
+		// handler that passed `holds_site_claim()` and then stalled until
+		// another handler took the site over could resume here and rotate the
+		// WINNER's epoch — invalidating its in-flight acks and leaving its
+		// record naming a cursor the site has left — before the record's own
+		// claim-joined write finally rejected it. The claim row is joined into
+		// the same statement as the value fence, so there is no window between
+		// asking and acting.
+		//
+		// The grant-gated `/door/rotate` route passes none: it is Aura moving
+		// the cursor it owns, not a rebind, and holds no site claim.
+		if ( '' !== $claim && '' !== $fence ) {
+			$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name = %s AND o.option_value = %s",
+					$claim,
+					$wpdb->esc_like( $fence . '|' ) . '%',
+					self::EPOCH,
+					$expected
+				)
+			);
+			wp_cache_delete( self::EPOCH, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			if ( 1 !== (int) $gone ) {
+				return array(
+					'rotated' => false,
+					'epoch'   => self::epoch(),
+				);
+			}
+			delete_option( self::FULL_MARKER );
+			delete_option( self::FULL_COUNTER );
+			return array(
+				'rotated' => true,
+				'epoch'   => self::epoch(),
+			);
+		}
+		$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::EPOCH, $expected ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		wp_cache_delete( self::EPOCH, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		if ( 1 !== (int) $gone ) {
+			return array(
+				'rotated' => false,
+				'epoch'   => self::epoch(),
+			);
+		}
+		delete_option( self::FULL_MARKER );
+		delete_option( self::FULL_COUNTER );
+		return array(
+			'rotated' => true,
+			'epoch'   => self::epoch(),
+		);
+	}
+
+	/**
+	 * Rows still pending (or never admitted) whose `at` is older than $ms.
+	 *
+	 * ONE statement: count_unacked()'s predicate — the numeric rows above the
+	 * ack floor — with the rows themselves returned instead of counted, then
+	 * `result` and age filtered in PHP. It walked `floor()+1 … highest_row_seq()`
+	 * with one get_option() per number, and this runs at the head of EVERY
+	 * `/status` poll: on a site whose ack is a thousand entries behind, that
+	 * was a thousand option reads per poll on the site's hottest endpoint,
+	 * and a gap between the floor and the top cost a read for each number
+	 * that has no row at all.
+	 *
+	 * Ordered by seq ascending, as the walk was — the reconciler settles in
+	 * that order and its counters are reported in it.
+	 *
+	 * @param int $ms Age in milliseconds.
+	 * @return array[]
+	 */
+	public static function stale_pending( $ms ) {
+		global $wpdb;
+		$cut  = time() - (int) floor( $ms / 1000 );
+		$like = $wpdb->esc_like( self::PREFIX ) . '%';
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name REGEXP %s AND CAST(SUBSTRING(option_name, %d) AS UNSIGNED) > %d",
+				$like,
+				self::ROW_REGEXP,
+				strlen( self::PREFIX ) + 1,
+				self::floor()
+			),
+			ARRAY_A
+		);
+		$out = array();
+		foreach ( (array) $rows as $r ) {
+			if ( ! isset( $r['option_name'], $r['option_value'] ) ) {
+				continue;
+			}
+			$row = maybe_unserialize( $r['option_value'] );
+			if ( ! is_array( $row ) || 'pending' !== ( $row['result'] ?? '' ) ) {
+				continue;
+			}
+			if ( strtotime( (string) ( $row['at'] ?? '' ) ) > $cut ) {
+				continue;
+			}
+			// Keyed by the NAME's suffix, not by the row's own `seq` field: the
+			// name is what the number is, and a row whose stored `seq` somehow
+			// disagreed must still sort where its row actually lives.
+			$out[ (int) substr( (string) $r['option_name'], strlen( self::PREFIX ) ) ] = $row;
+		}
+		ksort( $out, SORT_NUMERIC );
+		return array_values( $out );
+	}
+}

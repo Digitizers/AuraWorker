@@ -479,8 +479,78 @@ class Aura_Worker_Magic_Link {
 				409
 			);
 		}
-		if ( ! empty( $stored['connect_user_id'] ) ) {
-			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
+		// A CONNECT NEVER RUNS OVER A LIVE FOREIGN BINDING (Ruling P75).
+		//
+		// This is the construction that closes the whole rebind race class.
+		// Everything before it tried to make a REPOINT safe — a site bound to
+		// client A being handed to client B in one request, with A's holds, log
+		// rows and in-flight callbacks still on it. Six rulings went into
+		// narrowing the window between "B's credentials work" and "A's rows
+		// stop being current"; the window cannot be closed by ordering, because
+		// a request that authenticated a moment ago is already past every gate.
+		//
+		// So the repoint is not supported. A rebind is an UNBIND followed by a
+		// CONNECT: the unbind rotates the generation to `unbound` (Ruling P59),
+		// which retires A's queue and log cursor under a state everything can
+		// see, and only then may B connect. A connect that meets a live foreign
+		// binding refuses and writes NOTHING.
+		//
+		// Placed AFTER finish_before_rebind() — that settles the DEPARTED
+		// binding's Phase-B debt, which is what turns a properly unbound site's
+		// record into `unbound` — and BEFORE this install's first write.
+		//
+		// The record is read through binding_record(), so an upgraded site that
+		// 2.16 met already connected has its `unset` placeholder ADOPTED to the
+		// identity it is demonstrably live under first (Ruling P73), and reads
+		// as `bound` here like any other connected site.
+		//
+		// The comparison is on the CLIENT, under P66's rule: an identity that
+		// names no client cannot be proven the same as another, so a clientless
+		// connect onto a bound site refuses too. A dashboard base URL is shared
+		// by every site of every customer on it and proves nothing.
+		//
+		// AND IT FAILS CLOSED (Ruling P75 follow-up). This check IS the
+		// protection now, so a record it cannot establish must not be read as
+		// permission to bind. Two ways that happens, both answered
+		// `aura_door_failed` 503 — retryable, nothing written:
+		//
+		//   - the record could not be READ at all (`gen` empty). A real record
+		//     always carries a generation, so an empty one means the row could
+		//     not be read or the lost-mint re-read failed (Ruling P72).
+		//   - the record still says `unset` while the site HAS a live identity.
+		//     Adoption is what turns an upgraded site's placeholder into the
+		//     `bound` record this refusal reads (Ruling P73), so an adoption
+		//     that could not be proven leaves a site that IS bound looking like
+		//     one that is not — precisely the reading that would let another
+		//     client bind over it.
+		if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+			$record = Aura_Worker_Door_Log::binding_record();
+			$state  = (string) $record['state'];
+			$unprovable = ( '' === (string) $record['gen'] );
+			if ( ! $unprovable && Aura_Worker_Door_Log::BINDING_UNSET === $state ) {
+				$live       = Aura_Worker_Door_Log::live_identity();
+				$unprovable = ( null !== $live['client'] || null !== $live['dashboard'] );
+			}
+			if ( $unprovable ) {
+				$release();
+				return new WP_Error(
+					'aura_door_failed',
+					__( 'Connect not completed: this site\'s Aura binding could not be established; retry.', 'digitizer-site-worker' ),
+					array( 'status' => 503, 'retry_after' => 5 )
+				);
+			}
+			if ( Aura_Worker_Door_Log::BINDING_BOUND === $state
+				&& ! self::same_bound_client( $record, $client )
+			) {
+				$release();
+				return new WP_REST_Response(
+					array(
+						'error' => 'This site is bound to another Aura client; unbind it first',
+						'code'  => 'aura_site_bound',
+					),
+					409
+				);
+			}
 		}
 		$token_hash = Aura_Worker_Security::hash_token( $token );
 		// The token is the ONE write whose loss the dashboard cannot see: a
@@ -490,6 +560,12 @@ class Aura_Worker_Magic_Link {
 		// (round-9). So it is not merely preceded by a check — it is
 		// CONDITIONAL on the claim, in one statement, and a handler that no
 		// longer owns the claim writes nothing at all.
+		// THE CONNECT USER (Ruling P48). It comes after finish_before_rebind()
+		// above because Phase B step (2) deletes exactly this option, so
+		// settling afterwards would erase this install's own write.
+		if ( ! empty( $stored['connect_user_id'] ) ) {
+			Aura_Worker_Rules::write_option_if_claimed( 'aura_worker_connect_user_id', (int) $stored['connect_user_id'], $site_claim_key, $site_fence );
+		}
 		self::write_token_under_claim( $token_hash, $site_fence );
 		// The token write is verified the same way the binding's is: read the row
 		// back from the database and compare (Codex round 30). update_option()
@@ -628,6 +704,70 @@ class Aura_Worker_Magic_Link {
 					$release();
 					return new WP_REST_Response( array( 'error' => 'Connect not completed: the previous ruleset could not be cleared; retry.', 'code' => 'aura_connect_store_failed' ), 500 );
 				}
+			}
+		}
+		// THE DOOR'S BINDING GENERATION (Rulings P58/P59/P62, findings F1-F4).
+		//
+		// A connect does NOT require an unbind first: finish_before_rebind()
+		// above returns true immediately for a site with no unbind marker, so
+		// this callback can install a new binding straight over an old one —
+		// and the departed client's holds would otherwise stay current, be
+		// listed to the replacement client through `/status`, and be approved
+		// through `elementor_replay_ability`, running the old client's input as
+		// the old client's actor.
+		//
+		// WHERE THIS SITS is the whole of its safety:
+		//   after the claim-conditional TOKEN write (F3/F4) — a token write
+		//     that failed verification leaves the OLD token and client active,
+		//     and a generation already rotated would have made THEIR pending
+		//     holds invisible and THEIR log cursor invalid for a rebind that
+		//     never happened; and a handler that stalled past
+		//     SITE_CLAIM_TAKEOVER_AFTER and lost the site never reaches here,
+		//     because that write rejected it first;
+		//   after the IDENTITY writes — the client line (the ruleset binding
+		//     sentinel) and `aura_worker_dashboard_url`, both stored and
+		//     verified above — so a connect that got this far is one that was
+		//     ALLOWED to bind: the refusal at the top of this handler turned
+		//     away anything meeting a live foreign binding (Ruling P75). The
+		//     site this rotates is `unbound`, `unset`, or already this
+		//     client's, and a rotation that fails is simply retried by the next
+		//     connect; there is no window in which a replacement client can see
+		//     a departed one's queue, because the two never overlap.
+		//
+		// Idempotent by identity: EVERY connect calls it, including a
+		// same-client token rotation, and rotate_binding() is a no-op when the
+		// record already names this (client, dashboard) in the `bound` state.
+		// A lazily-minted `unset` record never matches, so a site 2.16 met
+		// already connected rotates on its first connect (Ruling P61).
+		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			// UNDER THIS HANDLER'S OWN CLAIM (Ruling P78). Every other write
+			// this connect makes is claim-conditional; this one was not, so a
+			// handler that stalled past SITE_CLAIM_TAKEOVER_AFTER — after its
+			// token, rules and dashboard writes had already been refused —
+			// could still resume here and rotate the WINNER's generation,
+			// stranding the winner's holds and leaving the record naming a
+			// client this site no longer belongs to. It answered
+			// `aura_connect_lost_claim` a few lines later, having already done
+			// the damage.
+			$rebound = Aura_Worker_Elementor_Door::rebind(
+				array(
+					'client'    => '' === (string) $client ? null : (string) $client,
+					'dashboard' => '' === (string) $dashboard_url ? null : (string) $dashboard_url,
+				),
+				$site_claim_key,
+				$site_fence
+			);
+			if ( ! $rebound ) {
+				// Retryable: the next connect, called with the same identity,
+				// rotates. Nothing here is left in a state the replacement
+				// client can act on — the identity above already disowned the
+				// departed rows.
+				$release();
+				return new WP_Error(
+					'aura_door_failed',
+					__( 'Connect not completed: the Elementor door could not be handed to the new binding; retry.', 'digitizer-site-worker' ),
+					array( 'status' => 503, 'retry_after' => 5 )
+				);
 			}
 		}
 		// 2.11.0: the callback also mints an Application Password for the admin
@@ -2207,6 +2347,29 @@ class Aura_Worker_Magic_Link {
 	 *                                already held.
 	 * @return string This handler's fence when it holds the claim, else ''.
 	 */
+	/**
+	 * Is the connecting client the one this site is ALREADY bound to (Ruling
+	 * P75)?
+	 *
+	 * Under P66's rule, and for P66's reason: the supported legacy callback
+	 * signs no `client` line, so an identity that names no client is nothing
+	 * but a dashboard base URL — and two different Aura customers routinely
+	 * share one. An unprovable identity is never the same identity, so a
+	 * clientless connect onto a bound site is a foreign one and refuses.
+	 *
+	 * @param array  $record The binding record.
+	 * @param string $client The client this connect states, '' when none.
+	 * @return bool
+	 */
+	private static function same_bound_client( array $record, $client ) {
+		$bound = isset( $record['client'] ) && null !== $record['client'] ? (string) $record['client'] : '';
+		$next  = (string) $client;
+		if ( '' === $bound || '' === $next ) {
+			return false; // null never equals (Ruling P66)
+		}
+		return $bound === $next;
+	}
+
 	private static function claim_magic_link( $claim_key, $takeover_after = 0 ) {
 		global $wpdb;
 		$fence = bin2hex( random_bytes( 16 ) );

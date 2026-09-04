@@ -62,7 +62,7 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertFalse( get_option( 'aura_worker_site_token' ) );
 		$this->assertTrue( Aura_Worker_Unbind::is_set(), 'the marker survives cleanup' );
 		$this->assertSame( array(), Aura_Worker_Unbind::leftovers() );
-		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'token' ), $GLOBALS['_unbind_trace'] );
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'door', 'token' ), $GLOBALS['_unbind_trace'] );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
@@ -71,7 +71,7 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertFalse( Aura_Worker_Unbind::cleanup( false, $fence ) );
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
 		$this->assertSame( array(), Aura_Worker_Unbind::leftovers(), '(1)-(4) done' );
-		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant' ), $GLOBALS['_unbind_trace'], 'step (5) is not even entered' );
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'door' ), $GLOBALS['_unbind_trace'], 'the bookkeeping steps all ran; step (5) is not even entered' );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
@@ -82,12 +82,13 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertNotFalse( get_option( 'aura_worker_site_token' ) );
 		$this->assertContains( 'app_passwords', Aura_Worker_Unbind::leftovers() );
 		$this->assertNotContains( 'token', $GLOBALS['_unbind_trace'], 'a `final` call still stops short of the token' );
-		// Round-1 I1: ONLY step (5) is gated. Steps (1)-(4) are best-effort and
+		// Round-1 I1: ONLY step (5) is gated. Steps (1)-(4a) are best-effort and
 		// all attempted — a credential the host will never let go of must not
-		// pin the departed client's ruleset, dashboard url and gateway key on
-		// the site forever, which is what an abort here would do (maybe_finish()
-		// would re-enter the same abort every 300 s).
-		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant' ), $GLOBALS['_unbind_trace'] );
+		// pin the departed client's ruleset, dashboard url, gateway key and
+		// APPROVAL QUEUE (Ruling P44) on the site forever, which is what an
+		// abort here would do (maybe_finish() would re-enter the same abort
+		// every 300 s).
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'door' ), $GLOBALS['_unbind_trace'] );
 		$this->assertFalse( sa_app_password_exists( 3, 'uuid-managed' ), 'the rest of step (1) ran' );
 		$this->assertFalse( get_option( 'aura_worker_dashboard_url' ), 'step (2) ran anyway' );
 		$this->assertFalse( get_option( 'aura_worker_connect_user_id' ), 'step (2) ran anyway' );
@@ -193,11 +194,13 @@ final class UnbindCleanupTest extends TestCase {
 		$left = Aura_Worker_Unbind::leftovers();
 
 		$GLOBALS['_sa_option_read_fail'] = array();
-		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ), $left );
+		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' ), $left );
 	}
 
 	public function test_leftovers_names_every_pending_step_and_nothing_else(): void {
-		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey' ), Aura_Worker_Unbind::leftovers() );
+		// `door` is owed too (Ruling P69): nothing has stated this site is
+		// unbound, and a record that merely names nobody is not a statement.
+		$this->assertSame( array( 'app_passwords', 'options', 'ruleset', 'grant_pubkey', 'door' ), Aura_Worker_Unbind::leftovers() );
 	}
 
 	public function test_leftovers_is_empty_with_no_marker(): void {
@@ -870,4 +873,195 @@ final class UnbindCleanupTest extends TestCase {
 		$this->assertCount( 1, $found, 'registered exactly once, on the hook WordPress fires' );
 		$this->assertSame( 10, $found[0]['priority'] );
 	}
+
+	// -----------------------------------------------------------------------
+	// Ruling P44: the unbind takes the Elementor door's queue and log with it
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Seed a full door: a held row, a claimed row, three log rows, the ack
+	 * floor, the closure marker + its counter, the epoch — plus a 30-day
+	 * counter bucket and a snapshot envelope, which must SURVIVE.
+	 *
+	 * @return array The refs and names the assertions read back.
+	 */
+	private function seedDoor(): array {
+		foreach ( array( 'class-aura-worker-door-log', 'class-aura-worker-door-holds', 'class-elementor-door-governor' ) as $f ) {
+			require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/' . $f . '.php';
+		}
+		$call = array(
+			'ability' => 'elementor/publish-document',
+			'input'   => array( 'post_id' => 7 ),
+			'touches' => array( array( 'type' => 'page', 'id' => '7' ) ),
+			'actor'   => array( 'user_id' => 3, 'login' => 'bot' ),
+			'verdict' => 'none',
+		);
+		$held    = Aura_Worker_Door_Holds::hold( $call );
+		$claimed = Aura_Worker_Door_Holds::hold( $call );
+		Aura_Worker_Door_Holds::claim( $claimed );
+		// A DIED replay, not a live one: the reconciler settles a claim only
+		// once it is older than CLAIM_STALE_MS and holds no execution lease.
+		$this->ageClaim( $claimed );
+		for ( $i = 0; $i < 3; $i++ ) {
+			$seq = Aura_Worker_Door_Log::open_pending( $call );
+			Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		}
+		Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), 1 ); // installs the floor
+		Aura_Worker_Door_Log::close();                                 // the full marker
+		Aura_Worker_Door_Log::bump_refused();                          // and its counter
+		// The binding's working state too (Ruling P44 follow-up): a fresh
+		// binding must inherit neither the creation mutex nor the retention
+		// throttle.
+		update_option( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 1, 'started_at' => gmdate( 'c' ) ) );
+		update_option( Aura_Worker_Elementor_Door::PRUNED_AT, gmdate( 'c' ) );
+		// The door bound to the departing client, so the unbind's rotation to
+		// NOBODY is a real change (Ruling P59).
+		sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
+		$bucket                       = 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS );
+		$GLOBALS['_options'][ $bucket ] = 4;
+		$GLOBALS['_rows'][ $bucket ]    = maybe_serialize( 4 );
+		$env                          = ( new Aura_Worker_Snapshots() )->snapshot_option( 'blogname' );
+		$this->assertTrue( $env['success'] );
+		return array(
+			'held'    => $held,
+			'claimed' => $claimed,
+			'bucket'  => $bucket,
+			'env'     => (string) $env['snapshot']['id'],
+		);
+	}
+
+	/**
+	 * The door's TRANSACTIONAL rows, from the "database" — everything under
+	 * `aura_worker_door_` except the 30-day counter buckets, which share the
+	 * prefix and are deliberately kept (Ruling P44).
+	 */
+	private function doorRows(): array {
+		$out = array();
+		foreach ( array_unique( array_merge( array_keys( $GLOBALS['_rows'] ), array_keys( $GLOBALS['_options'] ) ) ) as $name ) {
+			$name = (string) $name;
+			if ( 0 === strpos( $name, 'aura_worker_door_' ) && 0 !== strpos( $name, Aura_Worker_Elementor_Door::COUNTER_PREFIX ) ) {
+				$out[] = $name;
+			}
+		}
+		sort( $out );
+		return $out;
+	}
+
+	/** Backdate a claimed row past CLAIM_STALE_MS, in the database and the cache alike. */
+	private function ageClaim( string $ref, int $extra_s = 60 ): void {
+		$name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+		$row  = get_option( $name, array() );
+		$row['claimed_at']          = gmdate( 'c', time() - (int) ( Aura_Worker_Elementor_Door::CLAIM_STALE_MS / 1000 ) - $extra_s );
+		$GLOBALS['_options'][ $name ] = $row;
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $row );
+	}
+
+	/** …and the reconciler leaves that claim alone rather than calling it interrupted. */
+	public function test_the_reconciler_skips_a_claim_whose_lease_is_held(): void {
+		$door = $this->seedDoor();
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $door['claimed'] ) ] = true;
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 0, $out['settled_claims'], 'running, not stale' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $door['claimed'] ) );
+	}
+
+	/**
+	 * Ruling P58: the unbind's door step mints a new generation. Nothing is
+	 * deleted, nothing can refuse, and `door` is not a leftover kind.
+	 */
+	public function test_the_unbind_mints_a_new_binding_generation( ): void {
+		$door   = $this->seedDoor();
+		$before = Aura_Worker_Door_Log::binding();
+		$fence  = Aura_Worker_Magic_Link::claim_site();
+
+		$this->assertTrue( Aura_Worker_Unbind::cleanup( true, $fence ) );
+
+		$this->assertNotSame( $before, Aura_Worker_Door_Log::binding(), 'a new generation' );
+		$this->assertNotContains( 'door', Aura_Worker_Unbind::leftovers(), 'and nothing is owed once it lands' );
+		$rec = Aura_Worker_Door_Log::binding_record();
+		$this->assertNull( $rec['client'], 'an unbound site is bound to nobody' );
+		$this->assertNull( $rec['dashboard'] );
+		$this->assertFalse( get_option( 'aura_worker_site_token' ), 'so the token still goes' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_held( $door['held'] ), 'the departed queue is invisible' );
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
+	}
+
+	/**
+	 * Ruling P68 (F1): a stale Phase B whose claim was taken over rotates
+	 * nothing.
+	 *
+	 * Phase B can outlive SITE_CLAIM_TAKEOVER_AFTER — the credential revocation
+	 * alone is several REST-shaped reads — and a replacement connect seizes the
+	 * claim and completes in the meantime. Every option step is joined to the
+	 * claim row; the rotation was not, so the stale cleanup resuming here
+	 * rotated the WINNER's binding to `unbound`: its holds went invisible and
+	 * its governed callbacks failed the binding fence until somebody
+	 * reconnected.
+	 */
+	public function test_a_stale_cleanup_whose_claim_was_taken_over_leaves_the_winner_alone(): void {
+		$this->seedDoor();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+
+		// The replacement connect: it seizes the claim and binds the site to
+		// its own client, all while this cleanup is still working.
+		$winner = '';
+		add_action(
+			'aura_worker_unbind_step',
+			static function ( $step ) use ( &$winner ) {
+				if ( 'grant' !== $step || '' !== $winner ) {
+					return;
+				}
+				$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
+				$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = maybe_serialize( 'winner-fence|' . time() );
+				// Under the WINNER's own fence: every rotation is claim-held
+				// now (Ruling P78), and this one is the winner's connect.
+				sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://app.example' ), 'winner-fence' );
+				$winner = Aura_Worker_Door_Log::binding();
+			}
+		);
+
+		$done = Aura_Worker_Unbind::cleanup( true, $fence );
+
+		$this->assertNotSame( '', $winner, 'the replacement really did rotate' );
+		$this->assertFalse( $done, 'the stale cleanup reports nothing complete' );
+		$this->assertSame( $winner, Aura_Worker_Door_Log::binding(), 'the winner\'s generation stands' );
+		$rec = Aura_Worker_Door_Log::binding_record();
+		$this->assertSame( 'bound', $rec['state'], 'and it was never rotated to unbound' );
+		$this->assertSame( 'c2', $rec['client'] );
+		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers(), 'the step is reported not done' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'so the token stays' );
+	}
+
+	/**
+	 * Ruling P69 (F2): an `unset` record is not an unbound site.
+	 *
+	 * 2.16 meeting an already-connected site lazily mints a placeholder whose
+	 * client and dashboard are both null — so an IDENTITY test read a failed
+	 * rotation as a completed one and let the cleanup delete the token. That is
+	 * the worst possible reading: `generation_is_live()` treats an `unset`
+	 * record's generation as CURRENT, so every row the departed binding stamped
+	 * stayed live, on a site nobody could tell anything ever again.
+	 */
+	public function test_an_unset_record_after_a_failed_rotation_still_owes_the_door(): void {
+		$this->seedDoor();
+		// The placeholder: minted, never stated. Its identity fields are null,
+		// exactly like an unbound record's.
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = array( 'gen' => 'placeholder-gen', 'state' => 'unset', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] );
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::BINDING ] = true; // the CAS fails transiently
+
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$done  = Aura_Worker_Unbind::cleanup( true, $fence );
+
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'], 'the rotation really did not land' );
+		$this->assertContains( 'door', Aura_Worker_Unbind::leftovers(), 'only `unbound` discharges the step' );
+		$this->assertFalse( $done, 'cleanup_complete is false' );
+		$this->assertNotFalse( get_option( 'aura_worker_site_token' ), 'and the token is retained, so a retry can still be told' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** A caller that lost the site claim deletes nothing — the same fence every step uses. */
 }

@@ -200,10 +200,16 @@ class Aura_Worker_Rules {
 	}
 
 	/** The only resource types a rule may name. Anything else never matches. */
-	const TYPES = array( 'site', 'page', 'post', 'plugin' );
+	const TYPES = array( 'site', 'page', 'post', 'plugin', 'design_system', 'page_create' );
+
+	/** Target types that carry no id — a rule on them names the whole category. */
+	const ID_LESS_TYPES = array( 'site', 'design_system', 'page_create' );
 
 	/** `page` and `post` are the same ID seen from two directions. */
 	const CONTENT_TYPES = array( 'page', 'post' );
+
+	/** Effects the matcher understands. `allow` is meaningful only at the Elementor door (2.16.0). */
+	const EFFECTS = array( 'block', 'warn', 'allow' );
 
 	/**
 	 * The base-class default: a tool that never said what it touches. Not a
@@ -219,9 +225,9 @@ class Aura_Worker_Rules {
 	/**
 	 * The rule that decides this call, or null.
 	 *
-	 * `block` beats `warn`. Expired rules never match. Unknown target types
-	 * never match — Aura refuses them at write time, and if one arrives anyway
-	 * the site does not guess.
+	 * `block` beats `warn` beats `allow` beats no match. Expired rules never
+	 * match. Unknown target types never match — Aura refuses them at write
+	 * time, and if one arrives anyway the site does not guess.
 	 *
 	 * @param array    $touches Resources the call declares: list of {type,id}.
 	 * @param array    $rules   Rules from the current ruleset.
@@ -326,7 +332,7 @@ class Aura_Worker_Rules {
 				continue;
 			}
 			$effect = isset( $rule['effect'] ) ? (string) $rule['effect'] : '';
-			if ( 'block' !== $effect && 'warn' !== $effect ) {
+			if ( ! in_array( $effect, self::EFFECTS, true ) ) {
 				continue;
 			}
 			// Site scoping (Aura spec §4, 2.12.0), through the shared predicate
@@ -341,7 +347,9 @@ class Aura_Worker_Rules {
 			if ( 'block' === $effect ) {
 				return $rule; // Nothing outranks a block.
 			}
-			if ( null === $winner ) {
+			// warn > allow: a caveat someone wrote wins over an opt-in someone
+			// else wrote (spec §3.4). First match wins within a rank.
+			if ( null === $winner || ( 'warn' === $effect && 'allow' === $winner['effect'] ) ) {
 				$winner = $rule;
 			}
 		}
@@ -426,8 +434,11 @@ class Aura_Worker_Rules {
 		if ( isset( $touched[ self::UNKNOWN . ':*' ] ) ) {
 			return true; // Undeclared: every live rule applies.
 		}
-		if ( 'site' === $type ) {
-			return ! empty( $touched );
+		if ( in_array( $type, self::ID_LESS_TYPES, true ) ) {
+			if ( 'site' === $type ) {
+				return ! empty( $touched ); // a freeze catches everything declared
+			}
+			return isset( $touched[ $type . ':*' ] ); // design_system / page_create: the category itself
 		}
 		$id = isset( $target['id'] ) ? (string) $target['id'] : '';
 		if ( '' === $id ) {
@@ -1525,6 +1536,43 @@ class Aura_Worker_Rules {
 	}
 
 	/**
+	 * The same record, read from the DATABASE — for a judgement that GATES a
+	 * mutation (Ruling P88).
+	 *
+	 * `current()` goes through the option cache, and by the time a door
+	 * judgement runs that cache is already warm: `Aura_Worker_Tools::execute_tool()`
+	 * calls `enforce()` on its way in, which reads the ruleset and caches it
+	 * for the rest of the request. A `/rules` push committing a new BLOCK in
+	 * between then changed nothing this request could see, and the approval it
+	 * should have stopped ran under the superseded ruleset.
+	 *
+	 * The row is read directly, and NOTHING is evicted (Ruling P88 follow-up):
+	 * a raw `$wpdb` read bypasses every cache by construction, so a flush buys
+	 * this reader nothing — and evicting `alloptions` on a site with a
+	 * persistent object cache would discard every autoloaded option, once per
+	 * judgement. The caches stay warm for the readers that legitimately want
+	 * them; this one simply does not consult them.
+	 * `stored_uncached()` already reports a failed read as a `WP_Error`; that
+	 * collapses to null, which every caller of this reads as
+	 * `rules_unavailable` and answers with its own consequence: a write is
+	 * HELD, a restore is refused retryably. Never as permission.
+	 *
+	 * Non-gating readers keep the cached form. This one costs a query, and it
+	 * is asked once per judgement.
+	 *
+	 * @since 2.16.0
+	 *
+	 * @return array|null
+	 */
+	public static function current_uncached() {
+		$rec = self::stored_uncached();
+		if ( is_wp_error( $rec ) || null === $rec || self::is_sentinel( $rec ) ) {
+			return null;
+		}
+		return $rec;
+	}
+
+	/**
 	 * Is this value a stored record? One definition, used by stored() and by
 	 * swap() on a value read straight from the database.
 	 *
@@ -2224,15 +2272,46 @@ class Aura_Worker_Rules {
 	 * @param array    $touches   What the call declares it touches.
 	 * @param string   $tool_name For the hook and the message.
 	 * @param int|null $now       Unix time; injected for tests.
-	 * @return array {effect: null|'warn'|'block', rule?: array, recorded?: bool}
+	 * @return array {effect: null|'warn'|'block', rule?: array, recorded?: bool} `allow` is never returned here — it reads as no match.
 	 */
+	/**
+	 * The winner that ENFORCEMENT would apply on the tools path: match()'s
+	 * winner, with an `allow` winner treated as no match at all.
+	 *
+	 * The one accessor for that question, because two callers ask it — the
+	 * enforcing path below, and Aura_Worker_Tools::preview_tool(), which
+	 * shows the operator what approving this call would do. A preview that
+	 * asked match() directly reported `effect: 'allow'` for a call the very
+	 * next request runs with no rule at all: the two disagreeing about the
+	 * same call, which is exactly what site_ref() was threaded through
+	 * match() to prevent.
+	 *
+	 * `allow` is not "permitted, on the record" here. The tools path already
+	 * defaults to the approval queue, so an allow rule changes nothing it
+	 * does; the effect speaks only at the Elementor door, which asks match()
+	 * for itself (class-elementor-door-governor.php).
+	 *
+	 * @param array    $touches  What the call declares it touches.
+	 * @param array    $rules    The ruleset to judge against.
+	 * @param int|null $now      Unix time; injected for tests.
+	 * @param string   $site_ref This site's identity.
+	 * @return array|null The rule enforcement would apply, or null.
+	 */
+	public static function enforceable_match( array $touches, array $rules, $now = null, $site_ref = '' ) {
+		$rule = self::match( $touches, $rules, $now, $site_ref );
+		if ( null !== $rule && 'allow' === ( isset( $rule['effect'] ) ? $rule['effect'] : '' ) ) {
+			return null;
+		}
+		return $rule;
+	}
+
 	public static function enforce( array $touches, $tool_name, $now = null ) {
 		self::note_expired( $now );
 		// Judged in THIS site's identity (self::site_ref(), the one accessor —
 		// the preview path asks the same question of the same record, so the
 		// two can never disagree). The fork inherits this through enforce(),
 		// so its governance wrapper needs no change of its own.
-		$rule = self::match( $touches, self::rules(), $now, self::site_ref() );
+		$rule = self::enforceable_match( $touches, self::rules(), $now, self::site_ref() );
 		if ( null === $rule ) {
 			return array( 'effect' => null );
 		}

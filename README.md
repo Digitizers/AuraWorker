@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.15.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.16.0-green" alt="Stable" />
 </p>
 
 ---
@@ -150,6 +150,15 @@ Reconnecting settles the debt first: both the magic-link `/connect` callback and
 marker only after the replacement binding is installed and read back — a failed swap leaves
 the marker still refusing the old binding.
 
+**A connect never runs over another client's live binding (2.16.0).** Moving a site from one
+Aura client to another is an **unbind followed by a connect**, never a single re-connect: a
+`/connect` callback that meets a site already bound to a different client answers
+`409 aura_site_bound` ("This site is bound to another Aura client; unbind it first") and
+writes nothing at all — no token, dashboard, client sentinel, grant key or connect user. A
+callback that names **no** client is refused the same way on a bound site, since a dashboard
+base URL is shared by every site on it and proves no identity. The same client re-saving, a
+site that has been unbound, and a site nobody has ever bound all connect exactly as before.
+
 `GET /aura/v1/status` reports, each as a JSON object whose *presence* is the signal:
 
 | Key | Shape | Meaning |
@@ -189,7 +198,7 @@ admin-ajax action, not by a REST route.
 | `POST` | `/tools/execute` | Execute a tool with validated parameters |
 | `GET` | `/context` | Full site context for AI decision-making |
 
-**Built-in MCP tools (27):**
+**Built-in MCP tools (29):**
 
 | Tool | Kind | Purpose |
 |------|------|---------|
@@ -212,6 +221,8 @@ admin-ajax action, not by a REST route.
 | `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
 | `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many abilities pass the discovery rule such a server applies — a property of the abilities, not proof any server serves them; a registry-resolving server (Angie's) picks up mutating ones outside SiteAgent's approval path |
 | `audit_rules` | read | operator-ruleset presence + age, 24h block/warn counts, expired-but-listed rules, enforcement points in this build |
+| `snapshot_get` | read | retrieve a stored snapshot of page content (reversible write metadata) |
+| `elementor_replay_ability` | write | executes an approved held Elementor write (destructive, requires Aura approval) — claims the hold, re-judges it against the current ruleset, and runs the original mutation as the user who asked |
 | `set_seo_meta` | write | set a post/page's SEO title / description / focus keyword (approval-gated; only fields you pass change) |
 | `update_plugin_safely` | write | backup → update → health check → auto-rollback |
 | `clear_caches` | write | flush object/opcode caches + detected page-cache plugins |
@@ -226,6 +237,10 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.16.0
+
+- Elementor MCP door governance: every write through Elementor >= 4.3's official MCP server is held for approval in Aura unless an operator `allow` rule covers it; `block` refuses; every write that runs is snapshotted first on the site and recorded in a per-site door log Aura drains. New tools `elementor_replay_ability`, `snapshot_get`; new routes `/aura/v1/door/reject`, `/aura/v1/door/ack` (which answers `stale: true`, having written nothing, when the cursor names rows this log does not have — a log rewound out from under Aura); `/status` carries `door`; `audit_mcp_exposure` carries `elementor.governor`. Rules gain the `allow` effect and the `design_system` / `page_create` targets.
 
 ### 2.15.0
 

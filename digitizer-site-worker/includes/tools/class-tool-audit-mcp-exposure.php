@@ -93,7 +93,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			'angie'                => 'object — { active, version, mcp_server_present } (the known second door; absence of Angie does not mean absence of a second server)',
 			'abilities'            => 'object — { total, discoverable_by_type_rule, discoverable_and_mutating, discoverable_mutating_names }. These count abilities that PASS the discovery rule co-installed servers apply (no meta.mcp.type, or "tool") — a property of the abilities, NOT proof that anything currently serves them. Reachability additionally requires a server that resolves targets from the site-wide registry; a server with an explicit tool list reaches only what it lists. Read together with `servers`: with none registered, these counts describe a door that does not exist yet.',
 			'coverage'             => 'object — { total_seen, returned, truncated, cap } bounded-coverage contract',
-			'elementor'            => 'object — Elementor >= 4.3\'s official MCP door (2.15.0). { installed, version, mcp_module: { class_present, active, abilities_registered, server_id }, consent: [{ user_id, login, allowed, timestamp }], consent_unproven: [user_id], consent_truncated, app_passwords: { elementor: [{ user_id, login, name, created, last_used, last_ip }], elementor_entries_truncated, elementor_unproven: [user_id], candidates_read, elementor_truncated, other: { users_checked, count, recently_used, unproven: [user_id] } }, coverage: { users_total, users_checked, truncated, cap } }. consent rows and Elementor-named Application Passwords are found across ALL users (two bounded usermeta queries, 50 rows each); every other Application Password of edit_posts users is counted (200 users). No usermeta value over 256 KB is decoded — such a row is listed in the subtree\'s *_unproven. A scan that failed is { error } in its place (mcp_module / consent / app_passwords.elementor / app_passwords.other + coverage), never an empty list. Requires manage_options; every subtree is { error: \'manage_options required\' } otherwise. Shape: Digitizers/Aura docs/superpowers/specs/2026-09-02-elementor-mcp-door-detection-design.md §3.',
+			'elementor'            => 'object — Elementor >= 4.3\'s official MCP door (2.15.0). { installed, version, mcp_module: { class_present, active, abilities_registered, server_id }, consent: [{ user_id, login, allowed, timestamp }], consent_unproven: [user_id], consent_truncated, app_passwords: { elementor: [{ user_id, login, name, created, last_used, last_ip }], elementor_entries_truncated, elementor_unproven: [user_id], candidates_read, elementor_truncated, other: { users_checked, count, recently_used, unproven: [user_id] } }, coverage: { users_total, users_checked, truncated, cap }, governor: { active } when the 2.16.0 door governor did not initialise (no Elementor MCP module on this site), else { active: true, epoch, seam: ok|unavailable|unchecked, door: open|closed, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full: { since, refused } | null } — the door log and hold queue this site\'s own governor is keeping, so the fleet rollup can flag a full log, a full hold queue, or a seam that never verified without polling /status. The `_30d` fields are rolling 24h×30 hourly-bucket sums; `log_ungoverned_30d` counts refusals the door log itself could not record. }. consent rows and Elementor-named Application Passwords are found across ALL users (two bounded usermeta queries, 50 rows each); every other Application Password of edit_posts users is counted (200 users). No usermeta value over 256 KB is decoded — such a row is listed in the subtree\'s *_unproven. A scan that failed is { error } in its place (mcp_module / consent / app_passwords.elementor / app_passwords.other / coverage / governor), never an empty list. Requires manage_options; every subtree is { error: \'manage_options required\' } otherwise. Shape: Digitizers/Aura docs/superpowers/specs/2026-09-02-elementor-mcp-door-detection-design.md §3; the governor block: docs/superpowers/specs/2026-09-02-elementor-door-governance-design.md.',
 		);
 	}
 
@@ -1079,6 +1079,7 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 					'other'     => array( 'error' => 'manage_options required' ),
 				),
 				'coverage'      => array( 'error' => 'manage_options required' ),
+				'governor'      => array( 'error' => 'manage_options required' ),
 			);
 		}
 		$out = array(
@@ -1133,6 +1134,11 @@ class Aura_Tool_Audit_Mcp_Exposure extends Aura_Tool_Base {
 			$passwords['other']   = $this->subtree_error( $e );
 			$out['app_passwords'] = $passwords;
 			$out['coverage']      = $this->subtree_error( $e );
+		}
+		try {
+			$out['governor'] = Aura_Worker_Elementor_Door::governor_block();
+		} catch ( \Throwable $e ) {
+			$out['governor'] = $this->subtree_error( $e );
 		}
 		return $out;
 	}

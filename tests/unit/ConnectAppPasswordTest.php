@@ -67,8 +67,13 @@ final class ConnectAppPasswordTest extends TestCase {
 		return null === $rec ? 0 : (int) ( $rec['user_id'] ?? 0 );
 	}
 
-	private function request(): WP_REST_Request {
-		$token = 'raw-token';
+	/**
+	 * A signed connect. It NAMES ITS CLIENT (Ruling P75): a re-save of a site
+	 * that is already bound is only allowed to the client it is bound to, and
+	 * an identity with no client line cannot be proven to be that one (P66).
+	 * Every rotation case in this file is the same client connecting again.
+	 */
+	private function request( string $client = 'client-a', string $token = 'raw-token' ): WP_REST_Request {
 		$dash  = 'https://dash.example';
 		$ts    = time();
 		$req   = new WP_REST_Request();
@@ -76,7 +81,8 @@ final class ConnectAppPasswordTest extends TestCase {
 		$req->set_param( 'token', $token );
 		$req->set_param( 'dashboard_url', $dash );
 		$req->set_param( 'timestamp', $ts );
-		$req->set_param( 'signature', Aura_Worker_Magic_Link::sign_connect_payload( $this->secret, $this->magic_id, $token, $dash, $ts ) );
+		$req->set_param( 'client', $client );
+		$req->set_param( 'signature', Aura_Worker_Magic_Link::sign_connect_payload( $this->secret, $this->magic_id, $token, $dash, $ts, '', $client ) );
 		return $req;
 	}
 
@@ -1020,7 +1026,12 @@ final class ConnectAppPasswordTest extends TestCase {
 
 		$GLOBALS['_sa_option_write_fail']['aura_worker_ruleset'] = true;
 		set_transient( 'aura_magic_' . $this->magic_id, array( 'connect_secret' => $this->secret, 'connect_user_id' => 7 ), 600 );
-		$res = $this->ml->handle_connect( $this->requestWithClient( 'client-new' ) );
+		// The SAME client re-saving with a FRESH token (Ruling P75): a repoint
+		// to another client is refused before any of this, so the binding
+		// failure is reached by the connect that is allowed to reach it — and
+		// the new token is what makes the failed write visible, since the
+		// stored record still names the old one.
+		$res = $this->ml->handle_connect( $this->request( 'client-a', 'raw-token-2' ) );
 		$GLOBALS['_sa_option_write_fail'] = array();
 		$this->assertSame( 500, $res->get_status(), 'the binding failure still fails the connect' );
 		$this->assertNotContains( $old, array_column( WP_Application_Passwords::get_user_application_passwords( 7 ), 'uuid' ), 'the old credential died with its token' );

@@ -141,7 +141,7 @@ final class UnbindSettingsTest extends TestCase {
 	 */
 	public function test_an_unreadable_marker_is_reported_as_unknown_not_as_four_debts(): void {
 		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Unbind::OPTION ] = true;
-		$this->assertCount( 4, Aura_Worker_Unbind::leftovers(), 'the gate still fails closed' );
+		$this->assertCount( 5, Aura_Worker_Unbind::leftovers(), 'the gate still fails closed' );
 
 		$html = $this->panel();
 		$this->assertStringContainsString( 'Disconnected by Aura', $html );
@@ -169,7 +169,7 @@ final class UnbindSettingsTest extends TestCase {
 	/** The order, witnessed: the token is entered last, and only then. */
 	public function test_the_teardown_deletes_the_token_last(): void {
 		$this->remove();
-		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'token' ), $GLOBALS['_unbind_trace'] );
+		$this->assertSame( array( 'revoke', 'options', 'ruleset', 'grant', 'door', 'token' ), $GLOBALS['_unbind_trace'] );
 	}
 
 	public function test_remove_aura_data_requires_manage_options(): void {

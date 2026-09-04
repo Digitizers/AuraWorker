@@ -117,11 +117,48 @@ final class UninstallCoverageTest extends TestCase {
 	 *   INSERT … ON DUPLICATE KEY UPDATE that no scan of function calls could
 	 *   ever see) and the ruleset store's compare-and-swap on
 	 *   'aura_worker_ruleset'.
+	 * - includes/class-aura-worker-door-log.php (9, 2.16.0) — each door log
+	 *   row's compare-and-set (write_option_where()'s UPDATE, on
+	 *   'aura_worker_door_log_<seq>'), the ack floor's upward-only raise
+	 *   (ack()'s UPDATE on 'aura_worker_door_log_acked'), the closure
+	 *   refusal counter's atomic increment (bump_refused()'s
+	 *   INSERT … ON DUPLICATE KEY UPDATE on 'aura_worker_door_log_full_refused'),
+	 *   and insert_unique()'s real conditional INSERT (`INSERT ... WHERE NOT
+	 *   EXISTS`, shared by seq allocation, the epoch and the closure marker —
+	 *   one call site in source, counted once regardless of how many option
+	 *   names it is called with at runtime), and — since Ruling P59 — the
+	 *   binding generation's compare-and-swap (rotate_binding()'s UPDATE on
+	 *   'aura_worker_door_binding', which must change exactly one row so a
+	 *   transient failure cannot read as a rotation that happened), and — since
+	 *   Ruling P68 — that same rotation's two CLAIM-CONDITIONAL forms on the
+	 *   same 'aura_worker_door_binding' key: an UPDATE and an INSERT, each
+	 *   joined to the site claim row ('aura_worker_connect_lock'), so a stale
+	 *   unbind whose claim was taken over cannot rotate the winner's binding,
+	 *   and — since Ruling P73 — the ADOPTION of an `unset` record on that same
+	 *   'aura_worker_door_binding' key: a compare-and-swap that states the
+	 *   identity the site is already live under WITHOUT moving the generation,
+	 *   so an upgraded site's own rows stay current while a replacement
+	 *   connect's identity writes make the departed ones foreign at once, and —
+	 *   since Ruling P91 — the EPOCH WITNESS re-stamp on that same key, which a
+	 *   grant-gated `/door/rotate` makes so a legitimate cursor rotation is not
+	 *   mistaken for a half-done rebind. (Ruling P90 added no statement: it
+	 *   JOINED the ack's existing two — the floor raise on
+	 *   'aura_worker_door_log_acked' and the row purge on
+	 *   'aura_worker_door_log_<seq>' — to 'aura_worker_door_epoch', so neither
+	 *   can cross a rotation.)
+	 *   All names fall under the swept 'aura_worker_' prefix.
+	 * - includes/class-elementor-door-governor.php (1, 2.16.0) — the door's
+	 *   rolling 30-day counters, in the rule counters' shape:
+	 *   'aura_worker_door_c_<name>_h<hour>', an atomic
+	 *   INSERT … ON DUPLICATE KEY UPDATE no scan of function calls could see.
+	 *   Under the swept 'aura_worker_' prefix.
 	 */
 	private const ACKNOWLEDGED_RAW_OPTION_WRITES = array(
-		'includes/class-aura-worker-magic-link.php' => 3,
-		'includes/class-aura-worker-rules.php'      => 5,
-		'includes/class-aura-worker.php'            => 2,
+		'includes/class-aura-worker-door-log.php'    => 9,
+		'includes/class-aura-worker-magic-link.php'  => 3,
+		'includes/class-aura-worker-rules.php'       => 5,
+		'includes/class-aura-worker.php'             => 2,
+		'includes/class-elementor-door-governor.php' => 1,
 	);
 
 	protected function setUp(): void {
