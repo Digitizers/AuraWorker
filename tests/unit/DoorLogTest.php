@@ -577,6 +577,38 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S2 (Codex round-1 P1 on #88): the increment-plus-read must be
+	 * ONE atomic operation, not an atomic increment followed by a SEPARATE
+	 * re-read of the shared row. The old shape let an interleaved second
+	 * bump land between the first request's own upsert and its own read,
+	 * so BOTH requests could answer the row's latest value instead of each
+	 * answering what it itself assigned.
+	 *
+	 * Modelled here as two independent CONNECTIONS (two SA_Test_Wpdb
+	 * instances, exactly as two separate PHP requests would each hold their
+	 * own mysqli connection) interleaved via a seam that fires from INSIDE
+	 * the stub's own upsert handler — between THIS request's own INSERT and
+	 * its own `SELECT LAST_INSERT_ID()` — never a callback inside production
+	 * code, which has no such hook. Pre-fix (a plain re-read of the shared
+	 * row) this test is RED: both connections answer 2.
+	 */
+	public function test_two_interleaved_bumps_on_different_connections_never_answer_the_same_value(): void {
+		$other = null;
+		$GLOBALS['_sa_after_observation_bump'] = static function () use ( &$other ) {
+			$mine            = $GLOBALS['wpdb'];
+			$GLOBALS['wpdb'] = new SA_Test_Wpdb(); // a second, independent connection
+			$other           = Aura_Worker_Door_Log::bump_observation();
+			$GLOBALS['wpdb'] = $mine; // restored before THIS request's own next statement
+		};
+
+		$mine = Aura_Worker_Door_Log::bump_observation();
+
+		$this->assertSame( 1, $mine, "the first connection's own read answers what IT assigned, never a re-read of the row" );
+		$this->assertSame( 2, $other, 'the second, interleaved connection gets the next value' );
+		$this->assertNotSame( $mine, $other, 'never the same number twice' );
+	}
+
+	/**
 	 * A read-back that cannot be PROVEN (Ruling S1's same discipline) answers
 	 * null — "no witness this serve" — never a stale or guessed number, even
 	 * though the underlying upsert may well have landed.

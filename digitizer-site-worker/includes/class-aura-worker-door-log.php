@@ -1385,17 +1385,34 @@ class Aura_Worker_Door_Log {
 	 * uses, so two overlapping serves cannot both land on the same number and
 	 * neither can silently lose the other's increment.
 	 *
-	 * The bump alone is not enough: an upsert's own return says only "a row
-	 * changed", never which value it now holds, and `get_option()` would
-	 * answer this process's cache rather than what the statement above just
-	 * committed. So the new value is read back RAW and PROVEN
-	 * (`raw_option_read()`, never `get_option()`) — the same proof
-	 * `binding_raw()`/`epoch_raw()` require before a caller may trust what a
-	 * read says.
+	 * THE INCREMENT-PLUS-READ MUST BE ONE ATOMIC OPERATION TOO (Ruling S2,
+	 * Codex round-1 P1 on #88). A separate `raw_option_read()` after the
+	 * upsert is a re-read of the SHARED row: request A can land its upsert,
+	 * request B can land its own upsert on top, and A's read then observes
+	 * B's value — both calls can answer the same number, and neither is
+	 * proven to be the one THIS call actually produced. `get_option()` would
+	 * be worse still, answering this process's cache rather than what either
+	 * statement committed.
 	 *
-	 * A bump whose statement failed, or a read-back that could not be proven,
-	 * answers null — "no witness this serve", never a stale or guessed
-	 * number a caller could mistake for this call's own.
+	 * So the value is captured IN THE SAME STATEMENT, via MySQL's
+	 * `LAST_INSERT_ID(expr)` — an old, portable trick (MySQL 5.7, MySQL 8.0
+	 * and MariaDB all document and support it identically) for minting a
+	 * multi-writer-safe sequence from a non-AUTO_INCREMENT column: the upsert
+	 * assigns the new value AND sets it as this CONNECTION's session-level
+	 * `LAST_INSERT_ID()` in the same round trip, and the very next statement
+	 * on the SAME connection — `SELECT LAST_INSERT_ID()`, no WHERE, no table
+	 * — reads that session variable back. It is immune to the race above by
+	 * construction: `LAST_INSERT_ID()` is scoped to the connection that set
+	 * it, so another request's later upsert on another connection cannot
+	 * touch what THIS connection's session remembers, whatever it does to
+	 * the shared row in between. `LAST_INSERT_ID(1)` in the VALUES clause
+	 * covers the first insert the same way, since the row's own primary key
+	 * (`option_id`) is what a plain INSERT would otherwise stamp the session
+	 * with, not the counter value.
+	 *
+	 * A bump whose statement failed, or a read-back that could not be
+	 * proven, answers null — "no witness this serve", never a stale or
+	 * guessed number a caller could mistake for this call's own.
 	 *
 	 * @return int|null
 	 */
@@ -1404,7 +1421,7 @@ class Aura_Worker_Door_Log {
 		$wpdb->last_error = '';
 		$ok                = $wpdb->query(
 			$wpdb->prepare(
-				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, LAST_INSERT_ID(1), 'no') ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(option_value + 1)",
 				self::OBSERVATION
 			)
 		);
@@ -1412,13 +1429,15 @@ class Aura_Worker_Door_Log {
 		if ( false === $ok || '' !== (string) $wpdb->last_error ) {
 			return null; // the statement itself failed: nothing was witnessed
 		}
-		$read = self::raw_option_read( self::OBSERVATION );
-		if ( ! $read['ok'] || null === $read['value'] ) {
-			// The bump may well have landed — but a read that cannot prove
-			// what it landed AS must not hand back a guess (Ruling S1).
+		$wpdb->last_error = '';
+		$id                = $wpdb->get_var( 'SELECT LAST_INSERT_ID()' );
+		if ( null === $id || '' !== (string) $wpdb->last_error || ! is_numeric( $id ) ) {
+			// The upsert may well have landed — but a connection that cannot
+			// prove what IT assigned must not hand back a guess, and never
+			// the shared row's current value (Ruling S2).
 			return null;
 		}
-		return (int) $read['value'];
+		return (int) $id;
 	}
 
 	/**

@@ -1895,6 +1895,17 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		private $sa_last_var = null;
 		/**
+		 * MySQL's LAST_INSERT_ID() session variable (Ruling S2, 2.16.2): set
+		 * ONLY by a statement that runs THROUGH THIS INSTANCE — a racer that
+		 * writes the row directly (bypassing $wpdb->query()) must never touch
+		 * it, exactly as a second real MySQL connection's own session cannot
+		 * see into this one's. This is what lets `bump_observation()`'s
+		 * upsert-then-`SELECT LAST_INSERT_ID()` answer THIS call's own
+		 * assigned value even when another connection increments the same row
+		 * in between.
+		 */
+		private $sa_last_insert_id = null;
+		/**
 		 * The same thing for get_row(). wpdb keeps ONE $last_result; modelling
 		 * the two separately is the harsher choice, because it means the stale
 		 * answer a probe can meet is always another PROBE's row — the most
@@ -2216,6 +2227,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return '1';
 			}
+			// Aura_Worker_Door_Log::bump_observation()'s connection-scoped
+			// read-back (Ruling S2, 2.16.2): the value the LAST statement
+			// issued THROUGH THIS INSTANCE assigned via LAST_INSERT_ID(expr)
+			// — never a re-read of the shared row, which is exactly the race
+			// this replaced. `_sa_wpdb_error` above already covers "the
+			// read-back itself fails"; null here additionally covers the
+			// honest case where nothing has been assigned on this connection
+			// yet.
+			if ( 'SELECT LAST_INSERT_ID()' === trim( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return null === $this->sa_last_insert_id ? null : (string) $this->sa_last_insert_id;
+			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				$name = stripslashes( $m[1] );
@@ -2461,9 +2484,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * can never be the stale answer another test's probe meets.
 		 */
 		public function sa_forget_last_result(): void {
-			$this->sa_last_var     = null;
-			$this->sa_last_row     = null;
-			$this->sa_last_results = array();
+			$this->sa_last_var        = null;
+			$this->sa_last_row        = null;
+			$this->sa_last_results    = array();
+			// LAST_INSERT_ID() is a per-CONNECTION session variable (Ruling
+			// S2): a fresh test is a fresh connection, and one test's bump
+			// must never be readable as another's witness.
+			$this->sa_last_insert_id  = null;
 		}
 
 		/**
@@ -3042,6 +3069,50 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$name = stripslashes( $m[1] );
 				$GLOBALS['_rows'][ $name ]    = isset( $GLOBALS['_rows'][ $name ] ) ? (string) ( (int) $GLOBALS['_rows'][ $name ] + 1 ) : '1';
 				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
+				return 1;
+			}
+			// Aura_Worker_Door_Log::bump_observation()'s upsert (Ruling S2,
+			// 2.16.2): the SAME atomic create-or-increment as above, but the
+			// value this statement assigns is ALSO captured into MySQL's
+			// session-level LAST_INSERT_ID() via the LAST_INSERT_ID(expr)
+			// trick — connection-scoped, so a caller's own immediately
+			// following `SELECT LAST_INSERT_ID()` answers what THIS
+			// statement assigned, never a re-read of a row another
+			// connection may have moved on again in between.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', LAST_INSERT_ID\(1\), 'no'\) ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID\(option_value \+ 1\)$/", $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				// The statement itself failing — a driver error, not a race —
+				// scoped by option name like every other CAS write path here.
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( null ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						$this->last_error = 'write failed';
+						return false;
+					}
+				}
+				$next                          = isset( $GLOBALS['_rows'][ $name ] ) ? ( (int) $GLOBALS['_rows'][ $name ] + 1 ) : 1;
+				$GLOBALS['_rows'][ $name ]     = (string) $next;
+				$GLOBALS['_options'][ $name ]  = (string) $next;
+				// Set on THIS instance only — never on a value a racer wrote
+				// directly to $_rows/$_options, which must leave this
+				// connection's own session variable untouched (Ruling S2).
+				$this->sa_last_insert_id = $next;
+				// The window between THIS statement and this SAME caller's
+				// own following `SELECT LAST_INSERT_ID()` — the exact window
+				// Ruling S2 exists to close. A test fires an interleaved
+				// bump here, typically on a SECOND SA_Test_Wpdb instance (a
+				// second connection), to prove this instance's own
+				// LAST_INSERT_ID() is immune to it. Fires once.
+				if ( isset( $GLOBALS['_sa_after_observation_bump'] ) && is_callable( $GLOBALS['_sa_after_observation_bump'] ) ) {
+					$racer = $GLOBALS['_sa_after_observation_bump'];
+					unset( $GLOBALS['_sa_after_observation_bump'] );
+					$racer();
+				}
 				return 1;
 			}
 			// The conditional DELETE a magic-link claim release issues: the row
