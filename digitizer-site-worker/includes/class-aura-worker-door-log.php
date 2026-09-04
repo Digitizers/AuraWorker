@@ -1452,6 +1452,14 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( self::FULL_COUNTER, 'options' );
 	}
 
+	/** @var int|null Test seam: stands in for PHP_INT_SIZE in bump_door_version()'s Ruling S7 check. Never read by production code. */
+	private static $int_size_override_for_tests = null;
+
+	/** @param int|null $bytes Test seam. */
+	public static function set_int_size_for_tests( $bytes ) {
+		self::$int_size_override_for_tests = $bytes;
+	}
+
 	/**
 	 * Bump the per-site DOOR VERSION atomically and hand back the value THIS
 	 * call produced — a counter Aura orders overlapping `/status` polls by
@@ -1506,6 +1514,25 @@ class Aura_Worker_Door_Log {
 	 * coercion in an unadorned `option_value + 1` is not guaranteed against
 	 * every stored representation the way an explicit CAST is.
 	 *
+	 * 32-BIT PHP CANNOT REPRESENT THE CLOCK — OR THE ANSWER — AS AN INT
+	 * (Ruling S7, Codex round-3 P2 on #88). Today's microsecond timestamp
+	 * (~1.7e15) is already past a 32-bit build's `PHP_INT_MAX` (~2.1e9), so
+	 * `(int) floor( microtime( true ) * 1000000 )` would silently overflow
+	 * or clamp there, corrupting the very value the clock floor exists to
+	 * make trustworthy. The WRITE side never risks it: `microtime( false )`'s
+	 * two pieces — whole seconds (~1.7e9) and the microsecond fraction
+	 * (0-999999) — each fit comfortably in a 32-bit int on their own, and
+	 * `sprintf( '%d%06d', … )` concatenates their DECIMAL DIGITS into the
+	 * same 16-digit value as text, bound with `%s` rather than `%d` — never
+	 * assembled as a single PHP int at all. MySQL then parses that string in
+	 * its OWN 64-bit integer domain when it evaluates `GREATEST`/`CAST`,
+	 * regardless of the PHP client's word size, so the counter itself always
+	 * advances correctly. Only the READ-BACK is bounded: `(int) $id` on a
+	 * value this large would be exactly the corruption above, so a 32-bit
+	 * build answers `observation: null` UNCONDITIONALLY — no witness on such
+	 * a build, ever, and Aura's ordering falls back to its own request order
+	 * for that site (documented in readme.txt).
+	 *
 	 * A bump whose statement failed, or a read-back that could not be
 	 * proven, answers null — "no witness this serve", never a stale or
 	 * guessed number a caller could mistake for this call's own. So does a
@@ -1521,13 +1548,19 @@ class Aura_Worker_Door_Log {
 	public static function bump_door_version() {
 		global $wpdb;
 		$wpdb->last_error = '';
-		// Microsecond wall-clock, as a 64-bit int: PHP ints are 64-bit on
-		// every platform this plugin targets, and the value (~1.7e15 today)
-		// is far inside that range for centuries yet.
-		$clock             = (int) floor( microtime( true ) * 1000000 );
-		$ok                = $wpdb->query(
+		// Built as TEXT, never assembled as one PHP int (Ruling S7): see the
+		// docblock above. `microtime( false )` returns "0.usec sec" — the
+		// fractional-seconds half first, the whole-seconds half second.
+		list( $frac, $sec ) = explode( ' ', microtime( false ), 2 );
+		// TRUNCATED, never rounded: round() can carry 999999.9997 up to
+		// 1000000 — SEVEN digits, which would overrun the %06d field and
+		// corrupt the clock's fixed 6-digit microsecond width instead of
+		// incrementing the second it belongs to. (int) cast truncates.
+		$usec                = min( 999999, (int) ( ( (float) $frac ) * 1000000 ) );
+		$clock               = sprintf( '%d%06d', (int) $sec, $usec );
+		$ok                  = $wpdb->query(
 			$wpdb->prepare(
-				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, LAST_INSERT_ID(GREATEST(1, %d)), 'no') ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(GREATEST(CAST(option_value AS UNSIGNED) + 1, %d))",
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, LAST_INSERT_ID(GREATEST(1, %s)), 'no') ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(GREATEST(CAST(option_value AS UNSIGNED) + 1, %s))",
 				self::OBSERVATION,
 				$clock,
 				$clock
@@ -1543,6 +1576,14 @@ class Aura_Worker_Door_Log {
 			// The upsert may well have landed — but a connection that cannot
 			// prove what IT assigned must not hand back a guess, and never
 			// the shared row's current value (Ruling S2).
+			return null;
+		}
+		$int_size = null !== self::$int_size_override_for_tests ? self::$int_size_override_for_tests : PHP_INT_SIZE;
+		if ( $int_size < 8 ) {
+			// Ruling S7: this build cannot represent the answer as an int
+			// without corrupting it. The counter still advanced — MySQL did
+			// the arithmetic — but nothing here may claim to have witnessed
+			// what it now holds.
 			return null;
 		}
 		$id = (int) $id;
@@ -1572,7 +1613,14 @@ class Aura_Worker_Door_Log {
 		if ( ! $read['ok'] ) {
 			return null;
 		}
-		return null === $read['value'] ? null : (int) $read['value'];
+		if ( null === $read['value'] || ! is_numeric( $read['value'] ) ) {
+			return null;
+		}
+		$int_size = null !== self::$int_size_override_for_tests ? self::$int_size_override_for_tests : PHP_INT_SIZE;
+		if ( $int_size < 8 ) {
+			return null; // Ruling S7 — see bump_door_version()
+		}
+		return (int) $read['value'];
 	}
 
 	/**

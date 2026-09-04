@@ -705,4 +705,40 @@ final class DoorLogTest extends TestCase {
 		$this->assertGreaterThan( $after_rotation, Aura_Worker_Door_Log::bump_door_version(), 'and the next bump continues past it' );
 	}
 
+	/**
+	 * Ruling S7 (Codex round-3 P2 on #88): on a 32-bit PHP build the
+	 * clock-derived value (~1.7e15 today) cannot be represented as an int
+	 * without corrupting it, so the READ-BACK always answers null there —
+	 * even though the counter itself still advances correctly, since the
+	 * WRITE side is built as a decimal STRING (never assembled as one PHP
+	 * int) and MySQL evaluates it in its own 64-bit domain regardless of the
+	 * PHP client's word size. Modelled via a test-only seam standing in for
+	 * `PHP_INT_SIZE`, since the real constant cannot be redefined.
+	 */
+	public function test_bump_door_version_answers_null_on_a_32_bit_build_but_still_advances_the_counter(): void {
+		Aura_Worker_Door_Log::set_int_size_for_tests( 4 );
+		$first  = Aura_Worker_Door_Log::bump_door_version();
+		$second = Aura_Worker_Door_Log::bump_door_version();
+		Aura_Worker_Door_Log::set_int_size_for_tests( null );
+
+		$this->assertNull( $first, 'a 32-bit build must never hand back a witness it cannot represent' );
+		$this->assertNull( $second );
+
+		// The counter still advanced on every bump above — proven by
+		// switching back to a 64-bit read and finding a real, positive
+		// value already stored, not the null a corrupted write would leave.
+		$this->assertGreaterThan( 0, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/** The same 32-bit guard applies to the READ-ONLY audit path (Ruling S7). */
+	public function test_door_version_raw_also_answers_null_on_a_32_bit_build(): void {
+		Aura_Worker_Door_Log::bump_door_version(); // a real value now exists in the row
+
+		Aura_Worker_Door_Log::set_int_size_for_tests( 4 );
+		$out = Aura_Worker_Door_Log::door_version_raw();
+		Aura_Worker_Door_Log::set_int_size_for_tests( null );
+
+		$this->assertNull( $out, 'a 32-bit build cannot prove what the row holds without risking corruption' );
+		$this->assertGreaterThan( 0, Aura_Worker_Door_Log::door_version_raw(), 'and the value is still there once read on a build that can represent it' );
+	}
 }

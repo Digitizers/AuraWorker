@@ -240,7 +240,7 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 
 ### 2.16.2
 
-- `/status`'s door fragment carries `observation`, a per-site door-version witness bumped atomically by every door-state mutation (never by a mere poll) and clock-floored so a restored backup can never reissue a value it already served, so Aura can order overlapping polls by the site's own witness instead of request timestamps; `elementor.governor` reports the current value.
+- `/status`'s door fragment carries `observation`, a per-site door-version witness bumped atomically by every door-state mutation (never by a mere poll) and clock-floored so a restored backup can never reissue a value it already served, so Aura can order overlapping polls by the site's own witness instead of request timestamps; `elementor.governor` reports the current value. The observation witness needs 64-bit PHP; on a 32-bit build it always reports `null` and ordering falls back to Aura's own request order for that site.
 
 ### 2.16.1
 

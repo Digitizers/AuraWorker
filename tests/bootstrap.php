@@ -3086,19 +3086,20 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// Aura_Worker_Door_Log::bump_door_version()'s upsert (Rulings S2,
 			// S4 and S6, 2.16.2): the SAME atomic create-or-increment as
 			// above, but CLOCK-FLOORED — GREATEST( current + 1, the caller's
-			// own wall-clock microseconds, captured twice as %d because it is
-			// bound into both the VALUES and the UPDATE clause of the SAME
-			// statement — so a `wp_options` restore that rolls the stored
-			// value back can never make this counter reissue a value it
-			// already served. The value this statement assigns is ALSO
+			// own wall-clock microseconds, captured twice as %s (a DECIMAL
+			// STRING, never assembled as one PHP int — Ruling S7) because it
+			// is bound into both the VALUES and the UPDATE clause of the
+			// SAME statement — so a `wp_options` restore that rolls the
+			// stored value back can never make this counter reissue a value
+			// it already served. The value this statement assigns is ALSO
 			// captured into MySQL's session-level LAST_INSERT_ID() via the
 			// LAST_INSERT_ID(expr) trick — connection-scoped, so a caller's
 			// own immediately following `SELECT LAST_INSERT_ID()` answers
 			// what THIS statement assigned, never a re-read of a row another
 			// connection may have moved on again in between (Ruling S2).
-			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', LAST_INSERT_ID\(GREATEST\(1, (\d+)\)\), 'no'\) ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID\(GREATEST\(CAST\(option_value AS UNSIGNED\) \+ 1, (\d+)\)\)$/", $query, $m ) ) {
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', LAST_INSERT_ID\(GREATEST\(1, '(\d+)'\)\), 'no'\) ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID\(GREATEST\(CAST\(option_value AS UNSIGNED\) \+ 1, '(\d+)'\)\)$/", $query, $m ) ) {
 				$name  = stripslashes( $m[1] );
-				$clock = (int) $m[2]; // the same value the statement bound into both %d slots
+				$clock = (int) $m[2]; // the same decimal string the statement bound into both %s slots — this stub always runs on a 64-bit test host
 				// The statement itself failing — a driver error, not a race —
 				// scoped by option name like every other CAS write path here.
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
@@ -4550,6 +4551,12 @@ function sa_reset_state(): void {
 		// than failing the test that actually left it set.
 		Aura_Worker_Rules::$rest_request_override = null;
 		Aura_Worker_Rules::$cookie_auth_override  = null;
+	}
+	if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+		// Ruling S7's test seam: a test that fakes a 32-bit build and forgets
+		// to clear it would otherwise poison every later test's door version
+		// with a permanent `null` witness.
+		Aura_Worker_Door_Log::set_int_size_for_tests( null );
 	}
 	// Update-tool fixtures: a test that seeds these and forgets to clear them
 	// would otherwise leak into every later test's get_plugins()/
