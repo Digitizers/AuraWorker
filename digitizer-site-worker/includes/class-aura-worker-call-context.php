@@ -67,6 +67,21 @@ class Aura_Worker_Call_Context {
 	private static $verified = array();
 
 	/**
+	 * The capture's third answer (Ruling P79): a request that authenticated,
+	 * whose binding could NOT be established.
+	 *
+	 * It is not null. Null means "nothing authenticated" — WP-CLI, cron, a
+	 * cookie-authenticated admin — and falls back to reading the generation at
+	 * admission, which is exactly the fallback an unreadable capture must not
+	 * take: an unbind creating or rotating the record in between would then be
+	 * compared with itself and the revoked credential's write would run.
+	 *
+	 * Not a value any generation can hold: `wp_generate_uuid4()` produces no
+	 * NUL byte.
+	 */
+	const BINDING_UNREADABLE = "\0unreadable";
+
+	/**
 	 * The binding generation this request AUTHENTICATED under (Ruling P76).
 	 *
 	 * Captured where WordPress decides the request is who it says it is — the
@@ -166,17 +181,41 @@ class Aura_Worker_Call_Context {
 		if ( null !== self::$authenticated_binding || ! class_exists( 'Aura_Worker_Door_Log' ) ) {
 			return; // the FIRST authentication of the request is the one that counts
 		}
-		$gen = (string) Aura_Worker_Door_Log::binding_raw();
-		if ( '' !== $gen ) {
-			self::$authenticated_binding = $gen;
-		}
+		// THE RECORD, MINTING IT IF IT IS NOT THERE (Ruling P79). Reading raw
+		// and giving up on an empty answer recorded a successful authentication
+		// as though none had happened — which is the CLI/cron fallback, and on
+		// the first governed request after upgrading a connected site (no
+		// record yet) that was every such request. An unbind minting or
+		// rotating the record before admission was then compared with itself.
+		//
+		// `binding_record()` is the same path every other reader takes: it
+		// mints lazily, adopts an `unset` placeholder (Ruling P73) — which does
+		// not rotate, so the generation it leaves is the one already standing —
+		// and answers an empty generation when it could establish nothing.
+		// RE-ENTRANT-SAFE, and fail-closed while it runs. `binding_record()`
+		// reads the ruleset store to adopt, and that read can travel back
+		// through this plugin's own token check — which calls this again. The
+		// sentinel is installed FIRST, so a re-entrant call sees a non-null
+		// capture and returns immediately, and a read that never completes
+		// leaves the request refusing rather than falling back.
+		self::$authenticated_binding = self::BINDING_UNREADABLE;
+		$rec = Aura_Worker_Door_Log::binding_record();
+		$gen = (string) ( isset( $rec['gen'] ) ? $rec['gen'] : '' );
+		// UNREADABLE IS ITS OWN ANSWER, never "no capture": this request
+		// authenticated, and every admission it makes must refuse rather than
+		// fall back to whatever the record says by then.
+		self::$authenticated_binding = ( '' === $gen ) ? self::BINDING_UNREADABLE : $gen;
 	}
 
 	/**
-	 * The generation this request authenticated under, or null when nothing
-	 * captured one — WP-CLI, cron, and any context with no authentication hook
-	 * to hang the capture on. A null baseline means "read the generation at
-	 * admission", which is what every writer did before Ruling P76.
+	 * The generation this request authenticated under.
+	 *
+	 * Three answers (Ruling P79): a generation; `BINDING_UNREADABLE` when this
+	 * request DID authenticate but the binding could not be established, which
+	 * refuses every admission it goes on to make; and null when nothing
+	 * authenticated at all — WP-CLI, cron, a cookie-authenticated admin — which
+	 * alone means "read the generation at admission", as every writer did
+	 * before Ruling P76.
 	 *
 	 * @return string|null
 	 */

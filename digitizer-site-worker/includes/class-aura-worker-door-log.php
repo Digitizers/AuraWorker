@@ -157,6 +157,14 @@ class Aura_Worker_Door_Log {
 		// which is what every writer did before.
 		if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
 			$authed = Aura_Worker_Call_Context::authenticated_binding();
+			if ( Aura_Worker_Call_Context::BINDING_UNREADABLE === $authed ) {
+				// This request authenticated and its binding could not be
+				// established (Ruling P79). Falling back to the record as it
+				// stands is the bug: an unbind minting or rotating it in
+				// between would be compared with itself. Null refuses every
+				// admission — nothing written, nothing run.
+				return null;
+			}
 			if ( null !== $authed && '' !== (string) $authed ) {
 				return (string) $authed;
 			}

@@ -526,6 +526,66 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( 'binding_changed', $row['reason'] );
 	}
 
+	/**
+	 * Ruling P79 (F2): an authentication whose binding could not be
+	 * established is not "no authentication".
+	 *
+	 * The capture used to read the record raw and give up on an empty answer,
+	 * recording a successful authentication exactly as it records a CLI run —
+	 * which falls back to the generation at admission. On the first governed
+	 * request after upgrading a connected site (no record yet) that was every
+	 * such request: an unbind minting or rotating the record before admission
+	 * was then compared with itself, and the revoked credential's write ran.
+	 */
+	public function test_an_authentication_whose_binding_is_unreadable_refuses_the_write(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$inner_ran = 0;
+		add_action(
+			'sa_test_inner_ran',
+			static function () use ( &$inner_ran ) {
+				++$inner_ran;
+			}
+		);
+		// No record, and the mint that would create one cannot land.
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] );
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::BINDING;
+
+		Aura_Worker_Call_Context::capture_authenticated_binding();
+		$this->assertSame( Aura_Worker_Call_Context::BINDING_UNREADABLE, Aura_Worker_Call_Context::authenticated_binding() );
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$GLOBALS['_sa_insert_unique_fail'] = false;
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'], 'retryable: nothing ran' );
+		$this->assertSame( 0, $inner_ran );
+		$this->assertNull( Aura_Worker_Door_Log::get( 1 ), 'and no row was written' );
+	}
+
+	/**
+	 * …and the first governed request after an upgrade MINTS one at
+	 * authentication, so the row carries a real generation rather than falling
+	 * back at admission.
+	 */
+	public function test_the_first_request_after_an_upgrade_captures_a_minted_generation(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] );
+
+		Aura_Worker_Call_Context::capture_authenticated_binding();
+
+		$gen = Aura_Worker_Call_Context::authenticated_binding();
+		$this->assertNotNull( $gen );
+		$this->assertNotSame( Aura_Worker_Call_Context::BINDING_UNREADABLE, $gen );
+		$this->assertSame( Aura_Worker_Door_Log::binding_raw(), $gen, 'minted, and it is the record\'s own' );
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertIsArray( $out );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::get( 1 )['binding'] );
+	}
+
 	/** With NO capture — WP-CLI, cron — the stamp is the record as it stands. */
 	public function test_a_write_with_no_captured_binding_stamps_the_current_generation(): void {
 		$this->registerAll();

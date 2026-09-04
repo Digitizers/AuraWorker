@@ -808,6 +808,15 @@ function sa_token_hash(): string {
 	// Aura_Worker_Security::capture_token_auth() itself afterwards.
 	if ( class_exists( 'Aura_Worker_Security' ) ) {
 		Aura_Worker_Security::capture_token_auth( $hash );
+		// …but a FIXTURE is not a request (Ruling P79). capture_token_auth()
+		// now also captures the binding this request authenticated under, and
+		// a fixture that seeds the token half-way through building a site would
+		// pin (and adopt) a binding against an identity that is not finished
+		// being written. A test that means to authenticate calls
+		// Aura_Worker_Call_Context::capture_authenticated_binding() itself.
+		if ( class_exists( 'Aura_Worker_Call_Context' ) ) {
+			Aura_Worker_Call_Context::reset();
+		}
 	}
 	return $hash;
 }

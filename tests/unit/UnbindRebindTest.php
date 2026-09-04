@@ -67,7 +67,13 @@ final class UnbindRebindTest extends TestCase {
 		update_option( 'aura_worker_site_token', Aura_Worker_Security::hash_token( SA_RAW_SITE_TOKEN ) );
 		update_option( 'aura_worker_connect_user_id', self::ADMIN );
 		update_option( 'aura_worker_dashboard_url', 'https://departed.example' );
-		Aura_Worker_Rules::bind( 'c1', sa_token_hash() );
+		// The CLIENT before the token AUTHENTICATION (Ruling P79): capturing an
+		// authentication now also establishes the binding record, adopting an
+		// upgraded site's placeholder to whatever identity is live at that
+		// instant. Binding c1 first is the order a real site is in by the time
+		// any request authenticates against it.
+		Aura_Worker_Rules::bind( 'c1', Aura_Worker_Security::hash_token( SA_RAW_SITE_TOKEN ) );
+		sa_token_hash();
 		sa_set_managed_app_password( self::ADMIN, self::OLD_UUID );
 		sa_set_marker(
 			array(
