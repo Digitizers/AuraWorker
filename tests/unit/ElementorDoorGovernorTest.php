@@ -1143,4 +1143,33 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertNull( $frag['binding'] );
 		$this->assertNull( $block['binding'] );
 	}
+
+	/**
+	 * Ruling S1 (Codex round-1 P2 on #87): a `query` filter that blanks the
+	 * binding statement (or an unready handle) leaves `last_error` untouched
+	 * and hands back the PREVIOUS statement's row — priming with generation
+	 * A, rewriting the record to B, then suppressing the next statement used
+	 * to answer both shapes A instead of `null`, mislabelling a departed
+	 * client's door-log entries as the current client's own.
+	 */
+	public function test_binding_is_null_in_both_shapes_when_the_next_query_is_suppressed_after_a_rebind(): void {
+		$this->registerAll();
+		$rec_a = array( 'gen' => 'gen-a', 'state' => 'bound', 'client' => 'client-a', 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec_a;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec_a );
+		$this->assertSame( 'gen-a', Aura_Worker_Elementor_Door::status_fragment()['binding'], 'primed: a real read proves generation A' );
+
+		$rec_b = array( 'gen' => 'gen-b', 'state' => 'bound', 'client' => 'client-b', 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec_b;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec_b );
+		$GLOBALS['_sa_wpdb_query_filtered_out']               = true;
+
+		$frag  = Aura_Worker_Elementor_Door::status_fragment();
+		$block = Aura_Worker_Elementor_Door::governor_block();
+
+		$GLOBALS['_sa_wpdb_query_filtered_out'] = false;
+
+		$this->assertNull( $frag['binding'], 'never the stale A, and never the unproven B' );
+		$this->assertNull( $block['binding'], 'never the stale A, and never the unproven B' );
+	}
 }

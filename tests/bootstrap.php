@@ -2418,6 +2418,35 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$len = strlen( $raw );
 				return (object) array( 'probe' => $m[1], 'len' => $len, 'v' => $len <= $max ? $raw : null );
 			}
+			// Aura_Worker_Door_Log::raw_option_read() (Ruling S1, Codex
+			// round-1 P2 on #87): the same nonce proof as the app-password
+			// reads above, over a plain wp_options row instead of usermeta.
+			// Shares `_sa_option_read_fail`'s per-name counter WITH
+			// get_var()'s branch below (row_from_db()'s own inline read still
+			// goes through get_var()) — a test that arms one name's counter
+			// must see it decremented the same way whichever method reads it
+			// next, or a sequence mixing both (the watermark's patch, then
+			// the fence) would prove nothing.
+			if ( preg_match( "/^SELECT '([^']*)' AS probe, \(SELECT option_value FROM \S+ WHERE option_name = '([^']*)' LIMIT 1\) AS v$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$probe                    = $m[1];
+				$name                     = stripslashes( $m[2] );
+				if ( ! empty( $GLOBALS['_sa_option_read_fail'][ $name ] ) ) {
+					$fail = $GLOBALS['_sa_option_read_fail'][ $name ];
+					if ( is_int( $fail ) && $fail > 0 ) {
+						$GLOBALS['_sa_option_read_fail'][ $name ] = ( $fail > 1 ) ? $fail - 1 : -1;
+					} else {
+						$this->last_error = 'read failed';
+						return null;
+					}
+				}
+				$answer = sa_read_option_uncached( $name );
+				sa_after_option_read( $name );
+				return (object) array(
+					'probe' => $probe,
+					'v'     => $answer,
+				);
+			}
 			// Reformatting the production probe would otherwise unhook every
 			// I5/M12/N1 test silently — they would fall through to $_db_row,
 			// read null, and go on passing while proving nothing. LOUD instead.

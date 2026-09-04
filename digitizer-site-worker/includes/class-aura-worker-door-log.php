@@ -31,6 +31,8 @@ class Aura_Worker_Door_Log {
 
 	/** @var bool Whether this request has already tried to adopt an `unset` record (Ruling P73). */
 	private static $binding_adopt_tried = false;
+	/** @var int Monotonic counter feeding raw_option_read()'s per-call proof nonce (Ruling S1). */
+	private static $raw_read_seq = 0;
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
 	const MAX_UNACKED  = 2000;
@@ -647,13 +649,18 @@ class Aura_Worker_Door_Log {
 	 * @return array{ ok: bool, gen: string }
 	 */
 	public static function fence_identity() {
-		global $wpdb;
-		$wpdb->last_error = '';
-		$raw              = self::raw_option( self::BINDING );
-		if ( '' !== (string) $wpdb->last_error ) {
+		// PROVEN, not just error-free (Ruling S1, Codex round-1 P2 on #87): a
+		// `query` filter that blanks the statement, or an unready handle,
+		// leaves `last_error` untouched and hands back the PREVIOUS
+		// statement's answer — checking the error string alone read that as a
+		// successful read of THIS one. `raw_option_read()`'s `ok` is the
+		// freshness proof; a false one is exactly as unreadable as a driver
+		// error.
+		$read = self::raw_option_read( self::BINDING );
+		if ( ! $read['ok'] ) {
 			return array( 'ok' => false, 'gen' => '' );
 		}
-		$rec = null === $raw ? null : maybe_unserialize( $raw );
+		$rec = null === $read['value'] ? null : maybe_unserialize( $read['value'] );
 		// No record at all is not a failure — it is a site nobody has stated
 		// anything about — but it matches no stamped row, and an EMPTY stamp is
 		// never current either (Ruling P72).
@@ -1065,16 +1072,88 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * One option's raw, still-serialised bytes from the DATABASE, PROVEN to
+	 * have been read (Ruling S1, Codex round-1 P2 on #87).
+	 *
+	 * wpdb::get_var()/get_row() extract their answer from `$last_result`,
+	 * populated by whichever statement ran LAST — and wpdb::query() has two
+	 * early returns before its flush() that leave `$last_result` exactly as
+	 * the previous statement left it: an unready handle, and a `query` filter
+	 * that blanks the SQL. Neither touches `last_error`, so a caller that
+	 * only checks the error string is empty cannot tell a proven read from a
+	 * statement that never ran at all — this is what let
+	 * `binding_raw()`/`epoch_raw()` answer an earlier generation instead of
+	 * `''` when the statement between two reads was suppressed.
+	 *
+	 * `$wpdb->last_query` is NOT the proof (unlike the two-step read this
+	 * replaced): comparing it to "the SQL just issued" is blind to the one
+	 * case that matters most — the SAME option read twice in a row, where the
+	 * suppressed call's prepared string is BYTE-IDENTICAL to the proven
+	 * call's, so the comparison passes on a stale answer. Nor is
+	 * `$wpdb->ready` — a third-party `db.php` drop-in is free to never set
+	 * it, which would strand every caller here on "unproven" forever.
+	 *
+	 * The proof travels IN BAND instead, the same shape
+	 * `aura_worker_app_password_list()` already established
+	 * (includes/credential-rules.php): a per-call nonce selected alongside
+	 * the value in ONE statement, via `get_row()` — only OUR OWN statement
+	 * can put THIS call's nonce in the row that comes back. A stale row
+	 * carries an EARLIER call's nonce (or none), so the comparison alone
+	 * tells a proven read from an unproven one, whatever `last_query` or
+	 * `ready` say and however many times the same option is read in a row.
+	 *
+	 * @param string $name Option name.
+	 * @return array{ ok: bool, value: string|null } `ok` false ⇒ UNPROVEN — a
+	 *         stale answer or a driver failure, never trustworthy; `value` is
+	 *         the row's content only when `ok` is true (null there means the
+	 *         row is genuinely absent).
+	 */
+	private static function raw_option_read( $name ) {
+		global $wpdb;
+		if ( ! is_object( $wpdb ) || ! isset( $wpdb->options ) ) {
+			return array( 'ok' => false, 'value' => null );
+		}
+		$wpdb->last_error = '';
+		++self::$raw_read_seq;
+		// wp_generate_uuid4(), not wp_generate_password(): the latter is
+		// PLUGGABLE and filtered through `random_password`, and a constant
+		// nonce is no nonce at all — the same reasoning credential-rules.php
+		// documents for the app-password proof. The monotonic counter is the
+		// belt: nothing outside this function can make two of its calls
+		// agree even if a filter pinned the randomiser.
+		$nonce = self::$raw_read_seq . '-' . wp_generate_uuid4();
+		$sql   = $wpdb->prepare(
+			"SELECT %s AS probe, (SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1) AS v",
+			$nonce,
+			$name
+		);
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			return array( 'ok' => false, 'value' => null ); // prepare() refused: nothing was issued
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.NotPrepared
+		$row = $wpdb->get_row( $sql );
+		$ok  = is_object( $row ) && isset( $row->probe ) && $nonce === (string) $row->probe && '' === (string) $wpdb->last_error;
+		return array(
+			'ok'    => $ok,
+			'value' => ( $ok && isset( $row->v ) && null !== $row->v ) ? (string) $row->v : null,
+		);
+	}
+
+	/**
 	 * One option's raw, still-serialised bytes from the DATABASE — never this
 	 * request's cache. The predicate a compare-and-swap fences on.
+	 *
+	 * UNPROVEN collapses into the same `null` a genuinely absent row answers
+	 * (Ruling S1) — every caller here already treats null as "cannot
+	 * establish" and fails closed on it; only `fence_identity()` and
+	 * `row_for_fence()` need the two told apart, and read `raw_option_read()`
+	 * directly for that.
 	 *
 	 * @param string $name Option name.
 	 * @return string|null
 	 */
 	private static function raw_option( $name ) {
-		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name ) );
-		return null === $raw ? null : (string) $raw;
+		return self::raw_option_read( $name )['value'];
 	}
 
 	/** @param int $seq Seq. @return array|null */
@@ -1161,16 +1240,19 @@ class Aura_Worker_Door_Log {
 	 * @return array|null|false
 	 */
 	public static function row_for_fence( $seq ) {
-		global $wpdb;
-		$wpdb->last_error = '';
-		$raw              = self::raw_option( self::PREFIX . (int) $seq );
-		if ( '' !== (string) $wpdb->last_error ) {
+		// PROVEN, not just error-free (Ruling S1, Codex round-1 P2 on #87):
+		// see raw_option_read()'s docblock. A false `ok` is the same
+		// "unreadable" this fence already answers `false` for on a driver
+		// error — a stale answer must not be mistaken for the row's current
+		// content, or for the row being genuinely absent.
+		$read = self::raw_option_read( self::PREFIX . (int) $seq );
+		if ( ! $read['ok'] ) {
 			return false;
 		}
-		if ( null === $raw ) {
+		if ( null === $read['value'] ) {
 			return null;
 		}
-		$val = maybe_unserialize( $raw );
+		$val = maybe_unserialize( $read['value'] );
 		return is_array( $val ) ? $val : false;
 	}
 
