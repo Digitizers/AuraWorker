@@ -1405,10 +1405,29 @@ class Aura_Worker_Door_Log {
 	 * construction: `LAST_INSERT_ID()` is scoped to the connection that set
 	 * it, so another request's later upsert on another connection cannot
 	 * touch what THIS connection's session remembers, whatever it does to
-	 * the shared row in between. `LAST_INSERT_ID(1)` in the VALUES clause
-	 * covers the first insert the same way, since the row's own primary key
-	 * (`option_id`) is what a plain INSERT would otherwise stamp the session
-	 * with, not the counter value.
+	 * the shared row in between.
+	 *
+	 * CLOCK-FLOORED (Ruling S4, Codex round-2 P1 on #88). A plain increment
+	 * is not enough: `wp_options` can be restored from a backup — a snapshot
+	 * predating this row's later bumps — and a counter restored to a lower
+	 * value resumes REISSUING numbers it already served before the backup
+	 * was taken, which Aura's ordering depends on being unique. So every
+	 * assignment is `GREATEST( current + 1, <wall-clock microseconds> )`:
+	 * a restore can roll the STORED value back, but it cannot roll the
+	 * CLOCK back, so the very next bump after a restore resumes above every
+	 * value this site issued before it, never repeating one. The only way
+	 * this still repeats a value is the wall clock itself stepping
+	 * backwards (an NTP correction, a manually adjusted server clock) —
+	 * accepted: that is a fault in the host's own time, not in this
+	 * counter, and no counter can order events across it.
+	 * `GREATEST(1, …)` in the VALUES clause covers the first-ever insert the
+	 * same way a plain `LAST_INSERT_ID(1)` would have covered it, and also
+	 * means a fresh site's FIRST witness is the clock value, not a bare `1`
+	 * — a value a restored backup could trivially reissue is never handed
+	 * out even once. `CAST(option_value AS UNSIGNED)` is required because
+	 * the column is a serialised TEXT value: MySQL's implicit string-to-int
+	 * coercion in an unadorned `option_value + 1` is not guaranteed against
+	 * every stored representation the way an explicit CAST is.
 	 *
 	 * A bump whose statement failed, or a read-back that could not be
 	 * proven, answers null — "no witness this serve", never a stale or
@@ -1419,10 +1438,16 @@ class Aura_Worker_Door_Log {
 	public static function bump_observation() {
 		global $wpdb;
 		$wpdb->last_error = '';
+		// Microsecond wall-clock, as a 64-bit int: PHP ints are 64-bit on
+		// every platform this plugin targets, and the value (~1.7e15 today)
+		// is far inside that range for centuries yet.
+		$clock             = (int) floor( microtime( true ) * 1000000 );
 		$ok                = $wpdb->query(
 			$wpdb->prepare(
-				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, LAST_INSERT_ID(1), 'no') ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(option_value + 1)",
-				self::OBSERVATION
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, LAST_INSERT_ID(GREATEST(1, %d)), 'no') ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(GREATEST(CAST(option_value AS UNSIGNED) + 1, %d))",
+				self::OBSERVATION,
+				$clock,
+				$clock
 			)
 		);
 		wp_cache_delete( self::OBSERVATION, 'options' );

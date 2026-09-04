@@ -555,25 +555,69 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
-	 * The site-issued observation witness (Ruling A65, 2.16.2): an atomic
-	 * bump, proven read back, so consecutive calls in one request see
-	 * consecutive integers — never a guess, never a repeat.
+	 * The site-issued observation witness (Ruling A65, 2.16.2), CLOCK-FLOORED
+	 * (Ruling S4, Codex round-2 P1 on #88): each bump is
+	 * GREATEST( current + 1, wall-clock-microseconds ), so it is guaranteed
+	 * only to STRICTLY INCREASE — never a fixed "+1" delta, since a slower
+	 * clock can carry it further ahead than a bare increment would. Asserting
+	 * an exact `+1` here would be asserting a coincidence of timing, not the
+	 * guarantee the counter actually makes.
 	 */
-	public function test_bump_observation_increments_by_exactly_one_and_is_an_int(): void {
+	public function test_bump_observation_strictly_increases_and_is_an_int(): void {
 		$a = Aura_Worker_Door_Log::bump_observation();
 		$b = Aura_Worker_Door_Log::bump_observation();
 		$c = Aura_Worker_Door_Log::bump_observation();
 		$this->assertIsInt( $a );
-		$this->assertSame( $a + 1, $b );
-		$this->assertSame( $b + 1, $c );
+		$this->assertGreaterThanOrEqual( $a + 1, $b );
+		$this->assertGreaterThanOrEqual( $b + 1, $c );
 	}
 
-	/** Two serves within one request give consecutive values — never the same number twice. */
-	public function test_two_bumps_in_one_request_give_consecutive_values(): void {
+	/** Two serves within one request strictly increase — never the same number twice. */
+	public function test_two_bumps_in_one_request_never_answer_the_same_value(): void {
 		$first  = Aura_Worker_Door_Log::bump_observation();
 		$second = Aura_Worker_Door_Log::bump_observation();
-		$this->assertNotSame( $first, $second );
-		$this->assertSame( $first + 1, $second );
+		$this->assertGreaterThan( $first, $second );
+	}
+
+	/**
+	 * Ruling S4 (Codex round-2 P1 on #88): a plain per-row counter is not
+	 * enough — `wp_options` can be restored from a backup taken before this
+	 * row's later bumps, and a counter restored to a lower stored value
+	 * would otherwise resume REISSUING numbers it already served, which
+	 * breaks Aura's ordering. Clock-flooring means a restore can roll the
+	 * STORED value back but not the CLOCK, so the very next bump after a
+	 * restore still resumes strictly above every value issued before it.
+	 */
+	public function test_a_restore_never_reissues_a_value_already_served_before_it(): void {
+		$before_restore = 0;
+		for ( $i = 0; $i < 3; $i++ ) {
+			$before_restore = Aura_Worker_Door_Log::bump_observation();
+		}
+
+		// The database is restored from a backup taken before any of the
+		// bumps above — the row rolls back to a value far below every one
+		// of them, exactly as a snapshot restore would.
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::OBSERVATION ]    = '100';
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::OBSERVATION ] = '100';
+
+		$after_restore = Aura_Worker_Door_Log::bump_observation();
+
+		$this->assertGreaterThan(
+			$before_restore,
+			$after_restore,
+			'the clock floor means a restored counter resumes strictly ABOVE every value it issued before the backup, never reissuing one'
+		);
+	}
+
+	/**
+	 * The clock floor applies even to a row that has NEVER existed (Ruling
+	 * S4): the first-ever bump on a fresh site still answers the clock
+	 * value, not a bare `1` — a value any restored backup could trivially
+	 * reissue is never handed out even once.
+	 */
+	public function test_the_first_ever_bump_on_a_fresh_site_answers_the_clock_derived_value_not_one(): void {
+		$first = Aura_Worker_Door_Log::bump_observation();
+		$this->assertGreaterThanOrEqual( 1000000000000000, $first, 'microsecond wall-clock time today is well past 10^15' );
 	}
 
 	/**
@@ -590,7 +634,7 @@ final class DoorLogTest extends TestCase {
 	 * the stub's own upsert handler — between THIS request's own INSERT and
 	 * its own `SELECT LAST_INSERT_ID()` — never a callback inside production
 	 * code, which has no such hook. Pre-fix (a plain re-read of the shared
-	 * row) this test is RED: both connections answer 2.
+	 * row) this test is RED: both connections would answer the same value.
 	 */
 	public function test_two_interleaved_bumps_on_different_connections_never_answer_the_same_value(): void {
 		$other = null;
@@ -603,9 +647,10 @@ final class DoorLogTest extends TestCase {
 
 		$mine = Aura_Worker_Door_Log::bump_observation();
 
-		$this->assertSame( 1, $mine, "the first connection's own read answers what IT assigned, never a re-read of the row" );
-		$this->assertSame( 2, $other, 'the second, interleaved connection gets the next value' );
+		$this->assertIsInt( $mine );
+		$this->assertIsInt( $other );
 		$this->assertNotSame( $mine, $other, 'never the same number twice' );
+		$this->assertGreaterThan( $mine, $other, "the second, interleaved connection's own upsert ran AFTER the first's, so it lands strictly ahead — the first connection's own read answers what IT assigned, never a re-read of the row" );
 	}
 
 	/**
@@ -634,6 +679,6 @@ final class DoorLogTest extends TestCase {
 		$seq    = Aura_Worker_Door_Log::bump_observation();
 		Aura_Worker_Door_Log::rotate_epoch( $before );
 		$this->assertSame( $seq, Aura_Worker_Door_Log::observation_raw(), 'a rewind recovery must not zero the witness' );
-		$this->assertSame( $seq + 1, Aura_Worker_Door_Log::bump_observation(), 'and the next bump continues from it' );
+		$this->assertGreaterThan( $seq, Aura_Worker_Door_Log::bump_observation(), 'and the next bump continues past it' );
 	}
 }

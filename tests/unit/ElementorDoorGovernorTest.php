@@ -1176,16 +1176,17 @@ final class ElementorDoorGovernorTest extends TestCase {
 	/**
 	 * `observation` (Ruling A65, 2.16.2): the site-issued, monotonic witness
 	 * Aura orders overlapping `/status` polls by. Each SERVE of the fragment
-	 * bumps it ATOMICALLY, so two polls in the same test see consecutive
-	 * integers — never a client-side timestamp, which an earlier-started
-	 * request could still deliver out of order.
+	 * bumps it ATOMICALLY — CLOCK-FLOORED (Ruling S4), so it is guaranteed
+	 * only to strictly increase, never a fixed `+1` delta — never a
+	 * client-side timestamp, which an earlier-started request could still
+	 * deliver out of order.
 	 */
-	public function test_status_fragment_observation_increases_by_one_per_serve(): void {
+	public function test_status_fragment_observation_strictly_increases_per_serve(): void {
 		$this->registerAll();
 		$first  = Aura_Worker_Elementor_Door::status_fragment()['observation'];
 		$second = Aura_Worker_Elementor_Door::status_fragment()['observation'];
 		$this->assertIsInt( $first );
-		$this->assertSame( $first + 1, $second, 'the site\'s own witness, not a client-side timestamp' );
+		$this->assertGreaterThan( $first, $second, "the site's own witness, not a client-side timestamp" );
 	}
 
 	/**
@@ -1197,7 +1198,7 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$served = Aura_Worker_Elementor_Door::status_fragment()['observation'];
 		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'] );
 		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'], 'a second audit read changes nothing' );
-		$this->assertSame( $served + 1, Aura_Worker_Elementor_Door::status_fragment()['observation'], 'only a SERVE advances it' );
+		$this->assertGreaterThan( $served, Aura_Worker_Elementor_Door::status_fragment()['observation'], 'only a SERVE advances it' );
 	}
 
 	/**

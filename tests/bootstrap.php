@@ -3071,16 +3071,22 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
 				return 1;
 			}
-			// Aura_Worker_Door_Log::bump_observation()'s upsert (Ruling S2,
-			// 2.16.2): the SAME atomic create-or-increment as above, but the
-			// value this statement assigns is ALSO captured into MySQL's
-			// session-level LAST_INSERT_ID() via the LAST_INSERT_ID(expr)
-			// trick — connection-scoped, so a caller's own immediately
-			// following `SELECT LAST_INSERT_ID()` answers what THIS
-			// statement assigned, never a re-read of a row another
-			// connection may have moved on again in between.
-			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', LAST_INSERT_ID\(1\), 'no'\) ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID\(option_value \+ 1\)$/", $query, $m ) ) {
-				$name = stripslashes( $m[1] );
+			// Aura_Worker_Door_Log::bump_observation()'s upsert (Rulings S2
+			// and S4, 2.16.2): the SAME atomic create-or-increment as above,
+			// but CLOCK-FLOORED — GREATEST( current + 1, the caller's own
+			// wall-clock microseconds, captured twice as %d because it is
+			// bound into both the VALUES and the UPDATE clause of the SAME
+			// statement — so a `wp_options` restore that rolls the stored
+			// value back can never make this counter reissue a value it
+			// already served. The value this statement assigns is ALSO
+			// captured into MySQL's session-level LAST_INSERT_ID() via the
+			// LAST_INSERT_ID(expr) trick — connection-scoped, so a caller's
+			// own immediately following `SELECT LAST_INSERT_ID()` answers
+			// what THIS statement assigned, never a re-read of a row another
+			// connection may have moved on again in between (Ruling S2).
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', LAST_INSERT_ID\(GREATEST\(1, (\d+)\)\), 'no'\) ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID\(GREATEST\(CAST\(option_value AS UNSIGNED\) \+ 1, (\d+)\)\)$/", $query, $m ) ) {
+				$name  = stripslashes( $m[1] );
+				$clock = (int) $m[2]; // the same value the statement bound into both %d slots
 				// The statement itself failing — a driver error, not a race —
 				// scoped by option name like every other CAS write path here.
 				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
@@ -3095,7 +3101,12 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 						return false;
 					}
 				}
-				$next                          = isset( $GLOBALS['_rows'][ $name ] ) ? ( (int) $GLOBALS['_rows'][ $name ] + 1 ) : 1;
+				// GREATEST(1, clock) for a fresh row and GREATEST(current+1,
+				// clock) for an existing one are the SAME formula once a
+				// fresh row's "current" is taken as 0 — unified here exactly
+				// as production's single SQL expression covers both cases.
+				$current                       = isset( $GLOBALS['_rows'][ $name ] ) ? (int) $GLOBALS['_rows'][ $name ] : 0;
+				$next                          = max( $current + 1, $clock );
 				$GLOBALS['_rows'][ $name ]     = (string) $next;
 				$GLOBALS['_options'][ $name ]  = (string) $next;
 				// Set on THIS instance only — never on a value a racer wrote
