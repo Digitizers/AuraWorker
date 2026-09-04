@@ -1874,6 +1874,18 @@ class Aura_Worker_Door_Log {
 	 * — nothing here could prove state and version moved together, or that
 	 * either moved at all if something failed partway.
 	 *
+	 * A ROLLED-BACK UNIT REPORTS NO `result` AT ALL (Ruling S15, Codex
+	 * round-6 P2 on #88). Both paths that answer `committed: false` — the
+	 * bump's own write failing, and `$writes()` itself asking to roll back —
+	 * used to hand the CALLER's success-shaped `$result` straight back
+	 * regardless: `ack()` and `rotate_epoch()` both returned
+	 * `$outcome['result']` unconditionally, so a bump failure after a real
+	 * ack or rotation reported it as having happened, when the ROLLBACK just
+	 * undid it. `committed: false` now carries no `result` key at all —
+	 * every caller MUST check `committed` first and build its own failure
+	 * answer (typically by re-reading the now-unwound state) rather than
+	 * ever trust `result` without having checked it.
+	 *
 	 * @param callable $writes Returns array{ mutated: bool, result: mixed,
 	 *                         evict?: string[] } or array{ rollback: true,
 	 *                         result: mixed }. `mutated` false ⇒ an
@@ -1893,17 +1905,20 @@ class Aura_Worker_Door_Log {
 	 *                         wrote, for the post-commit repeat (Ruling S11).
 	 *                         `result` is handed back to the CALLER of
 	 *                         versioned().
-	 * @return array{ committed: bool, result: mixed, observation: int|null }
+	 * @return array{ committed: bool, result?: mixed, observation?: int|null }
 	 *         `committed` is false when $writes() asked for a rollback, or
 	 *         reported a mutation whose version bump then failed its own
 	 *         WRITE — either way the WHOLE unit rolls back (on a
 	 *         transactional engine only — see Ruling S13 above), including
 	 *         every statement $writes() itself ran, so the caller must treat
-	 *         this exactly like $writes() failing outright. `observation` is
-	 *         the witness THIS call produced — null whenever it could not be
-	 *         proven, which can happen even while `committed` is true (Ruling
-	 *         S10): a reconnect between the COMMIT and the read-back, or a
-	 *         non-transactional engine, or 32-bit PHP.
+	 *         this exactly like $writes() failing outright — and `result` is
+	 *         ABSENT whenever `committed` is false (Ruling S15): never read
+	 *         it without checking `committed` first. `observation` is
+	 *         likewise absent on failure, and otherwise the witness THIS call
+	 *         produced — null whenever it could not be proven, which can
+	 *         happen even while `committed` is true (Ruling S10): a reconnect
+	 *         between the COMMIT and the read-back, or a non-transactional
+	 *         engine, or 32-bit PHP.
 	 */
 	public static function versioned( callable $writes ) {
 		global $wpdb;
@@ -1956,9 +1971,19 @@ class Aura_Worker_Door_Log {
 			// Ruling S8: the bump's own WRITE failed, so the mutation must
 			// not land either — every statement $writes() ran is undone.
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// Ruling S15 (Codex round-6 P2 on #88): `$result` above is the
+			// SUCCESS-shaped value $writes() already computed BEFORE the
+			// bump's write failed — ack_write()'s `acked`/`floor`,
+			// rotate_epoch_write()'s `rotated: true`/`epoch`, and so on.
+			// Handing it back here, after the ROLLBACK that just undid
+			// every statement behind it, told `ack()`/`rotate_epoch()` (both
+			// of which returned `$outcome['result']` unconditionally) that
+			// their write had gone through when nothing did. A rolled-back
+			// unit reports NOTHING it did — no `result` at all — so every
+			// caller must check `committed` first and build its own failure
+			// answer rather than trust a `result` that might be stale.
 			return array(
 				'committed' => false,
-				'result'    => $result,
 			);
 		}
 		// Ruling S13: on a non-transactional engine the state write already
@@ -2138,6 +2163,20 @@ class Aura_Worker_Door_Log {
 				return self::ack_write( $epoch, $seq );
 			}
 		);
+		if ( ! $outcome['committed'] ) {
+			// Ruling S15 (Codex round-6 P2 on #88): a rolled-back unit
+			// carries no `result` — `ack_write()`'s own `acked`/`floor`
+			// were computed BEFORE the bump's write failed (or the COMMIT
+			// could not be proven, Ruling S16) and undone with everything
+			// else. Reading `self::floor()` now answers the floor as the
+			// rollback actually left it, never the value this ack thought
+			// it had raised.
+			return array(
+				'acked'     => 0,
+				'floor'     => self::floor(),
+				'committed' => false,
+			);
+		}
 		return $outcome['result'];
 	}
 
@@ -2324,6 +2363,19 @@ class Aura_Worker_Door_Log {
 				return self::rotate_epoch_write( $expected, $claim, $fence );
 			}
 		);
+		if ( ! $outcome['committed'] ) {
+			// Ruling S15 (Codex round-6 P2 on #88): a rolled-back unit
+			// carries no `result` — `rotate_epoch_write()`'s own
+			// `rotated: true`/`epoch` were computed BEFORE the bump's write
+			// failed (or the COMMIT could not be proven, Ruling S16) and
+			// undone along with everything else. `epoch_raw()` reads the
+			// row exactly as the rollback left it — the one that was never
+			// actually replaced — rather than trusting a stale guess.
+			return array(
+				'rotated' => false,
+				'epoch'   => self::epoch_raw(),
+			);
+		}
 		return $outcome['result'];
 	}
 

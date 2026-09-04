@@ -1055,6 +1055,51 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S15 (Codex round-6 P2 on #88): `versioned()` used to hand a
+	 * rolled-back caller its own SUCCESS-shaped `result` — `ack()` returned
+	 * `$outcome['result']` unconditionally, so a bump-write failure after a
+	 * real floor raise reported the ack as having happened, when the
+	 * ROLLBACK just undid it. `ack()` now checks `committed` itself and
+	 * answers a FAILURE shape instead: nothing acked, nothing purged, the
+	 * floor read fresh from the row the rollback actually left behind.
+	 */
+	public function test_a_bump_write_failure_inside_ack_purges_nothing_and_reports_committed_false(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertArrayHasKey( 'committed', $out );
+		$this->assertFalse( $out['committed'], 'a rolled-back ack reports committed: false' );
+		$this->assertSame( 0, $out['acked'] );
+		$this->assertSame( 0, $out['floor'], 'the floor raise was rolled back with the failed bump' );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'], 'the row this ack would have purged is still there' );
+	}
+
+	/**
+	 * The same Ruling S15 fix, on `rotate_epoch()`: a bump-write failure
+	 * after a real epoch rotation used to report `rotated: true` — the
+	 * closure's own success-shaped result, handed back unconditionally by a
+	 * caller that never checked `committed`. `rotate_epoch()` now answers
+	 * `rotated: false` with the epoch read fresh from the rolled-back row.
+	 */
+	public function test_a_bump_write_failure_inside_rotate_epoch_reports_rotated_false(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertFalse( $out['rotated'] );
+		$this->assertSame( $before, $out['epoch'], 'the never-replaced epoch, read fresh after the rollback' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::epoch_raw() );
+	}
+
+	/**
 	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
 	 * `SHOW TABLE STATUS LIKE 'wp_options'` ONCE per request and caches the
 	 * answer — a second call must not re-issue the probe.

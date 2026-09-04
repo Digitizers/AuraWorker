@@ -1549,6 +1549,22 @@ class Aura_Worker_API {
 
 		$result = Aura_Worker_Door_Log::ack( $epoch, $seq );
 
+		// Ruling S15 (Codex round-6 P2 on #88): `committed: false` means the
+		// whole unit rolled back — nothing was acked, nothing was purged, and
+		// `Aura_Worker_Door_Log::ack()` did not even try to compute a
+		// success-shaped answer. RETRYABLE, not a designated refusal: the
+		// same `aura_log_failed` code `restore_unsettled()` already answers
+		// with for the identical shape of fact — this site could not record
+		// an outcome, so the caller repeats the call rather than assuming its
+		// ack landed.
+		if ( array_key_exists( 'committed', $result ) && ! $result['committed'] ) {
+			return new WP_Error(
+				'aura_log_failed',
+				'This site could not record the outcome of this ack; nothing was acknowledged. Retry.',
+				array( 'status' => 503 )
+			);
+		}
+
 		$body = array(
 			'acked'   => (int) $result['acked'],
 			'floor'   => (int) $result['floor'],

@@ -234,6 +234,29 @@ final class DoorRestTest extends TestCase {
 		$this->assertIsArray( get_option( 'aura_worker_door_log_2' ), 'the still-unacked row survives' );
 	}
 
+	/**
+	 * Ruling S15 (Codex round-6 P2 on #88): `Aura_Worker_Door_Log::ack()`
+	 * answers `committed: false` when a real floor raise's own version bump
+	 * fails and the whole unit rolls back — nothing acked, nothing purged.
+	 * The route treats that exactly like `restore_unsettled()` treats an
+	 * unsettled restore: RETRYABLE (503 aura_log_failed), never a 200 that
+	 * claims the ack happened.
+	 */
+	public function test_a_failed_bump_inside_ack_answers_503_aura_log_failed(): void {
+		Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$res                                                                  = $this->api->ack_door_log( $this->request( array( 'epoch' => $epoch, 'seq' => 1 ) ) );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_log_failed', $res->get_error_code() );
+		$data = $res->get_error_data();
+		$this->assertSame( 503, $data['status'] );
+		$this->assertIsArray( get_option( 'aura_worker_door_log_1' ), 'the row this ack would have purged is still there' );
+	}
+
 	public function test_a_stale_ack_at_or_below_the_current_floor_is_a_no_op(): void {
 		Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
 		$epoch = Aura_Worker_Door_Log::epoch();
