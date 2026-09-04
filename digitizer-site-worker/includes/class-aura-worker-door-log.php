@@ -721,6 +721,70 @@ class Aura_Worker_Door_Log {
 	 * @return string '' when there is no record.
 	 */
 	/**
+	 * Re-stamp the binding record's EPOCH witness, and nothing else (Ruling
+	 * P91).
+	 *
+	 * The grant-gated `/door/rotate` moves the log cursor legitimately and
+	 * touches no binding — but the record still names the epoch it was written
+	 * with, and P81's repair reads a disagreement as a half-done rebind. So the
+	 * next same-identity connect performed a FULL rebind: a new generation for
+	 * an identity that never changed, holds queued since the rotation gone
+	 * foreign, in-flight writes failing their fence. A rewind cost the site its
+	 * queue.
+	 *
+	 * This is the other half of that rule: a rotation that legitimately moves
+	 * the cursor says so on the record. The compare-and-swap is fenced on the
+	 * bytes just read and changes ONLY `epoch` — never the generation, the
+	 * state or the identity — so it cannot hand the site to anybody, which is
+	 * why it needs no site claim (the route holds none: it is Aura moving the
+	 * cursor it owns, not a rebind).
+	 *
+	 * A lost CAS means somebody wrote the record underneath: re-read and try
+	 * once more, because the winner may be a rebind that has already stamped
+	 * the new epoch itself. Still failing is not fatal — P81's repair on the
+	 * next connect is the documented fallback — so the caller is told rather
+	 * than refused.
+	 *
+	 * @param string $epoch The epoch the record should now name.
+	 * @return bool The record names it.
+	 */
+	public static function restamp_binding_epoch( $epoch ) {
+		global $wpdb;
+		$epoch = (string) $epoch;
+		if ( '' === $epoch ) {
+			return false;
+		}
+		for ( $try = 0; $try < 2; $try++ ) {
+			$raw = self::raw_option( self::BINDING );
+			$rec = null === $raw ? null : maybe_unserialize( $raw );
+			if ( ! is_array( $rec ) || ! isset( $rec['gen'] ) ) {
+				return false; // no record to stamp; the next reader mints one with the current epoch
+			}
+			if ( isset( $rec['epoch'] ) && $epoch === (string) $rec['epoch'] ) {
+				return true;
+			}
+			$next          = $rec;
+			$next['epoch'] = $epoch;
+			$wpdb->last_error = '';
+			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+					maybe_serialize( $next ),
+					self::BINDING,
+					$raw
+				)
+			);
+			wp_cache_delete( self::BINDING, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			wp_cache_delete( 'alloptions', 'options' );
+			if ( 1 === (int) $rows && '' === (string) $wpdb->last_error ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * The log epoch as the DATABASE has it, never minted (Ruling P81).
 	 *
 	 * `epoch()` mints when the row is absent, which is right for a reader and

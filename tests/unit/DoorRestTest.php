@@ -275,6 +275,57 @@ final class DoorRestTest extends TestCase {
 		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ), 'nothing rotated' );
 	}
 
+	/**
+	 * Ruling P91 (F2): a legitimate rotation re-stamps the binding record's
+	 * epoch witness, so the next same-identity connect is still a no-op.
+	 *
+	 * The record names the epoch it was written with, and P81's repair reads a
+	 * disagreement as a half-done rebind — so `/door/rotate` used to cost the
+	 * site its whole queue on the very next connect: a new generation for an
+	 * identity that never changed, every hold queued since the rotation gone
+	 * foreign, in-flight writes failing their fence.
+	 */
+	public function test_a_rotation_restamps_the_witness_so_the_next_connect_rebinds_nothing(): void {
+		$this->enforce_grants();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$gen    = Aura_Worker_Door_Log::binding_raw();
+		$before = Aura_Worker_Door_Log::epoch();
+		$req    = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$this->assertTrue( $res->data['rotated'] );
+		$this->assertArrayNotHasKey( 'witness_stale', $res->data );
+		$this->assertSame( Aura_Worker_Door_Log::epoch_raw(), Aura_Worker_Door_Log::binding_record()['epoch'], 'the record names the new cursor' );
+
+		// …and the same client connecting again rebinds NOTHING.
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation never moved' );
+		$this->assertSame( Aura_Worker_Door_Log::epoch_raw(), $res->data['epoch'], 'nor did the cursor' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/** A witness that will not land is REPORTED, never a refusal. */
+	public function test_a_witness_restamp_that_cannot_land_is_reported(): void {
+		$this->enforce_grants();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence );
+		Aura_Worker_Magic_Link::release_site( $fence );
+		$before = Aura_Worker_Door_Log::epoch();
+		$req    = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$GLOBALS['_sa_option_cas_fail'] = array();
+		$this->assertTrue( $res->data['rotated'], 'the rotation itself succeeded' );
+		$this->assertTrue( $res->data['witness_stale'], 'and Aura is told the record did not catch up' );
+	}
+
 	public function test_a_grant_over_the_current_epoch_rotates_and_keeps_the_floor_and_the_rows(): void {
 		$this->enforce_grants();
 		for ( $i = 1; $i <= 3; $i++ ) {

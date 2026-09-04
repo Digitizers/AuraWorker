@@ -1567,14 +1567,29 @@ class Aura_Worker_API {
 		// cannot both mint one (Ruling P23).
 		$out = Aura_Worker_Door_Log::rotate_epoch( $epoch );
 
-		return new WP_REST_Response(
-			array(
-				'rotated' => (bool) $out['rotated'],
-				'epoch'   => (string) $out['epoch'],
-				'floor'   => Aura_Worker_Door_Log::floor(),
-			),
-			200
+		// A LEGITIMATE ROTATION SAYS SO ON THE BINDING RECORD (Ruling P91).
+		// The record names the epoch it was written with, and P81's repair
+		// reads a disagreement as a half-done rebind — so without this the next
+		// same-identity connect performed a FULL rebind: a new generation for
+		// an identity that never changed, holds queued since the rotation gone
+		// foreign, in-flight writes failing their fence. A rewind cost the site
+		// its queue.
+		//
+		// Only the witness moves; the generation, the state and the identity
+		// are untouched, so this hands the site to nobody and needs no site
+		// claim. A stamp that will not land is reported rather than refused —
+		// the rotation itself succeeded, and P81's repair on the next connect
+		// is the fallback.
+		$body = array(
+			'rotated' => (bool) $out['rotated'],
+			'epoch'   => (string) $out['epoch'],
+			'floor'   => Aura_Worker_Door_Log::floor(),
 		);
+		if ( ! empty( $out['rotated'] ) && ! Aura_Worker_Door_Log::restamp_binding_epoch( (string) $out['epoch'] ) ) {
+			$body['witness_stale'] = true;
+		}
+
+		return new WP_REST_Response( $body, 200 );
 	}
 
 	/**
