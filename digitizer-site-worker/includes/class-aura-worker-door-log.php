@@ -332,6 +332,10 @@ class Aura_Worker_Door_Log {
 			'state'     => $state,
 			'client'    => isset( $rec['client'] ) && null !== $rec['client'] ? (string) $rec['client'] : null,
 			'dashboard' => isset( $rec['dashboard'] ) && null !== $rec['dashboard'] ? (string) $rec['dashboard'] : null,
+			// The epoch this record was written WITH (Ruling P81). Absent on a
+			// record written before that rule, which reads as '' and therefore
+			// as "differs" — so the next same-identity connect repairs it.
+			'epoch'     => isset( $rec['epoch'] ) ? (string) $rec['epoch'] : '',
 		);
 	}
 
@@ -713,6 +717,22 @@ class Aura_Worker_Door_Log {
 	 *
 	 * @return string '' when there is no record.
 	 */
+	/**
+	 * The log epoch as the DATABASE has it, never minted (Ruling P81).
+	 *
+	 * `epoch()` mints when the row is absent, which is right for a reader and
+	 * wrong for the comparison that decides whether an earlier rebind finished:
+	 * a minted epoch would agree with nothing and read as a repair that is not
+	 * needed.
+	 *
+	 * @return string '' when there is no epoch row.
+	 */
+	public static function epoch_raw() {
+		$raw = self::raw_option( self::EPOCH );
+		$val = null === $raw ? null : maybe_unserialize( $raw );
+		return is_string( $val ) ? $val : '';
+	}
+
 	public static function binding_raw() {
 		$raw = self::raw_option( self::BINDING );
 		$rec = null === $raw ? null : maybe_unserialize( $raw );
@@ -830,17 +850,51 @@ class Aura_Worker_Door_Log {
 				&& ( self::BINDING_UNBOUND === $target || self::identity_is_provable( $state['client'] ) )
 				&& $state['client'] === $client
 				&& $state['dashboard'] === $dashboard
+				// …AND THE EPOCH IT WAS WRITTEN WITH IS STILL THE SITE'S
+				// (Ruling P81). A rebind whose record CAS failed after the
+				// epoch had already rotated leaves the two disagreeing, and the
+				// identity-equal shortcut used to declare that finished: the new
+				// binding stayed on the PREVIOUS epoch, and a previously
+				// authenticated ack carrying it could advance the floor over
+				// the new binding's own entries. When they differ the rotation
+				// runs again — a retry repairs it, which is the whole point of
+				// the shortcut being idempotent rather than merely fast.
+				//
+				// A record with no `epoch` predates this rule and reads as
+				// differing exactly once, which repairs it too.
+				&& '' !== (string) $state['epoch']
+				&& (string) $state['epoch'] === self::epoch_raw()
 			) {
 				return true;
 			}
 		}
 
-		$was  = self::epoch(); // read BEFORE the swap, so the rotate below fences on it
+		// THE EPOCH MOVES FIRST, AND ITS SUCCESS IS PART OF THE REBIND (Ruling
+		// P81). It used to follow the record's compare-and-swap with its answer
+		// ignored: a failed rotation left the NEW binding sitting on the
+		// PREVIOUS epoch and the rebind still reported success. Nothing
+		// repaired it either — the next connect states the same identity, the
+		// shortcut above declared it done — so an ack authenticated under the
+		// old binding, carrying that same epoch, could advance the floor over
+		// the new binding's log entries.
+		//
+		// Rotating first makes the failure harmless: nothing else has changed,
+		// so the record still names the old binding and the caller's retry
+		// simply does the whole thing again.
+		$was       = self::epoch(); // read BEFORE the rotation, which fences on it
+		$rot       = self::rotate_epoch( $was );
+		$new_epoch = (string) ( isset( $rot['epoch'] ) ? $rot['epoch'] : '' );
+		if ( empty( $rot['rotated'] ) || '' === $new_epoch || $new_epoch === $was ) {
+			return false; // the record is untouched; the retry starts over
+		}
 		$next = array(
 			'gen'       => wp_generate_uuid4(),
 			'state'     => $target,
 			'client'    => $client,
 			'dashboard' => $dashboard,
+			// WHICH EPOCH THIS BINDING BELONGS TO: the witness the shortcut
+			// above compares, so a half-done rebind is visible to the retry.
+			'epoch'     => $new_epoch,
 		);
 
 		$like = $claimed ? $wpdb->esc_like( $fence . '|' ) . '%' : '';
@@ -902,14 +956,10 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( 'notoptions', 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
 		self::forget_live_identity();
-		if ( ! $done ) {
-			return false;
-		}
-		// The epoch follows, so the new binding starts at cursor 0. Its own
-		// fenced rotate answering 0 rows is a LOST RACE somebody else already
-		// settled — the epoch moved either way, which is all this needs.
-		self::rotate_epoch( $was );
-		return true;
+		// The epoch has already moved, so a failed record write leaves the site
+		// on a fresh cursor with the OLD binding — visible to the retry as an
+		// epoch the record does not name, and repaired by it.
+		return $done;
 	}
 
 	/**

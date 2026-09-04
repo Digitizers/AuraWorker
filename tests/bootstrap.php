@@ -2880,6 +2880,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					unset( $GLOBALS['_sa_before_fenced_delete'][ $name ] ); // fires once
 					$racer();
 				}
+				// The statement itself failing at the driver — NOT "no row
+				// matched" (Ruling P81, and the same seam the claim-joined
+				// delete already honours): a caller that must PROVE the row is
+				// gone has to tell the two apart.
+				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {
+					$this->last_error = 'delete failed';
+					return false;
+				}
 				if ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $expected ) {
 					return 0; // Someone else wrote (or already deleted) first.
 				}

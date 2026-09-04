@@ -402,6 +402,71 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P81 (F1): the epoch rotates FIRST, and a failure to rotate it
+	 * fails the whole rebind with nothing changed.
+	 *
+	 * It used to follow the record's compare-and-swap with its answer ignored,
+	 * so a failed rotation left the NEW binding sitting on the PREVIOUS epoch
+	 * and the rebind still reported success — and nothing repaired it, because
+	 * the next connect states the same identity and the shortcut declared it
+	 * done. An ack authenticated under the old binding, carrying that same
+	 * epoch, could then advance the floor over the new binding's entries.
+	 */
+	public function test_a_rebind_whose_epoch_cannot_rotate_changes_nothing(): void {
+		sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
+		$gen   = Aura_Worker_Door_Log::binding_raw();
+		$epoch = Aura_Worker_Door_Log::epoch_raw();
+		$GLOBALS['_sa_option_delete_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$this->assertFalse( sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://dash.example' ) ) );
+
+		$GLOBALS['_sa_option_delete_fail'] = array();
+		$this->assertSame( $epoch, Aura_Worker_Door_Log::epoch_raw(), 'the cursor did not move' );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'and neither did the binding' );
+		$this->assertSame( 'c1', Aura_Worker_Door_Log::binding_record()['client'] );
+	}
+
+	/** …and a record write that fails after it leaves a retry that completes. */
+	public function test_a_rebind_whose_record_write_fails_is_completed_by_the_retry(): void {
+		sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::BINDING ] = 1; // the first write only
+
+		$this->assertFalse( sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://dash.example' ) ) );
+		$this->assertSame( 'c1', Aura_Worker_Door_Log::binding_record()['client'], 'the record is still the old one' );
+
+		$this->assertTrue( sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://dash.example' ) ) );
+
+		$GLOBALS['_sa_option_write_fail'] = array();
+		$rec = Aura_Worker_Door_Log::binding_record();
+		$this->assertSame( 'c2', $rec['client'] );
+		$this->assertSame( Aura_Worker_Door_Log::epoch_raw(), $rec['epoch'], 'and the record names the epoch it belongs to' );
+	}
+
+	/**
+	 * …and a record whose epoch is NOT the site's is repaired by the very next
+	 * connect stating the same identity — the shortcut is idempotent, not
+	 * merely fast.
+	 */
+	public function test_a_same_identity_connect_repairs_a_record_on_a_stale_epoch(): void {
+		sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
+		// The state a half-done rebind leaves: the record names an epoch the
+		// site has moved off.
+		$rec          = Aura_Worker_Door_Log::binding_record();
+		$rec['epoch'] = 'an-epoch-this-site-has-left';
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
+		$gen   = $rec['gen'];
+		$epoch = Aura_Worker_Door_Log::epoch_raw();
+
+		$this->assertTrue( sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) ) );
+
+		$after = Aura_Worker_Door_Log::binding_record();
+		$this->assertNotSame( $gen, $after['gen'], 'the rebind really ran' );
+		$this->assertNotSame( $epoch, Aura_Worker_Door_Log::epoch_raw(), 'the cursor moved with it' );
+		$this->assertSame( Aura_Worker_Door_Log::epoch_raw(), $after['epoch'], 'and they agree now' );
+	}
+
+	/**
 	 * rotate_binding() mints a value nothing older can match — and is a NO-OP
 	 * when the record already names the identity being installed (Ruling P59).
 	 */
