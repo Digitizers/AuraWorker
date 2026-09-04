@@ -1193,17 +1193,18 @@ class Aura_Worker_Door_Holds {
 	 * another generation is simply invisible: not listed, not claimable, not
 	 * counted against the cap, and swept when the reconciler next runs.
 	 *
-	 * TWO questions, not one (Ruling P62): the row's generation must be the
-	 * current one AND that generation's record must still describe the identity
-	 * this site is LIVE under. The connect writes its identity — the client
-	 * line and the dashboard URL — before it rotates, so a changed-client
-	 * connect that answered at all has already made the departed rows foreign,
-	 * whether or not the rotation itself landed. Without the second question a
-	 * failed rotation left the old client's holds listed and replayable under
-	 * the new client's token.
+	 * ONE question (Ruling P75): is the row's generation the current one? It
+	 * used to be two — the generation AND whether its record still described
+	 * the identity the site was live under — because a connect could publish a
+	 * new client over a live binding and the generation would not move until
+	 * the rotation landed. A connect cannot do that any more: meeting a live
+	 * foreign binding it refuses (`aura_site_bound`) and writes nothing. A
+	 * rebind is an unbind, which rotates to `unbound`, followed by a connect —
+	 * so the identity cannot change while a generation stands, and generation
+	 * equality is the whole test.
 	 *
-	 * A row with NO binding predates the rule and is treated as ours: refusing
-	 * it would strand approvals nobody can re-issue across an upgrade.
+	 * A row with NO binding is NOT ours (Ruling P72): nothing predates the
+	 * stamp, so an empty one can only have come from a lazy-mint race.
 	 *
 	 * @param array $row The held or claimed row.
 	 * @return bool

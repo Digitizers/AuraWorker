@@ -1088,10 +1088,9 @@ class Aura_Worker_Elementor_Door {
 		if ( '' === $claimed ) {
 			return false; // an EMPTY stamp is a mismatch, never a legacy pass (Ruling P72)
 		}
-		// The same predicate every other reader uses (Ruling P62) — the
-		// generation must be current AND its record must still describe the
-		// identity this site is live under — asked of the DATABASE rather than
-		// of this process's caches (Ruling P64).
+		// The same predicate every other reader uses — is this generation the
+		// current one (Ruling P75) — asked of the DATABASE rather than of this
+		// process's caches (Ruling P64).
 		return Aura_Worker_Door_Log::generation_is_live_uncached( $claimed );
 	}
 

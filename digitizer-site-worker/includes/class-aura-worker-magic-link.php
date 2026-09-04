@@ -697,12 +697,13 @@ class Aura_Worker_Magic_Link {
 		//     because that write rejected it first;
 		//   after the IDENTITY writes — the client line (the ruleset binding
 		//     sentinel) and `aura_worker_dashboard_url`, both stored and
-		//     verified above. row_is_current() compares the record's identity
-		//     against those two options (Ruling P62), so once this connect
-		//     answers AT ALL — success or `aura_door_failed` — every departed
-		//     row is already foreign, whether or not the rotation below lands.
-		//     That is what makes the retryable failure safe rather than a
-		//     window in which the replacement client can see the old queue.
+		//     verified above — so a connect that got this far is one that was
+		//     ALLOWED to bind: the refusal at the top of this handler turned
+		//     away anything meeting a live foreign binding (Ruling P75). The
+		//     site this rotates is `unbound`, `unset`, or already this
+		//     client's, and a rotation that fails is simply retried by the next
+		//     connect; there is no window in which a replacement client can see
+		//     a departed one's queue, because the two never overlap.
 		//
 		// Idempotent by identity: EVERY connect calls it, including a
 		// same-client token rotation, and rotate_binding() is a no-op when the

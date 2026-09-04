@@ -652,19 +652,15 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * Is this generation the one the site is LIVE under (Ruling P62)?
+	 * Is this generation the CURRENT one (Ruling P75)?
 	 *
-	 * The generation must be current AND its record must still describe the
-	 * identity the site is actually bound to now. The second half is what
-	 * covers a rotation that did not land: the connect writes its identity
-	 * options before it rotates, so by the time it answers — success or
-	 * `aura_door_failed` — the record still names the DEPARTED client while the
-	 * site is live under the new one, and every row stamped with it is foreign.
-	 *
-	 * An `unset` record makes no claim about whose the door is, so it cannot
-	 * contradict the live identity: rows stamped by it stay current, which is
-	 * the pre-P62 behaviour and the right one for a site nobody has stated
-	 * anything about.
+	 * It used to ask a second question as well — whether the record still
+	 * described the identity the site is live under — because a connect could
+	 * publish a new client over a live binding while the generation stayed put
+	 * until its rotation landed. A connect refuses that outright now
+	 * (`aura_site_bound`), so a rebind is an unbind followed by a connect and
+	 * no identity can move under a live generation. What is left is the
+	 * comparison the generation exists for.
 	 *
 	 * @param string $gen The generation stamped on a row.
 	 * @return bool

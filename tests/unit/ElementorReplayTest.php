@@ -610,11 +610,10 @@ final class ElementorReplayTest extends TestCase {
 	 * Ruling P64 (F1): the fence reads the database, not this process's caches.
 	 *
 	 * By the time a replay reaches its fence, `get_held()` has already
-	 * populated WordPress's option cache for the binding record AND
-	 * `live_identity()`'s per-request static. A rebind completing in ANOTHER
-	 * PHP process invalidates neither — both are this process's memory — so
-	 * the fence compared the claim against a generation and an identity that
-	 * had stopped being current, and the departed client's mutation ran.
+	 * populated WordPress's option cache for the binding record. A rebind
+	 * completing in ANOTHER PHP process does not invalidate it — it is this
+	 * process's memory — so the fence compared the claim against a generation
+	 * that had stopped being current, and the departed client's mutation ran.
 	 *
 	 * The rebind here is written with raw SQL precisely so no cache is
 	 * touched: that is exactly what another process's rebind looks like from
@@ -631,15 +630,15 @@ final class ElementorReplayTest extends TestCase {
 				++$inner_ran;
 			}
 		);
-		// Warm both caches the way a real replay does.
+		// Warm the cache the way a real replay does.
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
-		Aura_Worker_Door_Log::live_identity();
 
 		$this->afterSwapOn(
 			Aura_Worker_Door_Holds::CLAIMED . $ref,
 			static function () {
-				// ANOTHER process rebinding: the rows change, the caches in
-				// this one do not.
+				// ANOTHER process rebinding — an unbind, then that client's
+				// connect (Ruling P75) — so the row changes and the cache in
+				// this one does not.
 				$rec = array(
 					'gen'       => 'gen-from-another-process',
 					'state'     => 'bound',
