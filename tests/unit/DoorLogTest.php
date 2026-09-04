@@ -1211,6 +1211,63 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S18 (Codex round-7 P1 on #88): `ack_write()` evicts the floor's
+	 * cache entry and then re-reads it via `self::floor()` (to compute the
+	 * response it hands back) BEFORE this method decides whether to commit —
+	 * which re-caches the UNCOMMITTED, just-raised value. If the bump then
+	 * fails and the whole unit rolls back, the database reverts to the OLD
+	 * floor, but nothing evicted the cache again — so a caller re-reading
+	 * `floor()` right after `committed: false` got the never-landed value
+	 * back from cache. `versioned()` now repeats every listed eviction
+	 * before returning from ANY rollback it can reach once `$writes()` has
+	 * run, exactly like the post-COMMIT repeat (Ruling S11).
+	 */
+	public function test_a_bump_write_failure_inside_ack_evicts_the_cache_it_poisoned(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		// The object cache is a layer the stub keeps SEPARATE from "the
+		// database" ($GLOBALS['_rows']/['_options']) precisely so a
+		// transaction's ROLLBACK — which restores those two wholesale —
+		// cannot also silently prove this fix by accident: only an actual
+		// wp_cache_delete( FLOOR, 'options' ) call clears it.
+		//
+		// ack_write() evicts FLOOR TWICE before the bump ever runs: once
+		// from its own self::insert_unique( FLOOR, 0 ) (a no-op INSERT here,
+		// since the row already exists, but insert_unique_write() still
+		// evicts on every call), and again right after the raise — the
+		// eviction this test means to exercise. The hook below fires on
+		// the FIRST delete and re-arms itself for the SECOND, so the
+		// poisoned value lands at the correct moment regardless of that
+		// earlier, unrelated eviction.
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = true;
+		$GLOBALS['_sa_after_wp_cache_delete'][ Aura_Worker_Door_Log::FLOOR ] = static function () use ( $seq ) {
+			$GLOBALS['_sa_after_wp_cache_delete'][ Aura_Worker_Door_Log::FLOOR ] = static function () use ( $seq ) {
+				// Fires on the SECOND delete — ack_write()'s own eviction
+				// right after raising the floor — and models a read (this
+				// process's own subsequent `self::floor()` call, or a
+				// concurrent one) caching the UNCOMMITTED, just-raised
+				// value.
+				$GLOBALS['_sa_option_cache'][ Aura_Worker_Door_Log::FLOOR ] = $seq;
+			};
+		};
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete']                   = false;
+
+		$this->assertFalse( $out['committed'] );
+		// Without the fix this reads $seq back from the poisoned cache
+		// entry the hook above planted — a value the ROLLBACK's own
+		// database restore never touches, because it lives in a separate
+		// layer that only a repeated wp_cache_delete() call clears.
+		$this->assertSame( 0, Aura_Worker_Door_Log::floor(), 'the rollback repeats the eviction, so a fresh read answers the database, not the never-landed raise' );
+	}
+
+	/**
 	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
 	 * `SHOW TABLE STATUS LIKE 'wp_options'` ONCE per request and caches the
 	 * answer — a second call must not re-issue the probe.

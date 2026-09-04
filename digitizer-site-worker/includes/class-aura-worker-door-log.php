@@ -1926,6 +1926,22 @@ class Aura_Worker_Door_Log {
 	 * single statement completes. A failed `RELEASE` fails the whole unit
 	 * exactly like a failed bump: `ROLLBACK`, `committed: false`.
 	 *
+	 * A ROLLBACK REPEATS THE CALLBACK'S EVICTIONS TOO (Ruling S18, Codex
+	 * round-7 P1 on #88). `$writes()` can — and `ack_write()` does —
+	 * evict an option's cache entry and then RE-READ it before this method
+	 * ever decides whether to commit, which re-caches whatever the
+	 * UNCOMMITTED write just produced (`ack_write()`'s floor raise, read
+	 * back via `self::floor()` to compute the response, before the bump
+	 * that might still fail). Ruling S11 already repeats every listed
+	 * eviction after a successful COMMIT for exactly this shape of gap;
+	 * ROLLBACK left it unaddressed on the failure side; a caller re-reading
+	 * state right after `committed: false` could still get the
+	 * never-landed value back from cache. Every rollback this method can
+	 * still reach after `$writes()` ran — the bump's own write failing, a
+	 * failed savepoint release, and a COMMIT whose session could not be
+	 * proven — now repeats `$evict` before returning, the same list and the
+	 * same loop the success path already uses.
+	 *
 	 * @param callable $writes Returns array{ mutated: bool, result: mixed,
 	 *                         evict?: string[] } or array{ rollback: true,
 	 *                         result: mixed }. `mutated` false ⇒ an
@@ -1954,8 +1970,10 @@ class Aura_Worker_Door_Log {
 	 *         the session that opened the transaction (Ruling S16) — every
 	 *         one of those rolls the WHOLE unit back (on a transactional
 	 *         engine only — see Ruling S13 above), including every
-	 *         statement $writes() itself ran, so the caller must treat this
-	 *         exactly like $writes() failing outright — and `result` is
+	 *         statement $writes() itself ran AND every cache entry it
+	 *         evicted and re-read before this method decided to fail
+	 *         (Ruling S18), so the caller must treat this exactly like
+	 *         $writes() failing outright — and `result` is
 	 *         ABSENT whenever `committed` is false (Ruling S15): never read
 	 *         it without checking `committed` first. `observation` is
 	 *         likewise absent on failure, and otherwise the witness THIS call
@@ -2038,6 +2056,7 @@ class Aura_Worker_Door_Log {
 			// unit reports NOTHING it did — no `result` at all — so every
 			// caller must check `committed` first and build its own failure
 			// answer rather than trust a `result` that might be stale.
+			self::evict_after_rollback( $evict ); // Ruling S18
 			return array(
 				'committed' => false,
 			);
@@ -2059,6 +2078,7 @@ class Aura_Worker_Door_Log {
 			$wpdb->query( 'RELEASE SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 			if ( '' !== (string) $wpdb->last_error ) {
 				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				self::evict_after_rollback( $evict ); // Ruling S18
 				return array(
 					'committed' => false,
 				);
@@ -2090,6 +2110,7 @@ class Aura_Worker_Door_Log {
 				// branch above for why. The mutation this call thought it
 				// just committed was rolled back by MySQL itself the moment
 				// the original session was lost; nothing here landed.
+				self::evict_after_rollback( $evict ); // Ruling S18
 				return array(
 					'committed' => false,
 				);
@@ -2120,6 +2141,31 @@ class Aura_Worker_Door_Log {
 			// the read-back (Ruling S10) — even though `committed` is true.
 			'observation' => $observation,
 		);
+	}
+
+	/**
+	 * Repeat `$writes()`'s listed evictions on a ROLLBACK (Ruling S18, Codex
+	 * round-7 P1 on #88) — the failure-side twin of the post-COMMIT repeat
+	 * Ruling S11 already performs. `$writes()` can evict an option's cache
+	 * entry and then re-read it BEFORE this method decides whether to
+	 * commit — `ack_write()` does exactly this, re-reading the floor via
+	 * `self::floor()` right after raising it, to compute the response it
+	 * hands back — which re-caches the UNCOMMITTED value. If the version
+	 * bump then fails and the whole unit rolls back, that cache entry is
+	 * never touched again on the failure path, so a caller re-reading state
+	 * immediately after `committed: false` could still read back a value
+	 * that was never actually written. Called from every rollback this
+	 * method can reach once `$writes()` has run: the bump's own write
+	 * failing, a failed savepoint release, and a COMMIT whose session could
+	 * not be proven (Rulings S8, S17, S16).
+	 *
+	 * @param string[] $evict Option names $writes() reported touching.
+	 */
+	private static function evict_after_rollback( array $evict ) {
+		foreach ( $evict as $name ) {
+			wp_cache_delete( $name, 'options' );
+		}
+		wp_cache_delete( self::OBSERVATION, 'options' ); // the bump's own row
 	}
 
 	/**

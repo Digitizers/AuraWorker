@@ -364,6 +364,16 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 		if ( ! empty( $GLOBALS['_sa_option_cache_honors_wp_cache_delete'] ) && 'options' === $group && isset( $GLOBALS['_sa_option_cache'] ) && array_key_exists( $key, (array) $GLOBALS['_sa_option_cache'] ) ) {
 			unset( $GLOBALS['_sa_option_cache'][ $key ] );
 		}
+		// A hook keyed by option name, firing right after THIS eviction
+		// (Ruling S18, 2.16.2) — for a test modelling a re-read (this same
+		// process, or a concurrent one) re-caching a value at exactly this
+		// point, the same shape `_sa_after_insert_unique` already gives the
+		// insert path. Fires once per name.
+		if ( 'options' === $group && isset( $GLOBALS['_sa_after_wp_cache_delete'][ $key ] ) && is_callable( $GLOBALS['_sa_after_wp_cache_delete'][ $key ] ) ) {
+			$fn = $GLOBALS['_sa_after_wp_cache_delete'][ $key ];
+			unset( $GLOBALS['_sa_after_wp_cache_delete'][ $key ] );
+			$fn();
+		}
 		return true;
 	}
 }
@@ -3423,6 +3433,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
+	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
@@ -4691,6 +4702,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
+	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
