@@ -1750,6 +1750,19 @@ class Aura_Worker_Door_Log {
 	 * private write-only variant instead, inside its OWN single transaction —
 	 * see `rotate_epoch_write()`).
 	 *
+	 * THE READ-BACK RUNS AFTER COMMIT, NEVER BEFORE (Ruling S10, Codex
+	 * round-5 P1 on #88). If the connection dropped between the version
+	 * upsert and `SELECT LAST_INSERT_ID()`, WordPress could transparently
+	 * reconnect for the SELECT — and a fresh connection rolls back whatever
+	 * the OLD one had left uncommitted, so the state write and the bump
+	 * would be lost, while this method still returned `committed: true`
+	 * because the COMMIT that followed ran on the new connection over
+	 * nothing. Committing FIRST closes that: a reconnect after the COMMIT
+	 * lands on a session that never assigned anything, `SELECT
+	 * LAST_INSERT_ID()` on it answers `0` (Ruling S5 ⇒ null), but the
+	 * mutation is ALREADY durable, so `committed: true` stays honest even
+	 * when the witness could not be proven.
+	 *
 	 * @param callable $writes Returns array{ mutated: bool, result: mixed }.
 	 *                         `mutated` false ⇒ an idempotent no-op, a lost
 	 *                         race, a refusal — nothing to version, and
@@ -1760,11 +1773,15 @@ class Aura_Worker_Door_Log {
 	 *                         today's callers do, but the contract does not
 	 *                         assume otherwise). `result` is handed back to
 	 *                         the CALLER of versioned().
-	 * @return array{ committed: bool, result: mixed } `committed` is false
-	 *         ONLY when $writes() reported a mutation but the version bump's
-	 *         own WRITE then failed — the WHOLE unit rolls back, including
-	 *         every statement $writes() itself ran, so the caller must treat
-	 *         this exactly like $writes() failing outright.
+	 * @return array{ committed: bool, result: mixed, observation: int|null }
+	 *         `committed` is false ONLY when $writes() reported a mutation
+	 *         but the version bump's own WRITE then failed — the WHOLE unit
+	 *         rolls back, including every statement $writes() itself ran, so
+	 *         the caller must treat this exactly like $writes() failing
+	 *         outright. `observation` is the witness THIS call produced —
+	 *         null whenever it could not be proven, which can happen even
+	 *         while `committed` is true (Ruling S10): a reconnect between the
+	 *         COMMIT and the read-back.
 	 */
 	public static function versioned( callable $writes ) {
 		global $wpdb;
@@ -1785,7 +1802,8 @@ class Aura_Worker_Door_Log {
 				'result'    => $result,
 			);
 		}
-		if ( ! self::bump_door_version_write() ) {
+		$bump_ok = self::bump_door_version_write();
+		if ( ! $bump_ok ) {
 			// Ruling S8: the bump's own WRITE failed, so the mutation must
 			// not land either — every statement $writes() ran is undone.
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -1794,15 +1812,22 @@ class Aura_Worker_Door_Log {
 				'result'    => $result,
 			);
 		}
-		// Best-effort, and deliberately AFTER the decision to commit: a
-		// mutation that wrote successfully must land whether or not its own
-		// witness can be proven back (Ruling S2's read-back discipline still
-		// applies to WHAT the witness is, never to WHETHER the write did).
-		self::bump_door_version_read_back();
-		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
+		// Ruling S10: best-effort, deliberately AFTER commit — a reconnect
+		// between the bump and this SELECT lands on a session that never
+		// assigned anything and answers 0 (Ruling S5 ⇒ null), but the
+		// mutation is ALREADY committed, so `committed: true` stays honest.
+		$observation = self::bump_door_version_read_back();
 		return array(
-			'committed' => true,
-			'result'    => $result,
+			'committed'   => true,
+			'result'      => $result,
+			// The witness THIS call produced, for a caller that wants it
+			// (none of today's choke points read it — the door version is
+			// reported separately, on demand, via door_version_raw()) and
+			// for tests: null whenever the read-back could not be proven —
+			// including a reconnect landing between the COMMIT above and
+			// the read-back (Ruling S10) — even though `committed` is true.
+			'observation' => $observation,
 		);
 	}
 

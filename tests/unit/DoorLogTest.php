@@ -903,4 +903,53 @@ final class DoorLogTest extends TestCase {
 
 		$this->assertGreaterThan( $before, Aura_Worker_Door_Log::door_version_raw() );
 	}
+
+	/**
+	 * Ruling S10 (Codex round-5 P1 on #88): the read-back runs AFTER COMMIT,
+	 * never before. If the connection dropped between the version upsert
+	 * and SELECT LAST_INSERT_ID(), WordPress could reconnect for the SELECT
+	 * — and a FRESH connection rolls back whatever the OLD one had left
+	 * uncommitted, so committing only AFTER would have lost the mutation
+	 * while still reporting `committed: true`. Committing first closes that:
+	 * a reconnect landing AFTER the COMMIT lands on a session that never
+	 * assigned anything (`SELECT LAST_INSERT_ID()` answers `0`, Ruling S5 ⇒
+	 * null), but the mutation is ALREADY durable.
+	 */
+	public function test_a_reconnect_between_the_bump_and_the_read_back_leaves_the_mutation_committed(): void {
+		$GLOBALS['_db_queries']                  = array();
+		$GLOBALS['_sa_last_insert_id_reconnect'] = true; // the read-back answers 0, as a reconnect would
+		$outcome                                 = Aura_Worker_Door_Log::versioned(
+			function () {
+				$GLOBALS['_options']['aura_worker_door_s10_test'] = array( 'x' => 1 );
+				$GLOBALS['_rows']['aura_worker_door_s10_test']    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( 'aura_worker_door_s10_test' ),
+				);
+			}
+		);
+		$GLOBALS['_sa_last_insert_id_reconnect'] = false;
+
+		$this->assertTrue( $outcome['committed'], 'the mutation is committed regardless of whether its own witness could be read back' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertNull( $outcome['observation'], 'the reconnected read-back answers 0, which Ruling S5 turns into null' );
+		$this->assertArrayHasKey( 'aura_worker_door_s10_test', $GLOBALS['_options'], 'the state is present' );
+
+		// The ORDER, from the request's own statement log: COMMIT before the
+		// read-back it protects — never the reverse, which would commit a
+		// transaction the reconnect had already rolled back on the OLD
+		// connection.
+		$log    = $GLOBALS['_db_queries'];
+		$commit = array_search( 'COMMIT', $log, true );
+		$select = null;
+		foreach ( $log as $i => $sql ) {
+			if ( 'SELECT LAST_INSERT_ID()' === trim( (string) $sql ) ) {
+				$select = $i;
+			}
+		}
+		$this->assertNotFalse( $commit, 'the transaction committed' );
+		$this->assertNotNull( $select, 'the read-back was still attempted' );
+		$this->assertLessThan( $select, $commit, 'COMMIT runs before the read-back' );
+	}
 }
