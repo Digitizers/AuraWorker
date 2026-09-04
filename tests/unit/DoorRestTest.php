@@ -308,6 +308,42 @@ final class DoorRestTest extends TestCase {
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 
+	/**
+	 * Ruling P92 (F1): a rotation superseded mid-flight never stamps its stale
+	 * epoch over the winner's witness.
+	 *
+	 * Fencing on the record's bytes alone was not enough: this rotation can
+	 * pause after minting B while a concurrent rotation or rebind installs C
+	 * and stamps the record with it, and the resumed call would overwrite C's
+	 * witness with B — manufacturing exactly the disagreement the witness
+	 * exists to prevent, and costing the site its queue on the next connect.
+	 */
+	public function test_a_superseded_rotation_never_stamps_its_stale_epoch(): void {
+		$this->enforce_grants();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence );
+		Aura_Worker_Magic_Link::release_site( $fence );
+		$before = Aura_Worker_Door_Log::epoch();
+		$req    = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+		$res = $this->api->rotate_door_epoch( $req );
+		$b   = (string) $res->data['epoch'];
+		$this->assertTrue( $res->data['rotated'] );
+
+		// …and now C lands, with its own witness, before anything else reads.
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ] = 'epoch-c';
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ]    = 'epoch-c';
+		$rec          = Aura_Worker_Door_Log::binding_record();
+		$rec['epoch'] = 'epoch-c';
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
+
+		// The paused rotation resumes and tries to stamp B.
+		$this->assertTrue( Aura_Worker_Door_Log::restamp_binding_epoch( $b ), 'a later rotation owns the witness: nothing owed' );
+
+		$this->assertSame( 'epoch-c', Aura_Worker_Door_Log::binding_record()['epoch'], "the winner's witness stands" );
+	}
+
 	/** A witness that will not land is REPORTED, never a refusal. */
 	public function test_a_witness_restamp_that_cannot_land_is_reported(): void {
 		$this->enforce_grants();

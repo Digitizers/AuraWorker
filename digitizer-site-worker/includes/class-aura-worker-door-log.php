@@ -739,14 +739,25 @@ class Aura_Worker_Door_Log {
 	 * why it needs no site claim (the route holds none: it is Aura moving the
 	 * cursor it owns, not a rebind).
 	 *
-	 * A lost CAS means somebody wrote the record underneath: re-read and try
-	 * once more, because the winner may be a rebind that has already stamped
-	 * the new epoch itself. Still failing is not fatal — P81's repair on the
-	 * next connect is the documented fallback — so the caller is told rather
-	 * than refused.
+	 * JOINED TO THE EPOCH ROW (Ruling P92). Fencing on the record's bytes
+	 * alone was not enough: this rotation can pause after minting B while a
+	 * concurrent rotation or rebind installs C and stamps the record with it,
+	 * and the resumed call would then overwrite C's witness with a stale B —
+	 * manufacturing exactly the disagreement it exists to prevent, and costing
+	 * the site its queue on the next connect. The stamp lands only while the
+	 * LIVE epoch is still the one being stamped.
+	 *
+	 * Zero rows has two meanings and they are told apart by re-reading the
+	 * epoch: if it is no longer ours, a LATER rotation owns the witness now and
+	 * there is nothing left for this call to do — true, nothing owed. If it is
+	 * still ours, the record's bytes moved underneath, so re-read and try once
+	 * more (the winner may be a rebind that stamped it already). Still failing
+	 * with the epoch ours is the genuinely stale case — not fatal, since P81's
+	 * repair on the next connect is the documented fallback, so the caller is
+	 * told rather than refused.
 	 *
 	 * @param string $epoch The epoch the record should now name.
-	 * @return bool The record names it.
+	 * @return bool The record names it, or a later rotation owns it.
 	 */
 	public static function restamp_binding_epoch( $epoch ) {
 		global $wpdb;
@@ -755,6 +766,9 @@ class Aura_Worker_Door_Log {
 			return false;
 		}
 		for ( $try = 0; $try < 2; $try++ ) {
+			if ( $epoch !== self::epoch_raw() ) {
+				return true; // a later rotation owns the witness; this call owes nothing
+			}
 			$raw = self::raw_option( self::BINDING );
 			$rec = null === $raw ? null : maybe_unserialize( $raw );
 			if ( ! is_array( $rec ) || ! isset( $rec['gen'] ) ) {
@@ -763,25 +777,27 @@ class Aura_Worker_Door_Log {
 			if ( isset( $rec['epoch'] ) && $epoch === (string) $rec['epoch'] ) {
 				return true;
 			}
-			$next          = $rec;
-			$next['epoch'] = $epoch;
+			$next             = $rec;
+			$next['epoch']    = $epoch;
 			$wpdb->last_error = '';
 			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->prepare(
-					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+					"UPDATE {$wpdb->options} r JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x SET r.option_value = %s WHERE r.option_name = %s AND r.option_value = %s AND x.e = %s",
+					self::EPOCH,
 					maybe_serialize( $next ),
 					self::BINDING,
-					$raw
+					$raw,
+					$epoch
 				)
 			);
 			wp_cache_delete( self::BINDING, 'options' );
 			wp_cache_delete( 'notoptions', 'options' );
-			wp_cache_delete( 'alloptions', 'options' );
 			if ( 1 === (int) $rows && '' === (string) $wpdb->last_error ) {
 				return true;
 			}
 		}
-		return false;
+		// Still not stamped, and the epoch is still ours: genuinely stale.
+		return $epoch !== self::epoch_raw();
 	}
 
 	/**

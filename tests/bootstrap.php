@@ -2839,6 +2839,28 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// Aura_Worker_Door_Log::ack()'s floor raise: upward-only, via a
 			// numeric-cast predicate rather than a byte-exact one (the floor's
 			// stored value is compared as a number, not matched verbatim).
+			// The binding record's EPOCH WITNESS re-stamp, joined to the epoch
+			// row (Ruling P92): it lands only while the live epoch is still the
+			// one being stamped, so a rotation superseded mid-flight cannot
+			// write its stale value over the winner's.
+			if ( preg_match( "/^UPDATE \S+ r JOIN \( SELECT option_value AS e FROM \S+ WHERE option_name = '([^']+)' \) x SET r\.option_value = '(.*)' WHERE r\.option_name = '([^']+)' AND r\.option_value = '(.*)' AND x\.e = '(.*)'$/s", $query, $m ) ) {
+				list( , $epoch_name, $new, $name, $expect_bytes, $expect_epoch ) = array_map( 'stripslashes', $m );
+				if ( ! empty( $GLOBALS['_sa_option_cas_fail'][ $name ] ) ) {
+					return 0;
+				}
+				$epoch_now = sa_read_option_uncached( $epoch_name );
+				if ( null === $epoch_now || (string) $epoch_now !== $expect_epoch ) {
+					return 0; // a later rotation owns the witness
+				}
+				$cur = sa_read_option_uncached( $name );
+				if ( null === $cur || (string) $cur !== $expect_bytes ) {
+					return 0; // the record moved under the caller
+				}
+				$GLOBALS['_rows'][ $name ]    = $new;
+				$GLOBALS['_options'][ $name ] = maybe_unserialize( $new );
+				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				return 1;
+			}
 			// Aura_Worker_Door_Log::ack()'s floor raise, JOINED to the epoch row
 			// (Ruling P90): the raise happens only while the epoch still holds
 			// the value the ack named, so an ack can never cross a rotation.
