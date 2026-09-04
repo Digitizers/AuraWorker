@@ -1217,4 +1217,54 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertNull( $frag['observation'] );
 		$this->assertNull( $block['observation'] );
 	}
+
+	/**
+	 * Ruling S3 (Codex round-1 P2 on #88): the witness must be issued LAST,
+	 * after door_state(), the hold listing, the log's top and its backlog
+	 * count have all already been read — never allocated up front and left
+	 * describing a fragment whose state is assembled around it. Proven from
+	 * the request's own statement log: the witness's two statements (its
+	 * upsert, then its connection-scoped `SELECT LAST_INSERT_ID()` — Ruling
+	 * S2) are the LAST entries, never interleaved with or preceding any
+	 * other state read.
+	 */
+	public function test_status_fragment_issues_the_witness_only_after_every_state_read(): void {
+		$this->registerAll();
+
+		$GLOBALS['_db_queries'] = array();
+		$frag                   = Aura_Worker_Elementor_Door::status_fragment();
+
+		$log = $GLOBALS['_db_queries'];
+		$this->assertGreaterThan( 2, count( $log ), 'other state reads must have happened for the ordering to prove anything' );
+		$this->assertSame( 'SELECT LAST_INSERT_ID()', trim( (string) end( $log ) ), "the witness's own connection-scoped read-back is the LAST statement issued" );
+		$this->assertStringContainsString(
+			Aura_Worker_Door_Log::OBSERVATION,
+			(string) $log[ count( $log ) - 2 ],
+			"immediately preceded by its own upsert, never separated from it by (or preceding) another state read"
+		);
+		$this->assertIsInt( $frag['observation'] );
+	}
+
+	/**
+	 * The other half of Ruling S3: because the witness is allocated LAST, a
+	 * door change landing at the EARLIEST possible moment it could — inside
+	 * the witness's own bump — can never retroactively appear in fields this
+	 * SAME response already captured. Pre-fix (the witness allocated up
+	 * front, beside `binding`), this exact seam would have left `door`
+	 * reporting a state a door change had already invalidated by the time
+	 * the rest of the fragment was built.
+	 */
+	public function test_status_fragment_state_fields_are_fixed_before_the_witness_is_ever_allocated(): void {
+		$this->registerAll();
+		$this->assertSame( 'open', Aura_Worker_Elementor_Door::status_fragment()['door'], 'primed: the door reports open before anything closes it' );
+
+		$GLOBALS['_sa_after_observation_bump'] = static function () {
+			Aura_Worker_Door_Log::close(); // the earliest a door change could land relative to the witness
+		};
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertSame( 'open', $frag['door'], 'this response\'s state was already fixed — and therefore already read — before the witness, and so before the mutation, was ever issued' );
+		$this->assertIsInt( $frag['observation'], 'the witness itself still landed' );
+	}
 }

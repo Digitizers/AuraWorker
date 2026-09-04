@@ -436,7 +436,7 @@ class Aura_Worker_Elementor_Door {
 				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
 			);
 		}
-		return array(
+		$fragment = array(
 			// Is Elementor STILL here? A fragment with `active: false` is a
 			// door reported from its own persisted state (Ruling P28).
 			'active'      => self::active(),
@@ -446,14 +446,6 @@ class Aura_Worker_Elementor_Door {
 			// `entry.binding` with it to label a departed client's entries;
 			// null when the record cannot be read (Ruling A5b).
 			'binding'     => ( '' === $binding ) ? null : $binding,
-			// The site-issued observation witness (Ruling A65): an integer
-			// bumped ATOMICALLY on every serve of this fragment, so Aura can
-			// order overlapping polls of this site by the site's own witness
-			// instead of a client-side timestamp an earlier-started request
-			// can still deliver later than a later-started one. Null when the
-			// bump or its proven read-back could not be established — no
-			// witness this serve, never a stale or guessed number.
-			'observation' => Aura_Worker_Door_Log::bump_observation(),
 			'seam'        => self::$seam,
 			'door'        => self::door_state(),
 			'held'        => Aura_Worker_Door_Holds::listing(),
@@ -481,6 +473,20 @@ class Aura_Worker_Elementor_Door {
 			'log_unacked' => Aura_Worker_Door_Log::count_unacked(),
 			'log_full'    => Aura_Worker_Door_Log::full_report(),
 		);
+		// THE WITNESS IS ISSUED LAST, AFTER EVERY OTHER STATE READ (Ruling S3,
+		// Codex round-1 P2 on #88). Allocating it up front — beside `binding`,
+		// before `door_state()`, the hold listing and the log were read — let
+		// two overlapping requests interleave AROUND it: request A takes
+		// observation 1 and then pauses; request B takes observation 2 and
+		// finishes first; a door change lands; A resumes, reads the NEWER
+		// state, and reports it under the OLDER witness. Aura would then see
+		// observation 1 carrying state that only existed after observation 2.
+		// Bumping here instead — as the very last statement before `return`,
+		// once the whole fragment above has already been read — means
+		// overlapping responses are ordered by when their OWN state finished
+		// being read, never by a midpoint inside that read.
+		$fragment['observation'] = Aura_Worker_Door_Log::bump_observation();
+		return $fragment;
 	}
 
 	/* ------------------------------------------------------------------ */
