@@ -886,4 +886,21 @@ final class DoorLogTest extends TestCase {
 		// mutation: state and version move together or not at all.
 		$this->assertSame( $before, $after, "the racer's own two version reads never disagree with each other across this gap" );
 	}
+
+	/**
+	 * Ruling S9 (Codex round-4 P2 on #88): every counter the fragment or
+	 * governor_block() reports advances the version through the SAME
+	 * versioned() unit as its own upsert — bump_refused() (log_full.refused)
+	 * included, which changing bumps.php did not used to touch at all: a
+	 * later poll could see a changed refusal count under an unchanged
+	 * observation.
+	 */
+	public function test_a_refusal_on_a_closed_log_raises_the_observation(): void {
+		Aura_Worker_Door_Log::close();
+		$before = Aura_Worker_Door_Log::door_version_raw();
+
+		Aura_Worker_Door_Log::bump_refused();
+
+		$this->assertGreaterThan( $before, Aura_Worker_Door_Log::door_version_raw() );
+	}
 }

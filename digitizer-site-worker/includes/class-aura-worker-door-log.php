@@ -1522,16 +1522,30 @@ class Aura_Worker_Door_Log {
 		return null !== self::raw_option( self::FULL_MARKER );
 	}
 
-	/** Atomic increment, no row per refusal. */
+	/**
+	 * Atomic increment, no row per refusal — versioned with its own upsert
+	 * (Ruling S9, Codex round-4 P2 on #88): `log_full.refused` is reported
+	 * in both `status_fragment()` and `governor_block()`, so a refusal that
+	 * changes it must advance the version in the SAME transaction, or a
+	 * later poll can see the new count under an unchanged observation.
+	 */
 	public static function bump_refused() {
-		global $wpdb;
-		$wpdb->query(
-			$wpdb->prepare(
-				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
-				self::FULL_COUNTER
-			)
+		self::versioned(
+			function () {
+				global $wpdb;
+				$wpdb->query(
+					$wpdb->prepare(
+						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+						self::FULL_COUNTER
+					)
+				);
+				wp_cache_delete( self::FULL_COUNTER, 'options' );
+				return array(
+					'mutated' => true, // an upsert counter always changes something
+					'result'  => null,
+				);
+			}
 		);
-		wp_cache_delete( self::FULL_COUNTER, 'options' );
 	}
 
 	/** @var int|null Test seam: stands in for PHP_INT_SIZE in bump_door_version()'s Ruling S7 check. Never read by production code. */

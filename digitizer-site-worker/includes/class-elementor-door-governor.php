@@ -3017,11 +3017,24 @@ class Aura_Worker_Elementor_Door {
 	 * @param string $name log_ungoverned|unobserved|hook_missed|unknown_ability.
 	 */
 	private static function bump_counter( $name ) {
-		global $wpdb;
-		$option = self::COUNTER_PREFIX . $name . '_h' . (int) floor( time() / HOUR_IN_SECONDS );
-		$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1", $option ) );
-		wp_cache_delete( $option, 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
+		// Ruling S9 (Codex round-4 P2 on #88): the 30-day counter buckets are
+		// reported in `governor_block()`'s own `*_30d` fields, so a bump
+		// versions itself in the SAME transaction as its own upsert — the
+		// same reasoning `Aura_Worker_Door_Log::bump_refused()` follows for
+		// `log_full.refused`.
+		Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				global $wpdb;
+				$option = self::COUNTER_PREFIX . $name . '_h' . (int) floor( time() / HOUR_IN_SECONDS );
+				$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1", $option ) );
+				wp_cache_delete( $option, 'options' );
+				wp_cache_delete( 'notoptions', 'options' );
+				return array(
+					'mutated' => true,
+					'result'  => null,
+				);
+			}
+		);
 	}
 
 	/**
