@@ -382,7 +382,7 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { active, epoch, binding, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
+	 * @return array|null { active, epoch, binding, observation, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::present() ) {
@@ -446,6 +446,14 @@ class Aura_Worker_Elementor_Door {
 			// `entry.binding` with it to label a departed client's entries;
 			// null when the record cannot be read (Ruling A5b).
 			'binding'     => ( '' === $binding ) ? null : $binding,
+			// The site-issued observation witness (Ruling A65): an integer
+			// bumped ATOMICALLY on every serve of this fragment, so Aura can
+			// order overlapping polls of this site by the site's own witness
+			// instead of a client-side timestamp an earlier-started request
+			// can still deliver later than a later-started one. Null when the
+			// bump or its proven read-back could not be established — no
+			// witness this serve, never a stale or guessed number.
+			'observation' => Aura_Worker_Door_Log::bump_observation(),
 			'seam'        => self::$seam,
 			'door'        => self::door_state(),
 			'held'        => Aura_Worker_Door_Holds::listing(),
@@ -3127,7 +3135,7 @@ class Aura_Worker_Elementor_Door {
 	 * `unchecked` when that has not run in this request is an honest answer,
 	 * not a gap; the audit never forces a coverage check of its own.
 	 *
-	 * @return array { active, epoch, binding, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full }
+	 * @return array { active, epoch, binding, observation, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full }
 	 */
 	public static function governor_block() {
 		if ( ! self::present() ) {
@@ -3147,6 +3155,10 @@ class Aura_Worker_Elementor_Door {
 			// `entry.binding` with it to label a departed client's entries;
 			// null when the record cannot be read (Ruling A5b).
 			'binding'             => '' === $binding ? null : $binding,
+			// READ-ONLY (Ruling A65): this is an on-demand AUDIT, never a
+			// poll, and must not itself advance the counter Aura orders
+			// `/status` polls by. Null when the row cannot be proven read.
+			'observation'         => Aura_Worker_Door_Log::observation_raw(),
 			'seam'                => self::$seam,
 			'door'                => self::door_state(),
 			'held_count'          => $held,

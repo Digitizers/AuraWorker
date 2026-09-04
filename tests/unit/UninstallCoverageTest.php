@@ -146,7 +146,11 @@ final class UninstallCoverageTest extends TestCase {
 	 *   'aura_worker_door_log_acked' and the row purge on
 	 *   'aura_worker_door_log_<seq>' — to 'aura_worker_door_epoch', so neither
 	 *   can cross a rotation.)
-	 *   All names fall under the swept 'aura_worker_' prefix.
+	 *   All names fall under the swept 'aura_worker_' prefix. And — since
+	 *   2.16.2, Ruling A65 — the site-issued observation witness's own atomic
+	 *   increment (bump_observation()'s INSERT … ON DUPLICATE KEY UPDATE on
+	 *   'aura_worker_door_observation'), the same upsert shape bump_refused()
+	 *   above already uses. Also under the swept 'aura_worker_' prefix.
 	 * - includes/class-elementor-door-governor.php (1, 2.16.0) — the door's
 	 *   rolling 30-day counters, in the rule counters' shape:
 	 *   'aura_worker_door_c_<name>_h<hour>', an atomic
@@ -154,7 +158,7 @@ final class UninstallCoverageTest extends TestCase {
 	 *   Under the swept 'aura_worker_' prefix.
 	 */
 	private const ACKNOWLEDGED_RAW_OPTION_WRITES = array(
-		'includes/class-aura-worker-door-log.php'    => 9,
+		'includes/class-aura-worker-door-log.php'    => 10,
 		'includes/class-aura-worker-magic-link.php'  => 3,
 		'includes/class-aura-worker-rules.php'       => 5,
 		'includes/class-aura-worker.php'             => 2,

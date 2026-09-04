@@ -35,6 +35,21 @@ class Aura_Worker_Door_Log {
 	private static $raw_read_seq = 0;
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
+	/**
+	 * The site-issued, monotonic OBSERVATION WITNESS (Ruling A65, 2.16.2).
+	 * Aura orders overlapping `/status` polls of the same site to decide which
+	 * door observation is newest, and a client-side timestamp cannot prove
+	 * that order — an earlier-started request can still reach the site later
+	 * than one started after it. The site issues the order instead: this
+	 * counter is bumped ATOMICALLY on every serve of the status fragment
+	 * (`bump_observation()`) and read read-only for the audit block
+	 * (`observation_raw()`).
+	 *
+	 * NEVER reset by rotation, rebind or unbind — it orders observations
+	 * across all of them, which a counter scoped to one binding generation
+	 * could not do.
+	 */
+	const OBSERVATION  = 'aura_worker_door_observation';
 	const MAX_UNACKED  = 2000;
 	const PAGE         = 100;
 	/** How many INSERT collisions to ride through before giving up. */
@@ -1362,6 +1377,68 @@ class Aura_Worker_Door_Log {
 			)
 		);
 		wp_cache_delete( self::FULL_COUNTER, 'options' );
+	}
+
+	/**
+	 * Bump the observation witness ATOMICALLY and hand back the value THIS
+	 * call produced (Ruling A65) — the same upsert shape `bump_refused()`
+	 * uses, so two overlapping serves cannot both land on the same number and
+	 * neither can silently lose the other's increment.
+	 *
+	 * The bump alone is not enough: an upsert's own return says only "a row
+	 * changed", never which value it now holds, and `get_option()` would
+	 * answer this process's cache rather than what the statement above just
+	 * committed. So the new value is read back RAW and PROVEN
+	 * (`raw_option_read()`, never `get_option()`) — the same proof
+	 * `binding_raw()`/`epoch_raw()` require before a caller may trust what a
+	 * read says.
+	 *
+	 * A bump whose statement failed, or a read-back that could not be proven,
+	 * answers null — "no witness this serve", never a stale or guessed
+	 * number a caller could mistake for this call's own.
+	 *
+	 * @return int|null
+	 */
+	public static function bump_observation() {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$ok                = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+				self::OBSERVATION
+			)
+		);
+		wp_cache_delete( self::OBSERVATION, 'options' );
+		if ( false === $ok || '' !== (string) $wpdb->last_error ) {
+			return null; // the statement itself failed: nothing was witnessed
+		}
+		$read = self::raw_option_read( self::OBSERVATION );
+		if ( ! $read['ok'] || null === $read['value'] ) {
+			// The bump may well have landed — but a read that cannot prove
+			// what it landed AS must not hand back a guess (Ruling S1).
+			return null;
+		}
+		return (int) $read['value'];
+	}
+
+	/**
+	 * The observation witness as the DATABASE holds it, READ-ONLY (Ruling
+	 * A65) — for `governor_block()`, which is an on-demand AUDIT, never a
+	 * poll: reporting it must not itself advance the very counter Aura uses
+	 * to order polls.
+	 *
+	 * PROVEN, never minted: an absent or unreadable row answers null, not
+	 * zero, which a caller could not tell apart from "this site has never
+	 * served a status fragment".
+	 *
+	 * @return int|null
+	 */
+	public static function observation_raw() {
+		$read = self::raw_option_read( self::OBSERVATION );
+		if ( ! $read['ok'] ) {
+			return null;
+		}
+		return null === $read['value'] ? null : (int) $read['value'];
 	}
 
 	/**

@@ -553,4 +553,55 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_sa_wpdb_query_filtered_out'] = false;
 		$this->assertSame( '', $stale, 'unreadable, never A (stale) and never B (unproven)' );
 	}
+
+	/**
+	 * The site-issued observation witness (Ruling A65, 2.16.2): an atomic
+	 * bump, proven read back, so consecutive calls in one request see
+	 * consecutive integers — never a guess, never a repeat.
+	 */
+	public function test_bump_observation_increments_by_exactly_one_and_is_an_int(): void {
+		$a = Aura_Worker_Door_Log::bump_observation();
+		$b = Aura_Worker_Door_Log::bump_observation();
+		$c = Aura_Worker_Door_Log::bump_observation();
+		$this->assertIsInt( $a );
+		$this->assertSame( $a + 1, $b );
+		$this->assertSame( $b + 1, $c );
+	}
+
+	/** Two serves within one request give consecutive values — never the same number twice. */
+	public function test_two_bumps_in_one_request_give_consecutive_values(): void {
+		$first  = Aura_Worker_Door_Log::bump_observation();
+		$second = Aura_Worker_Door_Log::bump_observation();
+		$this->assertNotSame( $first, $second );
+		$this->assertSame( $first + 1, $second );
+	}
+
+	/**
+	 * A read-back that cannot be PROVEN (Ruling S1's same discipline) answers
+	 * null — "no witness this serve" — never a stale or guessed number, even
+	 * though the underlying upsert may well have landed.
+	 */
+	public function test_bump_observation_answers_null_when_the_read_back_cannot_be_proven(): void {
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+		$out                       = Aura_Worker_Door_Log::bump_observation();
+		$GLOBALS['_sa_wpdb_error'] = '';
+		$this->assertNull( $out );
+	}
+
+	/** `observation_raw()` is READ-ONLY: it reports the current value and never advances it. */
+	public function test_observation_raw_reports_without_bumping(): void {
+		$this->assertNull( Aura_Worker_Door_Log::observation_raw(), 'no witness has ever served this site' );
+		$bumped = Aura_Worker_Door_Log::bump_observation();
+		$this->assertSame( $bumped, Aura_Worker_Door_Log::observation_raw() );
+		$this->assertSame( $bumped, Aura_Worker_Door_Log::observation_raw(), 'a second read changes nothing' );
+	}
+
+	/** The counter is NEVER reset by rotation, rebind or unbind (Ruling A65) — it orders observations across all of them. */
+	public function test_observation_survives_an_epoch_rotation(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$seq    = Aura_Worker_Door_Log::bump_observation();
+		Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertSame( $seq, Aura_Worker_Door_Log::observation_raw(), 'a rewind recovery must not zero the witness' );
+		$this->assertSame( $seq + 1, Aura_Worker_Door_Log::bump_observation(), 'and the next bump continues from it' );
+	}
 }

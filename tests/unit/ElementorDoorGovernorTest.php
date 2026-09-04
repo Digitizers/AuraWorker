@@ -1172,4 +1172,49 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertNull( $frag['binding'], 'never the stale A, and never the unproven B' );
 		$this->assertNull( $block['binding'], 'never the stale A, and never the unproven B' );
 	}
+
+	/**
+	 * `observation` (Ruling A65, 2.16.2): the site-issued, monotonic witness
+	 * Aura orders overlapping `/status` polls by. Each SERVE of the fragment
+	 * bumps it ATOMICALLY, so two polls in the same test see consecutive
+	 * integers — never a client-side timestamp, which an earlier-started
+	 * request could still deliver out of order.
+	 */
+	public function test_status_fragment_observation_increases_by_one_per_serve(): void {
+		$this->registerAll();
+		$first  = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$second = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$this->assertIsInt( $first );
+		$this->assertSame( $first + 1, $second, 'the site\'s own witness, not a client-side timestamp' );
+	}
+
+	/**
+	 * `governor_block()` is an on-demand AUDIT, never a poll — reading it must
+	 * not itself advance the counter `/status` orders polls by.
+	 */
+	public function test_governor_block_reports_the_current_observation_without_bumping_it(): void {
+		$this->registerAll();
+		$served = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'] );
+		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'], 'a second audit read changes nothing' );
+		$this->assertSame( $served + 1, Aura_Worker_Elementor_Door::status_fragment()['observation'], 'only a SERVE advances it' );
+	}
+
+	/**
+	 * A bump whose read-back cannot be proven answers `observation: null` —
+	 * "no witness this serve" — never a stale or guessed number, in both
+	 * shapes.
+	 */
+	public function test_observation_is_null_in_both_shapes_when_it_cannot_be_proven(): void {
+		$this->registerAll();
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+
+		$frag  = Aura_Worker_Elementor_Door::status_fragment();
+		$block = Aura_Worker_Elementor_Door::governor_block();
+
+		$GLOBALS['_sa_wpdb_error'] = '';
+
+		$this->assertNull( $frag['observation'] );
+		$this->assertNull( $block['observation'] );
+	}
 }
