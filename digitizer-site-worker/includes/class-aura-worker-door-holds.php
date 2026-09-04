@@ -1014,7 +1014,15 @@ class Aura_Worker_Door_Holds {
 		$at    = strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) );
 		$lease = self::lease_is_held( (string) $ref );
 		if ( true === $lease ) {
-			return true; // running, whatever its age
+			// HELD, BUT NOT FOR EVER (Ruling P84). A named lock lives as long
+			// as the database CONNECTION that took it, and a persistent
+			// connection outlives the PHP request that borrowed it — so a
+			// request killed mid-callback can leave its lock reported held
+			// with nobody behind it. `true` used to mean running whatever the
+			// age, so such a claim held a queue slot and was never reconciled,
+			// permanently. The hard cap bounds it: a lease is evidence of life
+			// for LEASE_HARD_CAP_S, and after that only the row's age speaks.
+			return false === $at || $at > $cap;
 		}
 		if ( self::LEASE_UNSUPPORTED === ( isset( $row['lease'] ) ? (string) $row['lease'] : '' ) ) {
 			// Claimed on an engine that HAS no named locks (Ruling P70), so

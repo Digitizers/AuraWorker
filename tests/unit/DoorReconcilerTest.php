@@ -767,6 +767,54 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertNotNull( Aura_Worker_Door_Log::get( $seq ), 'and the row is still there' );
 	}
 
+	/**
+	 * Ruling P84 (F2): a lease is evidence of life for LEASE_HARD_CAP_S, and
+	 * no longer.
+	 *
+	 * A named lock lives as long as the database CONNECTION that took it, and
+	 * a persistent connection outlives the PHP request that borrowed it — so a
+	 * request killed mid-callback can leave `IS_USED_LOCK` reporting a holder
+	 * with nobody behind it. A held lock used to mean "running, whatever its
+	 * age": the claim kept its queue slot, the pending row was never settled
+	 * and the creation mutex was never cleared, permanently.
+	 */
+	public function test_a_lock_held_past_the_hard_cap_no_longer_protects_a_claim(): void {
+		$ref = $this->hold();
+		$this->claim( $ref );
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $ref ) ] = true;
+		$this->patchOption( Aura_Worker_Door_Holds::CLAIMED . $ref, array( 'claimed_at' => gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 ) ) );
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 1, $out['settled_claims'], 'a stranded lock does not hold a slot for ever' );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+	}
+
+	/** …and inside the cap a held lock still means running. */
+	public function test_a_lock_held_inside_the_hard_cap_still_protects_a_claim(): void {
+		$ref = $this->hold();
+		$this->claim( $ref ); // backdated past CLAIM_STALE_MS, well inside the cap
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $ref ) ] = true;
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 0, $out['settled_claims'] );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'a replay that is genuinely running is left alone' );
+	}
+
+	/** The same rule for a pending ROW and for the creation mutex it owns. */
+	public function test_a_lock_held_past_the_hard_cap_no_longer_protects_a_row_or_its_mutex(): void {
+		$seq = $this->entry( array( 'at' => gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 ) ), true, false );
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => $seq, 'started_at' => gmdate( 'c', time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S - 60 ) ) );
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::seq_lease_name( $seq ) ] = true;
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 1, $out['interrupted'], 'the row is settled' );
+		$this->assertSame( 'interrupted', $this->row( $seq )['result'] );
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ), 'and the mutex is freed' );
+	}
+
 	/** The same mutex with no lease held is cleared by age, exactly as before. */
 	public function test_an_old_mutex_with_no_seq_lease_is_still_cleared(): void {
 		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => $this->longAgo() ) );

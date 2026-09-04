@@ -664,7 +664,13 @@ class Aura_Worker_Elementor_Door {
 	private static function write_is_running( $seq, array $row ) {
 		$lease = Aura_Worker_Door_Holds::seq_lease_is_held( $seq );
 		if ( true === $lease ) {
-			return true;
+			// HELD, BUT NOT FOR EVER (Ruling P84) — the same rule the claim
+			// predicate follows. A named lock lives as long as the database
+			// CONNECTION, and a persistent connection outlives the request
+			// that borrowed it: a lock stranded that way used to keep a pending
+			// row unsettled and the creation mutex unclearable for good.
+			$at = strtotime( (string) ( isset( $row['at'] ) ? $row['at'] : '' ) );
+			return false === $at || $at > time() - Aura_Worker_Door_Holds::LEASE_HARD_CAP_S;
 		}
 		$unleasable = ( Aura_Worker_Door_Holds::LEASE_UNSUPPORTED === ( isset( $row['lease'] ) ? (string) $row['lease'] : '' ) );
 		if ( null === $lease || $unleasable ) {
