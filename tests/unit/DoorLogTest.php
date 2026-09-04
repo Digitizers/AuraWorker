@@ -986,4 +986,41 @@ final class DoorLogTest extends TestCase {
 		$this->assertIsArray( $fresh );
 		$this->assertFalse( $fresh['stale'], 'the post-commit repeat evicted the racer\'s repopulated entry, so this read reaches the database again' );
 	}
+
+	/**
+	 * Ruling S12 (Codex round-5 P2 on #88): when the epoch DELETE succeeds
+	 * but the replacement insert_unique_write() then fails, the old code
+	 * ignored that false result — the transaction still bumped the version
+	 * and committed with NO epoch row at all, reporting `rotated: true` with
+	 * an empty one. Both branches of rotate_epoch_write() now check it and
+	 * roll the WHOLE unit back — the DELETE included — so the epoch this
+	 * call reports, and the one the row actually still holds, are the
+	 * ORIGINAL, never-replaced one.
+	 */
+	public function test_rotate_epoch_rolls_back_when_the_claim_conditioned_replacement_insert_fails(): void {
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-magic-link.php';
+		$before = Aura_Worker_Door_Log::epoch();
+		$fence  = Aura_Worker_Magic_Link::claim_site();
+
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::EPOCH;
+		$out                               = Aura_Worker_Door_Log::rotate_epoch( $before, Aura_Worker_Magic_Link::SITE_CLAIM, $fence );
+		$GLOBALS['_sa_insert_unique_fail']  = false;
+
+		$this->assertFalse( $out['rotated'] );
+		$this->assertSame( $before, $out['epoch'], 'the epoch this call reports is the one that was never actually replaced' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::epoch_raw(), 'and the row itself still holds it — the DELETE rolled back too' );
+	}
+
+	/** The same failure, on the unclaimed (grant-gated /door/rotate) branch. */
+	public function test_rotate_epoch_rolls_back_when_the_unclaimed_replacement_insert_fails(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::EPOCH;
+		$out                               = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_insert_unique_fail']  = false;
+
+		$this->assertFalse( $out['rotated'] );
+		$this->assertSame( $before, $out['epoch'] );
+		$this->assertSame( $before, Aura_Worker_Door_Log::epoch_raw() );
+	}
 }

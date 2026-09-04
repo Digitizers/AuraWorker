@@ -1110,7 +1110,19 @@ class Aura_Worker_Door_Log {
 		$outcome = self::versioned(
 			function () use ( $was, $claim, $fence, $target, $client, $dashboard, $rec, $raw, $claimed ) {
 				global $wpdb;
-				$rot       = self::rotate_epoch_write( $was, $claim, $fence );
+				$rot = self::rotate_epoch_write( $was, $claim, $fence );
+				if ( ! empty( $rot['rollback'] ) ) {
+					// Ruling S12: rotate_epoch_write() itself hit a failed
+					// replacement insert and asked for the WHOLE unit to
+					// roll back — propagated here rather than swallowed,
+					// or this closure's own 'mutated' => false would tell
+					// versioned() to COMMIT, landing the epoch's DELETE
+					// with no replacement row after all.
+					return array(
+						'rollback' => true,
+						'result'   => false,
+					);
+				}
 				$new_epoch = (string) ( $rot['result']['epoch'] ?? '' );
 				if ( empty( $rot['result']['rotated'] ) || '' === $new_epoch || $new_epoch === $was ) {
 					return array(
@@ -2264,7 +2276,23 @@ class Aura_Worker_Door_Log {
 			// read, but that mint is a versioned insert_unique() call and
 			// would nest a transaction. insert_unique_write() is the SAME
 			// mint, write-only, sharing this one.
-			self::insert_unique_write( self::EPOCH, wp_generate_uuid4() );
+			if ( ! self::insert_unique_write( self::EPOCH, wp_generate_uuid4() ) ) {
+				// Ruling S12 (Codex round-5 P2 on #88): the replacement
+				// insert failed — a lost race, a driver error. Left
+				// unchecked, the transaction would still bump the version
+				// and commit with NO epoch row at all, reporting
+				// `rotated: true` with an empty one. The whole unit rolls
+				// back instead — the DELETE above included — and the epoch
+				// this call still names is the one that was actually never
+				// replaced.
+				return array(
+					'rollback' => true,
+					'result'   => array(
+						'rotated' => false,
+						'epoch'   => $expected,
+					),
+				);
+			}
 			return array(
 				'mutated' => true,
 				'result'  => array(
@@ -2290,7 +2318,16 @@ class Aura_Worker_Door_Log {
 		delete_option( self::FULL_MARKER );
 		delete_option( self::FULL_COUNTER );
 		// See the mint note on the claim-conditioned branch above.
-		self::insert_unique_write( self::EPOCH, wp_generate_uuid4() );
+		if ( ! self::insert_unique_write( self::EPOCH, wp_generate_uuid4() ) ) {
+			// Ruling S12 — see the claim-conditioned branch above.
+			return array(
+				'rollback' => true,
+				'result'   => array(
+					'rotated' => false,
+					'epoch'   => $expected,
+				),
+			);
+		}
 		return array(
 			'mutated' => true,
 			'result'  => array(
