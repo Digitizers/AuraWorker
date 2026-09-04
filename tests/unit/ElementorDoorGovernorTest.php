@@ -230,6 +230,68 @@ final class ElementorDoorGovernorTest extends TestCase {
 		}
 	}
 
+	/** One row PAST the bound, the state an earlier overflow leaves behind. */
+	private function fillPastTheBound(): void {
+		$this->fillTheLog();
+		$i = Aura_Worker_Door_Log::MAX_UNACKED + 1;
+		$GLOBALS['_options'][ 'aura_worker_door_log_' . $i ] = array( 'seq' => $i, 'result' => 'ok', 'admitted' => true );
+		$GLOBALS['_rows'][ 'aura_worker_door_log_' . $i ]    = maybe_serialize( $GLOBALS['_options'][ 'aura_worker_door_log_' . $i ] );
+	}
+
+	/**
+	 * Ruling P82 (F2), first half: a log already over the bound refuses
+	 * WITHOUT taking a row.
+	 *
+	 * The count happened only after `open_pending()` had inserted one, so every
+	 * refusal still allocated a number past the bound — and on a site whose
+	 * closure marker could not be written, that repeated for every request.
+	 */
+	public function test_a_log_already_over_the_bound_refuses_without_taking_a_row(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$this->fillPastTheBound();
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertSame( 'aura_log_full', $out->get_error_code() );
+		$this->assertNull( Aura_Worker_Door_Log::get( Aura_Worker_Door_Log::MAX_UNACKED + 2 ), 'no row was taken' );
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed() );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
+	}
+
+	/**
+	 * …and second half: a closure that cannot be WRITTEN is not a closure.
+	 *
+	 * The marker insert failing while ordinary inserts still worked left every
+	 * caller answering `aura_log_full` while `is_closed()` reported an open
+	 * door — a refusal `/status` contradicts — and each of those callers had
+	 * appended another row past the bound on its way there.
+	 */
+	public function test_a_closure_that_cannot_be_written_is_retryable_and_takes_no_row(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		$this->fillPastTheBound();
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::FULL_MARKER;
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code(), 'retryable, NOT a closure it cannot prove' );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertFalse( Aura_Worker_Door_Log::is_closed(), 'and the door really is not closed' );
+		$this->assertFalse( get_option( Aura_Worker_Door_Log::FULL_COUNTER, false ), 'no refusal was counted' );
+		$this->assertNull( Aura_Worker_Door_Log::get( Aura_Worker_Door_Log::MAX_UNACKED + 2 ), 'and no row was taken' );
+
+		// …and a second request opens nothing either: the pre-check catches it
+		// before `open_pending()`, so the log does not keep growing.
+		$out2 = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$GLOBALS['_sa_insert_unique_fail'] = false;
+		$this->assertSame( 'aura_log_failed', $out2->get_error_code() );
+		$this->assertNull( Aura_Worker_Door_Log::get( Aura_Worker_Door_Log::MAX_UNACKED + 2 ) );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
+	}
+
 	public function test_at_the_bound_the_request_backs_out_settling_discarded_and_closes(): void {
 		$this->registerAll();
 		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
@@ -364,9 +426,10 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( 'aura_log_failed', $out->get_error_code(), 'retryable: nothing ran' );
 		$this->assertSame( 503, $out->get_error_data()['status'] );
 		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
-		$row = Aura_Worker_Door_Log::get( Aura_Worker_Door_Log::MAX_UNACKED + 1 );
-		$this->assertSame( 'discarded', $row['result'], 'the reservation is handed back (P29 shape)' );
-		$this->assertTrue( $row['admitted'] );
+		// NO reservation at all (Ruling P82): the bound is asked before a row is
+		// taken, so an unreadable count costs no number. It used to insert one
+		// and hand it straight back as `discarded`.
+		$this->assertNull( Aura_Worker_Door_Log::get( Aura_Worker_Door_Log::MAX_UNACKED + 1 ) );
 		$GLOBALS['_sa_door_unacked_error'] = false;
 		$this->assertFalse( Aura_Worker_Door_Log::is_closed(), 'a database blip is not an overflow' );
 		$this->assertNull( Aura_Worker_Door_Log::full_report() );
@@ -384,7 +447,7 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$ref = (string) $out->get_error_data()['ref'];
 		$this->assertFalse( Aura_Worker_Door_Holds::get_held( $ref )['log_entry'], 'and says its entry was not written' );
 		$GLOBALS['_sa_door_unacked_error'] = false;
-		$this->assertSame( 'discarded', Aura_Worker_Door_Log::get( 1 )['result'] );
+		$this->assertNull( Aura_Worker_Door_Log::get( 1 ), 'and no row was taken for it (Ruling P82)' );
 		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
 		$this->assertSame( 1, (int) get_option( 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS ), 0 ) );
 	}

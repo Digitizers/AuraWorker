@@ -1763,6 +1763,17 @@ class Aura_Worker_Elementor_Door {
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}
+		// AND THE BOUND, BEFORE A ROW IS TAKEN (Ruling P82). The count used to
+		// happen only after `open_pending()` had already inserted a row, so a
+		// site whose closure marker could not be written kept appending rows —
+		// each one refused and discarded, each one still a number allocated
+		// past the bound — for as long as the marker insert kept failing, while
+		// `/status` went on reporting an open door. Asking first means an
+		// overflow costs nothing.
+		$over = self::refuse_if_over_bound();
+		if ( null !== $over ) {
+			return $over;
+		}
 		// A replay's verdict is what the OPERATOR decided, not what the rules
 		// said: `none` / `rules_unavailable` reached the write because Aura
 		// approved it, and the entry says `approved` rather than repeating a
@@ -1806,8 +1817,16 @@ class Aura_Worker_Elementor_Door {
 			// deletes the row while the log still looks open never runs its
 			// reopen check, and the marker installed after it would shut the
 			// door for ever with nothing left to ack.
-			Aura_Worker_Door_Log::close();
+			//
+			// AND ITS ANSWER DECIDES WHAT THIS IS (Ruling P82): a marker that
+			// did not land leaves the door open, so `aura_log_full` would be a
+			// refusal `/status` contradicts. Retryable instead, and no refusal
+			// counted — a closure nobody can prove is not one.
+			$closed = Aura_Worker_Door_Log::close();
 			Aura_Worker_Door_Log::discard( $seq );
+			if ( ! $closed ) {
+				return self::log_unreadable_error();
+			}
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}
@@ -2282,6 +2301,12 @@ class Aura_Worker_Elementor_Door {
 			self::bump_counter( 'log_ungoverned' );
 			return false;
 		}
+		// The bound, before a row is taken (Ruling P82) — the same rule the
+		// write path follows, for the same reason.
+		if ( null !== self::refuse_if_over_bound() ) {
+			self::bump_counter( 'log_ungoverned' );
+			return false;
+		}
 		$seq = Aura_Worker_Door_Log::open_pending(
 			array_merge(
 				array(
@@ -2315,9 +2340,12 @@ class Aura_Worker_Elementor_Door {
 			// deletes the row while the log still looks open never runs its
 			// reopen check, and the marker installed after it would shut the
 			// door for ever with nothing left to ack.
-			Aura_Worker_Door_Log::close();
+			$closed = Aura_Worker_Door_Log::close();
 			Aura_Worker_Door_Log::discard( $seq );
 			self::bump_counter( 'log_ungoverned' );
+			if ( $closed ) {
+				Aura_Worker_Door_Log::bump_refused();
+			}
 			return false;
 		}
 		// NOT admitted here (Ruling P25): settle() admits in the same write,
@@ -3071,6 +3099,40 @@ class Aura_Worker_Elementor_Door {
 		return new WP_Error( 'aura_log_failed', __( "Aura could not read this site's door log backlog; the call was not run — retry.", 'digitizer-site-worker' ), array( 'status' => 503 ) );
 	}
 
+	/**
+	 * IS THE LOG ALREADY OVER THE BOUND — asked BEFORE a row is taken (Ruling
+	 * P82)?
+	 *
+	 * The count used to happen only after `open_pending()` had inserted one, so
+	 * a site whose closure marker could not be written kept appending rows,
+	 * each refused and discarded but each a number allocated past the bound,
+	 * for as long as the marker insert kept failing — while `/status` reported
+	 * an open door. The bounded log was bounded only while the marker's insert
+	 * worked.
+	 *
+	 * Three answers, and each is the same one the post-insert check gives:
+	 * unreadable ⇒ retryable 503, nothing counted; over the bound and provably
+	 * closed ⇒ `aura_log_full` with the refusal counted; over the bound and NOT
+	 * provably closed ⇒ retryable 503, because a refusal `/status` contradicts
+	 * is worse than a retry.
+	 *
+	 * @return WP_Error|null Null when the caller may go on and take a row.
+	 */
+	private static function refuse_if_over_bound() {
+		$unacked = Aura_Worker_Door_Log::count_unacked();
+		if ( null === $unacked ) {
+			return self::log_unreadable_error();
+		}
+		if ( $unacked <= Aura_Worker_Door_Log::MAX_UNACKED ) {
+			return null;
+		}
+		if ( ! Aura_Worker_Door_Log::close() ) {
+			return self::log_unreadable_error();
+		}
+		Aura_Worker_Door_Log::bump_refused();
+		return self::log_full_error();
+	}
+
 	/** @return WP_Error */
 	private static function log_full_error() {
 		return new WP_Error( 'aura_log_full', __( "Aura has not acknowledged this site's door log; the door is closed to writes until it does", 'digitizer-site-worker' ), array( 'status' => 503 ) );
@@ -3486,6 +3548,11 @@ class Aura_Worker_Elementor_Door {
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}
+		// The bound, before a row is taken (Ruling P82).
+		$over = self::refuse_if_over_bound();
+		if ( null !== $over ) {
+			return $over;
+		}
 		$seq = Aura_Worker_Door_Log::open_pending(
 			array(
 				'ability'    => 'aura/restore',
@@ -3520,8 +3587,11 @@ class Aura_Worker_Elementor_Door {
 			// deletes the row while the log still looks open never runs its
 			// reopen check, and the marker installed after it would shut the
 			// door for ever with nothing left to ack.
-			Aura_Worker_Door_Log::close();
+			$closed = Aura_Worker_Door_Log::close();
 			Aura_Worker_Door_Log::discard( $seq );
+			if ( ! $closed ) {
+				return self::log_unreadable_error();
+			}
 			Aura_Worker_Door_Log::bump_refused();
 			return self::log_full_error();
 		}

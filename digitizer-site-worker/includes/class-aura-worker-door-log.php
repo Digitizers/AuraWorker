@@ -1158,7 +1158,14 @@ class Aura_Worker_Door_Log {
 
 	/** One owner: the INSERT. */
 	public static function close() {
-		self::insert_unique( self::FULL_MARKER, gmdate( 'c' ) );
+		if ( self::insert_unique( self::FULL_MARKER, gmdate( 'c' ) ) ) {
+			return true;
+		}
+		// A LOST insert is a closure too — somebody else's marker is under that
+		// name — but a FAILED one is not (Ruling P82), and `insert_unique()`
+		// answers false to both. Ask the row: the marker is either there or it
+		// is not, and a closure nobody can prove is not one.
+		return null !== self::raw_option( self::FULL_MARKER );
 	}
 
 	/** Atomic increment, no row per refusal. */
