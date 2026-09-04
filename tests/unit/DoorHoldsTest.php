@@ -179,22 +179,21 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/**
-	 * Ruling P73 (F1): an `unset` record is ADOPTED, never compared blind.
+	 * Ruling P73: an `unset` record is ADOPTED.
 	 *
-	 * A site 2.16 meets already connected mints an `unset` placeholder, and
-	 * `unset` used to be a BYPASS: its generation was live without the identity
-	 * ever being compared. A connect publishes the new token, client sentinel
-	 * and dashboard URL BEFORE it rotates the generation — so in that interval
-	 * a request authenticating with the REPLACEMENT credentials was told the
-	 * departed binding's generation was live, and could claim and run the
-	 * previous client's stored mutation.
+	 * A site 2.16 meets already connected mints an `unset` placeholder, which
+	 * states nothing about whose door this is. Adoption states what the site
+	 * can already see — the client sentinel and the dashboard URL — WITHOUT
+	 * moving the generation, so the site's own rows stay current and no
+	 * approval is stranded.
 	 *
-	 * Adoption states what the site can already see, WITHOUT moving the
-	 * generation: the site's own rows stay current, and P62's identity
-	 * comparison starts applying to everybody.
+	 * The window this originally closed (a replacement connect publishing its
+	 * identity before the rotation) no longer exists: since Ruling P75 a
+	 * connect refuses to run over a live foreign binding at all. What adoption
+	 * still does is put every site's record into a state the unbind, the
+	 * connect refusal and `leftovers()` can all read.
 	 */
-	public function test_an_unset_record_is_adopted_and_a_replacement_identity_makes_the_hold_foreign(): void {
-		// An upgraded site: a placeholder record and a hold stamped with it.
+	public function test_an_unset_record_is_adopted_to_the_identity_the_site_is_live_under(): void {
 		$rec = array( 'gen' => 'upgrade-gen', 'state' => 'unset', 'client' => null, 'dashboard' => null );
 		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
 		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
@@ -203,21 +202,22 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertIsString( $ref );
 		$this->assertSame( 'upgrade-gen', $GLOBALS['_options'][ 'aura_worker_door_held_' . $ref ]['binding'], 'the placeholder generation, unchanged' );
 
-		// The first read adopts it — no rotation, so the hold is still ours.
 		$after = Aura_Worker_Door_Log::binding_record();
+
 		$this->assertSame( 'bound', $after['state'] );
 		$this->assertSame( 'client-a', $after['client'] );
+		$this->assertSame( 'https://app.example', $after['dashboard'] );
 		$this->assertSame( 'upgrade-gen', $after['gen'], 'ADOPTED, not rotated' );
-		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the site still serves its own queue' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'so the site still serves its own queue' );
+	}
 
-		// The replacement connect publishes its credentials and identity, and
-		// has NOT rotated the generation yet.
-		$this->publishIdentity( 'client-b', 'tok-b' );
+	/** …and a site with NO live identity keeps `unset`: nothing to adopt it for. */
+	public function test_a_site_with_no_live_identity_keeps_an_unset_record(): void {
+		$rec = array( 'gen' => 'upgrade-gen', 'state' => 'unset', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
 
-		$this->assertSame( 'upgrade-gen', Aura_Worker_Door_Log::binding(), 'the rotation really has not happened' );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'and the departed hold is already foreign' );
-		$this->assertSame( array(), Aura_Worker_Door_Holds::listing() );
-		$this->assertSame( 'not_held', Aura_Worker_Door_Holds::claim( $ref )->get_error_code() );
+		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'] );
 	}
 
 	/**

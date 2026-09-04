@@ -211,7 +211,10 @@ final class ConnectProvisionTest extends TestCase {
 		// tool reachable with the site token alone, behind a 200.
 		$key = base64_encode( str_repeat( 'k', 32 ) );
 		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_grant_pubkey' => true );
-		$res = $this->ml->handle_connect( $this->request( array( 'grant_pubkey' => $key ) ) );
+		// Named client on both halves (Ruling P75): once a site is bound, only
+		// the client it is bound to may re-save it, and an identity with no
+		// client line cannot be proven to be that one (P66).
+		$res = $this->ml->handle_connect( $this->request( array( 'grant_pubkey' => $key, 'client' => 'c1' ) ) );
 		$GLOBALS['_sa_option_write_fail'] = array();
 		$this->assertSame( 500, $res->get_status() );
 		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
@@ -224,7 +227,7 @@ final class ConnectProvisionTest extends TestCase {
 		$GLOBALS['_options']['aura_worker_grant_pubkey'] = 'old-key';
 		$GLOBALS['_rows']['aura_worker_grant_pubkey']    = 'old-key';
 		$GLOBALS['_sa_option_write_fail'] = array( 'aura_worker_grant_pubkey' => true );
-		$res = $this->ml->handle_connect( $this->request() );
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1' ) ) );
 		$GLOBALS['_sa_option_write_fail'] = array();
 		$this->assertSame( 500, $res->get_status() );
 		$this->assertSame( 'aura_connect_store_failed', $res->get_data()['code'] );
@@ -447,6 +450,19 @@ final class ConnectProvisionTest extends TestCase {
 		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) );
 	}
 
+	/**
+	 * The whole departed state: a binding, its door rows, and then the unbind
+	 * that retires them — the order a real rebind happens in (Ruling P75).
+	 *
+	 * @return string The departed hold's ref.
+	 */
+	private function seedDepartedDoorState( string $client = 'c1', string $dashboard = 'https://dash.example' ): string {
+		$this->seedPreviousBinding( $client, $dashboard );
+		$ref = $this->seedDoorState();
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) );
+		return $ref;
+	}
+
 	/** A hold and a settled log row belonging to that binding. */
 	private function seedDoorState(): string {
 		foreach ( array( 'class-aura-worker-door-log', 'class-aura-worker-door-holds', 'class-elementor-door-governor' ) as $f ) {
@@ -538,8 +554,7 @@ final class ConnectProvisionTest extends TestCase {
 	 * still current and replayable by the replacement.
 	 */
 	public function test_a_rotation_that_cannot_be_verified_refuses_the_connect(): void {
-		$this->seedUnboundSite( 'c1', 'https://dash.example' );
-		$ref = $this->seedDoorState();
+		$ref = $this->seedDepartedDoorState();
 		$gen = Aura_Worker_Door_Log::binding();
 		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
 
@@ -626,8 +641,7 @@ final class ConnectProvisionTest extends TestCase {
 	 * the log is the SITE's audit trail and the new client drains it by acking.
 	 */
 	public function test_a_changed_binding_connect_mints_a_new_generation_and_keeps_every_row(): void {
-		$this->seedUnboundSite( 'c1', 'https://dash.example' );
-		$ref            = $this->seedDoorState();
+		$ref            = $this->seedDepartedDoorState();
 		$before_binding = Aura_Worker_Door_Log::binding();
 		$before_epoch   = Aura_Worker_Door_Log::epoch();
 
@@ -644,7 +658,7 @@ final class ConnectProvisionTest extends TestCase {
 		// …and the log is served regardless, each entry naming the binding that wrote it.
 		$log = Aura_Worker_Door_Log::log_after( 0 );
 		$this->assertNotSame( array(), $log, "the site's audit trail is not the binding's to take" );
-		$this->assertSame( $before_binding, $log[0]['binding'], 'a departed client\'s entry, and it says so' );
+		$this->assertNotSame( Aura_Worker_Door_Log::binding(), $log[0]['binding'], 'a departed client\'s entry, and it says so' );
 	}
 
 	/** A same-binding re-save leaves the generation, and the queue, alone. */

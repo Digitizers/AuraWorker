@@ -295,6 +295,15 @@ class Aura_Worker_Elementor_Door {
 	 * already names this identity — so a caller can answer a failure honestly
 	 * and the next connect simply does it again.
 	 *
+	 * A REBIND IS AN UNBIND FOLLOWED BY A CONNECT (Ruling P75). There is no
+	 * repoint: a connect meeting a live foreign binding refuses
+	 * (`aura_site_bound`) and writes nothing, so the two callers of this are
+	 * the unbind's step (4a) — which rotates to `unbound`, retiring the
+	 * departed queue and cursor under a state everything can read — and the
+	 * connect that follows, which binds a site that is `unbound` or `unset`.
+	 * The two are never one request, which is why nothing here has to be safe
+	 * against a client change happening under a live binding.
+	 *
 	 * @param array $identity { client: string|null, dashboard: string|null }.
 	 * @return bool The door now belongs to that identity.
 	 */
@@ -996,11 +1005,22 @@ class Aura_Worker_Elementor_Door {
 	 * which is the case a replay-only fence could not see.
 	 *
 	 * UNCACHED (Ruling P64). By this point the request has been through
-	 * `get_held()` and whatever else, so both WordPress's option cache and
-	 * `live_identity()`'s per-request static hold answers from before the
-	 * callback — and a rebind completing in another PHP process invalidates
-	 * neither, because both are this process's memory. The fence reads the
-	 * rows itself, and a read it cannot trust refuses.
+	 * `get_held()` and whatever else, so WordPress's option cache holds an
+	 * answer from before the callback — and a rebind completing in another PHP
+	 * process does not invalidate it, because it is this process's memory. The
+	 * fence reads the row itself, and a read it cannot trust refuses.
+	 *
+	 * WHAT IT STILL CATCHES, now that a connect cannot repoint a live binding
+	 * (Ruling P75): a request that was already PAST authentication when the
+	 * unbind rotated the generation. Its credentials were checked against a
+	 * binding that has since been retired, and this is where it is told so.
+	 *
+	 * The bounded residual is a callback ALREADY RUNNING when the unbind lands.
+	 * It finishes under its execution lease — the reconciler will not touch a
+	 * leased row (Ruling P56) — and settles its own entry stamped with the old
+	 * generation, so the mutation is recorded in the site's audit trail as the
+	 * departed binding's. Nothing narrower is possible without being able to
+	 * interrupt PHP mid-callback.
 	 *
 	 * A row with NO binding is REFUSED (Ruling P72). Nothing predates the
 	 * stamp — 2.16 introduces the door and the stamp together — so an empty

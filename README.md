@@ -150,6 +150,15 @@ Reconnecting settles the debt first: both the magic-link `/connect` callback and
 marker only after the replacement binding is installed and read back — a failed swap leaves
 the marker still refusing the old binding.
 
+**A connect never runs over another client's live binding (2.16.0).** Moving a site from one
+Aura client to another is an **unbind followed by a connect**, never a single re-connect: a
+`/connect` callback that meets a site already bound to a different client answers
+`409 aura_site_bound` ("This site is bound to another Aura client; unbind it first") and
+writes nothing at all — no token, dashboard, client sentinel, grant key or connect user. A
+callback that names **no** client is refused the same way on a bound site, since a dashboard
+base URL is shared by every site on it and proves no identity. The same client re-saving, a
+site that has been unbound, and a site nobody has ever bound all connect exactly as before.
+
 `GET /aura/v1/status` reports, each as a JSON object whose *presence* is the signal:
 
 | Key | Shape | Meaning |

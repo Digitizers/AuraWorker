@@ -4134,9 +4134,8 @@ function sa_reset_state(): void {
 		Aura_Worker_Elementor_Door::reset_for_tests();
 	}
 	if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
-		// live_identity()'s per-request cache is a static too (Ruling P62): the
-		// client line and dashboard URL a test seeds must not be read through a
-		// previous test's answer.
+		// The binding's per-request decision is a static (Ruling P73): whether
+		// this "request" has already offered an `unset` record for adoption.
 		Aura_Worker_Door_Log::forget_live_identity();
 	}
 	if ( method_exists( 'Aura_Worker_Door_Holds', 'forget_lock_support' ) ) {
