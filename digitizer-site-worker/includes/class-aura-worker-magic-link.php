@@ -508,9 +508,38 @@ class Aura_Worker_Magic_Link {
 		// names no client cannot be proven the same as another, so a clientless
 		// connect onto a bound site refuses too. A dashboard base URL is shared
 		// by every site of every customer on it and proves nothing.
+		//
+		// AND IT FAILS CLOSED (Ruling P75 follow-up). This check IS the
+		// protection now, so a record it cannot establish must not be read as
+		// permission to bind. Two ways that happens, both answered
+		// `aura_door_failed` 503 — retryable, nothing written:
+		//
+		//   - the record could not be READ at all (`gen` empty). A real record
+		//     always carries a generation, so an empty one means the row could
+		//     not be read or the lost-mint re-read failed (Ruling P72).
+		//   - the record still says `unset` while the site HAS a live identity.
+		//     Adoption is what turns an upgraded site's placeholder into the
+		//     `bound` record this refusal reads (Ruling P73), so an adoption
+		//     that could not be proven leaves a site that IS bound looking like
+		//     one that is not — precisely the reading that would let another
+		//     client bind over it.
 		if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
 			$record = Aura_Worker_Door_Log::binding_record();
-			if ( Aura_Worker_Door_Log::BINDING_BOUND === (string) $record['state']
+			$state  = (string) $record['state'];
+			$unprovable = ( '' === (string) $record['gen'] );
+			if ( ! $unprovable && Aura_Worker_Door_Log::BINDING_UNSET === $state ) {
+				$live       = Aura_Worker_Door_Log::live_identity();
+				$unprovable = ( null !== $live['client'] || null !== $live['dashboard'] );
+			}
+			if ( $unprovable ) {
+				$release();
+				return new WP_Error(
+					'aura_door_failed',
+					__( 'Connect not completed: this site\'s Aura binding could not be established; retry.', 'digitizer-site-worker' ),
+					array( 'status' => 503, 'retry_after' => 5 )
+				);
+			}
+			if ( Aura_Worker_Door_Log::BINDING_BOUND === $state
 				&& ! self::same_bound_client( $record, $client )
 			) {
 				$release();

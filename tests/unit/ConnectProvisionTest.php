@@ -531,6 +531,59 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client() );
 	}
 
+	/**
+	 * Ruling P75 follow-up: a connect that cannot PROVE the binding record does
+	 * not bind.
+	 *
+	 * The refusal above is the protection, and it reads the record. An upgraded
+	 * site's placeholder only becomes the `bound` record it reads once adoption
+	 * lands (Ruling P73) — so an adoption that could not be proven leaves a site
+	 * that IS bound looking like one that is not, which is exactly the reading
+	 * that would let another client bind over it.
+	 */
+	public function test_a_connect_whose_adoption_cannot_be_proven_binds_nothing(): void {
+		// An upgraded site: an `unset` placeholder, live under c1.
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$rec = array( 'gen' => 'upgrade-gen', 'state' => 'unset', 'client' => null, 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
+		Aura_Worker_Door_Log::forget_live_identity();
+		$token = get_option( 'aura_worker_site_token' );
+		// The adoption's compare-and-swap lands nowhere, twice over: the write
+		// fails and the re-read still says `unset`.
+		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new.example' ) ) );
+
+		$GLOBALS['_sa_option_cas_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_door_failed', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'], 'retryable: nothing was written' );
+		$this->assertSame( $token, get_option( 'aura_worker_site_token' ) );
+		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client() );
+		$this->assertSame( 'https://dash.example', get_option( 'aura_worker_dashboard_url' ) );
+		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'], 'the record never moved' );
+	}
+
+	/** …and a record that cannot be READ at all refuses the same way. */
+	public function test_a_connect_whose_binding_record_cannot_be_read_binds_nothing(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$token = get_option( 'aura_worker_site_token' );
+		// No record, and the lost-mint re-read cannot establish one either.
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ] );
+		Aura_Worker_Door_Log::forget_live_identity();
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::BINDING;
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new.example' ) ) );
+
+		$GLOBALS['_sa_insert_unique_fail'] = false;
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_door_failed', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertSame( $token, get_option( 'aura_worker_site_token' ) );
+		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client() );
+	}
+
 	/** A site nobody has ever stated anything about binds normally. */
 	public function test_a_connect_at_a_site_with_no_live_identity_binds(): void {
 		// No token, no sentinel, no dashboard: the record is `unset` and stays
