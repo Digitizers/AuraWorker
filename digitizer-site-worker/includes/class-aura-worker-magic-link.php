@@ -479,6 +479,50 @@ class Aura_Worker_Magic_Link {
 				409
 			);
 		}
+		// A CONNECT NEVER RUNS OVER A LIVE FOREIGN BINDING (Ruling P75).
+		//
+		// This is the construction that closes the whole rebind race class.
+		// Everything before it tried to make a REPOINT safe — a site bound to
+		// client A being handed to client B in one request, with A's holds, log
+		// rows and in-flight callbacks still on it. Six rulings went into
+		// narrowing the window between "B's credentials work" and "A's rows
+		// stop being current"; the window cannot be closed by ordering, because
+		// a request that authenticated a moment ago is already past every gate.
+		//
+		// So the repoint is not supported. A rebind is an UNBIND followed by a
+		// CONNECT: the unbind rotates the generation to `unbound` (Ruling P59),
+		// which retires A's queue and log cursor under a state everything can
+		// see, and only then may B connect. A connect that meets a live foreign
+		// binding refuses and writes NOTHING.
+		//
+		// Placed AFTER finish_before_rebind() — that settles the DEPARTED
+		// binding's Phase-B debt, which is what turns a properly unbound site's
+		// record into `unbound` — and BEFORE this install's first write.
+		//
+		// The record is read through binding_record(), so an upgraded site that
+		// 2.16 met already connected has its `unset` placeholder ADOPTED to the
+		// identity it is demonstrably live under first (Ruling P73), and reads
+		// as `bound` here like any other connected site.
+		//
+		// The comparison is on the CLIENT, under P66's rule: an identity that
+		// names no client cannot be proven the same as another, so a clientless
+		// connect onto a bound site refuses too. A dashboard base URL is shared
+		// by every site of every customer on it and proves nothing.
+		if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+			$record = Aura_Worker_Door_Log::binding_record();
+			if ( Aura_Worker_Door_Log::BINDING_BOUND === (string) $record['state']
+				&& ! self::same_bound_client( $record, $client )
+			) {
+				$release();
+				return new WP_REST_Response(
+					array(
+						'error' => 'This site is bound to another Aura client; unbind it first',
+						'code'  => 'aura_site_bound',
+					),
+					409
+				);
+			}
+		}
 		$token_hash = Aura_Worker_Security::hash_token( $token );
 		// The token is the ONE write whose loss the dashboard cannot see: a
 		// handler resuming after its claim was released could otherwise
@@ -2262,6 +2306,29 @@ class Aura_Worker_Magic_Link {
 	 *                                already held.
 	 * @return string This handler's fence when it holds the claim, else ''.
 	 */
+	/**
+	 * Is the connecting client the one this site is ALREADY bound to (Ruling
+	 * P75)?
+	 *
+	 * Under P66's rule, and for P66's reason: the supported legacy callback
+	 * signs no `client` line, so an identity that names no client is nothing
+	 * but a dashboard base URL — and two different Aura customers routinely
+	 * share one. An unprovable identity is never the same identity, so a
+	 * clientless connect onto a bound site is a foreign one and refuses.
+	 *
+	 * @param array  $record The binding record.
+	 * @param string $client The client this connect states, '' when none.
+	 * @return bool
+	 */
+	private static function same_bound_client( array $record, $client ) {
+		$bound = isset( $record['client'] ) && null !== $record['client'] ? (string) $record['client'] : '';
+		$next  = (string) $client;
+		if ( '' === $bound || '' === $next ) {
+			return false; // null never equals (Ruling P66)
+		}
+		return $bound === $next;
+	}
+
 	private static function claim_magic_link( $claim_key, $takeover_after = 0 ) {
 		global $wpdb;
 		$fence = bin2hex( random_bytes( 16 ) );

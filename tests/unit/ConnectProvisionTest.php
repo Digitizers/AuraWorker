@@ -433,6 +433,20 @@ final class ConnectProvisionTest extends TestCase {
 		Aura_Worker_Door_Log::rotate_binding( array( 'client' => $client, 'dashboard' => $dashboard ) );
 	}
 
+	/**
+	 * …and then UNBOUND, the way an unbind's step (4a) leaves the door
+	 * (Ruling P75).
+	 *
+	 * A rebind is an unbind followed by a connect. Every case that used to be
+	 * written as "a changed-binding connect" is now this fixture plus a
+	 * connect: the record says `unbound`, the departed rows are already
+	 * foreign, and the new client is free to bind.
+	 */
+	private function seedUnboundSite( ?string $client = 'c1', string $dashboard = 'https://dash.example' ): void {
+		$this->seedPreviousBinding( $client, $dashboard );
+		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) );
+	}
+
 	/** A hold and a settled log row belonging to that binding. */
 	private function seedDoorState(): string {
 		foreach ( array( 'class-aura-worker-door-log', 'class-aura-worker-door-holds', 'class-elementor-door-governor' ) as $f ) {
@@ -453,40 +467,65 @@ final class ConnectProvisionTest extends TestCase {
 	}
 
 	/**
-	 * Ruling P62 (F2): once a changed-client connect ANSWERS, the departed
-	 * rows are foreign — rotation landed or not.
+	 * Ruling P75: a connect never runs over a live foreign binding.
 	 *
-	 * On a keyless site there is no signed grant to fall back on, so a
-	 * replacement client holding the new token could authenticate immediately,
-	 * see the old client's holds through `/status` and replay them. The
-	 * identity options are written before the rotation is attempted, and
-	 * currentness is judged against them, so the failure window is closed by
-	 * construction rather than by rolling the token back.
+	 * The repoint — client A's site handed to client B in one request, with A's
+	 * holds, log rows and in-flight callbacks still on it — is not supported.
+	 * A rebind is an unbind followed by a connect, and this is the refusal that
+	 * makes that the only path.
 	 */
-	public function test_a_keyless_connect_whose_rotation_fails_still_disowns_the_departed_queue(): void {
+	public function test_a_connect_from_another_client_writes_nothing_at_all(): void {
 		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
-		$ref = $this->seedDoorState();
-		$gen = Aura_Worker_Door_Log::binding();
-		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$ref   = $this->seedDoorState();
+		$gen   = Aura_Worker_Door_Log::binding();
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$token = get_option( 'aura_worker_site_token' );
+		update_option( 'aura_worker_connect_user_id', 41 );
 
-		// Keyless: no grant_pubkey at all, which is the case with no signed
-		// grant standing between the new token and a replay.
-		$res = $this->ml->handle_connect(
-			$this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new.example', 'grant_pubkey' => null, 'sign_pubkey' => '' ) )
-		);
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://new.example' ) ) );
 
-		$GLOBALS['_sa_option_cas_fail'] = array();
-		$this->assertInstanceOf( WP_Error::class, $res );
-		$this->assertSame( 'aura_door_failed', $res->get_error_code() );
-		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), 'the generation did not move' );
-		// The NEW token is live and the new identity is stored, so the door is
-		// already the new client's — and the old client's queue is not in it.
-		Aura_Worker_Door_Log::forget_live_identity();
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_site_bound', $res->get_data()['code'] );
+		$this->assertSame( 'This site is bound to another Aura client; unbind it first', $res->get_data()['error'] );
+		// NOTHING was written: not the token, not the dashboard, not the client
+		// sentinel, not the grant key, not the connect user.
+		$this->assertSame( $token, get_option( 'aura_worker_site_token' ) );
+		$this->assertSame( 'https://dash.example', get_option( 'aura_worker_dashboard_url' ) );
+		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client() );
+		$this->assertFalse( get_option( 'aura_worker_grant_pubkey', false ) );
+		$this->assertSame( 41, (int) get_option( 'aura_worker_connect_user_id' ) );
+		// …and the site's own binding, queue and cursor are exactly as they were.
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding() );
+		$this->assertSame( $epoch, Aura_Worker_Door_Log::epoch() );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'c1 still holds its own queue' );
+	}
+
+	/**
+	 * …and a CLIENTLESS connect onto a bound site is a foreign one (Ruling
+	 * P66): an identity that names no client is nothing but a dashboard base
+	 * URL, which two different Aura customers routinely share.
+	 */
+	public function test_a_clientless_connect_onto_a_bound_site_is_refused(): void {
+		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => null, 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 409, $res->get_status() );
+		$this->assertSame( 'aura_site_bound', $res->get_data()['code'] );
+		$this->assertSame( 'c1', Aura_Worker_Rules::bound_client() );
+	}
+
+	/** A site nobody has ever stated anything about binds normally. */
+	public function test_a_connect_at_a_site_with_no_live_identity_binds(): void {
+		// No token, no sentinel, no dashboard: the record is `unset` and stays
+		// `unset` (Ruling P73 adopts only where there is an identity to adopt).
+		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'] );
+
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
 		$this->assertSame( 'c2', Aura_Worker_Rules::bound_client() );
-		$this->assertSame( 'https://new.example', get_option( 'aura_worker_dashboard_url' ) );
-		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the departed hold is not readable' );
-		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nor listed' );
-		$this->assertSame( 'not_held', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'], 'nor replayable' );
+		$this->assertSame( 'bound', Aura_Worker_Door_Log::binding_record()['state'] );
 	}
 
 	/**
@@ -499,7 +538,7 @@ final class ConnectProvisionTest extends TestCase {
 	 * still current and replayable by the replacement.
 	 */
 	public function test_a_rotation_that_cannot_be_verified_refuses_the_connect(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$this->seedUnboundSite( 'c1', 'https://dash.example' );
 		$ref = $this->seedDoorState();
 		$gen = Aura_Worker_Door_Log::binding();
 		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
@@ -510,11 +549,10 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( 'aura_door_failed', $res->get_error_code() );
 		$this->assertSame( 503, $res->get_error_data()['status'] );
 		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), 'the generation did not move' );
-		// …but the identity options DID land before the rotation was attempted,
-		// so the departed rows are already foreign (Ruling P62): a failed
-		// rotation is not a window in which the replacement client can see the
-		// old queue.
-		Aura_Worker_Door_Log::forget_live_identity();
+		// The departed rows were already foreign before this connect ran — the
+		// UNBIND retired them (Ruling P75). A failed rotation is not a window
+		// in which anyone can see the old queue, because there was never a
+		// moment when a live foreign binding and a new client overlapped.
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the departed hold is not readable' );
 		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nor listed' );
 		$this->assertSame( 'not_held', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'], 'nor replayable' );
@@ -544,7 +582,9 @@ final class ConnectProvisionTest extends TestCase {
 		// The claim-conditional token write lands nowhere.
 		$GLOBALS['_sa_option_write_fail']['aura_worker_site_token'] = true;
 
-		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
+		// The SAME client re-saving (Ruling P75): a repoint onto a live foreign
+		// binding never reaches a token write at all.
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c1', 'dashboard_url' => 'https://dash.example' ) ) );
 
 		$GLOBALS['_sa_option_write_fail'] = array();
 		$this->assertSame( 500, $res->get_status() );
@@ -563,7 +603,7 @@ final class ConnectProvisionTest extends TestCase {
 	 * owns the claim.
 	 */
 	public function test_a_connect_that_lost_the_site_claim_never_rotates_the_winners_generation(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$this->seedUnboundSite( 'c1', 'https://dash.example' );
 		$gen = Aura_Worker_Door_Log::binding();
 		// The winner took the claim while this handler was stalled: every
 		// claim-conditional write of ours now matches no row.
@@ -586,7 +626,7 @@ final class ConnectProvisionTest extends TestCase {
 	 * the log is the SITE's audit trail and the new client drains it by acking.
 	 */
 	public function test_a_changed_binding_connect_mints_a_new_generation_and_keeps_every_row(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$this->seedUnboundSite( 'c1', 'https://dash.example' );
 		$ref            = $this->seedDoorState();
 		$before_binding = Aura_Worker_Door_Log::binding();
 		$before_epoch   = Aura_Worker_Door_Log::epoch();
@@ -640,7 +680,7 @@ final class ConnectProvisionTest extends TestCase {
 
 	/** …and a successful changed-binding connect still writes every one of them. */
 	public function test_a_successful_changed_binding_connect_writes_them_all(): void {
-		$this->seedPreviousBinding( 'c1', 'https://dash.example' );
+		$this->seedUnboundSite( 'c1', 'https://dash.example' );
 		update_option( 'aura_worker_connect_user_id', 41 );
 		$this->seedDoorState();
 
