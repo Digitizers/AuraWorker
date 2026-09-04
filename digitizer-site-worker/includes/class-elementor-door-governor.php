@@ -3032,6 +3032,8 @@ class Aura_Worker_Elementor_Door {
 				return array(
 					'mutated' => true,
 					'result'  => null,
+					// Ruling S11: repeated by versioned() after commit.
+					'evict'   => array( $option, 'notoptions' ),
 				);
 			}
 		);

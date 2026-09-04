@@ -952,4 +952,38 @@ final class DoorLogTest extends TestCase {
 		$this->assertNotNull( $select, 'the read-back was still attempted' );
 		$this->assertLessThan( $select, $commit, 'COMMIT runs before the read-back' );
 	}
+
+	/**
+	 * Ruling S11 (Codex round-5 P1 on #88): every wrapped write's own
+	 * pre-commit eviction leaves a window — a CONCURRENT request can
+	 * repopulate the option cache from the pre-commit snapshot before this
+	 * transaction commits, and nothing evicted it again afterwards. Modelled
+	 * with a racer that repopulates $GLOBALS['_sa_option_cache'] (the stub's
+	 * request-level option cache — see get_option()) at exactly that point,
+	 * via the SAME seam used elsewhere in this suite
+	 * ($GLOBALS['_sa_after_insert_unique']). versioned()'s post-commit
+	 * repeat must evict it a second time, so the next get_option() sees the
+	 * NEW value, not the racer's stale one.
+	 */
+	public function test_a_racer_repopulating_the_cache_before_commit_is_defeated_by_the_post_commit_repeat(): void {
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = true;
+		$name = 'aura_worker_door_s11_test';
+
+		$GLOBALS['_sa_after_insert_unique'][ $name ] = static function () use ( $name ) {
+			// The exact gap Ruling S11 closes: this fires right after the
+			// write's OWN pre-commit eviction, before the transaction
+			// commits. A concurrent request re-reads the row from the
+			// pre-commit database snapshot and caches THAT.
+			$GLOBALS['_sa_option_cache'][ $name ] = array( 'stale' => true );
+		};
+
+		$won = Aura_Worker_Door_Log::insert_unique( $name, array( 'stale' => false ) );
+
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false;
+
+		$this->assertTrue( $won );
+		$fresh = get_option( $name );
+		$this->assertIsArray( $fresh );
+		$this->assertFalse( $fresh['stale'], 'the post-commit repeat evicted the racer\'s repopulated entry, so this read reaches the database again' );
+	}
 }

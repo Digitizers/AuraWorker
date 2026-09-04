@@ -140,6 +140,11 @@ class Aura_Worker_Door_Log {
 				return array(
 					'mutated' => $won,
 					'result'  => $won,
+					// Ruling S11 (Codex round-5 P1 on #88): repeated by
+					// versioned() AFTER commit, in case a concurrent
+					// request repopulated the cache from the pre-commit
+					// snapshot before the commit landed.
+					'evict'   => array( $name, 'notoptions', 'alloptions' ),
 				);
 			}
 		);
@@ -1188,6 +1193,8 @@ class Aura_Worker_Door_Log {
 				return array(
 					'mutated' => $done,
 					'result'  => $done,
+					// Ruling S11: repeated by versioned() after commit.
+					'evict'   => array( self::BINDING, 'notoptions', 'alloptions' ),
 				);
 			}
 		);
@@ -1346,6 +1353,8 @@ class Aura_Worker_Door_Log {
 				return array(
 					'mutated' => $won,
 					'result'  => $won,
+					// Ruling S11: repeated by versioned() after commit.
+					'evict'   => array( $option, 'notoptions' ),
 				);
 			}
 		);
@@ -1543,6 +1552,8 @@ class Aura_Worker_Door_Log {
 				return array(
 					'mutated' => true, // an upsert counter always changes something
 					'result'  => null,
+					// Ruling S11: repeated by versioned() after commit.
+					'evict'   => array( self::FULL_COUNTER ),
 				);
 			}
 		);
@@ -1763,25 +1774,47 @@ class Aura_Worker_Door_Log {
 	 * mutation is ALREADY durable, so `committed: true` stays honest even
 	 * when the witness could not be proven.
 	 *
-	 * @param callable $writes Returns array{ mutated: bool, result: mixed }.
-	 *                         `mutated` false ⇒ an idempotent no-op, a lost
-	 *                         race, a refusal — nothing to version, and
-	 *                         nothing to roll back either (the transaction
-	 *                         still closes, via COMMIT, since $writes() may
-	 *                         legitimately have written and decided
-	 *                         "not mutated" on its own evidence — none of
-	 *                         today's callers do, but the contract does not
-	 *                         assume otherwise). `result` is handed back to
-	 *                         the CALLER of versioned().
+	 *
+	 * EVERY EVICTION IS REPEATED AFTER COMMIT (Ruling S11, Codex round-5 P1
+	 * on #88). `$writes()` still evicts the option cache the moment it
+	 * writes, exactly as before — later reads in the SAME request (this
+	 * process's own cache) must see the fresh value immediately, commit or
+	 * not. But a CONCURRENT request can repopulate that cache entry from the
+	 * pre-commit database snapshot in the window between that eviction and
+	 * this COMMIT, and nothing evicted it again afterwards — so `$writes()`
+	 * additionally returns the option names it touched (`evict`), and this
+	 * method deletes each one from the cache a second time once the write is
+	 * durable, closing that window. `self::OBSERVATION` is always included,
+	 * since the bump touches it on every call.
+	 *
+	 * @param callable $writes Returns array{ mutated: bool, result: mixed,
+	 *                         evict?: string[] } or array{ rollback: true,
+	 *                         result: mixed }. `mutated` false ⇒ an
+	 *                         idempotent no-op, a lost race, a refusal —
+	 *                         nothing to version, and nothing to roll back
+	 *                         either (the transaction still closes, via
+	 *                         COMMIT, since $writes() may legitimately have
+	 *                         written and decided "not mutated" on its own
+	 *                         evidence — none of today's callers do, but the
+	 *                         contract does not assume otherwise). `rollback`
+	 *                         true (Ruling S12) ⇒ $writes() itself proved a
+	 *                         LATER statement could not complete what an
+	 *                         EARLIER one in the same call started, and the
+	 *                         whole unit must fail — never mistaken for
+	 *                         "not mutated", which would COMMIT the partial
+	 *                         work. `evict` lists every option name $writes()
+	 *                         wrote, for the post-commit repeat (Ruling S11).
+	 *                         `result` is handed back to the CALLER of
+	 *                         versioned().
 	 * @return array{ committed: bool, result: mixed, observation: int|null }
-	 *         `committed` is false ONLY when $writes() reported a mutation
-	 *         but the version bump's own WRITE then failed — the WHOLE unit
-	 *         rolls back, including every statement $writes() itself ran, so
-	 *         the caller must treat this exactly like $writes() failing
-	 *         outright. `observation` is the witness THIS call produced —
-	 *         null whenever it could not be proven, which can happen even
-	 *         while `committed` is true (Ruling S10): a reconnect between the
-	 *         COMMIT and the read-back.
+	 *         `committed` is false when $writes() asked for a rollback, or
+	 *         reported a mutation whose version bump then failed its own
+	 *         WRITE — either way the WHOLE unit rolls back, including every
+	 *         statement $writes() itself ran, so the caller must treat this
+	 *         exactly like $writes() failing outright. `observation` is the
+	 *         witness THIS call produced — null whenever it could not be
+	 *         proven, which can happen even while `committed` is true (Ruling
+	 *         S10): a reconnect between the COMMIT and the read-back.
 	 */
 	public static function versioned( callable $writes ) {
 		global $wpdb;
@@ -1793,8 +1826,17 @@ class Aura_Worker_Door_Log {
 			throw $e;
 		}
 		$outcome = is_array( $outcome ) ? $outcome : array();
+		if ( ! empty( $outcome['rollback'] ) ) {
+			// Ruling S12: $writes() itself demands the unit fail.
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			return array(
+				'committed' => false,
+				'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
+			);
+		}
 		$mutated = ! empty( $outcome['mutated'] );
 		$result  = array_key_exists( 'result', $outcome ) ? $outcome['result'] : null;
+		$evict   = isset( $outcome['evict'] ) && is_array( $outcome['evict'] ) ? $outcome['evict'] : array();
 		if ( ! $mutated ) {
 			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 			return array(
@@ -1813,6 +1855,12 @@ class Aura_Worker_Door_Log {
 			);
 		}
 		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
+		// Ruling S11: repeat every eviction $writes() performed, now that
+		// the write is durable.
+		foreach ( $evict as $name ) {
+			wp_cache_delete( $name, 'options' );
+		}
+		wp_cache_delete( self::OBSERVATION, 'options' ); // the bump's own row
 		// Ruling S10: best-effort, deliberately AFTER commit — a reconnect
 		// between the bump and this SELECT lands on a session that never
 		// assigned anything and answers 0 (Ruling S5 ⇒ null), but the
@@ -1961,6 +2009,9 @@ class Aura_Worker_Door_Log {
 	 */
 	private static function ack_write( $epoch, $seq ) {
 		global $wpdb;
+		// Ruling S11 (Codex round-5 P1 on #88): every name this call evicts,
+		// repeated by versioned() after commit.
+		$evict = array( self::FLOOR );
 		// Floor: INSERT if absent, else raise only when lower. The floor as it
 		// stood BEFORE the raise bounds the cache invalidation below to the
 		// newly acked range — never 1..seq on a site with a long history
@@ -2001,6 +2052,7 @@ class Aura_Worker_Door_Log {
 					'acked' => 0,
 					'floor' => self::floor(),
 				),
+				'evict'   => $evict,
 			);
 		}
 		$floor = self::floor();
@@ -2025,6 +2077,7 @@ class Aura_Worker_Door_Log {
 			);
 			for ( $i = $prev_floor + 1; $i <= $floor; $i++ ) {
 				wp_cache_delete( self::PREFIX . $i, 'options' );
+				$evict[] = self::PREFIX . $i;
 			}
 		}
 		// Reopened only on a READABLE count under the bound (Ruling P53). An
@@ -2037,6 +2090,8 @@ class Aura_Worker_Door_Log {
 			delete_option( self::FULL_MARKER );
 			delete_option( self::FULL_COUNTER );
 			$reopened = true;
+			$evict[]  = self::FULL_MARKER;
+			$evict[]  = self::FULL_COUNTER;
 		}
 		return array(
 			'mutated' => ( $raised >= 1 || $acked > 0 || $reopened ),
@@ -2044,6 +2099,7 @@ class Aura_Worker_Door_Log {
 				'acked' => $acked,
 				'floor' => $floor,
 			),
+			'evict'   => $evict,
 		);
 	}
 
@@ -2215,6 +2271,8 @@ class Aura_Worker_Door_Log {
 					'rotated' => true,
 					'epoch'   => self::epoch_raw(),
 				),
+				// Ruling S11: repeated by versioned() after commit.
+				'evict'   => array( self::EPOCH, 'notoptions', 'alloptions', self::FULL_MARKER, self::FULL_COUNTER ),
 			);
 		}
 		$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::EPOCH, $expected ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -2239,6 +2297,8 @@ class Aura_Worker_Door_Log {
 				'rotated' => true,
 				'epoch'   => self::epoch_raw(),
 			),
+			// Ruling S11: repeated by versioned() after commit.
+			'evict'   => array( self::EPOCH, 'notoptions', 'alloptions', self::FULL_MARKER, self::FULL_COUNTER ),
 		);
 	}
 

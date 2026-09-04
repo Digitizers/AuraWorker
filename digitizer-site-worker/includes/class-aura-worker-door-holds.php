@@ -608,6 +608,9 @@ class Aura_Worker_Door_Holds {
 				return array(
 					'mutated' => $claimed_gone || $held_gone,
 					'result'  => null,
+					// Ruling S11 (Codex round-5 P1 on #88): repeated by
+					// versioned() after commit.
+					'evict'   => array( self::CLAIMED . $ref, self::HELD . $ref, 'notoptions' ),
 				);
 			}
 		);
@@ -1380,6 +1383,9 @@ class Aura_Worker_Door_Holds {
 				return array(
 					'mutated' => $won,
 					'result'  => $won,
+					// Ruling S11 (Codex round-5 P1 on #88): repeated by
+					// versioned() after commit.
+					'evict'   => array( $name, 'notoptions' ),
 				);
 			}
 		);

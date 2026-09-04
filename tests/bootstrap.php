@@ -344,10 +344,25 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 			'key'   => $key,
 			'group' => $group,
 		);
-		// The one cache entry this stub models: core's `notoptions` negative
-		// cache (wp-includes/option.php). Evicting it forgets every miss.
+		// The one cache entry this stub models UNCONDITIONALLY: core's
+		// `notoptions` negative cache (wp-includes/option.php). Evicting it
+		// forgets every miss.
 		if ( 'notoptions' === $key && 'options' === $group ) {
 			$GLOBALS['_notoptions'] = array();
+		}
+		// Ruling S11 (Codex round-5 P1 on #88): a real wp_cache_delete(
+		// $option, 'options' ) also evicts THIS request's own cached copy of
+		// that option — $GLOBALS['_sa_option_cache'], the layer several
+		// OTHER tests seed to model "this process read a stale value and
+		// must not be fooled by a write that never evicted its own cache".
+		// Those tests seed that value specifically because THIS stub used to
+		// let it survive every wp_cache_delete() call, so making eviction
+		// real here — unconditionally — would silently rewrite what several
+		// unrelated, already-passing tests are proving. So this is opt-in,
+		// armed only by the one test that exists to prove versioned()'s
+		// post-commit re-eviction actually defeats a racer's repopulation.
+		if ( ! empty( $GLOBALS['_sa_option_cache_honors_wp_cache_delete'] ) && 'options' === $group && isset( $GLOBALS['_sa_option_cache'] ) && array_key_exists( $key, (array) $GLOBALS['_sa_option_cache'] ) ) {
+			unset( $GLOBALS['_sa_option_cache'][ $key ] );
 		}
 		return true;
 	}
@@ -3270,6 +3285,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_cas_always_lose']   = false;
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
+	$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false; // Ruling S11's opt-in — see wp_cache_delete()'s own comment.
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
@@ -4535,6 +4551,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_cas_always_lose']   = false;
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
+	$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false; // Ruling S11's opt-in — see wp_cache_delete()'s own comment.
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
