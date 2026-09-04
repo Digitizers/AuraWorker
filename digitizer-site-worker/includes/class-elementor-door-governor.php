@@ -304,10 +304,18 @@ class Aura_Worker_Elementor_Door {
 	 * The two are never one request, which is why nothing here has to be safe
 	 * against a client change happening under a live binding.
 	 *
-	 * @param array $identity { client: string|null, dashboard: string|null }.
+	 * CLAIM-CONDITIONED, ALWAYS (Ruling P78): a rotation happens under the site
+	 * claim its caller holds, or it does not happen. A stale connect handler
+	 * that lost the site to a takeover rotated the WINNER's generation from
+	 * here, stranding the winner's holds and leaving the record naming a client
+	 * that had already been replaced.
+	 *
+	 * @param array  $identity { client: string|null, dashboard: string|null }.
+	 * @param string $claim    Site-claim option name. REQUIRED.
+	 * @param string $fence    The caller's claim fence. REQUIRED.
 	 * @return bool The door now belongs to that identity.
 	 */
-	public static function rebind( array $identity, $claim = '', $fence = '' ) {
+	public static function rebind( array $identity, $claim, $fence ) {
 		return Aura_Worker_Door_Log::rotate_binding( $identity, $claim, $fence );
 	}
 

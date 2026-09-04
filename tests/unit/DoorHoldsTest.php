@@ -136,7 +136,7 @@ final class DoorHoldsTest extends TestCase {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
 
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) ); // a changed-binding connect, or an unbind
+		sa_rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) ); // a changed-binding connect, or an unbind
 
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ), 'not readable' );
 		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'not listed' );
@@ -149,7 +149,7 @@ final class DoorHoldsTest extends TestCase {
 	/** …and the sweep is what finally removes it. */
 	public function test_the_sweep_removes_a_hold_from_another_binding(): void {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) );
+		sa_rotate_binding( array( 'client' => 'other', 'dashboard' => 'https://other.example' ) );
 
 		$this->assertSame( 1, Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS ) );
 
@@ -317,7 +317,7 @@ final class DoorHoldsTest extends TestCase {
 		$before = Aura_Worker_Door_Log::binding(); // the lazy mint
 		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'] );
 
-		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) ) );
+		$this->assertTrue( sa_rotate_binding( array( 'client' => null, 'dashboard' => null ) ) );
 
 		$this->assertNotSame( $before, Aura_Worker_Door_Log::binding(), 'the generation moved' );
 		$this->assertSame( 'unbound', Aura_Worker_Door_Log::binding_record()['state'] );
@@ -327,7 +327,7 @@ final class DoorHoldsTest extends TestCase {
 	public function test_a_connect_rotates_a_lazily_minted_record(): void {
 		$before = Aura_Worker_Door_Log::binding();
 
-		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) ) );
+		$this->assertTrue( sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) ) );
 
 		$this->assertNotSame( $before, Aura_Worker_Door_Log::binding() );
 		$this->assertSame( 'bound', Aura_Worker_Door_Log::binding_record()['state'] );
@@ -335,10 +335,10 @@ final class DoorHoldsTest extends TestCase {
 
 	/** An already-unbound record does not rotate again for another unbind. */
 	public function test_an_unbind_of_an_already_unbound_record_is_a_no_op(): void {
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) );
+		sa_rotate_binding( array( 'client' => null, 'dashboard' => null ) );
 		$gen = Aura_Worker_Door_Log::binding();
 
-		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) ) );
+		$this->assertTrue( sa_rotate_binding( array( 'client' => null, 'dashboard' => null ) ) );
 
 		$this->assertSame( $gen, Aura_Worker_Door_Log::binding() );
 	}
@@ -350,7 +350,7 @@ final class DoorHoldsTest extends TestCase {
 		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $legacy );
 
 		$this->assertSame( 'unset', Aura_Worker_Door_Log::binding_record()['state'] );
-		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) ), 'and rotates' );
+		$this->assertTrue( sa_rotate_binding( array( 'client' => null, 'dashboard' => null ) ), 'and rotates' );
 		$this->assertNotSame( 'legacy-gen', Aura_Worker_Door_Log::binding() );
 	}
 
@@ -358,7 +358,7 @@ final class DoorHoldsTest extends TestCase {
 	private function legacyConnect( string $dashboard ): void {
 		$GLOBALS['_options']['aura_worker_dashboard_url'] = $dashboard;
 		$GLOBALS['_rows']['aura_worker_dashboard_url']    = maybe_serialize( $dashboard );
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => $dashboard ) );
+		sa_rotate_binding( array( 'client' => null, 'dashboard' => $dashboard ) );
 	}
 
 	/**
@@ -409,18 +409,18 @@ final class DoorHoldsTest extends TestCase {
 		$before   = Aura_Worker_Door_Log::binding();
 		$identity = array( 'client' => 'c1', 'dashboard' => 'https://dash.example' );
 
-		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( $identity ) );
+		$this->assertTrue( sa_rotate_binding( $identity ) );
 		$after = Aura_Worker_Door_Log::binding();
 		$this->assertMatchesRegularExpression( '/^[0-9a-f-]{36}$/', $after );
 		$this->assertNotSame( $before, $after );
 
 		// The SAME identity again changes nothing — which is what lets a failed
 		// rotation simply be retried by the next connect.
-		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( $identity ) );
+		$this->assertTrue( sa_rotate_binding( $identity ) );
 		$this->assertSame( $after, Aura_Worker_Door_Log::binding() );
 
 		// A different one moves it.
-		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://dash.example' ) ) );
+		$this->assertTrue( sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://dash.example' ) ) );
 		$this->assertNotSame( $after, Aura_Worker_Door_Log::binding() );
 	}
 

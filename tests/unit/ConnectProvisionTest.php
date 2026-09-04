@@ -433,7 +433,7 @@ final class ConnectProvisionTest extends TestCase {
 		}
 		// The DOOR's own record of whose it is (Ruling P59) — what the next
 		// connect's rotation compares itself against.
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => $client, 'dashboard' => $dashboard ) );
+		sa_rotate_binding( array( 'client' => $client, 'dashboard' => $dashboard ) );
 	}
 
 	/**
@@ -447,7 +447,7 @@ final class ConnectProvisionTest extends TestCase {
 	 */
 	private function seedUnboundSite( ?string $client = 'c1', string $dashboard = 'https://dash.example' ): void {
 		$this->seedPreviousBinding( $client, $dashboard );
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) );
+		sa_rotate_binding( array( 'client' => null, 'dashboard' => null ) );
 	}
 
 	/**
@@ -459,7 +459,7 @@ final class ConnectProvisionTest extends TestCase {
 	private function seedDepartedDoorState( string $client = 'c1', string $dashboard = 'https://dash.example' ): string {
 		$this->seedPreviousBinding( $client, $dashboard );
 		$ref = $this->seedDoorState();
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => null, 'dashboard' => null ) );
+		sa_rotate_binding( array( 'client' => null, 'dashboard' => null ) );
 		return $ref;
 	}
 
@@ -609,7 +609,9 @@ final class ConnectProvisionTest extends TestCase {
 	public function test_a_rotation_that_cannot_be_verified_refuses_the_connect(): void {
 		$ref = $this->seedDepartedDoorState();
 		$gen = Aura_Worker_Door_Log::binding();
-		$GLOBALS['_sa_option_cas_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		// The connect's rotation is joined to its site claim (Ruling P78), so
+		// it is that statement that has to fail, not the bare compare-and-swap.
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
 
 		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
 
@@ -626,7 +628,7 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( 'not_held', Aura_Worker_Elementor_Door::replay( $ref, null )['reason'], 'nor replayable' );
 		// The TOKEN is installed — this is the connect's last step — so the
 		// next attempt with the same identity rotates and completes.
-		$GLOBALS['_sa_option_cas_fail'] = array();
+		$GLOBALS['_sa_option_write_fail'] = array();
 
 		$res2 = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example' ) ) );
 
@@ -660,6 +662,47 @@ final class ConnectProvisionTest extends TestCase {
 		$this->assertSame( $gen, Aura_Worker_Door_Log::binding(), 'the generation is untouched' );
 		$this->assertSame( $epoch, Aura_Worker_Door_Log::epoch(), 'and so is the log cursor' );
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the still-current client keeps its queue' );
+	}
+
+	/**
+	 * Ruling P78 (F1): a stale handler that lost the site AFTER its own writes
+	 * still rotates nothing.
+	 *
+	 * Every write this connect makes is claim-conditional — and the rotation
+	 * was not. A handler that stalled past SITE_CLAIM_TAKEOVER_AFTER, had its
+	 * token, rules and dashboard writes refused, and then resumed could still
+	 * rotate the WINNER's generation from the rebind: the winner's holds
+	 * stranded, the record naming a client this site no longer belongs to, and
+	 * `aura_connect_lost_claim` returned a few lines later having already done
+	 * the damage.
+	 */
+	public function test_a_stale_connect_that_lost_the_site_after_its_token_write_rotates_nothing(): void {
+		$this->seedUnboundSite( 'c1', 'https://dash.example' );
+		// The winner takes the site the instant this handler's token write
+		// lands, and completes its own binding.
+		$winner = '';
+		// Armed on the LAST claim-conditional write before the rotation: the
+		// handler has already installed its token, rules and dashboard, so it
+		// reaches the rebind rather than being turned away by a refused write.
+		$GLOBALS['_sa_after_claimed_write']['aura_worker_dashboard_url'] = static function () use ( &$winner ) {
+			$row = 'winner-fence|' . time();
+			$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = $row;
+			$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = maybe_serialize( $row );
+			sa_rotate_binding( array( 'client' => 'c3', 'dashboard' => 'https://winner.example' ), 'winner-fence' );
+			$winner = Aura_Worker_Door_Log::binding_raw();
+		};
+
+		// Keyless, so the grant-key step between the dashboard write and the
+		// rotation is a delete of a key that is not there — it verifies clean
+		// and the handler goes on to the rebind.
+		$res = $this->ml->handle_connect( $this->request( array( 'client' => 'c2', 'dashboard_url' => 'https://dash.example', 'grant_pubkey' => null, 'sign_pubkey' => '' ) ) );
+
+		$GLOBALS['_sa_after_claimed_write'] = array();
+		$this->assertNotSame( '', $winner, 'the winner really did bind' );
+		$this->assertNotSame( 200, $res instanceof WP_REST_Response ? $res->get_status() : 500 );
+		$this->assertSame( $winner, Aura_Worker_Door_Log::binding_raw(), "the winner's generation is untouched" );
+		$rec = Aura_Worker_Door_Log::binding_record();
+		$this->assertSame( 'c3', $rec['client'], 'and the record still names the winner' );
 	}
 
 	/**

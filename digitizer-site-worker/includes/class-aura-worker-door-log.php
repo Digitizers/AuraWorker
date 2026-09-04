@@ -731,7 +731,19 @@ class Aura_Worker_Door_Log {
 	 * happened, and a changed-client connect would complete with the departed
 	 * client's holds still current (F1).
 	 *
-	 * CLAIM-CONDITIONAL when a fence is supplied (Ruling P68). An unbind's
+	 * CLAIM-CONDITIONED, ALWAYS (Ruling P78). The claim key and fence are
+	 * REQUIRED — there is no unconditional form, because every caller that has
+	 * one is in the middle of a lifecycle operation that another request can
+	 * take the site away from mid-flight, and the one caller that forgot to
+	 * pass them (the connect) is exactly how the winner's generation got
+	 * rotated by a stale handler.
+	 *
+	 * TWO checks, not one. `holds_site_claim()` immediately before the write
+	 * so a caller that has already lost the site does not even try, and the
+	 * claim row JOINED INTO the statement so the answer cannot go stale
+	 * between asking and acting.
+	 *
+	 * CLAIM-CONDITIONAL (Ruling P68). An unbind's
 	 * Phase B can run long enough for `SITE_CLAIM_TAKEOVER_AFTER` to elapse and
 	 * a replacement connect to seize the site claim; a stale cleanup resuming
 	 * afterwards would rotate the WINNER's binding to `unbound`, and every hold
@@ -742,18 +754,24 @@ class Aura_Worker_Door_Log {
 	 * checking the claim and acting on it.
 	 *
 	 * @param array  $identity { client: string|null, dashboard: string|null }.
-	 * @param string $claim    Site-claim option name ('' ⇒ unconditional).
-	 * @param string $fence    The caller's claim fence ('' ⇒ unconditional).
+	 * @param string $claim    Site-claim option name. REQUIRED.
+	 * @param string $fence    The caller's claim fence. REQUIRED.
 	 * @return bool The record now names this identity.
 	 */
-	public static function rotate_binding( array $identity, $claim = '', $fence = '' ) {
+	public static function rotate_binding( array $identity, $claim, $fence ) {
 		global $wpdb;
-		$claim   = (string) $claim;
-		$fence   = (string) $fence;
-		$claimed = ( '' !== $claim && '' !== $fence );
-		if ( ( '' !== $claim ) !== ( '' !== $fence ) ) {
-			return false; // half a condition is not one
+		$claim = (string) $claim;
+		$fence = (string) $fence;
+		if ( '' === $claim || '' === $fence ) {
+			return false; // a rotation with nothing holding the site is not one
 		}
+		// The claim as it stands NOW, before anything is read or written. The
+		// join below is what makes the answer binding; this is what stops a
+		// caller that already knows it lost the site from doing the work.
+		if ( class_exists( 'Aura_Worker_Magic_Link' ) && ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			return false;
+		}
+		$claimed = true;
 		$client    = isset( $identity['client'] ) && '' !== (string) $identity['client'] ? (string) $identity['client'] : null;
 		$dashboard = isset( $identity['dashboard'] ) && '' !== (string) $identity['dashboard'] ? (string) $identity['dashboard'] : null;
 

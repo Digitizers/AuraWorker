@@ -740,11 +740,22 @@ class Aura_Worker_Magic_Link {
 		// A lazily-minted `unset` record never matches, so a site 2.16 met
 		// already connected rotates on its first connect (Ruling P61).
 		if ( class_exists( 'Aura_Worker_Elementor_Door' ) ) {
+			// UNDER THIS HANDLER'S OWN CLAIM (Ruling P78). Every other write
+			// this connect makes is claim-conditional; this one was not, so a
+			// handler that stalled past SITE_CLAIM_TAKEOVER_AFTER — after its
+			// token, rules and dashboard writes had already been refused —
+			// could still resume here and rotate the WINNER's generation,
+			// stranding the winner's holds and leaving the record naming a
+			// client this site no longer belongs to. It answered
+			// `aura_connect_lost_claim` a few lines later, having already done
+			// the damage.
 			$rebound = Aura_Worker_Elementor_Door::rebind(
 				array(
 					'client'    => '' === (string) $client ? null : (string) $client,
 					'dashboard' => '' === (string) $dashboard_url ? null : (string) $dashboard_url,
-				)
+				),
+				$site_claim_key,
+				$site_fence
 			);
 			if ( ! $rebound ) {
 				// Retryable: the next connect, called with the same identity,

@@ -773,6 +773,29 @@ function sa_sign_ruleset( array $payload, ?string $secret = null ): string {
  *
  * @return string
  */
+/**
+ * Rotate the door's binding the way production does — under the site claim
+ * (Ruling P78), which every rotation now REQUIRES.
+ *
+ * Takes the claim, rotates, releases. A test that is already holding the claim
+ * passes its own fence instead.
+ *
+ * @param array       $identity { client, dashboard }.
+ * @param string|null $fence    A fence the caller already holds, or null to take one.
+ * @return bool
+ */
+function sa_rotate_binding( array $identity, ?string $fence = null ): bool {
+	$own = ( null === $fence );
+	if ( $own ) {
+		$fence = Aura_Worker_Magic_Link::claim_site();
+	}
+	$done = Aura_Worker_Door_Log::rotate_binding( $identity, Aura_Worker_Magic_Link::SITE_CLAIM, (string) $fence );
+	if ( $own ) {
+		Aura_Worker_Magic_Link::release_site( (string) $fence );
+	}
+	return $done;
+}
+
 function sa_token_hash(): string {
 	if ( empty( $GLOBALS['_options']['aura_worker_site_token'] ) ) {
 		$GLOBALS['_options']['aura_worker_site_token'] = hash( 'sha256', SA_RAW_SITE_TOKEN );
@@ -2612,6 +2635,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = maybe_unserialize( $value );
 				$GLOBALS['_option_writes'][]  = array( 'set', $name );
+				// The window immediately AFTER one claim-conditional write, in
+				// which another request seizes the site (Ruling P78): a test
+				// arms a callback per option name, and it fires once.
+				if ( ! empty( $GLOBALS['_sa_after_claimed_write'][ $name ] ) ) {
+					$fn = $GLOBALS['_sa_after_claimed_write'][ $name ];
+					unset( $GLOBALS['_sa_after_claimed_write'][ $name ] );
+					$fn();
+				}
 				return 1;
 			}
 			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\\) SELECT '([^']*)', '(.*)', '([^']*)' FROM \S+ c WHERE c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' AND NOT EXISTS \\( SELECT 1 FROM \S+ WHERE option_name = '([^']*)' \\)$/s", $query, $m ) ) {
@@ -2968,6 +2999,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
+	$GLOBALS['_sa_after_claimed_write'] = array(); // Runs after one claim-conditional write, by option name (Ruling P78).
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
 	$GLOBALS['wpdb']              = new SA_Test_Wpdb();
@@ -4230,6 +4262,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_class_labels']          = array(); // class id => label
 	$GLOBALS['_sa_class_relations_throw'] = false;   // the index itself throws
 	$GLOBALS['_sa_after_swap']        = null;    // Runs immediately after a successful compare-and-swap.
+	$GLOBALS['_sa_after_claimed_write'] = array(); // Runs after one claim-conditional write, by option name (Ruling P78).
 	$GLOBALS['_sa_after_store_read']  = null;    // Runs between accept()'s store read and its token read.
 	$GLOBALS['_sa_after_option_read'] = null;    // Runs just after ONE uncached option read is answered (#434 Task 9).
 	$GLOBALS['_posts']        = array();

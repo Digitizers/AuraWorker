@@ -465,7 +465,7 @@ final class ElementorDoorGovernorTest extends TestCase {
 		// fence a few statements later. That is the window: admitted under one
 		// binding, about to run under another.
 		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () {
-			Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://new.example' ) );
+			sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://new.example' ) );
 		};
 
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );

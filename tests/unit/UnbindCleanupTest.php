@@ -916,7 +916,7 @@ final class UnbindCleanupTest extends TestCase {
 		update_option( Aura_Worker_Elementor_Door::PRUNED_AT, gmdate( 'c' ) );
 		// The door bound to the departing client, so the unbind's rotation to
 		// NOBODY is a real change (Ruling P59).
-		Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
+		sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ) );
 		$bucket                       = 'aura_worker_door_c_log_ungoverned_h' . (int) floor( time() / HOUR_IN_SECONDS );
 		$GLOBALS['_options'][ $bucket ] = 4;
 		$GLOBALS['_rows'][ $bucket ]    = maybe_serialize( 4 );
@@ -1015,7 +1015,9 @@ final class UnbindCleanupTest extends TestCase {
 				}
 				$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = 'winner-fence|' . time();
 				$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = maybe_serialize( 'winner-fence|' . time() );
-				Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://app.example' ) );
+				// Under the WINNER's own fence: every rotation is claim-held
+				// now (Ruling P78), and this one is the winner's connect.
+				sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://app.example' ), 'winner-fence' );
 				$winner = Aura_Worker_Door_Log::binding();
 			}
 		);
