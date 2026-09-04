@@ -799,8 +799,9 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 
 	/**
 	 * And the second-order undo: the `creation_restore` capture taken while
-	 * undoing a component creation carries that creation's ability, so
-	 * restoring THAT is judged on the design system too.
+	 * undoing a component creation CARRIES that creation's witness beside its
+	 * own `aura/restore` stamp (Ruling P80), so restoring THAT is judged on the
+	 * design system too.
 	 */
 	public function test_a_component_creations_own_restore_capture_is_judged_on_the_design_system(): void {
 		$this->seedPost( 60, Aura_Worker_Elementor_Door::CPT_COMPONENT );
@@ -812,7 +813,8 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( 200, $this->api->restore_snapshot( $this->request( array( 'id' => $rec['snapshot']['id'] ) ) )->get_status() );
 		$pre = $snaps->get( Aura_Worker_Door_Log::get( 1 )['snapshot_id'] );
 		$this->assertSame( 'creation_restore', $pre['door_kind'] );
-		$this->assertSame( 'elementor/manage-component', $pre['door']['ability'], 'the creating ability is carried onto the capture' );
+		$this->assertSame( 'aura/restore', $pre['door']['ability'], 'the capture is the restore\'s own' );
+		$this->assertSame( 'elementor/manage-component', $pre['door']['restores_ability'], 'and it carries the witness of what it undoes' );
 		$this->assertSame( 'trash', get_post( 60 )->post_status );
 
 		$this->installRuleset(
@@ -826,6 +828,55 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertInstanceOf( WP_Error::class, $res );
 		$this->assertSame( 'aura_rule_blocked', $res->get_error_code() );
 		$this->assertSame( 'trash', get_post( 60 )->post_status, 'the component was not brought back' );
+	}
+
+	/**
+	 * Ruling P80: the component witness survives EVERY generation of the undo.
+	 *
+	 * Undo, undo the undo, undo that: each capture is stamped `aura/restore`,
+	 * which says who took it and nothing about what it covers. The witness used
+	 * to be carried in one branch only, by overwriting that stamp — so the
+	 * third generation carried nothing, declared only the component's page id,
+	 * and walked straight past a `design_system` block rule.
+	 */
+	public function test_every_generation_of_a_component_undo_is_judged_on_the_design_system(): void {
+		$this->seedPost( 61, Aura_Worker_Elementor_Door::CPT_COMPONENT );
+		$snaps = new Aura_Worker_Snapshots();
+
+		// Generation 1: the creation itself.
+		$a = $snaps->snapshot_creation( array( 61 ), Aura_Worker_Elementor_Door::CPT_COMPONENT, array( 'seq' => 1, 'ability' => 'elementor/manage-component' ) )['snapshot'];
+
+		// Generation 2: undoing it (the component goes to the trash).
+		$this->assertSame( 200, $this->api->restore_snapshot( $this->request( array( 'id' => $a['id'] ) ) )->get_status() );
+		$b = $snaps->get( Aura_Worker_Door_Log::get( 1 )['snapshot_id'] );
+		$this->assertSame( 'creation_restore', $b['door_kind'] );
+		$this->assertSame( 'elementor/manage-component', $b['door']['restores_ability'] );
+
+		// Generation 3: undoing THAT (the component comes back).
+		$this->assertSame( 200, $this->api->restore_snapshot( $this->request( array( 'id' => $b['id'] ) ) )->get_status() );
+		$c = $snaps->get( Aura_Worker_Door_Log::get( 2 )['snapshot_id'] );
+		$this->assertSame( 'elementor/manage-component', $c['door']['restores_ability'], 'the witness is still there, three deep' );
+		$this->assertSame( 'publish', get_post( 61 )->post_status );
+
+		// The rule arrives, and NONE of the three may be undone any further.
+		$this->installRuleset(
+			array(
+				array( 'key' => 'rule/freeze-ds', 'effect' => 'block', 'target' => array( 'type' => 'design_system' ), 'reason' => 'brand review' ),
+			)
+		);
+
+		foreach ( array( 'creation' => $a, 'creation_restore' => $b, 'restore of the restore' => $c ) as $label => $env ) {
+			// Each of these is its own REQUEST on a real site; here they share
+			// one, and govern() memoises its verdict per (ability, restore_of)
+			// for the life of a request. Clearing the memo is what makes the
+			// three judgements independent, as they are in production.
+			Aura_Worker_Elementor_Door::reset_for_tests();
+			Aura_Worker_Elementor_Door::init();
+			$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'] ) ) );
+			$this->assertInstanceOf( WP_Error::class, $res, $label );
+			$this->assertSame( 'aura_rule_blocked', $res->get_error_code(), $label );
+		}
+		$this->assertSame( 'publish', get_post( 61 )->post_status, 'and the component was never touched' );
 	}
 
 	public function test_a_design_system_rule_does_not_reach_a_page_creations_restore(): void {

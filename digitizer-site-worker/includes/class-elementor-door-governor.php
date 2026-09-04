@@ -3256,6 +3256,36 @@ class Aura_Worker_Elementor_Door {
 			'ability'    => 'aura/restore',
 			'ref'        => $ref,
 		);
+		// THE WITNESS SURVIVES EVERY GENERATION OF THE UNDO (Ruling P80).
+		//
+		// A restore's own capture is stamped `aura/restore`, which says who
+		// took it and nothing about what it covers. A component's creation is
+		// governed as `design_system:*`, and so is the undo of it — but the
+		// capture taken while undoing carried no component witness of its own
+		// (a `posts` capture records no `post_type`), so the NEXT undo in the
+		// chain declared only the component's page id and walked past a
+		// `design_system` block rule.
+		//
+		// The carry is made ONCE, for every kind, rather than in the one branch
+		// that happened to need it first: whatever the restored envelope
+		// witnessed — its own creating ability, its own post type, or a witness
+		// it was itself carrying — is carried on. An undo of an undo of an undo
+		// is still judged the way the original write was.
+		$prev = isset( $record['door'] ) && is_array( $record['door'] ) ? $record['door'] : array();
+		foreach ( array(
+			'restores_ability'   => array( isset( $prev['ability'] ) ? $prev['ability'] : null, isset( $prev['restores_ability'] ) ? $prev['restores_ability'] : null ),
+			'restores_post_type' => array( isset( $record['post_type'] ) ? $record['post_type'] : null, isset( $prev['restores_post_type'] ) ? $prev['restores_post_type'] : null ),
+		) as $field => $sources ) {
+			foreach ( $sources as $value ) {
+				// `aura/restore` is the stamp every capture carries, not a
+				// witness: carrying it would say nothing and would hide the
+				// real one standing behind it.
+				if ( is_string( $value ) && '' !== $value && 'aura/restore' !== $value ) {
+					$door[ $field ] = (string) $value;
+					break;
+				}
+			}
+		}
 		switch ( (string) ( isset( $record['door_kind'] ) ? $record['door_kind'] : '' ) ) {
 			case 'design_system':
 				// The CURRENT set, not the old envelope's targets: a class or
@@ -3287,22 +3317,14 @@ class Aura_Worker_Elementor_Door {
 				// Undoing a creation trashes the created posts; capturing them
 				// first is what lets the trash itself be undone.
 				//
-				// The creating ABILITY is carried onto the capture: a
-				// component creation is governed as `design_system:*`, and
-				// the envelope that undoes the undo of it must be judged on
-				// that too (round-3 P1). It is the only marker that survives
-				// — a `posts` capture records no `post_type` of its own.
-				// The creating ABILITY overrides the stamp's `aura/restore`:
-				// is_component_envelope() reads it as its fallback witness, so
-				// the second-order undo is judged the way the creation was.
-				$carried = $door;
-				if ( isset( $record['door']['ability'] ) && is_string( $record['door']['ability'] ) ) {
-					$carried['ability'] = (string) $record['door']['ability'];
-				}
+				// The component witness rides along in `door.restores_*`,
+				// carried above for every kind (Ruling P80) — a `posts`
+				// capture records no `post_type` of its own, so without it the
+				// second-order undo would be page-only.
 				return $snaps->snapshot_posts(
 					(array) ( isset( $record['created_post_ids'] ) ? $record['created_post_ids'] : array() ),
 					self::PAGE_META_KEYS,
-					array( 'kind_label' => 'creation_restore', 'door' => $carried )
+					array( 'kind_label' => 'creation_restore', 'door' => $door )
 				);
 		}
 		return array( 'success' => true, 'snapshot' => null ); // not a door envelope: nothing to log
@@ -3361,8 +3383,11 @@ class Aura_Worker_Elementor_Door {
 				$touches[] = array( 'type' => 'page', 'id' => (string) $id );
 			}
 		}
-		if ( 'component' === $kind
-			|| ( in_array( $kind, array( 'creation', 'creation_restore' ), true ) && self::is_component_envelope( $record ) ) ) {
+		// The KIND says it outright, or the WITNESS does — carried or direct,
+		// and at any depth of undo (Ruling P80). Asked of every kind rather
+		// than of a list of them: an envelope that witnesses a component is a
+		// `design_system` mutation whatever label it happens to wear.
+		if ( 'component' === $kind || self::is_component_envelope( $record ) ) {
 			$touches[] = array( 'type' => 'design_system', 'id' => '*' );
 		}
 		return $touches;
@@ -3390,7 +3415,17 @@ class Aura_Worker_Elementor_Door {
 			return true;
 		}
 		$door = isset( $record['door'] ) && is_array( $record['door'] ) ? $record['door'] : array();
-		return isset( $door['ability'] ) && 'elementor/manage-component' === (string) $door['ability'];
+		// The DIRECT witness — this envelope was taken by a component write —
+		// and the CARRIED one, put there by pre_restore_capture() from whatever
+		// the envelope this capture undoes witnessed (Ruling P80). Either
+		// answers the same question: is what a restore of this would rewrite a
+		// component, and therefore a `design_system:*` mutation?
+		foreach ( array( 'ability', 'restores_ability' ) as $field ) {
+			if ( isset( $door[ $field ] ) && 'elementor/manage-component' === (string) $door[ $field ] ) {
+				return true;
+			}
+		}
+		return isset( $door['restores_post_type'] ) && self::CPT_COMPONENT === (string) $door['restores_post_type'];
 	}
 
 	/**
