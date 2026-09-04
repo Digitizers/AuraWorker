@@ -280,8 +280,7 @@ class Aura_Worker_Door_Holds {
 		}
 		if ( self::is_expired( $row, time() ) ) {
 			if ( null === self::get_claimed( $ref ) ) {
-				delete_option( self::HELD . $ref );
-				self::forget_held();
+				self::delete_versioned( self::HELD . $ref ); // Ruling S8
 			}
 			return null;
 		}
@@ -319,18 +318,8 @@ class Aura_Worker_Door_Holds {
 		if ( null === $bytes ) {
 			return null;
 		}
-		global $wpdb;
-		$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
-				self::HELD . $ref,
-				$bytes
-			)
-		);
-		wp_cache_delete( self::HELD . $ref, 'options' );
-		self::forget_held();
-		wp_cache_delete( 'notoptions', 'options' );
-		return 1 === (int) $gone ? $row : null;
+		// Ruling S8: versioned like every other fenced delete here.
+		return self::delete_versioned( self::HELD . $ref, $bytes ) ? $row : null;
 	}
 
 	/**
@@ -440,7 +429,6 @@ class Aura_Worker_Door_Holds {
 	 * @return array|WP_Error The claimed entry, or `not_held`.
 	 */
 	public static function claim( $ref ) {
-		global $wpdb;
 		$ref  = self::clean( $ref );
 		$held = self::from_db( self::HELD . $ref );
 		if ( null === $held ) {
@@ -482,14 +470,15 @@ class Aura_Worker_Door_Holds {
 		if ( ! Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed ) ) {
 			return self::not_held(); // already claimed
 		}
-		$wpdb->last_error = '';
-		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::HELD . $ref ) );
-		wp_cache_delete( self::HELD . $ref, 'options' );
-		self::forget_held();
-		if ( 1 !== (int) $gone ) {
+		// Ruling S8: versioned like every other fenced delete here — see
+		// delete_versioned(). No BYTE fence: ownership is already
+		// established by the CLAIMED insert's own uniqueness above, so a
+		// plain by-name delete (delete_option()'s own shape) is exactly
+		// what a real fence would additionally buy nothing over.
+		if ( ! self::delete_versioned( self::HELD . $ref ) ) {
 			// A reject or the sweep won the race: the entry we claimed from
 			// no longer exists. Back out; nothing runs.
-			delete_option( self::CLAIMED . $ref );
+			self::delete_versioned( self::CLAIMED . $ref );
 			return self::not_held();
 		}
 		return $claimed;
@@ -539,7 +528,6 @@ class Aura_Worker_Door_Holds {
 	 * @return bool The row is held again, by this call.
 	 */
 	public static function unclaim( $ref ) {
-		global $wpdb;
 		$ref     = self::clean( $ref );
 		$claimed = self::from_db( self::CLAIMED . $ref );
 		if ( null === $claimed ) {
@@ -558,10 +546,9 @@ class Aura_Worker_Door_Holds {
 		if ( ! $back ) {
 			return false; // a held row is already there — the claimed row stands
 		}
-		$wpdb->last_error = '';
-		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::CLAIMED . $ref ) );
-		wp_cache_delete( self::CLAIMED . $ref, 'options' );
-		return 1 === (int) $gone;
+		// Ruling S8: versioned like claim()'s own delete — no byte fence,
+		// ownership already established by the HELD insert's own uniqueness.
+		return self::delete_versioned( self::CLAIMED . $ref );
 	}
 
 	/** @param string $ref Ref. @param int $seq Seq. @return bool */
@@ -604,11 +591,26 @@ class Aura_Worker_Door_Holds {
 		return $written;
 	}
 
-	/** Delete the claimed row and any held twin. @param string $ref Ref. */
+	/**
+	 * Delete the claimed row and any held twin — versioned as ONE unit
+	 * (Ruling S8, Codex round-4 P1 on #88): both deletes are a SINGLE
+	 * logical release, and either one alone is enough to bump — a ref with
+	 * only a claimed row, only a held row, or both, all release cleanly.
+	 *
+	 * @param string $ref Ref.
+	 */
 	public static function release( $ref ) {
 		$ref = self::clean( $ref );
-		delete_option( self::CLAIMED . $ref );
-		delete_option( self::HELD . $ref );
+		Aura_Worker_Door_Log::versioned(
+			function () use ( $ref ) {
+				$claimed_gone = (bool) delete_option( self::CLAIMED . $ref );
+				$held_gone    = (bool) delete_option( self::HELD . $ref );
+				return array(
+					'mutated' => $claimed_gone || $held_gone,
+					'result'  => null,
+				);
+			}
+		);
 		self::forget_held();
 	}
 
@@ -617,7 +619,6 @@ class Aura_Worker_Door_Holds {
 	 * @return string rejected|already_claimed|not_held
 	 */
 	public static function reject( $ref ) {
-		global $wpdb;
 		$ref = self::clean( $ref );
 		if ( null !== self::get_claimed( $ref ) ) {
 			return 'already_claimed';
@@ -629,12 +630,9 @@ class Aura_Worker_Door_Holds {
 		// own delete (Codex round-8 P1): a replay that claimed between the
 		// read above and this statement already moved the row, and a reject
 		// reported on top of it would let Aura mark rejected an action whose
-		// mutation is running.
-		$wpdb->last_error = '';
-		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::HELD . $ref ) );
-		wp_cache_delete( self::HELD . $ref, 'options' );
-		self::forget_held();
-		return 1 === (int) $gone ? 'rejected' : 'already_claimed';
+		// mutation is running. Ruling S8: versioned like every other fenced
+		// delete here.
+		return self::delete_versioned( self::HELD . $ref ) ? 'rejected' : 'already_claimed';
 	}
 
 	/**
@@ -752,14 +750,12 @@ class Aura_Worker_Door_Holds {
 				if ( self::finish_unclaim_in_flight( $ref, $row, $at ) ) {
 					continue;
 				}
-				delete_option( self::HELD . $ref );
-				self::forget_held(); // the replay's own delete, retried
+				self::delete_versioned( self::HELD . $ref ); // the replay's own delete, retried — Ruling S8
 				$gone++;
 				continue;
 			}
 			if ( strtotime( (string) ( $row['expires_at'] ?? '' ) ) <= (int) $now ) {
-				delete_option( self::HELD . $ref );
-				self::forget_held();
+				self::delete_versioned( self::HELD . $ref ); // Ruling S8
 				$gone++;
 			}
 		}
@@ -801,16 +797,10 @@ class Aura_Worker_Door_Holds {
 		if ( null === $bytes ) {
 			return true; // the unclaim's own delete already landed
 		}
-		global $wpdb;
-		$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
-				self::CLAIMED . $ref,
-				$bytes
-			)
-		);
-		wp_cache_delete( self::CLAIMED . $ref, 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
+		// Ruling S8: versioned like every other fenced delete here — whether
+		// or not it actually removes a row (a racer may already have), so
+		// this always reports true regardless, exactly as before.
+		self::delete_versioned( self::CLAIMED . $ref, $bytes );
 		return true;
 	}
 
@@ -1139,8 +1129,7 @@ class Aura_Worker_Door_Holds {
 		}
 		foreach ( $held as $ref => $row ) {
 			if ( self::is_expired( $row, $now ) && null === self::get_claimed( $ref ) ) {
-				delete_option( self::HELD . $ref );
-				self::forget_held();
+				self::delete_versioned( self::HELD . $ref ); // Ruling S8
 				$gone++;
 			}
 		}
@@ -1196,19 +1185,9 @@ class Aura_Worker_Door_Holds {
 	 * @return bool One row removed.
 	 */
 	private static function delete_held_fenced( $ref, array $row ) {
-		global $wpdb;
 		$option = self::HELD . self::clean( $ref );
-		$gone   = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
-				$option,
-				maybe_serialize( $row )
-			)
-		);
-		wp_cache_delete( $option, 'options' );
-		self::forget_held();
-		wp_cache_delete( 'notoptions', 'options' );
-		return 1 === (int) $gone;
+		// Ruling S8: versioned like every other fenced delete here.
+		return self::delete_versioned( $option, maybe_serialize( $row ) );
 	}
 
 	/**
@@ -1330,23 +1309,82 @@ class Aura_Worker_Door_Holds {
 	 * Drop the memo — called by every held write in this process, so a reader
 	 * after a write never sees the queue as it was before it.
 	 *
-	 * THE CHOKE POINT FOR THE DOOR VERSION ON THIS CLASS'S SIDE (Ruling S6,
-	 * Codex round-3 P1 on #88): every held or claimed row this process
-	 * writes — `hold()`, `claim()`, `unclaim()`, `release()`, `reject()`,
-	 * `refresh_rule()`, `refresh_touches()`, `stamp_terminal_seq()`, and the
-	 * reconciler's sweep — already calls this uniformly, by the same
-	 * convention this docblock has always described, including the raw
-	 * `delete_option()`/`DELETE` statements `write_option_where()` and
-	 * `insert_unique()` never see. Bumping HERE, once, covers all of them
-	 * without instrumenting each caller — the "fenced deletes" `write_option_where()`'s
-	 * own choke point does not reach.
+	 * PURE CACHE INVALIDATION AS OF RULING S8 (Codex round-4 P1 on #88). It
+	 * used to ALSO bump the door version here (Ruling S6) — a single choke
+	 * point catching every held/claimed write, deletes included, since every
+	 * one of them already called this uniformly. That bump was a SEPARATE
+	 * statement from whatever write preceded it, which is exactly the gap
+	 * S8 closes: a poll landing between the write and this call could see
+	 * the new state under the OLD version. The fenced deletes this class
+	 * issues now bump from INSIDE the same transaction as their own DELETE,
+	 * through `delete_versioned()` below; the insert/update mutations bump
+	 * from inside `Aura_Worker_Door_Log::insert_unique()`/
+	 * `write_option_where()` the same way. This method is called from
+	 * BOTH kinds of site and must stay safe to call from inside an open
+	 * transaction OR outside one — which pure cache invalidation trivially
+	 * is, and a bump here no longer would be.
 	 *
 	 * @return void
 	 */
 	public static function forget_held() {
 		self::$held_rows = null;
 		self::$held_read = false;
-		Aura_Worker_Door_Log::bump_door_version();
+	}
+
+	/**
+	 * A single fenced DELETE (or an unconditional `delete_option()`),
+	 * versioned in one transaction with the door-version bump (Ruling S8,
+	 * Codex round-4 P1 on #88) — the "fenced deletes" choke point Ruling S6
+	 * named but could not close on its own, since a raw DELETE bypasses
+	 * both `Aura_Worker_Door_Log::insert_unique()` and `write_option_where()`.
+	 *
+	 * @param string      $name  Option name.
+	 * @param string|null $fence The exact serialised bytes the row must
+	 *                           still hold — a real fenced delete, the shape
+	 *                           every other mutex/row delete in the door
+	 *                           uses. Null for an unconditional
+	 *                           `delete_option()`, used only where no race
+	 *                           is possible (see call sites).
+	 * @return bool One row removed.
+	 */
+	private static function delete_versioned( $name, $fence = null ) {
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name, $fence ) {
+				global $wpdb;
+				$wpdb->last_error = '';
+				// NEVER delete_option() for the no-fence form (Ruling S8):
+				// its return does not reliably say whether a row existed to
+				// remove — this class's own stub models it as always true,
+				// and even real WordPress core's version is not something
+				// this method's callers (claim()/reject()/etc.) may depend
+				// on for "did this actually remove one row", which several
+				// of them fence their own next step on. A raw
+				// DELETE ... WHERE option_name = %s is the exact shape
+				// those callers always issued, fence or not.
+				if ( null === $fence ) {
+					$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $name )
+					);
+				} else {
+					$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare(
+							"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+							$name,
+							$fence
+						)
+					);
+				}
+				wp_cache_delete( $name, 'options' );
+				wp_cache_delete( 'notoptions', 'options' );
+				$won = 1 === (int) $gone;
+				return array(
+					'mutated' => $won,
+					'result'  => $won,
+				);
+			}
+		);
+		self::forget_held(); // cache-only now (see its own docblock) — safe whether or not the delete above landed
+		return $outcome['committed'] && $outcome['result'];
 	}
 
 	private static function rows( $prefix ) {

@@ -363,7 +363,14 @@ final class ElementorDoorGovernorTest extends TestCase {
 				return;
 			}
 			$racing = true;
-			Aura_Worker_Door_Log::ack( $epoch, $seq );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// ack() opens its own versioned() unit, which would nest inside
+			// whatever CAS write just fired this seam otherwise.
+			sa_on_another_connection(
+				static function () use ( $epoch, $seq ) {
+					Aura_Worker_Door_Log::ack( $epoch, $seq );
+				}
+			);
 		};
 
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
@@ -528,7 +535,14 @@ final class ElementorDoorGovernorTest extends TestCase {
 		// fence a few statements later. That is the window: admitted under one
 		// binding, about to run under another.
 		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () {
-			sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://new.example' ) );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// rotate_binding() opens its own versioned() unit, which would
+			// nest inside open_pending()'s still-open one otherwise.
+			sa_on_another_connection(
+				static function () {
+					sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://new.example' ) );
+				}
+			);
 		};
 
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );

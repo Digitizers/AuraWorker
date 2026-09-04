@@ -401,7 +401,12 @@ final class DoorReconcilerTest extends TestCase {
 		// sa_before_swap() does not clear its own seam.
 		$GLOBALS['_sa_before_swap'] = static function () {
 			$GLOBALS['_sa_before_swap'] = null;
-			Aura_Worker_Elementor_Door::reconcile();
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// reconcile()'s own writes each open their own versioned() unit,
+			// which would nest inside this poll's still-open one otherwise.
+			sa_on_another_connection( static function () {
+				Aura_Worker_Elementor_Door::reconcile();
+			} );
 		};
 
 		$out = Aura_Worker_Elementor_Door::reconcile();
@@ -439,7 +444,11 @@ final class DoorReconcilerTest extends TestCase {
 		// settle below is itself a swap.
 		$GLOBALS['_sa_before_swap'] = static function () use ( $seq ) {
 			$GLOBALS['_sa_before_swap'] = null;
-			Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok', 'created_post_ids' => array( 11 ) ) );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// see the test above.
+			sa_on_another_connection( static function () use ( $seq ) {
+				Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok', 'created_post_ids' => array( 11 ) ) );
+			} );
 		};
 
 		$out = Aura_Worker_Elementor_Door::reconcile();

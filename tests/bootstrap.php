@@ -1023,6 +1023,31 @@ function sa_before_swap(): void {
 	}
 }
 
+/**
+ * Run $fn as if it were issued on a SEPARATE database connection (Ruling S8,
+ * 2.16.2) — swaps $GLOBALS['wpdb'] to a fresh SA_Test_Wpdb for the duration,
+ * exactly as the interleaved-bump tests already do by hand. A racer
+ * representing another concurrent request's mutation must run this way
+ * whenever it can land while THIS connection has a
+ * Aura_Worker_Door_Log::versioned() transaction open — otherwise its own
+ * START TRANSACTION would appear to NEST inside this one's, which the stub
+ * refuses (MySQL has no nested transactions). Restores the original
+ * connection afterwards, even if $fn throws — a racer that leaves the swap
+ * in place would strand every statement AFTER it on the wrong "connection".
+ *
+ * @param callable $fn
+ * @return mixed $fn's own return value.
+ */
+function sa_on_another_connection( callable $fn ) {
+	$mine            = $GLOBALS['wpdb'];
+	$GLOBALS['wpdb'] = new SA_Test_Wpdb();
+	try {
+		return $fn();
+	} finally {
+		$GLOBALS['wpdb'] = $mine;
+	}
+}
+
 // --- Transient store --------------------------------------------------------
 
 if ( ! function_exists( 'get_transient' ) ) {
@@ -1906,6 +1931,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		private $sa_last_insert_id = null;
 		/**
+		 * Aura_Worker_Door_Log::versioned()'s open transaction snapshots
+		 * (Ruling S8, 2.16.2) — PER INSTANCE, exactly as a real transaction
+		 * is scoped to the CONNECTION that opened it: a racer standing in for
+		 * a second concurrent request swaps `$GLOBALS['wpdb']` to a fresh
+		 * `SA_Test_Wpdb` (never reusing this one), so that instance's own
+		 * transaction stack starts empty and its START TRANSACTION is never
+		 * mistaken for nesting inside THIS instance's still-open one.
+		 *
+		 * @var array<int, array{ rows: array, options: array, notoptions: array }>
+		 */
+		private $sa_txn_stack = array();
+		/**
 		 * The same thing for get_row(). wpdb keeps ONE $last_result; modelling
 		 * the two separately is the harsher choice, because it means the stale
 		 * answer a probe can meet is always another PROBE's row — the most
@@ -2503,6 +2540,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// S2): a fresh test is a fresh connection, and one test's bump
 			// must never be readable as another's witness.
 			$this->sa_last_insert_id  = null;
+			// A test that left a transaction open (a bug in the code under
+			// test, or a test that forgot to let versioned() finish) must not
+			// strand the NEXT test believing one is already open (Ruling S8).
+			$this->sa_txn_stack       = array();
 		}
 
 		/**
@@ -2645,6 +2686,45 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_query         = $query;
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
+
+			// Aura_Worker_Door_Log::versioned() (Ruling S8, 2.16.2): a state
+			// write and its door-version bump run inside ONE transaction, so
+			// the stub models START TRANSACTION/COMMIT/ROLLBACK by
+			// snapshotting the "database" ($_rows/$_options/$_notoptions) on
+			// entry and restoring it on ROLLBACK, discarding the snapshot on
+			// COMMIT. MySQL has no nested transactions — a second
+			// START TRANSACTION while one is already open would silently
+			// COMMIT the first on a real server — so a test (or a production
+			// bug) that nests one here fails LOUD instead of modelling that
+			// silent surprise.
+			if ( 'START TRANSACTION' === trim( $query ) || 'BEGIN' === trim( $query ) ) {
+				if ( ! empty( $this->sa_txn_stack ) ) {
+					throw new RuntimeException( 'wpdb stub: nested START TRANSACTION on the SAME connection — MySQL has none; this is a bug in the code under test, not something to model. A racer standing in for a second connection must swap $GLOBALS[\'wpdb\'] to a fresh SA_Test_Wpdb instead of reusing this one.' );
+				}
+				$this->sa_txn_stack[] = array(
+					'rows'       => $GLOBALS['_rows'],
+					'options'    => $GLOBALS['_options'],
+					'notoptions' => $GLOBALS['_notoptions'],
+				);
+				return true;
+			}
+			if ( 'COMMIT' === trim( $query ) ) {
+				if ( empty( $this->sa_txn_stack ) ) {
+					throw new RuntimeException( 'wpdb stub: COMMIT with no open transaction on this connection' );
+				}
+				array_pop( $this->sa_txn_stack );
+				return true;
+			}
+			if ( 'ROLLBACK' === trim( $query ) ) {
+				if ( empty( $this->sa_txn_stack ) ) {
+					throw new RuntimeException( 'wpdb stub: ROLLBACK with no open transaction on this connection' );
+				}
+				$snap                       = array_pop( $this->sa_txn_stack );
+				$GLOBALS['_rows']           = $snap['rows'];
+				$GLOBALS['_options']        = $snap['options'];
+				$GLOBALS['_notoptions']     = $snap['notoptions'];
+				return true;
+			}
 
 			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'(?: AND o\.option_value = '(.*)')?$/s", $query, $m ) ) {
 				// The optional trailing `AND o.option_value = …` is the log

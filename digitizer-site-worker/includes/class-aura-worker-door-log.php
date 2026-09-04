@@ -90,8 +90,13 @@ class Aura_Worker_Door_Log {
 	 *   cross-class constant reference): a mutex acquisition, not door state
 	 *   — the hold or claim it protects bumps once IT lands, through
 	 *   `Aura_Worker_Door_Holds::forget_held()`.
+	 * - `'aura_worker_door_creating'` (mirrors
+	 *   `Aura_Worker_Elementor_Door::CREATING`, same reasoning): the
+	 *   creation mutex a governed write takes while it runs — not door
+	 *   state either, and the log row its creation eventually settles is
+	 *   what bumps, through `write_option_where()`.
 	 */
-	const VERSION_EXEMPT_INSERTS = array( self::FLOOR, 'aura_worker_door_hold_lock' );
+	const VERSION_EXEMPT_INSERTS = array( self::FLOOR, 'aura_worker_door_hold_lock', 'aura_worker_door_creating' );
 
 	/**
 	 * Creates an option row only when none exists — a real mutex, unlike
@@ -103,19 +108,55 @@ class Aura_Worker_Door_Log {
 	 * closure marker cannot lose a race to a silent overwrite.
 	 *
 	 * A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1 on
-	 * #88): a NEW row is door state that did not exist a moment ago — a log
-	 * row (`open_pending()`), a held or claimed row (`Aura_Worker_Door_Holds`'
+	 * #88; made TRANSACTIONAL with the write by Ruling S8, Codex round-4 P1):
+	 * a NEW row is door state that did not exist a moment ago — a log row
+	 * (`open_pending()`), a held or claimed row (`Aura_Worker_Door_Holds`'
 	 * `hold()`/`claim()`/`unclaim()`), the epoch, the closure marker, a
-	 * binding record's first mint — so every successful insert bumps
-	 * `bump_door_version()`, except the two names in
-	 * `VERSION_EXEMPT_INSERTS` above. Bumping here, ONCE, covers every one
-	 * of those callers without instrumenting each of them separately.
+	 * binding record's first mint — so every successful insert bumps the
+	 * version in the SAME transaction as the insert itself (`versioned()`),
+	 * except the two names in `VERSION_EXEMPT_INSERTS` above, which skip
+	 * `versioned()` entirely — pure internal bookkeeping never worth a
+	 * transaction's overhead. Bumping here, ONCE, covers every one of those
+	 * callers without instrumenting each of them separately.
+	 *
+	 * NEVER CALL THIS FROM INSIDE AN ALREADY-OPEN TRANSACTION (see
+	 * `versioned()`'s own docblock) — `rotate_binding()` needs an insert
+	 * shaped exactly like this one's, from inside its OWN transaction, and
+	 * uses a private write-only twin (`bindingless_insert()`) rather than
+	 * this method for exactly that reason.
+	 *
+	 * @param string $name  Option name.
+	 * @param mixed  $value Value; serialized like an option.
+	 * @return bool True only when exactly one row was inserted (and, for a
+	 *              non-exempt name, its version bump also landed).
+	 */
+	public static function insert_unique( $name, $value ) {
+		if ( in_array( $name, self::VERSION_EXEMPT_INSERTS, true ) ) {
+			return self::insert_unique_write( $name, $value );
+		}
+		$outcome = self::versioned(
+			function () use ( $name, $value ) {
+				$won = self::insert_unique_write( $name, $value );
+				return array(
+					'mutated' => $won,
+					'result'  => $won,
+				);
+			}
+		);
+		return $outcome['committed'] && $outcome['result'];
+	}
+
+	/**
+	 * The insert alone, with no version bump and no transaction of its own —
+	 * `insert_unique()`'s body before Ruling S8, kept as the primitive every
+	 * versioned wrapper (this class's own `insert_unique()`, and
+	 * `rotate_binding()`'s inline mint) actually issues.
 	 *
 	 * @param string $name  Option name.
 	 * @param mixed  $value Value; serialized like an option.
 	 * @return bool True only when exactly one row was inserted.
 	 */
-	public static function insert_unique( $name, $value ) {
+	private static function insert_unique_write( $name, $value ) {
 		global $wpdb;
 		$rows = $wpdb->query(
 			$wpdb->prepare(
@@ -135,11 +176,7 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( $name, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
-		$won = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
-		if ( $won && ! in_array( $name, self::VERSION_EXEMPT_INSERTS, true ) ) {
-			self::bump_door_version();
-		}
-		return $won;
+		return ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
 	}
 
 	/**
@@ -1053,95 +1090,119 @@ class Aura_Worker_Door_Log {
 		if ( class_exists( 'Aura_Worker_Magic_Link' ) && ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
 			return false;
 		}
-		$rot       = self::rotate_epoch( $was, $claim, $fence );
-		$new_epoch = (string) ( isset( $rot['epoch'] ) ? $rot['epoch'] : '' );
-		if ( empty( $rot['rotated'] ) || '' === $new_epoch || $new_epoch === $was ) {
-			return false; // the record is untouched; the retry starts over
-		}
-		$next = array(
-			'gen'       => wp_generate_uuid4(),
-			'state'     => $target,
-			'client'    => $client,
-			'dashboard' => $dashboard,
-			// WHICH EPOCH THIS BINDING BELONGS TO: the witness the shortcut
-			// above compares, so a half-done rebind is visible to the retry.
-			'epoch'     => $new_epoch,
-		);
-
-		$like = $claimed ? $wpdb->esc_like( $fence . '|' ) . '%' : '';
-		if ( null === $rec ) {
-			// No record at all: a real conditional INSERT, so a concurrent
-			// minter cannot be overwritten blind. Under a claim it is the same
-			// INSERT with the claim row as its source, so a caller whose claim
-			// was taken over mints nothing either.
-			if ( $claimed ) {
-				$wpdb->last_error = '';
-				$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					$wpdb->prepare(
-						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, 'yes' FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
-						self::BINDING,
-						maybe_serialize( $next ),
-						$claim,
-						$like,
-						self::BINDING
-					)
+		// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1 —
+		// "the binding rotation" the ruling names explicitly; made
+		// TRANSACTIONAL by Ruling S8, Codex round-4 P1 on #88). The epoch
+		// rotation and the binding record's own write are ONE mutation, so
+		// they run in ONE `versioned()` unit — never two, which used to leave
+		// a window where a reader could see the new epoch paired with the
+		// OLD binding record under a version that had only counted the
+		// first of the two writes. `rotate_epoch_write()` — the WRITE-ONLY
+		// core, never the public `rotate_epoch()` — is called from inside
+		// this SAME transaction; calling the public one would nest a second
+		// `START TRANSACTION`, which `versioned()`'s own docblock explains
+		// MySQL has no way to honour.
+		$outcome = self::versioned(
+			function () use ( $was, $claim, $fence, $target, $client, $dashboard, $rec, $raw, $claimed ) {
+				global $wpdb;
+				$rot       = self::rotate_epoch_write( $was, $claim, $fence );
+				$new_epoch = (string) ( $rot['result']['epoch'] ?? '' );
+				if ( empty( $rot['result']['rotated'] ) || '' === $new_epoch || $new_epoch === $was ) {
+					return array(
+						'mutated' => false,
+						'result'  => false,
+					); // the record is untouched; the retry starts over
+				}
+				$next = array(
+					'gen'       => wp_generate_uuid4(),
+					'state'     => $target,
+					'client'    => $client,
+					'dashboard' => $dashboard,
+					// WHICH EPOCH THIS BINDING BELONGS TO: the witness the
+					// shortcut above compares, so a half-done rebind is
+					// visible to the retry.
+					'epoch'     => $new_epoch,
 				);
-				$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
-			} else {
-				$done = self::insert_unique( self::BINDING, $next );
+
+				$like = $claimed ? $wpdb->esc_like( $fence . '|' ) . '%' : '';
+				if ( null === $rec ) {
+					// No record at all: a real conditional INSERT, so a
+					// concurrent minter cannot be overwritten blind. Under a
+					// claim it is the same INSERT with the claim row as its
+					// source, so a caller whose claim was taken over mints
+					// nothing either.
+					if ( $claimed ) {
+						$wpdb->last_error = '';
+						$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+							$wpdb->prepare(
+								"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, 'yes' FROM {$wpdb->options} c WHERE c.option_name = %s AND c.option_value LIKE %s AND NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+								self::BINDING,
+								maybe_serialize( $next ),
+								$claim,
+								$like,
+								self::BINDING
+							)
+						);
+						$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+					} else {
+						// Dead today ($claimed is always true above), kept for
+						// completeness. insert_unique_write() — NEVER the
+						// public insert_unique() — since this already runs
+						// inside versioned()'s own transaction.
+						$done = self::insert_unique_write( self::BINDING, $next );
+					}
+				} elseif ( $claimed ) {
+					// The compare-and-swap AND the claim check, in one
+					// statement (Ruling P68): a claim seized by a replacement
+					// connect between the two would otherwise let a stale
+					// cleanup rotate the winner's record out from under it.
+					$wpdb->last_error = '';
+					$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare(
+							"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s AND o.option_value = %s",
+							$claim,
+							$like,
+							maybe_serialize( $next ),
+							self::BINDING,
+							$raw
+						)
+					);
+					$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+				} else {
+					// COMPARE-AND-SWAP on the bytes just read (F1): a
+					// transient failure must not read as a rotation that
+					// happened, or a changed-client connect would complete
+					// with the departed client's holds still current and
+					// replayable by the replacement.
+					$wpdb->last_error = '';
+					$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare(
+							"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+							maybe_serialize( $next ),
+							self::BINDING,
+							$raw
+						)
+					);
+					$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+				}
+				return array(
+					'mutated' => $done,
+					'result'  => $done,
+				);
 			}
-		} elseif ( $claimed ) {
-			// The compare-and-swap AND the claim check, in one statement
-			// (Ruling P68): a claim seized by a replacement connect between the
-			// two would otherwise let a stale cleanup rotate the winner's
-			// record out from under it.
-			$wpdb->last_error = '';
-			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->prepare(
-					"UPDATE {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s SET o.option_value = %s WHERE o.option_name = %s AND o.option_value = %s",
-					$claim,
-					$like,
-					maybe_serialize( $next ),
-					self::BINDING,
-					$raw
-				)
-			);
-			$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
-		} else {
-			// COMPARE-AND-SWAP on the bytes just read (F1): a transient failure
-			// must not read as a rotation that happened, or a changed-client
-			// connect would complete with the departed client's holds still
-			// current and replayable by the replacement.
-			$wpdb->last_error = '';
-			$rows             = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->prepare(
-					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
-					maybe_serialize( $next ),
-					self::BINDING,
-					$raw
-				)
-			);
-			$done = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
-		}
+		);
 		wp_cache_delete( self::BINDING, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
 		self::forget_live_identity();
 		// The epoch has already moved, so a failed record write leaves the site
 		// on a fresh cursor with the OLD binding — visible to the retry as an
-		// epoch the record does not name, and repaired by it.
-		if ( $done ) {
-			// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1
-			// on #88) — "the binding rotation" the ruling names explicitly.
-			// The internal rotate_epoch() call above already bumped once,
-			// which bounds the window a reader could see the new epoch
-			// paired with the OLD binding record; this second bump, on the
-			// binding record's own write landing, is what makes the version
-			// current with the record itself. Both are harmless, monotonic
-			// redundancy — never a correctness issue.
-			self::bump_door_version();
-		}
-		return $done;
+		// epoch the record does not name, and repaired by it. A bump's own
+		// WRITE failing rolls the WHOLE unit back (Ruling S8) — the epoch
+		// rotation included — so `committed: false` here means neither
+		// happened, exactly like the record write failing outright always
+		// meant.
+		return $outcome['committed'] && $outcome['result'];
 	}
 
 	/**
@@ -1259,15 +1320,19 @@ class Aura_Worker_Door_Log {
 	 * Public: the holds store and the governor use the same primitive.
 	 *
 	 * THE OTHER CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1
-	 * on #88): every row this touches is an EXISTING piece of door state
+	 * on #88; made TRANSACTIONAL with the write by Ruling S8, Codex round-4
+	 * P1): every row this touches is an EXISTING piece of door state
 	 * changing shape — `admit()`/`settle()`/`annotate()`/`patch_pending()`
 	 * on a log row, and `Aura_Worker_Door_Holds`'
 	 * `refresh_rule()`/`refresh_touches()`/`stamp_terminal_seq()` on a held
-	 * or claimed one — so a successful write bumps
-	 * `bump_door_version()` unconditionally. (Some of those Holds callers
-	 * also go on to call `forget_held()`, which bumps again — a harmless,
-	 * monotonic redundancy, not a correctness issue: the version exists to
-	 * be strictly greater after a mutation, never to count them exactly.)
+	 * or claimed one — so a successful write bumps the version in the SAME
+	 * transaction as the update itself (`versioned()`). Some of those Holds
+	 * callers also go on to call `forget_held()`, which is now a pure cache
+	 * invalidation and no longer bumps a second time (see its own docblock)
+	 * — one write, one bump, one transaction.
+	 *
+	 * NEVER CALL THIS FROM INSIDE AN ALREADY-OPEN TRANSACTION (see
+	 * `versioned()`'s own docblock).
 	 *
 	 * @param string $option Option name.
 	 * @param array  $after  New value.
@@ -1275,6 +1340,27 @@ class Aura_Worker_Door_Log {
 	 * @return bool
 	 */
 	public static function write_option_where( $option, array $after, array $before ) {
+		$outcome = self::versioned(
+			function () use ( $option, $after, $before ) {
+				$won = self::write_option_where_write( $option, $after, $before );
+				return array(
+					'mutated' => $won,
+					'result'  => $won,
+				);
+			}
+		);
+		return $outcome['committed'] && $outcome['result'];
+	}
+
+	/**
+	 * The update alone, with no version bump and no transaction of its own.
+	 *
+	 * @param string $option Option name.
+	 * @param array  $after  New value.
+	 * @param array  $before The value the caller read (the predicate).
+	 * @return bool
+	 */
+	private static function write_option_where_write( $option, array $after, array $before ) {
 		global $wpdb;
 		$wpdb->last_error = '';
 		$n                = $wpdb->query(
@@ -1287,11 +1373,7 @@ class Aura_Worker_Door_Log {
 		);
 		wp_cache_delete( $option, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
-		$won = 1 === (int) $n && '' === (string) $wpdb->last_error;
-		if ( $won ) {
-			self::bump_door_version();
-		}
-		return $won;
+		return 1 === (int) $n && '' === (string) $wpdb->last_error;
 	}
 
 	/**
@@ -1546,19 +1628,36 @@ class Aura_Worker_Door_Log {
 	 * @return int|null
 	 */
 	public static function bump_door_version() {
+		if ( ! self::bump_door_version_write() ) {
+			return null;
+		}
+		return self::bump_door_version_read_back();
+	}
+
+	/**
+	 * Just the upsert — split out from `bump_door_version()` so `versioned()`
+	 * (Ruling S8, Codex round-4 P1 on #88) can gate a transaction's COMMIT on
+	 * whether this WRITE landed, without that decision depending on the
+	 * read-back's own separate provability (Ruling S2), which is a different
+	 * question and must never roll back a mutation that genuinely happened.
+	 *
+	 * @return bool True only when the upsert statement itself succeeded.
+	 */
+	private static function bump_door_version_write() {
 		global $wpdb;
 		$wpdb->last_error = '';
-		// Built as TEXT, never assembled as one PHP int (Ruling S7): see the
-		// docblock above. `microtime( false )` returns "0.usec sec" — the
-		// fractional-seconds half first, the whole-seconds half second.
+		// Built as TEXT, never assembled as one PHP int (Ruling S7): see
+		// bump_door_version()'s docblock. `microtime( false )` returns
+		// "0.usec sec" — the fractional-seconds half first, the
+		// whole-seconds half second.
 		list( $frac, $sec ) = explode( ' ', microtime( false ), 2 );
 		// TRUNCATED, never rounded: round() can carry 999999.9997 up to
 		// 1000000 — SEVEN digits, which would overrun the %06d field and
 		// corrupt the clock's fixed 6-digit microsecond width instead of
 		// incrementing the second it belongs to. (int) cast truncates.
-		$usec                = min( 999999, (int) ( ( (float) $frac ) * 1000000 ) );
-		$clock               = sprintf( '%d%06d', (int) $sec, $usec );
-		$ok                  = $wpdb->query(
+		$usec  = min( 999999, (int) ( ( (float) $frac ) * 1000000 ) );
+		$clock = sprintf( '%d%06d', (int) $sec, $usec );
+		$ok    = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, LAST_INSERT_ID(GREATEST(1, %s)), 'no') ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(GREATEST(CAST(option_value AS UNSIGNED) + 1, %s))",
 				self::OBSERVATION,
@@ -1567,9 +1666,20 @@ class Aura_Worker_Door_Log {
 			)
 		);
 		wp_cache_delete( self::OBSERVATION, 'options' );
-		if ( false === $ok || '' !== (string) $wpdb->last_error ) {
-			return null; // the statement itself failed: nothing was witnessed
-		}
+		return false !== $ok && '' === (string) $wpdb->last_error;
+	}
+
+	/**
+	 * Just the read-back — the connection-scoped proof of what the LAST
+	 * upsert on THIS connection assigned (Ruling S2). NEVER gates a
+	 * transaction's commit (Ruling S8): a mutation that wrote successfully
+	 * must land whether or not its own witness can be proven back, so this
+	 * is always called AFTER the decision to commit, best-effort.
+	 *
+	 * @return int|null
+	 */
+	private static function bump_door_version_read_back() {
+		global $wpdb;
 		$wpdb->last_error = '';
 		$id                = $wpdb->get_var( 'SELECT LAST_INSERT_ID()' );
 		if ( null === $id || '' !== (string) $wpdb->last_error || ! is_numeric( $id ) ) {
@@ -1594,6 +1704,92 @@ class Aura_Worker_Door_Log {
 			return null;
 		}
 		return $id;
+	}
+
+	/**
+	 * Run `$writes()` and, if it reports a real mutation, bump the door
+	 * version — ALL IN ONE TRANSACTION (Ruling S8, Codex round-4 P1 on #88).
+	 *
+	 * WHY A TRANSACTION AT ALL. The mutation-based scheme (Ruling S6) still
+	 * committed the state write and its version bump as two SEPARATE
+	 * statements: a `/status` poll landing between them read the version
+	 * BEFORE the bump alongside state that already included the new write —
+	 * both of `status_fragment()`'s bracketing reads would agree on the OLD
+	 * version, so the poll would serve the new state under a version Aura's
+	 * strictly-greater comparison treats as unchanged. And if the bump then
+	 * failed outright, that new state stayed invisible until some UNRELATED
+	 * later mutation finally advanced the version past it. One transaction
+	 * closes both holes: no reader can observe the state write without the
+	 * bump, or the bump without the state write, because until COMMIT
+	 * neither is visible to any other connection at all.
+	 *
+	 * THIS MUST NEVER BE CALLED FROM INSIDE AN ALREADY-OPEN TRANSACTION.
+	 * MySQL has no nested transactions — issuing a second `START TRANSACTION`
+	 * implicitly COMMITS the first, silently closing out whatever the outer
+	 * caller had not finished and losing the atomicity this method exists to
+	 * provide. `git grep -n "START TRANSACTION\|\bBEGIN\b"` across the
+	 * plugin before this ruling found NO existing transaction use anywhere —
+	 * this is the first — so every choke point below routes through this ONE
+	 * method rather than opening its own, and none of them call each other
+	 * while already inside one (`rotate_binding()` used to call the PUBLIC
+	 * `rotate_epoch()`, itself now `versioned()`-wrapped; it now calls a
+	 * private write-only variant instead, inside its OWN single transaction —
+	 * see `rotate_epoch_write()`).
+	 *
+	 * @param callable $writes Returns array{ mutated: bool, result: mixed }.
+	 *                         `mutated` false ⇒ an idempotent no-op, a lost
+	 *                         race, a refusal — nothing to version, and
+	 *                         nothing to roll back either (the transaction
+	 *                         still closes, via COMMIT, since $writes() may
+	 *                         legitimately have written and decided
+	 *                         "not mutated" on its own evidence — none of
+	 *                         today's callers do, but the contract does not
+	 *                         assume otherwise). `result` is handed back to
+	 *                         the CALLER of versioned().
+	 * @return array{ committed: bool, result: mixed } `committed` is false
+	 *         ONLY when $writes() reported a mutation but the version bump's
+	 *         own WRITE then failed — the WHOLE unit rolls back, including
+	 *         every statement $writes() itself ran, so the caller must treat
+	 *         this exactly like $writes() failing outright.
+	 */
+	public static function versioned( callable $writes ) {
+		global $wpdb;
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		try {
+			$outcome = $writes();
+		} catch ( \Throwable $e ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			throw $e;
+		}
+		$outcome = is_array( $outcome ) ? $outcome : array();
+		$mutated = ! empty( $outcome['mutated'] );
+		$result  = array_key_exists( 'result', $outcome ) ? $outcome['result'] : null;
+		if ( ! $mutated ) {
+			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			return array(
+				'committed' => true,
+				'result'    => $result,
+			);
+		}
+		if ( ! self::bump_door_version_write() ) {
+			// Ruling S8: the bump's own WRITE failed, so the mutation must
+			// not land either — every statement $writes() ran is undone.
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			return array(
+				'committed' => false,
+				'result'    => $result,
+			);
+		}
+		// Best-effort, and deliberately AFTER the decision to commit: a
+		// mutation that wrote successfully must land whether or not its own
+		// witness can be proven back (Ruling S2's read-back discipline still
+		// applies to WHAT the witness is, never to WHETHER the write did).
+		self::bump_door_version_read_back();
+		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		return array(
+			'committed' => true,
+			'result'    => $result,
+		);
 	}
 
 	/**
@@ -1672,7 +1868,6 @@ class Aura_Worker_Door_Log {
 	 * @return array{ acked: int, floor: int, stale?: bool }
 	 */
 	public static function ack( $epoch, $seq ) {
-		global $wpdb;
 		$seq = (int) $seq;
 		if ( ! is_string( $epoch ) || $epoch !== self::epoch() ) {
 			return array( 'acked' => 0, 'floor' => self::floor() );
@@ -1701,18 +1896,46 @@ class Aura_Worker_Door_Log {
 		if ( $seq < 1 ) {
 			return array( 'acked' => 0, 'floor' => self::floor() );
 		}
+		// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1;
+		// made TRANSACTIONAL by Ruling S8, Codex round-4 P1 on #88): `ack()`
+		// mutates through hand-rolled SQL, not through
+		// `write_option_where()`/`insert_unique()`, so its writes and its
+		// bump run inside ONE `versioned()` unit — see `ack_write()`, which
+		// reports `mutated` ONLY when something actually changed (the floor
+		// rose, rows were purged, or the log reopened), never on the
+		// ordinary idempotent repeat.
+		$outcome = self::versioned(
+			function () use ( $epoch, $seq ) {
+				return self::ack_write( $epoch, $seq );
+			}
+		);
+		return $outcome['result'];
+	}
+
+	/**
+	 * `ack()`'s writes, with no transaction of its own — called from inside
+	 * the one `versioned()` opens.
+	 *
+	 * @param string $epoch Already proven current by the caller.
+	 * @param int    $seq   Already bounds-checked by the caller.
+	 * @return array{ mutated: bool, result: array }
+	 */
+	private static function ack_write( $epoch, $seq ) {
+		global $wpdb;
 		// Floor: INSERT if absent, else raise only when lower. The floor as it
 		// stood BEFORE the raise bounds the cache invalidation below to the
 		// newly acked range — never 1..seq on a site with a long history
-		// (Codex round-5 P2).
+		// (Codex round-5 P2). FLOOR is version-exempt (see
+		// VERSION_EXEMPT_INSERTS), so this does not open a nested transaction.
 		self::insert_unique( self::FLOOR, 0 );
 		$prev_floor_before_raise = self::floor();
-		// JOINED TO THE EPOCH ROW (Ruling P90). The check at the top of this
-		// method reads the epoch and then lets go of it, so a `/door/rotate` or
-		// a rebind installing a new epoch in between still had this ack advance
-		// the SHARED floor — and after a rewind that is destructive: an old,
-		// high cursor from epoch A is clamped against epoch B's freshly written
-		// rows, and the delete below then removes entries Aura has never seen.
+		// JOINED TO THE EPOCH ROW (Ruling P90). The check in ack() reads the
+		// epoch and then lets go of it, so a `/door/rotate` or a rebind
+		// installing a new epoch in between still had this ack advance the
+		// SHARED floor — and after a rewind that is destructive: an old,
+		// high cursor from epoch A is clamped against epoch B's freshly
+		// written rows, and the delete below then removes entries Aura has
+		// never seen.
 		//
 		// The epoch row is a condition of the statement itself, so the ack
 		// linearises before or after a rotation and never across one.
@@ -1733,7 +1956,13 @@ class Aura_Worker_Door_Log {
 			// ordinary idempotent repeat — the floor is already at or above
 			// this cursor — and still falls through to the delete, which is how
 			// a previous ack's unfinished purge is completed.
-			return array( 'acked' => 0, 'floor' => self::floor() );
+			return array(
+				'mutated' => false,
+				'result'  => array(
+					'acked' => 0,
+					'floor' => self::floor(),
+				),
+			);
 		}
 		$floor = self::floor();
 		$acked = 0;
@@ -1770,16 +1999,13 @@ class Aura_Worker_Door_Log {
 			delete_option( self::FULL_COUNTER );
 			$reopened = true;
 		}
-		// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1 on
-		// #88): `ack()` mutates through hand-rolled SQL, not through
-		// `write_option_where()`/`insert_unique()`, so it bumps for itself —
-		// but ONLY when something actually changed (the floor rose, rows
-		// were purged, or the log reopened), never on the ordinary
-		// idempotent repeat that falls through to here with all three false.
-		if ( $raised >= 1 || $acked > 0 || $reopened ) {
-			self::bump_door_version();
-		}
-		return array( 'acked' => $acked, 'floor' => $floor );
+		return array(
+			'mutated' => ( $raised >= 1 || $acked > 0 || $reopened ),
+			'result'  => array(
+				'acked' => $acked,
+				'floor' => $floor,
+			),
+		);
 	}
 
 	/**
@@ -1849,14 +2075,58 @@ class Aura_Worker_Door_Log {
 	 * @return array{ rotated: bool, epoch: string } `epoch` is the one now in force either way.
 	 */
 	public static function rotate_epoch( $expected, $claim = '', $fence = '' ) {
+		// PRIMED BEFORE THE TRANSACTION OPENS (Ruling S8): the epoch must
+		// already exist by the time rotate_epoch_write() runs, because that
+		// method reads it back with epoch_raw() — never the MINTING epoch(),
+		// which would nest a second transaction (see rotate_epoch_write()'s
+		// own docblock). Idempotent either way: an epoch that already exists
+		// is untouched, exactly like every other caller of epoch().
+		self::epoch();
+		$outcome = self::versioned(
+			function () use ( $expected, $claim, $fence ) {
+				return self::rotate_epoch_write( $expected, $claim, $fence );
+			}
+		);
+		return $outcome['result'];
+	}
+
+	/**
+	 * `rotate_epoch()`'s writes, with no transaction of its own — called
+	 * from inside the one `versioned()` opens, and ALSO called directly by
+	 * `rotate_binding()` (Ruling S8, Codex round-4 P1 on #88): a binding
+	 * rotation's epoch rotation and its own record write must land in the
+	 * SAME transaction, and `rotate_binding()` is itself `versioned()`-
+	 * wrapped, so it cannot call the PUBLIC `rotate_epoch()` — that would
+	 * nest a second `START TRANSACTION` inside the first, which MySQL has no
+	 * concept of (a nested one implicitly commits the outer). This method is
+	 * the shared write-only core both wrappers call into.
+	 *
+	 * @param string $expected The epoch the caller means to replace.
+	 * @param string $claim    Optional site-claim option name.
+	 * @param string $fence    Optional claim fence.
+	 * @return array{ mutated: bool, result: array{ rotated: bool, epoch: string } }
+	 */
+	private static function rotate_epoch_write( $expected, $claim = '', $fence = '' ) {
 		global $wpdb;
 		$expected = (string) $expected;
 		$claim    = (string) $claim;
 		$fence    = (string) $fence;
 		if ( '' === $expected ) {
 			return array(
-				'rotated' => false,
-				'epoch'   => self::epoch(),
+				'mutated' => false,
+				'result'  => array(
+					'rotated' => false,
+					// epoch_raw() here, NEVER the minting epoch() (Ruling S8):
+					// this runs INSIDE versioned()'s open transaction, and
+					// epoch()'s lazy mint is itself a versioned insert_unique()
+					// call — nesting a second START TRANSACTION, which MySQL
+					// has no way to honour. Both PUBLIC callers of this method
+					// (rotate_epoch(), rotate_binding()) already prime the
+					// epoch with a real epoch() read BEFORE opening their
+					// transaction, so it exists here in every real case; '' is
+					// the honest answer on the one a caller skipped that.
+					'epoch'   => self::epoch_raw(),
+				),
 			);
 		}
 		// CLAIM-CONDITIONED WHEN A REBIND ASKS (Ruling P83). A connect or unbind
@@ -1884,37 +2154,52 @@ class Aura_Worker_Door_Log {
 			wp_cache_delete( 'notoptions', 'options' );
 			if ( 1 !== (int) $gone ) {
 				return array(
-					'rotated' => false,
-					'epoch'   => self::epoch(),
+					'mutated' => false,
+					'result'  => array(
+						'rotated' => false,
+						'epoch'   => self::epoch_raw(), // never epoch() — see the docblock above
+					),
 				);
 			}
 			delete_option( self::FULL_MARKER );
 			delete_option( self::FULL_COUNTER );
-			// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3
-			// P1 on #88): the epoch — reported in the fragment — actually
-			// rotated, through hand-rolled SQL neither `write_option_where()`
-			// nor `insert_unique()` touches.
-			self::bump_door_version();
+			// THE NEW EPOCH IS MINTED HERE, INLINE (Ruling S8). The DELETE
+			// above only removed the old row — `self::epoch()`'s own
+			// lazy-mint used to supply the replacement on the caller's next
+			// read, but that mint is a versioned insert_unique() call and
+			// would nest a transaction. insert_unique_write() is the SAME
+			// mint, write-only, sharing this one.
+			self::insert_unique_write( self::EPOCH, wp_generate_uuid4() );
 			return array(
-				'rotated' => true,
-				'epoch'   => self::epoch(),
+				'mutated' => true,
+				'result'  => array(
+					'rotated' => true,
+					'epoch'   => self::epoch_raw(),
+				),
 			);
 		}
-		$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::EPOCH, $expected ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::EPOCH, $expected ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 		wp_cache_delete( self::EPOCH, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		if ( 1 !== (int) $gone ) {
 			return array(
-				'rotated' => false,
-				'epoch'   => self::epoch(),
+				'mutated' => false,
+				'result'  => array(
+					'rotated' => false,
+					'epoch'   => self::epoch_raw(),
+				),
 			);
 		}
 		delete_option( self::FULL_MARKER );
 		delete_option( self::FULL_COUNTER );
-		self::bump_door_version(); // see the choke-point note on the claim-conditioned branch above
+		// See the mint note on the claim-conditioned branch above.
+		self::insert_unique_write( self::EPOCH, wp_generate_uuid4() );
 		return array(
-			'rotated' => true,
-			'epoch'   => self::epoch(),
+			'mutated' => true,
+			'result'  => array(
+				'rotated' => true,
+				'epoch'   => self::epoch_raw(),
+			),
 		);
 	}
 

@@ -905,7 +905,12 @@ final class DoorHoldsTest extends TestCase {
 		// The window: the sweep lands after unclaim()'s held INSERT and before
 		// its claimed DELETE.
 		$GLOBALS['_sa_after_insert_unique'][ Aura_Worker_Door_Holds::HELD . $ref ] = static function () use ( &$swept ) {
-			$swept = Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// sweep()'s own deletes each open their own versioned() unit,
+			// which would nest inside unclaim()'s still-open one otherwise.
+			sa_on_another_connection( function () use ( &$swept ) {
+				$swept = Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS );
+			} );
 		};
 
 		$restored = Aura_Worker_Door_Holds::unclaim( $ref );
@@ -1101,6 +1106,57 @@ final class DoorHoldsTest extends TestCase {
 		// after it still bumps, proving the primitive itself is not disabled.
 		Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_held_test-ref', array( 'x' => 1 ) );
 		$this->assertNotSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'an ordinary door-prefixed insert still bumps' );
+	}
+
+	/**
+	 * Ruling S8 (Codex round-4 P1 on #88): hold()'s state write and its
+	 * version bump run in ONE transaction — proven from the request's own
+	 * statement log, the same way open_pending()/ack()/rotate_epoch() are in
+	 * DoorLogTest.php. hold() itself can open SEVERAL transactions in one
+	 * call (an epoch mint, a binding mint, the held row's own insert), so
+	 * this finds the bump nearest the HELD row's own insert rather than
+	 * assuming there is only one transaction in the log.
+	 */
+	public function test_hold_bumps_the_version_inside_its_own_transaction(): void {
+		$GLOBALS['_db_queries'] = array();
+		$ref                    = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsString( $ref );
+
+		$log = $GLOBALS['_db_queries'];
+		$held_insert = null;
+		foreach ( $log as $i => $sql ) {
+			if ( false !== strpos( (string) $sql, Aura_Worker_Door_Holds::HELD . $ref ) ) {
+				$held_insert = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $held_insert, 'the held row was written at all' );
+		// The bump nearest (at or after) the held row's own insert.
+		$bump = null;
+		for ( $i = $held_insert, $n = count( $log ); $i < $n; $i++ ) {
+			if ( false !== strpos( (string) $log[ $i ], Aura_Worker_Door_Log::OBSERVATION ) ) {
+				$bump = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $bump, 'the held insert bumped the version' );
+		$start = null;
+		for ( $i = $bump; $i >= 0; $i-- ) {
+			if ( 'START TRANSACTION' === trim( (string) $log[ $i ] ) ) {
+				$start = $i;
+				break;
+			}
+		}
+		$commit = null;
+		for ( $i = $bump, $n = count( $log ); $i < $n; $i++ ) {
+			if ( 'COMMIT' === trim( (string) $log[ $i ] ) ) {
+				$commit = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $start, 'a transaction opened before the bump' );
+		$this->assertNotNull( $commit, 'and closed with a COMMIT after it' );
+		$this->assertLessThanOrEqual( $held_insert, $start, "the SAME transaction covers the held row's own insert" );
 	}
 
 	/** The reconciler's stale-claim bound, as the governor declares it. */

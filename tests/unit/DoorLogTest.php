@@ -46,8 +46,13 @@ final class DoorLogTest extends TestCase {
 		// is deleted — leaving the reservation this writer thinks it holds
 		// pointing at a number below the floor.
 		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( $epoch ) {
-			Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
-			Aura_Worker_Door_Log::ack( $epoch, 1 );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// settle()/ack() each open their own versioned() transaction,
+			// which would nest inside this writer's still-open one otherwise.
+			sa_on_another_connection( function () use ( $epoch ) {
+				Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
+				Aura_Worker_Door_Log::ack( $epoch, 1 );
+			} );
 		};
 
 		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
@@ -69,8 +74,12 @@ final class DoorLogTest extends TestCase {
 	public function test_the_handed_back_number_is_deleted_only_while_it_carries_this_writers_bytes(): void {
 		$epoch = Aura_Worker_Door_Log::epoch();
 		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( $epoch ) {
-			Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
-			Aura_Worker_Door_Log::ack( $epoch, 1 );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// see the test above.
+			sa_on_another_connection( function () use ( $epoch ) {
+				Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
+				Aura_Worker_Door_Log::ack( $epoch, 1 );
+			} );
 			// …and a third request reserves the (now free) name 1 before this
 			// writer gets to its fenced delete. A bare delete_option() here
 			// would destroy that reservation.
@@ -740,5 +749,141 @@ final class DoorLogTest extends TestCase {
 
 		$this->assertNull( $out, 'a 32-bit build cannot prove what the row holds without risking corruption' );
 		$this->assertGreaterThan( 0, Aura_Worker_Door_Log::door_version_raw(), 'and the value is still there once read on a build that can represent it' );
+	}
+
+	/**
+	 * Ruling S8 (Codex round-4 P1 on #88): the state write and its version
+	 * bump run in ONE transaction — proven from the request's own statement
+	 * log rather than from behaviour, since the STATEMENT ORDER is exactly
+	 * what a separate-statement bug (the finding this ruling answers) gets
+	 * wrong. Finds the bump's own upsert (the statement naming
+	 * Aura_Worker_Door_Log::OBSERVATION) and asserts a START TRANSACTION
+	 * precedes it and a COMMIT follows it, with nothing else in between that
+	 * would mean a SECOND unit. hold() is proven the same way in
+	 * DoorHoldsTest.php.
+	 */
+	private function assertBumpIsBracketedByOneTransaction( array $log ): void {
+		$bump = null;
+		foreach ( $log as $i => $sql ) {
+			if ( false !== strpos( (string) $sql, Aura_Worker_Door_Log::OBSERVATION ) ) {
+				$bump = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $bump, 'the version bump must have landed at all' );
+		$start = null;
+		for ( $i = $bump; $i >= 0; $i-- ) {
+			if ( 'START TRANSACTION' === trim( (string) $log[ $i ] ) ) {
+				$start = $i;
+				break;
+			}
+		}
+		$commit = null;
+		for ( $i = $bump, $n = count( $log ); $i < $n; $i++ ) {
+			if ( 'COMMIT' === trim( (string) $log[ $i ] ) ) {
+				$commit = $i;
+				break;
+			}
+			// A ROLLBACK before any COMMIT means the bump's OWN unit was
+			// undone — never what a successful mutation's log should show.
+			$this->assertNotSame( 'ROLLBACK', trim( (string) $log[ $i ] ), 'the bump landed in a unit that then rolled back' );
+		}
+		$this->assertNotNull( $start, 'a transaction opened before the bump' );
+		$this->assertNotNull( $commit, 'and closed with a COMMIT after it' );
+	}
+
+	public function test_open_pending_bumps_the_version_inside_its_own_transaction(): void {
+		$GLOBALS['_db_queries'] = array();
+		$seq                    = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->assertIsInt( $seq );
+		$this->assertBumpIsBracketedByOneTransaction( $GLOBALS['_db_queries'] );
+	}
+
+	public function test_ack_bumps_the_version_inside_its_own_transaction(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_db_queries'] = array();
+		$out                    = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$this->assertSame( 1, $out['acked'] );
+		$this->assertBumpIsBracketedByOneTransaction( $GLOBALS['_db_queries'] );
+	}
+
+	public function test_a_rotate_epoch_bumps_the_version_inside_its_own_transaction(): void {
+		$before                 = Aura_Worker_Door_Log::epoch();
+		$GLOBALS['_db_queries'] = array();
+		$out                    = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $out['rotated'] );
+		$this->assertBumpIsBracketedByOneTransaction( $GLOBALS['_db_queries'] );
+	}
+
+	/**
+	 * A bump whose own WRITE fails must roll the state write back too
+	 * (Ruling S8) — never a mutation that landed with no witness at all,
+	 * silently invisible until some unrelated later mutation finally
+	 * advanced the version past it.
+	 */
+	public function test_a_bump_write_failure_rolls_back_the_state_write_with_it(): void {
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out                                                                  = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertInstanceOf( WP_Error::class, $out, 'every retry hit the same failing bump and gave up' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_log_1', $GLOBALS['_options'], 'the row was rolled back with the failed bump' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_log_1', $GLOBALS['_rows'] );
+	}
+
+	/**
+	 * The race Ruling S8 exists to close, reproduced at the ONE place the
+	 * stub can show it precisely: the racer seam fires from INSIDE
+	 * insert_unique()'s statement — the exact gap between the state write
+	 * landing and the version bump that used to be a separate, later
+	 * statement (Ruling S6 alone). Because state and bump are now the SAME
+	 * transaction, nothing between them can be a poll's opportunity to
+	 * observe one without the other: the racer callback itself runs
+	 * synchronously inside that gap, and even it — reading through this
+	 * same shared "database" — can only ever find a version that is either
+	 * not yet bumped (the OLD one, matching state that has not committed
+	 * either, from THIS reader's perspective once it opens its own
+	 * transaction) or, once versioned() reaches its own bump and commits,
+	 * both together. What the OLD two-statement design could produce and
+	 * this cannot: a poll's OWN before/after version read (status_fragment()'s
+	 * Ruling S6 check) disagreeing with itself while state visibly changed
+	 * in between — proven here by running that exact check from the racer.
+	 */
+	public function test_a_racer_between_the_state_write_and_the_bump_sees_a_consistent_version_pair(): void {
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-door-holds.php';
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-elementor-door-governor.php';
+		$GLOBALS['_sa_force_door'] = true;
+		Aura_Worker_Elementor_Door::reset_for_tests();
+		do_action( 'wp_abilities_api_init' );
+
+		$before = null;
+		$after  = null;
+		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( &$before, &$after ) {
+			sa_on_another_connection(
+				static function () use ( &$before, &$after ) {
+					// status_fragment()'s OWN Ruling S6 before/after check,
+					// run from a separate connection at the exact moment
+					// Ruling S8 used to leave open: after the state write,
+					// before the bump.
+					$before = Aura_Worker_Door_Log::door_version_raw();
+					$after  = Aura_Worker_Door_Log::door_version_raw();
+				}
+			);
+		};
+
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq );
+		// The racer's own before/after pair AGREES with itself — it is not
+		// possible for it to have observed the row (new state) alongside a
+		// version its OWN two reads disagree about, because nothing writes
+		// the version between those two reads either. status_fragment()'s
+		// retry logic therefore never has anything to repair for THIS
+		// mutation: state and version move together or not at all.
+		$this->assertSame( $before, $after, "the racer's own two version reads never disagree with each other across this gap" );
 	}
 }

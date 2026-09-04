@@ -770,8 +770,13 @@ final class ElementorReplayTest extends TestCase {
 		$this->afterSwapOn(
 			Aura_Worker_Door_Holds::CLAIMED . $ref,
 			static function () {
-				// Aura rotating the log epoch on a rewind, mid-replay.
-				Aura_Worker_Door_Log::rotate_epoch( Aura_Worker_Door_Log::epoch() );
+				// Aura rotating the log epoch on a rewind, mid-replay — as if
+				// on its OWN connection (Ruling S8): rotate_epoch() opens its
+				// own versioned() unit, which would nest inside whatever CAS
+				// write just fired this seam otherwise.
+				sa_on_another_connection( static function () {
+					Aura_Worker_Door_Log::rotate_epoch( Aura_Worker_Door_Log::epoch() );
+				} );
 			}
 		);
 
@@ -848,7 +853,12 @@ final class ElementorReplayTest extends TestCase {
 		// and the operator's reject deletes the held row it was moving.
 		$GLOBALS['_sa_before_swap'] = static function () use ( $ref ) {
 			$GLOBALS['_sa_before_swap'] = null; // fires once
-			Aura_Worker_Door_Holds::reject( $ref );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// reject()'s own delete opens its own versioned() unit, which
+			// would nest inside claim()'s still-open one otherwise.
+			sa_on_another_connection( static function () use ( $ref ) {
+				Aura_Worker_Door_Holds::reject( $ref );
+			} );
 		};
 
 		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
@@ -1065,7 +1075,12 @@ final class ElementorReplayTest extends TestCase {
 			$row['claimed_at'] = gmdate( 'c', time() - 3600 );
 			$GLOBALS['_options'][ Aura_Worker_Door_Holds::CLAIMED . $ref ] = $row;
 			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::CLAIMED . $ref ]    = maybe_serialize( $row );
-			Aura_Worker_Door_Holds::sweep( time(), Aura_Worker_Elementor_Door::CLAIM_STALE_MS );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// sweep()'s own deletes each open their own versioned() unit,
+			// which would nest inside unclaim()'s still-open one otherwise.
+			sa_on_another_connection( static function () {
+				Aura_Worker_Door_Holds::sweep( time(), Aura_Worker_Elementor_Door::CLAIM_STALE_MS );
+			} );
 		};
 
 		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
@@ -1105,7 +1120,13 @@ final class ElementorReplayTest extends TestCase {
 		// Both rows are taken out from under the replay before it gives up.
 		$GLOBALS['_sa_before_swap'] = static function () use ( $ref ) {
 			if ( null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
-				Aura_Worker_Door_Holds::release( $ref );
+				// A racer, so it runs as if on its OWN connection (Ruling
+				// S8) — release()'s own deletes open their own versioned()
+				// unit, which would nest inside whatever CAS write just
+				// fired this seam otherwise.
+				sa_on_another_connection( static function () use ( $ref ) {
+					Aura_Worker_Door_Holds::release( $ref );
+				} );
 			}
 		};
 
