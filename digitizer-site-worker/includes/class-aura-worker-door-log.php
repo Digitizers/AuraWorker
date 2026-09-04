@@ -1905,6 +1905,27 @@ class Aura_Worker_Door_Log {
 	 * the real transaction is gone, and this method answers `committed:
 	 * false` — accurately: nothing landed.
 	 *
+	 * THE SESSION ITSELF IS ESTABLISHED WITH A SAVEPOINT, NOT JUST NAMED
+	 * (Ruling S17, Codex round-7 P1 on #88). Ruling S16's nonce closed the
+	 * gap at the END of the transaction, but a reconnect can also land
+	 * WHILE the nonce's own `SET` is being issued: `wpdb` can transparently
+	 * retry that `SET` on a fresh AUTOCOMMIT session, and the retried
+	 * statement still assigns the SAME nonce this method compares against
+	 * later — so the final check above would pass even though no
+	 * transaction was ever open while `$writes()` and the bump ran.
+	 * `SAVEPOINT aura_door_tx` is issued immediately after `START
+	 * TRANSACTION`, BEFORE the nonce — a real transactional savepoint,
+	 * which needs no special privilege and, unlike the nonce, cannot be
+	 * silently re-created on a different session: `RELEASE SAVEPOINT
+	 * aura_door_tx`, issued right before the final `COMMIT`, either
+	 * confirms THIS savepoint (and therefore this transaction) is still
+	 * open, or fails with MySQL error 1305 ("SAVEPOINT … does not exist")
+	 * when a reconnect anywhere between `START TRANSACTION` and here left
+	 * nothing to release — an autocommit session that ran `SAVEPOINT`
+	 * outside any explicit transaction discards it the instant that
+	 * single statement completes. A failed `RELEASE` fails the whole unit
+	 * exactly like a failed bump: `ROLLBACK`, `committed: false`.
+	 *
 	 * @param callable $writes Returns array{ mutated: bool, result: mixed,
 	 *                         evict?: string[] } or array{ rollback: true,
 	 *                         result: mixed }. `mutated` false ⇒ an
@@ -1927,12 +1948,14 @@ class Aura_Worker_Door_Log {
 	 * @return array{ committed: bool, result?: mixed, observation?: int|null }
 	 *         `committed` is false when $writes() asked for a rollback,
 	 *         reported a mutation whose version bump then failed its own
-	 *         WRITE, or when the final COMMIT could not be PROVEN to have run
-	 *         on the session that opened the transaction (Ruling S16) —
-	 *         every one of those rolls the WHOLE unit back (on a
-	 *         transactional engine only — see Ruling S13 above), including
-	 *         every statement $writes() itself ran, so the caller must treat
-	 *         this exactly like $writes() failing outright — and `result` is
+	 *         WRITE, when the savepoint that proves the session held the
+	 *         transaction the whole time could not be released (Ruling S17),
+	 *         or when the final COMMIT could not be PROVEN to have run on
+	 *         the session that opened the transaction (Ruling S16) — every
+	 *         one of those rolls the WHOLE unit back (on a transactional
+	 *         engine only — see Ruling S13 above), including every
+	 *         statement $writes() itself ran, so the caller must treat this
+	 *         exactly like $writes() failing outright — and `result` is
 	 *         ABSENT whenever `committed` is false (Ruling S15): never read
 	 *         it without checking `committed` first. `observation` is
 	 *         likewise absent on failure, and otherwise the witness THIS call
@@ -1947,8 +1970,12 @@ class Aura_Worker_Door_Log {
 		$tx_nonce      = null;
 		if ( $transactional ) {
 			$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// Ruling S17 (Codex round-7 P1 on #88): a REAL transactional
+			// savepoint, before anything else — see this method's own
+			// docblock for why the nonce below is not enough on its own.
+			$wpdb->query( 'SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 			// Ruling S16 (Codex round-6 P1 on #88): the FIRST statement after
-			// START TRANSACTION, so it is set on THIS session before anything
+			// the savepoint, so it is set on THIS session before anything
 			// else runs — the proof the final COMMIT below checks before this
 			// method ever reports `committed: true`. See that COMMIT's own
 			// comment for what it proves and why.
@@ -2019,6 +2046,23 @@ class Aura_Worker_Door_Log {
 		// landed, durably, whatever the bump did — there is no rollback to
 		// perform, so execution simply continues to the shared tail below.
 		if ( $transactional ) {
+			// Ruling S17 (Codex round-7 P1 on #88): RELEASE the savepoint
+			// BEFORE the COMMIT it is meant to protect. A reconnect ANYWHERE
+			// between START TRANSACTION and here — including one that let a
+			// retried `SET` land on a fresh autocommit session carrying the
+			// SAME nonce Ruling S16 checks below — leaves no savepoint for
+			// this statement to find: an autocommit session that ran
+			// SAVEPOINT outside any explicit transaction discards it the
+			// instant that single statement completes, so MySQL answers
+			// error 1305 ("SAVEPOINT … does not exist") here instead. That
+			// failure is treated exactly like the bump's own write failing.
+			$wpdb->query( 'RELEASE SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			if ( '' !== (string) $wpdb->last_error ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				return array(
+					'committed' => false,
+				);
+			}
 			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
 			// Ruling S16 (Codex round-6 P1 on #88): PROVE this COMMIT ran on
 			// the SAME session that opened the transaction and set the nonce
@@ -2033,7 +2077,9 @@ class Aura_Worker_Door_Log {
 			// the two apart without needing COMMIT's own return value to be
 			// honest about which session it ran on (its return/last_error
 			// are still consulted below, for the ordinary case where the
-			// statement itself simply fails).
+			// statement itself simply fails). The RELEASE above already
+			// catches most of this window; this check remains for the
+			// narrower one still open between it and the COMMIT itself.
 			$commit_ok = ( '' === (string) $wpdb->last_error );
 			if ( $commit_ok ) {
 				$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching

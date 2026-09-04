@@ -1153,6 +1153,64 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S17 (Codex round-7 P1 on #88): the nonce alone is not proof — a
+	 * reconnect landing WHILE the nonce's own `SET` is issued can be
+	 * transparently retried by `wpdb` on a fresh autocommit session, and
+	 * the retried statement assigns the SAME nonce this method later checks,
+	 * so the post-COMMIT read-back would pass even though no transaction was
+	 * ever open while the callback and the bump ran. `SAVEPOINT aura_door_tx`
+	 * — set immediately after START TRANSACTION, before the nonce — cannot
+	 * be silently re-created this way: an autocommit session that runs
+	 * SAVEPOINT outside any explicit transaction discards it the instant
+	 * that statement completes, so the RELEASE this method issues right
+	 * before COMMIT fails loudly (modelled as MySQL error 1305) instead of
+	 * quietly succeeding on a session that was never really in a
+	 * transaction.
+	 */
+	public function test_a_reconnect_between_start_transaction_and_the_savepoint_reports_committed_false(): void {
+		$name = 'aura_worker_door_s17_test';
+
+		$GLOBALS['_sa_reconnect_before_savepoint'] = true;
+		$outcome                                   = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_savepoint'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'the savepoint this session never actually held could not be released' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the transaction the savepoint would have proven was never really open' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_rows'] );
+	}
+
+	/** The normal path: the savepoint releases cleanly, and committed stays true. */
+	public function test_the_normal_path_still_releases_the_savepoint_and_reports_committed_true(): void {
+		$name    = 'aura_worker_door_s17_normal_test';
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$this->assertTrue( $outcome['committed'] );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+	}
+
+	/**
 	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
 	 * `SHOW TABLE STATUS LIKE 'wp_options'` ONCE per request and caches the
 	 * answer — a second call must not re-issue the probe.

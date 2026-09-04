@@ -2758,7 +2758,52 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					'rows'       => $GLOBALS['_rows'],
 					'options'    => $GLOBALS['_options'],
 					'notoptions' => $GLOBALS['_notoptions'],
+					'savepoint'  => null,
 				);
+				return true;
+			}
+			// A real transactional SAVEPOINT (Ruling S17, 2.16.2) —
+			// `versioned()`'s proof that a transaction is actually open on
+			// THIS session, issued immediately after START TRANSACTION and
+			// released right before the final COMMIT. Recorded on the
+			// CURRENT (innermost) transaction frame — real MySQL scopes a
+			// savepoint to the transaction it was set in.
+			//
+			// `_sa_reconnect_before_savepoint` models a reconnect landing
+			// anywhere between START TRANSACTION and this statement taking
+			// effect: on a real server, a fresh connection has autocommit
+			// ON, so SAVEPOINT there opens (and instantly closes) its own
+			// implicit one-statement transaction — the savepoint vanishes
+			// the moment that statement completes, and RELEASE SAVEPOINT
+			// later finds nothing. Modelled by simply not recording it on
+			// the frame, so the later RELEASE sees a mismatch. Fires once.
+			if ( preg_match( '/^SAVEPOINT (\w+)$/', $query, $m ) ) {
+				if ( empty( $this->sa_txn_stack ) ) {
+					throw new RuntimeException( 'wpdb stub: SAVEPOINT with no open transaction on this connection' );
+				}
+				if ( ! empty( $GLOBALS['_sa_reconnect_before_savepoint'] ) ) {
+					$GLOBALS['_sa_reconnect_before_savepoint'] = false; // fires once
+					return true; // the statement "succeeds" — on a session that discards it instantly
+				}
+				$top                                                     = count( $this->sa_txn_stack ) - 1;
+				$this->sa_txn_stack[ $top ]['savepoint'] = stripslashes( $m[1] );
+				return true;
+			}
+			// The release this savepoint exists for: proves the CURRENT
+			// transaction frame still holds the savepoint this connection
+			// set — a reconnect anywhere in between (whether it skipped the
+			// SAVEPOINT above or, per Ruling S16's own gap, let a retried
+			// SET land on a fresh session with a matching nonce) leaves
+			// nothing here to release, and MySQL answers error 1305
+			// ("SAVEPOINT … does not exist").
+			if ( preg_match( '/^RELEASE SAVEPOINT (\w+)$/', $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				$top  = empty( $this->sa_txn_stack ) ? null : count( $this->sa_txn_stack ) - 1;
+				if ( null === $top || $this->sa_txn_stack[ $top ]['savepoint'] !== $name ) {
+					$this->last_error = "Error 1305: SAVEPOINT $name does not exist";
+					return false;
+				}
+				$this->sa_txn_stack[ $top ]['savepoint'] = null;
 				return true;
 			}
 			// A MySQL session (user) variable assignment (Ruling S16,
@@ -3367,6 +3412,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
@@ -4634,6 +4680,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
