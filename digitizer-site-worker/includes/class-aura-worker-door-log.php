@@ -881,8 +881,16 @@ class Aura_Worker_Door_Log {
 		// Rotating first makes the failure harmless: nothing else has changed,
 		// so the record still names the old binding and the caller's retry
 		// simply does the whole thing again.
-		$was       = self::epoch(); // read BEFORE the rotation, which fences on it
-		$rot       = self::rotate_epoch( $was );
+		$was = self::epoch(); // read BEFORE the rotation, which fences on it
+		// The claim, again, immediately before the epoch moves (Ruling P83).
+		// The read above and the identity comparison take time, and a handler
+		// that has lost the site in the meantime must not move the winner's
+		// cursor — the join below is the binding answer, this is the one that
+		// stops the work being done at all.
+		if ( class_exists( 'Aura_Worker_Magic_Link' ) && ! Aura_Worker_Magic_Link::holds_site_claim( $fence ) ) {
+			return false;
+		}
+		$rot       = self::rotate_epoch( $was, $claim, $fence );
 		$new_epoch = (string) ( isset( $rot['epoch'] ) ? $rot['epoch'] : '' );
 		if ( empty( $rot['rotated'] ) || '' === $new_epoch || $new_epoch === $was ) {
 			return false; // the record is untouched; the retry starts over
@@ -1348,12 +1356,50 @@ class Aura_Worker_Door_Log {
 	 * @param string $expected The epoch the caller means to replace.
 	 * @return array{ rotated: bool, epoch: string } `epoch` is the one now in force either way.
 	 */
-	public static function rotate_epoch( $expected ) {
+	public static function rotate_epoch( $expected, $claim = '', $fence = '' ) {
 		global $wpdb;
 		$expected = (string) $expected;
+		$claim    = (string) $claim;
+		$fence    = (string) $fence;
 		if ( '' === $expected ) {
 			return array(
 				'rotated' => false,
+				'epoch'   => self::epoch(),
+			);
+		}
+		// CLAIM-CONDITIONED WHEN A REBIND ASKS (Ruling P83). A connect or unbind
+		// handler that passed `holds_site_claim()` and then stalled until
+		// another handler took the site over could resume here and rotate the
+		// WINNER's epoch — invalidating its in-flight acks and leaving its
+		// record naming a cursor the site has left — before the record's own
+		// claim-joined write finally rejected it. The claim row is joined into
+		// the same statement as the value fence, so there is no window between
+		// asking and acting.
+		//
+		// The grant-gated `/door/rotate` route passes none: it is Aura moving
+		// the cursor it owns, not a rebind, and holds no site claim.
+		if ( '' !== $claim && '' !== $fence ) {
+			$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name = %s AND o.option_value = %s",
+					$claim,
+					$wpdb->esc_like( $fence . '|' ) . '%',
+					self::EPOCH,
+					$expected
+				)
+			);
+			wp_cache_delete( self::EPOCH, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			if ( 1 !== (int) $gone ) {
+				return array(
+					'rotated' => false,
+					'epoch'   => self::epoch(),
+				);
+			}
+			delete_option( self::FULL_MARKER );
+			delete_option( self::FULL_COUNTER );
+			return array(
+				'rotated' => true,
 				'epoch'   => self::epoch(),
 			);
 		}

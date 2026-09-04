@@ -2578,8 +2578,21 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
-			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'$/s", $query, $m ) ) {
-				list( , $claim, $like, $name ) = array_map( 'stripslashes', $m );
+			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'(?: AND o\.option_value = '(.*)')?$/s", $query, $m ) ) {
+				// The optional trailing `AND o.option_value = …` is the log
+				// epoch's claim-conditional fenced DELETE (Ruling P83): the
+				// claim check and the value fence in ONE statement, so a claim
+				// seized between them cannot exist.
+				$cas = isset( $m[4] ) ? stripslashes( $m[4] ) : null;
+				list( , $claim, $like, $name ) = array_map( 'stripslashes', array_slice( $m, 0, 4 ) );
+				// A racer seizing the site in the window between the caller's
+				// own claim check and this statement — the window the JOIN
+				// exists to close (Ruling P83). Fires once, by option name.
+				if ( isset( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) && is_callable( $GLOBALS['_sa_before_fenced_delete'][ $name ] ) ) {
+					$racer = $GLOBALS['_sa_before_fenced_delete'][ $name ];
+					unset( $GLOBALS['_sa_before_fenced_delete'][ $name ] );
+					$racer();
+				}
 				if ( ! empty( $GLOBALS['_sa_option_delete_fail'][ $name ] ) ) {
 					// The statement itself failing — NOT "no row matched".
 					// Kept apart from _sa_option_write_fail so a test can refuse
@@ -2590,8 +2603,12 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! sa_claim_like_matches( $claim, $like ) || null === sa_read_option_uncached( $name ) ) {
 					return 0;
 				}
+				if ( null !== $cas && ( ! isset( $GLOBALS['_rows'][ $name ] ) || (string) $GLOBALS['_rows'][ $name ] !== $cas ) ) {
+					return 0; // the bytes moved under the caller
+				}
 				unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
-				$GLOBALS['_option_writes'][] = array( 'delete', $name );
+				$GLOBALS['_notoptions'][ $name ] = true;
+				$GLOBALS['_option_writes'][]     = array( 'delete', $name );
 				return 1;
 			}
 			// The site token written CONDITIONALLY on the site claim (2.11.0,

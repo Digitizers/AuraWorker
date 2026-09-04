@@ -402,6 +402,38 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/**
+	 * Ruling P83 (F1): the epoch rotation is claim-conditioned too.
+	 *
+	 * The record's compare-and-swap joins the claim row; the epoch rotation
+	 * that now precedes it did not. A connect or unbind handler that passed
+	 * `holds_site_claim()` and then stalled until another handler took the site
+	 * over could resume, rotate the WINNER's epoch — invalidating its in-flight
+	 * acknowledgements and leaving its record naming a cursor the site had left
+	 * — and only then be rejected by the record write.
+	 */
+	public function test_a_stale_rebind_whose_claim_was_seized_never_rotates_the_winners_epoch(): void {
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$epoch = Aura_Worker_Door_Log::epoch_raw();
+		$gen   = Aura_Worker_Door_Log::binding_raw();
+
+		// The winner seizes the site in the window between this handler's own
+		// claim check and its epoch rotation.
+		$GLOBALS['_sa_before_fenced_delete'][ Aura_Worker_Door_Log::EPOCH ] = static function () {
+			$row = 'winner-fence|' . time();
+			$GLOBALS['_options'][ Aura_Worker_Magic_Link::SITE_CLAIM ] = $row;
+			$GLOBALS['_rows'][ Aura_Worker_Magic_Link::SITE_CLAIM ]    = maybe_serialize( $row );
+		};
+
+		$done = Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence );
+
+		$GLOBALS['_sa_before_fenced_delete'] = array();
+		$this->assertFalse( $done );
+		$this->assertSame( $epoch, Aura_Worker_Door_Log::epoch_raw(), "the winner's cursor is untouched" );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'and so is its binding' );
+	}
+
+	/**
 	 * Ruling P81 (F1): the epoch rotates FIRST, and a failure to rotate it
 	 * fails the whole rebind with nothing changed.
 	 *
