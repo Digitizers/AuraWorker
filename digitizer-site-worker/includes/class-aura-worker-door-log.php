@@ -422,7 +422,18 @@ class Aura_Worker_Door_Log {
 		// poll left rows nothing would ever report or reconcile. Minting here
 		// costs one conditional INSERT on the first row of a site's life and
 		// nothing after it.
-		self::epoch();
+		//
+		// AND ITS ANSWER IS A CONDITION OF THE WRITE (Ruling P96). The mint's
+		// result was ignored, so a transient failure to insert or read the
+		// epoch left it empty while the row insert below went on to succeed —
+		// and if Elementor was disabled before anything else minted one,
+		// `present()` saw neither an active module nor its sole persisted
+		// witness. `/status` then omitted the outstanding row for ever and no
+		// reconciler ever swept it. Door state is never stored without the
+		// witness that makes it findable.
+		if ( '' === (string) self::epoch() ) {
+			return new WP_Error( 'aura_log_failed', 'This site could not establish its door log epoch; the call was not run.', array( 'status' => 503 ) );
+		}
 		// WHOSE ENTRY THIS IS, BEFORE ANY NUMBER IS TAKEN (Ruling P72). A row
 		// stamped with an empty binding read as "written before the generation
 		// existed" and was therefore current for ever — so a write admitted

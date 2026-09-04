@@ -205,7 +205,15 @@ class Aura_Worker_Door_Holds {
 		// with Elementor disabled in between — would otherwise be a queue
 		// nothing reports and no reconciler ever sweeps. Before the insert, so
 		// the witness can never lag the state it witnesses.
-		Aura_Worker_Door_Log::epoch();
+		//
+		// AND ITS ANSWER IS A CONDITION OF THE HOLD (Ruling P96). The mint's
+		// result was ignored, so a transient failure left the epoch empty while
+		// this insert went on to succeed — a queued approval that `present()`
+		// could not witness, `/status` never reported, and no reconciler ever
+		// swept. Retryable, and nothing is written.
+		if ( '' === (string) Aura_Worker_Door_Log::epoch() ) {
+			return new WP_Error( 'aura_hold_failed', 'This site could not establish its door log epoch; the call was not held.', array( 'status' => 503, 'retry_after' => 5 ) );
+		}
 		$queued = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $row );
 		self::forget_held();
 		if ( ! $queued ) {

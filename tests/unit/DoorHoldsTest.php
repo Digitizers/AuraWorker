@@ -111,6 +111,44 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertNull( Aura_Worker_Door_Holds::count(), 'and the cap agrees: unknown, not zero' );
 	}
 
+	/**
+	 * Ruling P96 (F2), the hold's half: a queued approval `present()` could not
+	 * witness is not queued at all.
+	 */
+	public function test_a_hold_whose_epoch_cannot_be_minted_stores_nothing(): void {
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ] );
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::EPOCH;
+
+		$out = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$GLOBALS['_sa_insert_unique_fail'] = false;
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		Aura_Worker_Door_Holds::forget_held();
+		$this->assertSame( array(), Aura_Worker_Door_Holds::listing(), 'nothing was queued' );
+		$this->assertSame(
+			array(),
+			array_filter(
+				array_keys( $GLOBALS['_rows'] ),
+				static function ( $k ) {
+					return 0 === strpos( (string) $k, Aura_Worker_Door_Holds::HELD );
+				}
+			),
+			'and no held row exists'
+		);
+	}
+
+	/** …and with the epoch present, both proceed exactly as before. */
+	public function test_a_hold_with_an_epoch_present_is_queued(): void {
+		$this->assertNotSame( '', Aura_Worker_Door_Log::epoch() );
+
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$this->assertIsString( $ref );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ) );
+	}
+
 	/** A sweep with an unreadable read deletes nothing. */
 	public function test_a_sweep_with_an_unreadable_queue_deletes_nothing(): void {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );

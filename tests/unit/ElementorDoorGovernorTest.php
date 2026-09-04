@@ -649,6 +649,31 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( $gen, Aura_Worker_Door_Log::get( 1 )['binding'] );
 	}
 
+	/**
+	 * Ruling P96 (F2): door state is never stored without its epoch witness.
+	 *
+	 * `open_pending()` minted the epoch and ignored the answer, so a transient
+	 * failure left it empty while the row insert went on to succeed. With
+	 * Elementor disabled before anything else minted one, `present()` saw
+	 * neither an active module nor its sole persisted witness — so `/status`
+	 * omitted the outstanding row for ever and no reconciler ever swept it.
+	 */
+	public function test_a_write_whose_epoch_cannot_be_minted_stores_nothing(): void {
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+		unset( $GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ], $GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ] );
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::EPOCH;
+
+		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+
+		$GLOBALS['_sa_insert_unique_fail'] = false;
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_log_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'], 'retryable: nothing ran' );
+		$this->assertArrayNotHasKey( 'elementor/publish-document', $this->ran );
+		$this->assertNull( Aura_Worker_Door_Log::get( 1 ), 'and no row was written' );
+	}
+
 	/** With NO capture — WP-CLI, cron — the stamp is the record as it stands. */
 	public function test_a_write_with_no_captured_binding_stamps_the_current_generation(): void {
 		$this->registerAll();
