@@ -36,16 +36,29 @@ class Aura_Worker_Door_Log {
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
 	/**
-	 * The site-issued, monotonic OBSERVATION WITNESS (Ruling A65, 2.16.2).
-	 * Aura orders overlapping `/status` polls of the same site to decide which
-	 * door observation is newest, and a client-side timestamp cannot prove
-	 * that order — an earlier-started request can still reach the site later
-	 * than one started after it. The site issues the order instead: this
-	 * counter is bumped ATOMICALLY on every serve of the status fragment
-	 * (`bump_observation()`) and read read-only for the audit block
-	 * (`observation_raw()`).
+	 * The site-issued, monotonic DOOR VERSION (Ruling A65, 2.16.2; the wire
+	 * key stays `observation`). Aura orders overlapping `/status` polls of
+	 * the same site to decide which door observation is newest, and a
+	 * client-side timestamp cannot prove that order — an earlier-started
+	 * request can still reach the site later than one started after it.
 	 *
-	 * NEVER reset by rotation, rebind or unbind — it orders observations
+	 * A VERSION, not a serve counter (Ruling S6, Codex round-3 P1 on #88).
+	 * Bumping on every SERVE let two overlapping requests interleave AROUND
+	 * it: request A finishes reading state and pauses right before it takes
+	 * its witness; a door mutation lands; request B builds and serves the
+	 * NEW state under witness N; A resumes, takes N+1, and serves its OLDER
+	 * snapshot under the higher number — Aura would treat A's stale read as
+	 * newer than B's. So this counter is bumped by every door-state
+	 * MUTATION instead (`bump_door_version()`, called from the choke points
+	 * documented on `insert_unique()` and `write_option_where()`, from
+	 * `ack()`, from `rotate_epoch()`, from `rotate_binding()`, and from
+	 * `Aura_Worker_Door_Holds::forget_held()`), and `status_fragment()`
+	 * only READS it (`door_version_raw()`) — once before building the
+	 * fragment and once after; the two must agree for the version to be
+	 * reported at all. See `status_fragment()`'s own docblock for that
+	 * read protocol.
+	 *
+	 * NEVER reset by rotation, rebind or unbind — it orders mutations
 	 * across all of them, which a counter scoped to one binding generation
 	 * could not do.
 	 */
@@ -60,6 +73,27 @@ class Aura_Worker_Door_Log {
 	const TERMINAL = array( 'ok', 'refused', 'failed', 'interrupted', 'discarded', 'held' );
 
 	/**
+	 * Names `insert_unique()` mints that carry no reported door state — pure
+	 * internal bookkeeping, never read back into `status_fragment()` or
+	 * `governor_block()` (Ruling S6). Excluded from the door-version bump
+	 * below, or every ack() and every hold acquire/release would advance a
+	 * version number that exists to let a POLLER detect a change it could
+	 * actually SEE.
+	 *
+	 * - `self::FLOOR`: the ack floor's own first INSERT is a bookkeeping
+	 *   seed (value 0, meaning "nothing acked yet") — identical, as far as
+	 *   any reader is concerned, to the floor being absent. The floor's
+	 *   later RAISES go through a different statement in `ack()`, which
+	 *   bumps for itself.
+	 * - `'aura_worker_door_hold_lock'` (mirrors
+	 *   `Aura_Worker_Door_Holds::LOCK`, named as a literal rather than a
+	 *   cross-class constant reference): a mutex acquisition, not door state
+	 *   — the hold or claim it protects bumps once IT lands, through
+	 *   `Aura_Worker_Door_Holds::forget_held()`.
+	 */
+	const VERSION_EXEMPT_INSERTS = array( self::FLOOR, 'aura_worker_door_hold_lock' );
+
+	/**
 	 * Creates an option row only when none exists — a real mutex, unlike
 	 * add_option(), whose INSERT … ON DUPLICATE KEY UPDATE lets a racer that
 	 * passed the cached existence check overwrite and still return true.
@@ -67,6 +101,15 @@ class Aura_Worker_Door_Log {
 	 * (class-aura-worker-magic-link.php), and every door-side "INSERT" goes
 	 * through this one primitive so seq allocation, the epoch and the
 	 * closure marker cannot lose a race to a silent overwrite.
+	 *
+	 * A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1 on
+	 * #88): a NEW row is door state that did not exist a moment ago — a log
+	 * row (`open_pending()`), a held or claimed row (`Aura_Worker_Door_Holds`'
+	 * `hold()`/`claim()`/`unclaim()`), the epoch, the closure marker, a
+	 * binding record's first mint — so every successful insert bumps
+	 * `bump_door_version()`, except the two names in
+	 * `VERSION_EXEMPT_INSERTS` above. Bumping here, ONCE, covers every one
+	 * of those callers without instrumenting each of them separately.
 	 *
 	 * @param string $name  Option name.
 	 * @param mixed  $value Value; serialized like an option.
@@ -92,7 +135,11 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( $name, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		wp_cache_delete( 'alloptions', 'options' );
-		return ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+		$won = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
+		if ( $won && ! in_array( $name, self::VERSION_EXEMPT_INSERTS, true ) ) {
+			self::bump_door_version();
+		}
+		return $won;
 	}
 
 	/**
@@ -1083,6 +1130,17 @@ class Aura_Worker_Door_Log {
 		// The epoch has already moved, so a failed record write leaves the site
 		// on a fresh cursor with the OLD binding — visible to the retry as an
 		// epoch the record does not name, and repaired by it.
+		if ( $done ) {
+			// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1
+			// on #88) — "the binding rotation" the ruling names explicitly.
+			// The internal rotate_epoch() call above already bumped once,
+			// which bounds the window a reader could see the new epoch
+			// paired with the OLD binding record; this second bump, on the
+			// binding record's own write landing, is what makes the version
+			// current with the record itself. Both are harmless, monotonic
+			// redundancy — never a correctness issue.
+			self::bump_door_version();
+		}
 		return $done;
 	}
 
@@ -1200,6 +1258,17 @@ class Aura_Worker_Door_Log {
 	 * `UPDATE … SET option_value = %s WHERE option_name = %s AND option_value = %s`.
 	 * Public: the holds store and the governor use the same primitive.
 	 *
+	 * THE OTHER CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1
+	 * on #88): every row this touches is an EXISTING piece of door state
+	 * changing shape — `admit()`/`settle()`/`annotate()`/`patch_pending()`
+	 * on a log row, and `Aura_Worker_Door_Holds`'
+	 * `refresh_rule()`/`refresh_touches()`/`stamp_terminal_seq()` on a held
+	 * or claimed one — so a successful write bumps
+	 * `bump_door_version()` unconditionally. (Some of those Holds callers
+	 * also go on to call `forget_held()`, which bumps again — a harmless,
+	 * monotonic redundancy, not a correctness issue: the version exists to
+	 * be strictly greater after a mutation, never to count them exactly.)
+	 *
 	 * @param string $option Option name.
 	 * @param array  $after  New value.
 	 * @param array  $before The value the caller read (the predicate).
@@ -1218,7 +1287,11 @@ class Aura_Worker_Door_Log {
 		);
 		wp_cache_delete( $option, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
-		return 1 === (int) $n && '' === (string) $wpdb->last_error;
+		$won = 1 === (int) $n && '' === (string) $wpdb->last_error;
+		if ( $won ) {
+			self::bump_door_version();
+		}
+		return $won;
 	}
 
 	/**
@@ -1380,10 +1453,14 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * Bump the observation witness ATOMICALLY and hand back the value THIS
-	 * call produced (Ruling A65) — the same upsert shape `bump_refused()`
-	 * uses, so two overlapping serves cannot both land on the same number and
-	 * neither can silently lose the other's increment.
+	 * Bump the per-site DOOR VERSION atomically and hand back the value THIS
+	 * call produced — a counter Aura orders overlapping `/status` polls by
+	 * (Ruling A65), and since Ruling S6 (Codex round-3 P1 on #88) a WRITE
+	 * primitive rather than a per-serve one: see `insert_unique()` and
+	 * `write_option_where()`'s docblocks for the choke points that call this,
+	 * and `status_fragment()`'s for how it is READ. The same upsert shape
+	 * `bump_refused()` uses, so two overlapping mutations cannot both land on
+	 * the same number and neither can silently lose the other's increment.
 	 *
 	 * THE INCREMENT-PLUS-READ MUST BE ONE ATOMIC OPERATION TOO (Ruling S2,
 	 * Codex round-1 P1 on #88). A separate `raw_option_read()` after the
@@ -1441,7 +1518,7 @@ class Aura_Worker_Door_Log {
 	 *
 	 * @return int|null
 	 */
-	public static function bump_observation() {
+	public static function bump_door_version() {
 		global $wpdb;
 		$wpdb->last_error = '';
 		// Microsecond wall-clock, as a 64-bit int: PHP ints are 64-bit on
@@ -1479,18 +1556,18 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * The observation witness as the DATABASE holds it, READ-ONLY (Ruling
-	 * A65) — for `governor_block()`, which is an on-demand AUDIT, never a
-	 * poll: reporting it must not itself advance the very counter Aura uses
-	 * to order polls.
+	 * The door version as the DATABASE holds it, READ-ONLY (Ruling A65) —
+	 * for `governor_block()`'s on-demand AUDIT read and for
+	 * `status_fragment()`'s own before/after check (Ruling S6): neither may
+	 * itself advance the very counter Aura uses to order polls.
 	 *
 	 * PROVEN, never minted: an absent or unreadable row answers null, not
 	 * zero, which a caller could not tell apart from "this site has never
-	 * served a status fragment".
+	 * had a door mutation".
 	 *
 	 * @return int|null
 	 */
-	public static function observation_raw() {
+	public static function door_version_raw() {
 		$read = self::raw_option_read( self::OBSERVATION );
 		if ( ! $read['ok'] ) {
 			return null;
@@ -1638,10 +1715,21 @@ class Aura_Worker_Door_Log {
 		// unreadable one used to cast to 0 and delete the marker over a
 		// backlog that was still full — the door open again with nothing
 		// having been acked.
-		$unacked = self::count_unacked();
+		$unacked  = self::count_unacked();
+		$reopened = false;
 		if ( self::is_closed() && null !== $unacked && $unacked < self::MAX_UNACKED ) {
 			delete_option( self::FULL_MARKER );
 			delete_option( self::FULL_COUNTER );
+			$reopened = true;
+		}
+		// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3 P1 on
+		// #88): `ack()` mutates through hand-rolled SQL, not through
+		// `write_option_where()`/`insert_unique()`, so it bumps for itself —
+		// but ONLY when something actually changed (the floor rose, rows
+		// were purged, or the log reopened), never on the ordinary
+		// idempotent repeat that falls through to here with all three false.
+		if ( $raised >= 1 || $acked > 0 || $reopened ) {
+			self::bump_door_version();
 		}
 		return array( 'acked' => $acked, 'floor' => $floor );
 	}
@@ -1754,6 +1842,11 @@ class Aura_Worker_Door_Log {
 			}
 			delete_option( self::FULL_MARKER );
 			delete_option( self::FULL_COUNTER );
+			// A CHOKE POINT FOR THE DOOR VERSION (Ruling S6, Codex round-3
+			// P1 on #88): the epoch — reported in the fragment — actually
+			// rotated, through hand-rolled SQL neither `write_option_where()`
+			// nor `insert_unique()` touches.
+			self::bump_door_version();
 			return array(
 				'rotated' => true,
 				'epoch'   => self::epoch(),
@@ -1770,6 +1863,7 @@ class Aura_Worker_Door_Log {
 		}
 		delete_option( self::FULL_MARKER );
 		delete_option( self::FULL_COUNTER );
+		self::bump_door_version(); // see the choke-point note on the claim-conditioned branch above
 		return array(
 			'rotated' => true,
 			'epoch'   => self::epoch(),

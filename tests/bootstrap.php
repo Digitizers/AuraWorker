@@ -1899,7 +1899,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * ONLY by a statement that runs THROUGH THIS INSTANCE — a racer that
 		 * writes the row directly (bypassing $wpdb->query()) must never touch
 		 * it, exactly as a second real MySQL connection's own session cannot
-		 * see into this one's. This is what lets `bump_observation()`'s
+		 * see into this one's. This is what lets `bump_door_version()`'s
 		 * upsert-then-`SELECT LAST_INSERT_ID()` answer THIS call's own
 		 * assigned value even when another connection increments the same row
 		 * in between.
@@ -2227,7 +2227,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return '1';
 			}
-			// Aura_Worker_Door_Log::bump_observation()'s connection-scoped
+			// Aura_Worker_Door_Log::bump_door_version()'s connection-scoped
 			// read-back (Ruling S2, 2.16.2): the value the LAST statement
 			// issued THROUGH THIS INSTANCE assigned via LAST_INSERT_ID(expr)
 			// — never a re-read of the shared row, which is exactly the race
@@ -3083,10 +3083,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
 				return 1;
 			}
-			// Aura_Worker_Door_Log::bump_observation()'s upsert (Rulings S2
-			// and S4, 2.16.2): the SAME atomic create-or-increment as above,
-			// but CLOCK-FLOORED — GREATEST( current + 1, the caller's own
-			// wall-clock microseconds, captured twice as %d because it is
+			// Aura_Worker_Door_Log::bump_door_version()'s upsert (Rulings S2,
+			// S4 and S6, 2.16.2): the SAME atomic create-or-increment as
+			// above, but CLOCK-FLOORED — GREATEST( current + 1, the caller's
+			// own wall-clock microseconds, captured twice as %d because it is
 			// bound into both the VALUES and the UPDATE clause of the SAME
 			// statement — so a `wp_options` restore that rolls the stored
 			// value back can never make this counter reissue a value it
@@ -3131,9 +3131,9 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				// bump here, typically on a SECOND SA_Test_Wpdb instance (a
 				// second connection), to prove this instance's own
 				// LAST_INSERT_ID() is immune to it. Fires once.
-				if ( isset( $GLOBALS['_sa_after_observation_bump'] ) && is_callable( $GLOBALS['_sa_after_observation_bump'] ) ) {
-					$racer = $GLOBALS['_sa_after_observation_bump'];
-					unset( $GLOBALS['_sa_after_observation_bump'] );
+				if ( isset( $GLOBALS['_sa_after_door_version_bump'] ) && is_callable( $GLOBALS['_sa_after_door_version_bump'] ) ) {
+					$racer = $GLOBALS['_sa_after_door_version_bump'];
+					unset( $GLOBALS['_sa_after_door_version_bump'] );
 					$racer();
 				}
 				return 1;
@@ -3199,7 +3199,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
-	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_observation()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
+	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
@@ -4464,7 +4464,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
-	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_observation()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
+	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).

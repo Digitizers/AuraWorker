@@ -1174,31 +1174,51 @@ final class ElementorDoorGovernorTest extends TestCase {
 	}
 
 	/**
-	 * `observation` (Ruling A65, 2.16.2): the site-issued, monotonic witness
-	 * Aura orders overlapping `/status` polls by. Each SERVE of the fragment
-	 * bumps it ATOMICALLY — CLOCK-FLOORED (Ruling S4), so it is guaranteed
-	 * only to strictly increase, never a fixed `+1` delta — never a
-	 * client-side timestamp, which an earlier-started request could still
-	 * deliver out of order.
+	 * `observation` (Ruling A65, 2.16.2) is a per-site DOOR VERSION (Ruling
+	 * S6, Codex round-3 P1 on #88), never a serve counter: two polls with NO
+	 * mutation between them describe the SAME state, and correctly report
+	 * the SAME observation — Aura's strictly-greater comparison treats equal
+	 * as "not newer", which is exactly right here.
 	 */
-	public function test_status_fragment_observation_strictly_increases_per_serve(): void {
+	public function test_two_serves_with_no_mutation_between_them_answer_the_same_observation(): void {
 		$this->registerAll();
 		$first  = Aura_Worker_Elementor_Door::status_fragment()['observation'];
 		$second = Aura_Worker_Elementor_Door::status_fragment()['observation'];
 		$this->assertIsInt( $first );
-		$this->assertGreaterThan( $first, $second, "the site's own witness, not a client-side timestamp" );
+		$this->assertSame( $first, $second, 'nothing mutated between the two polls, so nothing ordered them apart' );
+	}
+
+	/** A door-state mutation between two polls is what raises the version — never merely being served (Ruling S6). */
+	public function test_a_mutation_between_serves_raises_the_observation(): void {
+		$this->registerAll();
+		$before = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+
+		// Any door-state mutation will do; a hold is the simplest one this
+		// suite already exercises elsewhere (DoorHoldsTest's own $call()).
+		Aura_Worker_Door_Holds::hold( array(
+			'ability' => 'elementor/publish-document',
+			'input'   => array( 'post_id' => 9 ),
+			'touches' => array( array( 'type' => 'page', 'id' => '9' ) ),
+			'actor'   => array( 'user_id' => 3, 'login' => 'bot', 'app_password_name' => 'Elementor MCP (Claude)', 'app_password_uuid' => 'u', 'via' => 'mcp' ),
+			'verdict' => 'none',
+			'rule'    => null,
+		) );
+
+		$after = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$this->assertGreaterThan( $before, $after, 'a real mutation lands between the two polls, so the second must be reported strictly newer' );
 	}
 
 	/**
-	 * `governor_block()` is an on-demand AUDIT, never a poll — reading it must
-	 * not itself advance the counter `/status` orders polls by.
+	 * `governor_block()` is an on-demand AUDIT, never a poll — reading it
+	 * must not itself advance the version, and neither does an ordinary
+	 * `status_fragment()` poll with nothing mutating in between (Ruling S6).
 	 */
 	public function test_governor_block_reports_the_current_observation_without_bumping_it(): void {
 		$this->registerAll();
 		$served = Aura_Worker_Elementor_Door::status_fragment()['observation'];
 		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'] );
 		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'], 'a second audit read changes nothing' );
-		$this->assertGreaterThan( $served, Aura_Worker_Elementor_Door::status_fragment()['observation'], 'only a SERVE advances it' );
+		$this->assertSame( $served, Aura_Worker_Elementor_Door::status_fragment()['observation'], 'nor does a second POLL, with nothing having mutated' );
 	}
 
 	/**
@@ -1220,52 +1240,58 @@ final class ElementorDoorGovernorTest extends TestCase {
 	}
 
 	/**
-	 * Ruling S3 (Codex round-1 P2 on #88): the witness must be issued LAST,
-	 * after door_state(), the hold listing, the log's top and its backlog
-	 * count have all already been read — never allocated up front and left
-	 * describing a fragment whose state is assembled around it. Proven from
-	 * the request's own statement log: the witness's two statements (its
-	 * upsert, then its connection-scoped `SELECT LAST_INSERT_ID()` — Ruling
-	 * S2) are the LAST entries, never interleaved with or preceding any
-	 * other state read.
+	 * Ruling S6 (Codex round-3 P1 on #88): the version is READ before and
+	 * after building the fragment, never allocated by `status_fragment()`
+	 * itself. A mutation landing between the two reads (a torn read) is
+	 * caught by comparing them, and the fragment is rebuilt ONCE from a
+	 * fresh pair. Modelled via the generic per-read seam
+	 * (`$GLOBALS['_sa_after_option_read']`, which every uncached option read
+	 * in this stub already runs through) filtered to the ONE option this
+	 * class's own version lives under, firing exactly once so only the
+	 * FIRST ("before") read of the first attempt triggers the mutation.
 	 */
-	public function test_status_fragment_issues_the_witness_only_after_every_state_read(): void {
+	public function test_a_mutation_during_construction_yields_a_rebuilt_fragment_with_the_new_version(): void {
 		$this->registerAll();
-
-		$GLOBALS['_db_queries'] = array();
-		$frag                   = Aura_Worker_Elementor_Door::status_fragment();
-
-		$log = $GLOBALS['_db_queries'];
-		$this->assertGreaterThan( 2, count( $log ), 'other state reads must have happened for the ordering to prove anything' );
-		$this->assertSame( 'SELECT LAST_INSERT_ID()', trim( (string) end( $log ) ), "the witness's own connection-scoped read-back is the LAST statement issued" );
-		$this->assertStringContainsString(
-			Aura_Worker_Door_Log::OBSERVATION,
-			(string) $log[ count( $log ) - 2 ],
-			"immediately preceded by its own upsert, never separated from it by (or preceding) another state read"
-		);
-		$this->assertIsInt( $frag['observation'] );
-	}
-
-	/**
-	 * The other half of Ruling S3: because the witness is allocated LAST, a
-	 * door change landing at the EARLIEST possible moment it could — inside
-	 * the witness's own bump — can never retroactively appear in fields this
-	 * SAME response already captured. Pre-fix (the witness allocated up
-	 * front, beside `binding`), this exact seam would have left `door`
-	 * reporting a state a door change had already invalidated by the time
-	 * the rest of the fragment was built.
-	 */
-	public function test_status_fragment_state_fields_are_fixed_before_the_witness_is_ever_allocated(): void {
-		$this->registerAll();
-		$this->assertSame( 'open', Aura_Worker_Elementor_Door::status_fragment()['door'], 'primed: the door reports open before anything closes it' );
-
-		$GLOBALS['_sa_after_observation_bump'] = static function () {
-			Aura_Worker_Door_Log::close(); // the earliest a door change could land relative to the witness
+		$fired = false;
+		$GLOBALS['_sa_after_option_read'] = static function ( $name ) use ( &$fired ) {
+			if ( $fired || Aura_Worker_Door_Log::OBSERVATION !== $name ) {
+				return;
+			}
+			$fired = true;
+			unset( $GLOBALS['_sa_after_option_read'] ); // fires once
+			Aura_Worker_Door_Log::bump_door_version(); // a real mutation, landing exactly between the "before" and "after" reads
 		};
 
 		$frag = Aura_Worker_Elementor_Door::status_fragment();
 
-		$this->assertSame( 'open', $frag['door'], 'this response\'s state was already fixed — and therefore already read — before the witness, and so before the mutation, was ever issued' );
-		$this->assertIsInt( $frag['observation'], 'the witness itself still landed' );
+		$GLOBALS['_sa_after_option_read'] = null;
+		$this->assertTrue( $fired, 'the seam must actually have fired for this test to prove anything' );
+		$this->assertIsInt( $frag['observation'], 'the rebuild found an agreeing pair of reads' );
+		$this->assertSame(
+			Aura_Worker_Door_Log::door_version_raw(),
+			$frag['observation'],
+			'the rebuilt fragment carries the version AFTER the mutation, never the torn one from the first attempt'
+		);
+	}
+
+	/**
+	 * Still torn after the one rebuild (Ruling S6): this site's door is
+	 * mutating faster than one request can read it consistently, and the
+	 * honest answer is `null` — unordered this poll — never a guess from
+	 * either attempt.
+	 */
+	public function test_a_mutation_on_every_read_yields_observation_null(): void {
+		$this->registerAll();
+		$GLOBALS['_sa_after_option_read'] = static function ( $name ) {
+			if ( Aura_Worker_Door_Log::OBSERVATION !== $name ) {
+				return;
+			}
+			Aura_Worker_Door_Log::bump_door_version(); // never stops: every read of the version sees a fresh mutation
+		};
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_after_option_read'] = null;
+		$this->assertNull( $frag['observation'], 'torn on the retry too: unordered this poll, never a guess' );
 	}
 }

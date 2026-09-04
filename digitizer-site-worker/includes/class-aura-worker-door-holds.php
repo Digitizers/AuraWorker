@@ -1330,11 +1330,23 @@ class Aura_Worker_Door_Holds {
 	 * Drop the memo — called by every held write in this process, so a reader
 	 * after a write never sees the queue as it was before it.
 	 *
+	 * THE CHOKE POINT FOR THE DOOR VERSION ON THIS CLASS'S SIDE (Ruling S6,
+	 * Codex round-3 P1 on #88): every held or claimed row this process
+	 * writes — `hold()`, `claim()`, `unclaim()`, `release()`, `reject()`,
+	 * `refresh_rule()`, `refresh_touches()`, `stamp_terminal_seq()`, and the
+	 * reconciler's sweep — already calls this uniformly, by the same
+	 * convention this docblock has always described, including the raw
+	 * `delete_option()`/`DELETE` statements `write_option_where()` and
+	 * `insert_unique()` never see. Bumping HERE, once, covers all of them
+	 * without instrumenting each caller — the "fenced deletes" `write_option_where()`'s
+	 * own choke point does not reach.
+	 *
 	 * @return void
 	 */
 	public static function forget_held() {
 		self::$held_rows = null;
 		self::$held_read = false;
+		Aura_Worker_Door_Log::bump_door_version();
 	}
 
 	private static function rows( $prefix ) {

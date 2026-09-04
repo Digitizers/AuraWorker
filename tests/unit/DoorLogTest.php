@@ -563,10 +563,10 @@ final class DoorLogTest extends TestCase {
 	 * an exact `+1` here would be asserting a coincidence of timing, not the
 	 * guarantee the counter actually makes.
 	 */
-	public function test_bump_observation_strictly_increases_and_is_an_int(): void {
-		$a = Aura_Worker_Door_Log::bump_observation();
-		$b = Aura_Worker_Door_Log::bump_observation();
-		$c = Aura_Worker_Door_Log::bump_observation();
+	public function test_bump_door_version_strictly_increases_and_is_an_int(): void {
+		$a = Aura_Worker_Door_Log::bump_door_version();
+		$b = Aura_Worker_Door_Log::bump_door_version();
+		$c = Aura_Worker_Door_Log::bump_door_version();
 		$this->assertIsInt( $a );
 		$this->assertGreaterThanOrEqual( $a + 1, $b );
 		$this->assertGreaterThanOrEqual( $b + 1, $c );
@@ -574,8 +574,8 @@ final class DoorLogTest extends TestCase {
 
 	/** Two serves within one request strictly increase — never the same number twice. */
 	public function test_two_bumps_in_one_request_never_answer_the_same_value(): void {
-		$first  = Aura_Worker_Door_Log::bump_observation();
-		$second = Aura_Worker_Door_Log::bump_observation();
+		$first  = Aura_Worker_Door_Log::bump_door_version();
+		$second = Aura_Worker_Door_Log::bump_door_version();
 		$this->assertGreaterThan( $first, $second );
 	}
 
@@ -591,7 +591,7 @@ final class DoorLogTest extends TestCase {
 	public function test_a_restore_never_reissues_a_value_already_served_before_it(): void {
 		$before_restore = 0;
 		for ( $i = 0; $i < 3; $i++ ) {
-			$before_restore = Aura_Worker_Door_Log::bump_observation();
+			$before_restore = Aura_Worker_Door_Log::bump_door_version();
 		}
 
 		// The database is restored from a backup taken before any of the
@@ -600,7 +600,7 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_rows'][ Aura_Worker_Door_Log::OBSERVATION ]    = '100';
 		$GLOBALS['_options'][ Aura_Worker_Door_Log::OBSERVATION ] = '100';
 
-		$after_restore = Aura_Worker_Door_Log::bump_observation();
+		$after_restore = Aura_Worker_Door_Log::bump_door_version();
 
 		$this->assertGreaterThan(
 			$before_restore,
@@ -616,7 +616,7 @@ final class DoorLogTest extends TestCase {
 	 * reissue is never handed out even once.
 	 */
 	public function test_the_first_ever_bump_on_a_fresh_site_answers_the_clock_derived_value_not_one(): void {
-		$first = Aura_Worker_Door_Log::bump_observation();
+		$first = Aura_Worker_Door_Log::bump_door_version();
 		$this->assertGreaterThanOrEqual( 1000000000000000, $first, 'microsecond wall-clock time today is well past 10^15' );
 	}
 
@@ -638,14 +638,14 @@ final class DoorLogTest extends TestCase {
 	 */
 	public function test_two_interleaved_bumps_on_different_connections_never_answer_the_same_value(): void {
 		$other = null;
-		$GLOBALS['_sa_after_observation_bump'] = static function () use ( &$other ) {
+		$GLOBALS['_sa_after_door_version_bump'] = static function () use ( &$other ) {
 			$mine            = $GLOBALS['wpdb'];
 			$GLOBALS['wpdb'] = new SA_Test_Wpdb(); // a second, independent connection
-			$other           = Aura_Worker_Door_Log::bump_observation();
+			$other           = Aura_Worker_Door_Log::bump_door_version();
 			$GLOBALS['wpdb'] = $mine; // restored before THIS request's own next statement
 		};
 
-		$mine = Aura_Worker_Door_Log::bump_observation();
+		$mine = Aura_Worker_Door_Log::bump_door_version();
 
 		$this->assertIsInt( $mine );
 		$this->assertIsInt( $other );
@@ -658,9 +658,9 @@ final class DoorLogTest extends TestCase {
 	 * null — "no witness this serve" — never a stale or guessed number, even
 	 * though the underlying upsert may well have landed.
 	 */
-	public function test_bump_observation_answers_null_when_the_read_back_cannot_be_proven(): void {
+	public function test_bump_door_version_answers_null_when_the_read_back_cannot_be_proven(): void {
 		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
-		$out                       = Aura_Worker_Door_Log::bump_observation();
+		$out                       = Aura_Worker_Door_Log::bump_door_version();
 		$GLOBALS['_sa_wpdb_error'] = '';
 		$this->assertNull( $out );
 	}
@@ -673,27 +673,36 @@ final class DoorLogTest extends TestCase {
 	 * answers `0`. `0` is numeric and would otherwise pass as a witness this
 	 * connection never actually produced; it must answer null instead.
 	 */
-	public function test_bump_observation_answers_null_when_the_read_back_is_a_reconnected_zero(): void {
+	public function test_bump_door_version_answers_null_when_the_read_back_is_a_reconnected_zero(): void {
 		$GLOBALS['_sa_last_insert_id_reconnect'] = true;
-		$out                                     = Aura_Worker_Door_Log::bump_observation();
+		$out                                     = Aura_Worker_Door_Log::bump_door_version();
 		$GLOBALS['_sa_last_insert_id_reconnect'] = false;
 		$this->assertNull( $out, 'a fresh-session LAST_INSERT_ID() of 0 is not this connection\'s own witness' );
 	}
 
-	/** `observation_raw()` is READ-ONLY: it reports the current value and never advances it. */
-	public function test_observation_raw_reports_without_bumping(): void {
-		$this->assertNull( Aura_Worker_Door_Log::observation_raw(), 'no witness has ever served this site' );
-		$bumped = Aura_Worker_Door_Log::bump_observation();
-		$this->assertSame( $bumped, Aura_Worker_Door_Log::observation_raw() );
-		$this->assertSame( $bumped, Aura_Worker_Door_Log::observation_raw(), 'a second read changes nothing' );
+	/** `door_version_raw()` is READ-ONLY: it reports the current value and never advances it. */
+	public function test_door_version_raw_reports_without_bumping(): void {
+		$this->assertNull( Aura_Worker_Door_Log::door_version_raw(), 'no witness has ever served this site' );
+		$bumped = Aura_Worker_Door_Log::bump_door_version();
+		$this->assertSame( $bumped, Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertSame( $bumped, Aura_Worker_Door_Log::door_version_raw(), 'a second read changes nothing' );
 	}
 
-	/** The counter is NEVER reset by rotation, rebind or unbind (Ruling A65) — it orders observations across all of them. */
+	/**
+	 * The counter is NEVER reset by rotation, rebind or unbind (Ruling A65)
+	 * — it orders mutations across all of them. Since Ruling S6 (Codex
+	 * round-3 P1 on #88), `rotate_epoch()` is ITSELF a choke point and bumps
+	 * on its own successful rotation — a rewind recovery is real door state
+	 * changing, so the version after it is strictly GREATER than whatever it
+	 * was before, never merely equal and never reset to null or zero.
+	 */
 	public function test_observation_survives_an_epoch_rotation(): void {
 		$before = Aura_Worker_Door_Log::epoch();
-		$seq    = Aura_Worker_Door_Log::bump_observation();
+		$seq    = Aura_Worker_Door_Log::bump_door_version();
 		Aura_Worker_Door_Log::rotate_epoch( $before );
-		$this->assertSame( $seq, Aura_Worker_Door_Log::observation_raw(), 'a rewind recovery must not zero the witness' );
-		$this->assertGreaterThan( $seq, Aura_Worker_Door_Log::bump_observation(), 'and the next bump continues past it' );
+		$after_rotation = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertGreaterThan( $seq, $after_rotation, 'the rotation is itself a mutation, and it bumps for itself' );
+		$this->assertGreaterThan( $after_rotation, Aura_Worker_Door_Log::bump_door_version(), 'and the next bump continues past it' );
 	}
+
 }

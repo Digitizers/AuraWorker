@@ -253,7 +253,7 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 == Changelog ==
 
 = 2.16.2 =
-* `/status`'s door fragment carries `observation`, a per-site counter incremented atomically on every serve, so Aura can order overlapping polls by the site's own witness instead of request timestamps; `elementor.governor` reports the current value.
+* `/status`'s door fragment carries `observation`, a per-site door-version witness bumped atomically by every door-state mutation (never by a mere poll) and clock-floored so a restored backup can never reissue a value it already served, so Aura can order overlapping polls by the site's own witness instead of request timestamps; `elementor.governor` reports the current value.
 
 = 2.16.1 =
 * `/status` door fragment and `audit_mcp_exposure`'s `elementor.governor` carry `binding`, the site's current binding generation, so Aura can label a departed client's door-log entries without inferring the generation from the rows.

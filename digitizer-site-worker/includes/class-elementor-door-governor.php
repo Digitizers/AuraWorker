@@ -380,6 +380,31 @@ class Aura_Worker_Elementor_Door {
 	 * grant anywhere. Rotation is Aura's decision, taken on `rewind.detected`
 	 * through the grant-gated `POST /aura/v1/door/rotate`.
 	 *
+	 * `observation` IS READ HERE, NEVER ALLOCATED (Ruling S6, Codex round-3
+	 * P1 on #88; see `Aura_Worker_Door_Log::bump_door_version()`'s docblock
+	 * for who allocates it — every door-state MUTATION does, not this read).
+	 * Issuing the witness up front (Ruling A65) — or even last, once the rest
+	 * of the fragment was already built (Ruling S3) — still let two
+	 * overlapping requests interleave AROUND a state read that takes more
+	 * than one statement: request A finishes reading state and pauses right
+	 * before taking its own witness; a door mutation lands and request B
+	 * builds and serves the NEW state under a HIGHER version; A resumes,
+	 * reads a version below B's, and serves an OLDER snapshot Aura's
+	 * strictly-greater comparison would still treat as unordered relative to
+	 * B's, or worse, as never having been superseded.
+	 *
+	 * So this method reads the version, builds the fragment, and reads the
+	 * version again. Equal ⇒ nothing mutated between the two reads, so the
+	 * fragment truly describes that version (two polls with no mutation
+	 * between them legitimately report the SAME observation — identical
+	 * state, which Aura's strictly-greater CAS correctly treats as "not
+	 * newer"). Different ⇒ a mutation landed mid-build — a TORN READ — and
+	 * the fragment is rebuilt once, from a fresh pair of reads. Still
+	 * different a second time ⇒ this site's door is mutating faster than one
+	 * request can read it consistently, and `observation: null` is the
+	 * honest answer — unordered this poll, exactly like every other field
+	 * here that cannot be proven.
+	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
 	 * @return array|null { active, epoch, binding, observation, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
@@ -388,6 +413,32 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return null;
 		}
+		for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+			$before_version = Aura_Worker_Door_Log::door_version_raw();
+			$fragment       = self::build_status_fragment_state( (int) $after, $epoch );
+			$after_version  = Aura_Worker_Door_Log::door_version_raw();
+			if ( $before_version === $after_version ) {
+				$fragment['observation'] = $before_version;
+				return $fragment;
+			}
+		}
+		$fragment['observation'] = null; // torn twice: unordered this poll
+		return $fragment;
+	}
+
+	/**
+	 * Every state read `status_fragment()` reports, EXCEPT `observation` —
+	 * split out so that method can run it TWICE, bracketed by the version
+	 * reads that decide whether either run is trustworthy (Ruling S6, see
+	 * `status_fragment()`'s own docblock for the read protocol and every
+	 * other semantic — absence, the cursor/epoch rule, rewind detection —
+	 * which is unchanged from before that ruling and not repeated here).
+	 *
+	 * @param int    $after Already normalised to (int) by the caller.
+	 * @param string $epoch The epoch that cursor belongs to.
+	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
+	 */
+	private static function build_status_fragment_state( $after, $epoch ) {
 		$after   = (int) $after;
 		$site    = Aura_Worker_Door_Log::epoch();
 		$binding = Aura_Worker_Door_Log::binding_raw();
@@ -436,7 +487,7 @@ class Aura_Worker_Elementor_Door {
 				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
 			);
 		}
-		$fragment = array(
+		return array(
 			// Is Elementor STILL here? A fragment with `active: false` is a
 			// door reported from its own persisted state (Ruling P28).
 			'active'      => self::active(),
@@ -473,20 +524,6 @@ class Aura_Worker_Elementor_Door {
 			'log_unacked' => Aura_Worker_Door_Log::count_unacked(),
 			'log_full'    => Aura_Worker_Door_Log::full_report(),
 		);
-		// THE WITNESS IS ISSUED LAST, AFTER EVERY OTHER STATE READ (Ruling S3,
-		// Codex round-1 P2 on #88). Allocating it up front — beside `binding`,
-		// before `door_state()`, the hold listing and the log were read — let
-		// two overlapping requests interleave AROUND it: request A takes
-		// observation 1 and then pauses; request B takes observation 2 and
-		// finishes first; a door change lands; A resumes, reads the NEWER
-		// state, and reports it under the OLDER witness. Aura would then see
-		// observation 1 carrying state that only existed after observation 2.
-		// Bumping here instead — as the very last statement before `return`,
-		// once the whole fragment above has already been read — means
-		// overlapping responses are ordered by when their OWN state finished
-		// being read, never by a midpoint inside that read.
-		$fragment['observation'] = Aura_Worker_Door_Log::bump_observation();
-		return $fragment;
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -3164,7 +3201,7 @@ class Aura_Worker_Elementor_Door {
 			// READ-ONLY (Ruling A65): this is an on-demand AUDIT, never a
 			// poll, and must not itself advance the counter Aura orders
 			// `/status` polls by. Null when the row cannot be proven read.
-			'observation'         => Aura_Worker_Door_Log::observation_raw(),
+			'observation'         => Aura_Worker_Door_Log::door_version_raw(),
 			'seam'                => self::$seam,
 			'door'                => self::door_state(),
 			'held_count'          => $held,

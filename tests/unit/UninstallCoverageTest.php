@@ -148,7 +148,7 @@ final class UninstallCoverageTest extends TestCase {
 	 *   can cross a rotation.)
 	 *   All names fall under the swept 'aura_worker_' prefix. And — since
 	 *   2.16.2, Ruling A65 — the site-issued observation witness's own atomic
-	 *   increment (bump_observation()'s INSERT … ON DUPLICATE KEY UPDATE on
+	 *   increment (bump_door_version()'s INSERT … ON DUPLICATE KEY UPDATE on
 	 *   'aura_worker_door_observation'), the same upsert shape bump_refused()
 	 *   above already uses. Also under the swept 'aura_worker_' prefix.
 	 * - includes/class-elementor-door-governor.php (1, 2.16.0) — the door's

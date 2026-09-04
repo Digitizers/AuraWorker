@@ -1057,6 +1057,52 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'and its held twin was not purged out from under the replay' );
 	}
 
+	/**
+	 * Ruling S6 (Codex round-3 P1 on #88): `forget_held()` is the choke point
+	 * that bumps the door version for every held/claimed write on this
+	 * class's side — `hold()`, `claim()`, `unclaim()`, `release()`,
+	 * `reject()`, `refresh_rule()`, `refresh_touches()`, `stamp_terminal_seq()`
+	 * and the sweep — because every one of them already calls it uniformly.
+	 * Proven here across the write shapes that reach it by the most
+	 * different routes: a fresh insert (`hold()`), a CAS row update
+	 * (`refresh_rule()`), and a raw, fenced delete (`release()`).
+	 */
+	public function test_hold_refresh_rule_and_release_each_bump_the_door_version(): void {
+		$before = Aura_Worker_Door_Log::door_version_raw();
+		$ref    = Aura_Worker_Door_Holds::hold( $this->call() );
+		$after_hold = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertIsInt( $after_hold );
+		$this->assertNotSame( $before, $after_hold, 'a fresh insert (hold()) bumps' );
+
+		Aura_Worker_Door_Holds::refresh_rule( $ref, array( 'key' => 'r', 'state' => 'blocked' ) );
+		$after_refresh = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertGreaterThan( $after_hold, $after_refresh, 'a CAS row update (refresh_rule()) bumps too' );
+
+		Aura_Worker_Door_Holds::release( $ref );
+		$after_release = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertGreaterThan( $after_refresh, $after_release, 'and a raw, fenced delete (release()) bumps as well — none of the three go through write_option_where()/insert_unique() alone' );
+	}
+
+	/**
+	 * The internal hold-queue LOCK mutex is not door state Aura ever sees —
+	 * `insert_unique()`'s exemption list (Ruling S6) must not bump for its
+	 * acquisition. Tested directly on the primitive rather than through
+	 * `hold()`, which itself performs SEVERAL real mutations for one call
+	 * (an epoch mint, a binding mint, the held row's own insert — each
+	 * legitimately bumps on its own, so counting hold()'s total bumps could
+	 * never isolate the lock's contribution from theirs).
+	 */
+	public function test_insert_unique_on_the_hold_lock_name_does_not_bump_the_door_version(): void {
+		$before = Aura_Worker_Door_Log::door_version_raw();
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Door_Holds::LOCK, 'token' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'the internal mutex is not reported door state, so acquiring it must not bump' );
+
+		// The exemption is scoped to that one name — an ordinary insert right
+		// after it still bumps, proving the primitive itself is not disabled.
+		Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_held_test-ref', array( 'x' => 1 ) );
+		$this->assertNotSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'an ordinary door-prefixed insert still bumps' );
+	}
+
 	/** The reconciler's stale-claim bound, as the governor declares it. */
 	private const CLAIM_STALE_MS   = 600000;
 	private const CLAIM_STALE_MS_S = 600;

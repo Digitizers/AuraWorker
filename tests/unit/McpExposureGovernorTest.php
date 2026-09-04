@@ -123,7 +123,14 @@ final class McpExposureGovernorTest extends TestCase {
 		$this->assertIsString( $b['epoch'] );
 		$this->assertNotSame( '', $b['epoch'] );
 		$this->assertNull( $b['binding'], 'nothing has bound this site, and a read never mints one (Ruling A5b)' );
-		$this->assertNull( $b['observation'], 'nothing has served /status yet, and an audit read never bumps it (Ruling A65)' );
+		// THIS call is the one that mints the epoch (asserted non-empty just
+		// above), and minting a virgin site's epoch is ITSELF a door-state
+		// mutation (Ruling S6: insert_unique() bumps on any new door-prefixed
+		// row) — so a fresh site's first governor_block() legitimately reports
+		// a real version, not null. door_version_raw() reads whatever THIS
+		// call just wrote; the audit itself never bumps beyond that.
+		$this->assertIsInt( $b['observation'], "this call's own epoch mint is a real mutation (Ruling S6), not the audit itself bumping anything" );
+		$this->assertSame( Aura_Worker_Door_Log::door_version_raw(), $b['observation'], 'a second read of the row changes nothing' );
 		$this->assertSame( 'ok', $b['seam'], 'verify_coverage() ran and every registered elementor/* ability is wrapped' );
 		$this->assertSame( 'open', $b['door'] );
 		$this->assertSame( 0, $b['held_count'] );
