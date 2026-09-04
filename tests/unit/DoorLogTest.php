@@ -283,7 +283,16 @@ final class DoorLogTest extends TestCase {
 		$this->assertSame( array( 3 ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ), 'log_after() walks from the floor, so it never meets the hole the ack left' );
 	}
 
-	public function test_an_ack_above_every_row_is_clamped_to_the_top_of_the_log(): void {
+	/**
+	 * Ruling P95: a seq above the top acknowledges NOTHING — it is not clamped.
+	 *
+	 * Clamping is exactly wrong after an options-table rewind: between the
+	 * rewind and `/status` detecting it, an in-flight ack from the pre-rewind
+	 * log still carries the CURRENT epoch, and if a new write has already
+	 * reused the next number, clamping that old, higher cursor raises the floor
+	 * straight through the new row and deletes an entry Aura never received.
+	 */
+	public function test_an_ack_above_every_row_acknowledges_nothing(): void {
 		$epoch = Aura_Worker_Door_Log::epoch();
 		Aura_Worker_Door_Log::open_pending( $this->entry() );
 		Aura_Worker_Door_Log::admit( 1 );
@@ -291,10 +300,32 @@ final class DoorLogTest extends TestCase {
 
 		$out = Aura_Worker_Door_Log::ack( $epoch, PHP_INT_MAX );
 
-		$this->assertSame( 1, $out['floor'], 'the floor never rises above a seq that exists' );
-		$this->assertSame( 1, $out['acked'] );
-		$this->assertSame( 2, Aura_Worker_Door_Log::open_pending( $this->entry() ), 'the next number is an integer, and its option name is parseable' );
+		$this->assertSame( 0, $out['acked'], 'a cursor this log does not have acks nothing' );
+		$this->assertSame( 0, $out['floor'], 'and the floor is untouched' );
+		$this->assertTrue( $out['stale'], 'Aura is told to re-read rather than assume it landed' );
+		$this->assertNotNull( Aura_Worker_Door_Log::get( 1 ), 'the row Aura never received is still here' );
+		// …and the numbering is still sane afterwards: the overflow the clamp
+		// guarded against cannot happen, because the floor is only ever raised
+		// to a cursor at or below the top.
+		$this->assertSame( 2, Aura_Worker_Door_Log::open_pending( $this->entry() ) );
 		$this->assertArrayHasKey( 'aura_worker_door_log_2', $GLOBALS['_options'] );
+	}
+
+	/** …and an ack AT the top still works exactly as it did. */
+	public function test_an_ack_at_the_top_of_the_log_still_acknowledges(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		for ( $i = 1; $i <= 2; $i++ ) {
+			Aura_Worker_Door_Log::open_pending( $this->entry() );
+			Aura_Worker_Door_Log::admit( $i );
+			Aura_Worker_Door_Log::settle( $i, array( 'result' => 'ok' ) );
+		}
+
+		$out = Aura_Worker_Door_Log::ack( $epoch, 2 );
+
+		$this->assertSame( 2, $out['acked'] );
+		$this->assertSame( 2, $out['floor'] );
+		$this->assertArrayNotHasKey( 'stale', $out );
+		$this->assertNull( Aura_Worker_Door_Log::get( 2 ) );
 	}
 
 	public function test_an_ack_below_the_floor_still_deletes_every_row_the_floor_covers(): void {

@@ -240,7 +240,7 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 
 ### 2.16.0
 
-- Elementor MCP door governance: every write through Elementor >= 4.3's official MCP server is held for approval in Aura unless an operator `allow` rule covers it; `block` refuses; every write that runs is snapshotted first on the site and recorded in a per-site door log Aura drains. New tools `elementor_replay_ability`, `snapshot_get`; new routes `/aura/v1/door/reject`, `/aura/v1/door/ack`; `/status` carries `door`; `audit_mcp_exposure` carries `elementor.governor`. Rules gain the `allow` effect and the `design_system` / `page_create` targets.
+- Elementor MCP door governance: every write through Elementor >= 4.3's official MCP server is held for approval in Aura unless an operator `allow` rule covers it; `block` refuses; every write that runs is snapshotted first on the site and recorded in a per-site door log Aura drains. New tools `elementor_replay_ability`, `snapshot_get`; new routes `/aura/v1/door/reject`, `/aura/v1/door/ack` (which answers `stale: true`, having written nothing, when the cursor names rows this log does not have — a log rewound out from under Aura); `/status` carries `door`; `audit_mcp_exposure` carries `elementor.governor`. Rules gain the `allow` effect and the `design_system` / `page_create` targets.
 
 ### 2.15.0
 

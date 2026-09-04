@@ -1549,16 +1549,23 @@ class Aura_Worker_API {
 
 		$result = Aura_Worker_Door_Log::ack( $epoch, $seq );
 
-		return new WP_REST_Response(
-			array(
-				'acked'   => (int) $result['acked'],
-				'floor'   => (int) $result['floor'],
-				'epoch'   => Aura_Worker_Door_Log::epoch(),
-				'unacked' => Aura_Worker_Door_Log::count_unacked(),
-				'door'    => Aura_Worker_Elementor_Door::door_state(),
-			),
-			200
+		$body = array(
+			'acked'   => (int) $result['acked'],
+			'floor'   => (int) $result['floor'],
+			'epoch'   => Aura_Worker_Door_Log::epoch(),
+			'unacked' => Aura_Worker_Door_Log::count_unacked(),
+			'door'    => Aura_Worker_Elementor_Door::door_state(),
 		);
+		// STALE: the cursor named rows this log does not have (Ruling P95).
+		// Nothing was written — not the floor, not the purge — because such an
+		// ack comes from a log that was rewound out from under Aura, and
+		// clamping it to the current top would delete rows Aura never received.
+		// Aura re-reads `/status` rather than assuming its ack landed.
+		if ( ! empty( $result['stale'] ) ) {
+			$body['stale'] = true;
+		}
+
+		return new WP_REST_Response( $body, 200 );
 	}
 
 	/**

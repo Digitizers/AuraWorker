@@ -1303,9 +1303,21 @@ class Aura_Worker_Door_Log {
 	 * the rows in `($seq, $floor]` behind — under the floor, so never served,
 	 * never acked and never deleted.
 	 *
+	 * A SEQ ABOVE THE TOP ACKNOWLEDGES NOTHING (Ruling P95). It used to be
+	 * CLAMPED down to the top, which is exactly wrong after an options-table
+	 * rewind: between the rewind and `/status` detecting it, an in-flight ack
+	 * from the pre-rewind log still carries the CURRENT epoch, and if a new
+	 * write has already reused the next number, clamping that old, higher
+	 * cursor raises the floor straight through the new row and deletes an entry
+	 * Aura never received. Such an ack is stale by construction — it names rows
+	 * this log does not have — and it is answered `stale: true` with nothing
+	 * written at all. The overflow the clamp guarded against cannot happen
+	 * without it: the floor is only ever raised to a cursor at or below the
+	 * top.
+	 *
 	 * @param string $epoch The epoch Aura is acking.
 	 * @param int    $seq   Highest seq of its contiguous committed prefix.
-	 * @return array{ acked: int, floor: int }
+	 * @return array{ acked: int, floor: int, stale?: bool }
 	 */
 	public static function ack( $epoch, $seq ) {
 		global $wpdb;
@@ -1323,7 +1335,16 @@ class Aura_Worker_Door_Log {
 		}
 		$top = max( $max, self::floor() );
 		if ( $seq > $top ) {
-			$seq = $top;
+			// Above everything this log has: a cursor from a log that was
+			// rewound out from under Aura (Ruling P95). Nothing is written —
+			// not the floor's insert, not its raise, not the purge — and the
+			// answer says why, so Aura re-reads rather than assuming its ack
+			// landed.
+			return array(
+				'acked' => 0,
+				'floor' => self::floor(),
+				'stale' => true,
+			);
 		}
 		if ( $seq < 1 ) {
 			return array( 'acked' => 0, 'floor' => self::floor() );
