@@ -3075,7 +3075,7 @@ class Aura_Worker_Elementor_Door {
 				$wpdb->esc_like( self::COUNTER_PREFIX ) . '%'
 			)
 		);
-		$gone = 0;
+		$expired = array();
 		foreach ( (array) $names as $name ) {
 			// The hour suffix, whatever counter name sits between it and the
 			// prefix. A row under this prefix that carries no numeric hour is
@@ -3085,11 +3085,38 @@ class Aura_Worker_Elementor_Door {
 				continue;
 			}
 			if ( (int) $m[1] < $oldest ) {
-				delete_option( (string) $name );
-				$gone++;
+				$expired[] = (string) $name;
 			}
 		}
-		return $gone;
+		if ( empty( $expired ) ) {
+			return 0;
+		}
+		// Ruling S19 (Codex round-7 P2 on #88): every OTHER counter mutation
+		// — bump_counter()'s own upsert (Ruling S9), bump_refused() — already
+		// advances the door version in the SAME transaction as its write, but
+		// this sweep's deletes bypassed versioned() entirely: a poll landing
+		// right after a prune saw fewer `*_30d` rows under an UNCHANGED
+		// observation, the same hole Ruling S6 closed for every other
+		// mutation. One unit for the WHOLE pass — not one per bucket, which
+		// would bump the version once per deleted row for a single sweep.
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $expired ) {
+				foreach ( $expired as $name ) {
+					delete_option( $name );
+				}
+				return array(
+					'mutated' => true,
+					'result'  => count( $expired ),
+					// Ruling S11: repeated by versioned() after commit.
+					'evict'   => $expired,
+				);
+			}
+		);
+		// A rolled-back prune deleted nothing (Ruling S15/S8): the
+		// version bump's own write failing undoes every delete $writes()
+		// just ran, so reporting anything but 0 here would claim buckets
+		// were pruned that the transaction just put back.
+		return $outcome['committed'] ? (int) $outcome['result'] : 0;
 	}
 
 	/**

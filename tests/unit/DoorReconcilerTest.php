@@ -1449,6 +1449,33 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( 8, Aura_Worker_Elementor_Door::count_30d( 'log_ungoverned', $now ), 'and the survivors still sum' );
 	}
 
+	/**
+	 * Ruling S19 (Codex round-7 P2 on #88): `prune_counters()` deleted its
+	 * expired buckets with a plain `delete_option()` loop, never through
+	 * `versioned()` — unlike `bump_counter()`'s own upsert (Ruling S9) and
+	 * `Aura_Worker_Door_Log::bump_refused()`, which both advance the door
+	 * version in the SAME transaction as their write. A `/status` poll
+	 * landing right after a prune therefore saw fewer `*_30d` rows under an
+	 * UNCHANGED observation — the exact hole Ruling S6 closed for every
+	 * other door mutation, left open for this one. `prune_counters()` now
+	 * runs its whole pass — every expired bucket's delete — as ONE
+	 * `versioned()` unit.
+	 */
+	public function test_a_prune_that_deletes_a_bucket_advances_the_door_version(): void {
+		$outside = (int) floor( ( time() - 31 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		$this->seedBucket( 'log_ungoverned', $outside, 100 );
+		$before = Aura_Worker_Door_Log::door_version_raw();
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$this->assertSame( 1, $out['pruned_counters'] );
+		$after = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertNotNull( $after );
+		if ( null !== $before ) {
+			$this->assertGreaterThan( $before, $after, 'a pruning deletion is a door mutation like any other and must advance the version' );
+		}
+	}
+
 	public function test_the_counter_prune_shares_the_retention_gate(): void {
 		// Bounded like the envelope sweep, and by the same stamp: `/status` is
 		// the hottest endpoint this site has (Ruling P9(a)).
