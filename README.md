@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.16.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.16.1-green" alt="Stable" />
 </p>
 
 ---
@@ -237,6 +237,10 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.16.1
+
+- `/status`'s door fragment and `audit_mcp_exposure`'s `elementor.governor` block carry `binding`, the site's current binding generation, so Aura can label a departed client's door-log entries without inferring the generation from the rows. Read raw, never minted; `null` when the record cannot be read.
 
 ### 2.16.0
 

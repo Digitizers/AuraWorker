@@ -1099,10 +1099,77 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->registerAll();
 		$open = Aura_Worker_Elementor_Door::status_fragment();
 		$this->assertSame( Aura_Worker_Door_Log::epoch(), $open['epoch'] );
+		$this->assertNull( $open['binding'], 'nothing has bound this site, and a read never mints one (Ruling A5b)' );
 		$this->assertSame( 'ok', $open['seam'] );
 		$this->assertSame( 'open', $open['door'] );
 		Aura_Worker_Elementor_Door::set_callback_reader_for_tests( static function () { throw new ReflectionException( 'no such property' ); } );
 		do_action( 'wp_abilities_api_init' );
 		$this->assertSame( 'closed', Aura_Worker_Elementor_Door::status_fragment()['door'] );
+	}
+
+	/**
+	 * `binding` (Ruling A5b) is the CURRENT binding generation, read RAW and
+	 * NEVER MINTED — the same read the fence itself trusts
+	 * (`Aura_Worker_Door_Log::binding_raw()`) — in both the `/status`
+	 * fragment and the `elementor.governor` audit block, so Aura can label a
+	 * departed client's door-log entries without inferring the generation
+	 * from the rows.
+	 */
+	public function test_binding_reports_the_current_generation_raw_in_both_shapes(): void {
+		$this->registerAll();
+		$rec = array( 'gen' => 'gen-current', 'state' => 'bound', 'client' => 'client-a', 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec );
+
+		$this->assertSame( 'gen-current', Aura_Worker_Elementor_Door::status_fragment()['binding'] );
+		$this->assertSame( 'gen-current', Aura_Worker_Elementor_Door::governor_block()['binding'] );
+		$this->assertSame( Aura_Worker_Door_Log::binding_raw(), Aura_Worker_Elementor_Door::status_fragment()['binding'], 'the same raw read the fence itself uses' );
+	}
+
+	/**
+	 * A binding record that cannot be read reports `binding: null` in both
+	 * shapes, never a guess (the same "unreadable ⇒ null" rule every other
+	 * fragment field follows).
+	 */
+	public function test_binding_is_null_in_both_shapes_when_the_record_cannot_be_read(): void {
+		$this->registerAll();
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+
+		$frag  = Aura_Worker_Elementor_Door::status_fragment();
+		$block = Aura_Worker_Elementor_Door::governor_block();
+
+		$GLOBALS['_sa_wpdb_error'] = '';
+
+		$this->assertNull( $frag['binding'] );
+		$this->assertNull( $block['binding'] );
+	}
+
+	/**
+	 * Ruling S1 (Codex round-1 P2 on #87): a `query` filter that blanks the
+	 * binding statement (or an unready handle) leaves `last_error` untouched
+	 * and hands back the PREVIOUS statement's row — priming with generation
+	 * A, rewriting the record to B, then suppressing the next statement used
+	 * to answer both shapes A instead of `null`, mislabelling a departed
+	 * client's door-log entries as the current client's own.
+	 */
+	public function test_binding_is_null_in_both_shapes_when_the_next_query_is_suppressed_after_a_rebind(): void {
+		$this->registerAll();
+		$rec_a = array( 'gen' => 'gen-a', 'state' => 'bound', 'client' => 'client-a', 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec_a;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec_a );
+		$this->assertSame( 'gen-a', Aura_Worker_Elementor_Door::status_fragment()['binding'], 'primed: a real read proves generation A' );
+
+		$rec_b = array( 'gen' => 'gen-b', 'state' => 'bound', 'client' => 'client-b', 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec_b;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec_b );
+		$GLOBALS['_sa_wpdb_query_filtered_out']               = true;
+
+		$frag  = Aura_Worker_Elementor_Door::status_fragment();
+		$block = Aura_Worker_Elementor_Door::governor_block();
+
+		$GLOBALS['_sa_wpdb_query_filtered_out'] = false;
+
+		$this->assertNull( $frag['binding'], 'never the stale A, and never the unproven B' );
+		$this->assertNull( $block['binding'], 'never the stale A, and never the unproven B' );
 	}
 }

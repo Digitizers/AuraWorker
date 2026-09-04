@@ -501,4 +501,56 @@ final class DoorLogTest extends TestCase {
 
 		$this->assertSame( array( $four ), array_column( Aura_Worker_Door_Log::stale_pending( 60000 ), 'seq' ) );
 	}
+
+	/* ------------------------------------------------------------------ */
+	/* Ruling S1 (Codex round-1 P2 on #87): every raw reader is PROVEN     */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * `$wpdb->query()` has two early returns before its flush() — an unready
+	 * handle, and a `query` filter that blanks the SQL — that leave
+	 * `$last_result` exactly as the PREVIOUS statement left it, with
+	 * `last_error` untouched. `binding_raw()` used to trust that stale
+	 * result: primed with generation A, the record rewritten to B by another
+	 * process, and the next statement suppressed, it went on answering A —
+	 * label a departed client's door-log entries as this client's own. The
+	 * proven raw read (`raw_option_read()`'s per-call nonce) answers
+	 * unreadable (`''`) instead, never a generation nobody can vouch for.
+	 */
+	public function test_binding_raw_answers_unreadable_not_a_stale_generation_when_the_next_query_is_suppressed(): void {
+		$rec_a = array( 'gen' => 'gen-a', 'state' => 'bound', 'client' => 'client-a', 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec_a;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec_a );
+
+		$this->assertSame( 'gen-a', Aura_Worker_Door_Log::binding_raw(), 'primed: a real read proves generation A' );
+
+		// Another process rebinds the site — the record now names B — while
+		// THIS request's next statement against the row is suppressed.
+		$rec_b = array( 'gen' => 'gen-b', 'state' => 'bound', 'client' => 'client-b', 'dashboard' => null );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::BINDING ] = $rec_b;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::BINDING ]    = maybe_serialize( $rec_b );
+		$GLOBALS['_sa_wpdb_query_filtered_out']               = true;
+
+		$stale = Aura_Worker_Door_Log::binding_raw();
+
+		$GLOBALS['_sa_wpdb_query_filtered_out'] = false;
+		$this->assertSame( '', $stale, 'unreadable, never A (stale) and never B (unproven)' );
+	}
+
+	/** The same proof, for `epoch_raw()` (Ruling P81's never-minted reader). */
+	public function test_epoch_raw_answers_unreadable_not_a_stale_epoch_when_the_next_query_is_suppressed(): void {
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ] = 'epoch-a';
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ]    = maybe_serialize( 'epoch-a' );
+
+		$this->assertSame( 'epoch-a', Aura_Worker_Door_Log::epoch_raw(), 'primed: a real read proves epoch A' );
+
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ] = 'epoch-b';
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ]    = maybe_serialize( 'epoch-b' );
+		$GLOBALS['_sa_wpdb_query_filtered_out']             = true;
+
+		$stale = Aura_Worker_Door_Log::epoch_raw();
+
+		$GLOBALS['_sa_wpdb_query_filtered_out'] = false;
+		$this->assertSame( '', $stale, 'unreadable, never A (stale) and never B (unproven)' );
+	}
 }
