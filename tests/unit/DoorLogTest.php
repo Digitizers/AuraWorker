@@ -507,6 +507,69 @@ final class DoorLogTest extends TestCase {
 		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ) );
 	}
 
+	/**
+	 * Ruling S62 (Codex round-23 P2 on #88): an AMBIGUOUSLY committed
+	 * rotation -- the durable-witness fallback itself could not prove the
+	 * commit either way (Ruling S51) -- used to answer `rotated: false`,
+	 * so `rotate_door_epoch()`'s own caller never ran
+	 * restamp_binding_epoch() and the next same-identity connect treated
+	 * a rotation that had, in fact, already landed as a half-done rebind.
+	 * `rotate_epoch()` now mints its OWN replacement epoch BEFORE
+	 * versioned() ever runs and, on an unknown commit, re-reads the epoch
+	 * raw and compares it to that EXACT target -- never merely "did the
+	 * epoch change", which the two tests just above (a racer's own
+	 * winning rotation, or a caller naming an epoch that was never real)
+	 * would also satisfy without THIS call's own write having landed at
+	 * all.
+	 */
+	public function test_an_ambiguously_committed_rotation_that_actually_landed_completes_idempotently(): void {
+		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s62';
+		// Reaches the durable-witness fallback: the COMMIT statement
+		// itself looks clean, but the post-commit session-nonce
+		// read-back finds no session variables (Ruling S16's own
+		// reconnect-after-commit model).
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s62';
+		// And the fallback's OWN witness read then fails too -- genuinely
+		// unknown, never resolved either way by the existing S51 fallback
+		// alone.
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertTrue( $out['rotated'], 'this call\'s own pre-minted target is exactly what the epoch now holds -- the ambiguous commit actually landed' );
+		$this->assertSame( 'nonce-s62', $out['epoch'] );
+		$this->assertSame( 'nonce-s62', get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S62: a retry of the SAME logical rotation, once it has
+	 * genuinely landed (this models the caller re-deriving $expected
+	 * fresh and finding the epoch already rotated -- the ordinary,
+	 * ALREADY-correct "lost the fence" path, unaffected by this ruling):
+	 * no second rotation runs, and the epoch answered is the one already
+	 * in force.
+	 */
+	public function test_a_retry_of_an_already_landed_rotation_rotates_nothing_a_second_time(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$first  = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $first['rotated'] );
+
+		// A retry naming the OLD (now stale) epoch -- exactly what a
+		// caller unaware the first attempt landed would send again.
+		$second = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$this->assertFalse( $second['rotated'], 'the fence is genuinely lost -- nothing for THIS call to do' );
+		$this->assertSame( $first['epoch'], $second['epoch'], 'the epoch already in force, unchanged by the retry' );
+		$this->assertSame( $first['epoch'], get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
 	public function test_stale_pending_finds_only_pending_rows_older_than_the_cutoff(): void {
 		$old = Aura_Worker_Door_Log::open_pending( $this->entry() );
 		$this->backdate( $old, 3600 );

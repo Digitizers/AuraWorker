@@ -3564,25 +3564,60 @@ class Aura_Worker_Door_Log {
 		// own docblock). Idempotent either way: an epoch that already exists
 		// is untouched, exactly like every other caller of epoch().
 		self::epoch();
-		$outcome = self::versioned(
-			function () use ( $expected, $claim, $fence ) {
-				return self::rotate_epoch_write( $expected, $claim, $fence );
+		// Ruling S62 (Codex round-23 P2 on #88): minted HERE, before
+		// versioned() ever runs — the ONE fixed TARGET this call's own
+		// attempt means to reach, threaded into rotate_epoch_write() so an
+		// AMBIGUOUS commit can be completed idempotently below by asking
+		// "did MY OWN mint land", never "did the epoch merely change" (a
+		// concurrent, unrelated rotation winning the SAME race must still
+		// answer `rotated: false` here — see the two long-standing tests
+		// this ruling does not touch: a racer's own epoch winning the
+		// fence, and a caller naming an epoch that was never real to begin
+		// with, both still report `rotated: false`, exactly as before).
+		$new_epoch = wp_generate_uuid4();
+		$outcome   = self::versioned(
+			function () use ( $expected, $claim, $fence, $new_epoch ) {
+				return self::rotate_epoch_write( $expected, $claim, $fence, $new_epoch );
 			}
 		);
-		if ( ! $outcome['committed'] ) {
-			// Ruling S15 (Codex round-6 P2 on #88): a rolled-back unit
-			// carries no `result` — `rotate_epoch_write()`'s own
-			// `rotated: true`/`epoch` were computed BEFORE the bump's write
-			// failed (or the COMMIT could not be proven, Ruling S16) and
-			// undone along with everything else. `epoch_raw()` reads the
-			// row exactly as the rollback left it — the one that was never
-			// actually replaced — rather than trusting a stale guess.
+		if ( true === $outcome['committed'] ) {
+			// UNCHANGED from before this ruling: a CLEAN commit already
+			// proves whatever rotate_epoch_write() itself decided — true
+			// when its own fenced write actually landed, false when its
+			// own fence was lost to a DIFFERENT rotation (Ruling S15: safe
+			// to trust `$outcome['result']` only when `committed` is
+			// exactly `true`).
+			return $outcome['result'];
+		}
+		// Ruling S62: `committed` is `false` (a PROVEN rollback — the
+		// savepoint was lost, or the bump's own write failed, before this
+		// call's mint could ever matter) or `null` (Ruling S51: UNKNOWN —
+		// the durable witness itself could not be read either way). A
+		// proven `false` answers exactly as before (nothing landed,
+		// `rotated: false`); the genuinely new case is `null`: re-reading
+		// the epoch raw and comparing it to the exact `$new_epoch` THIS
+		// call minted — never merely "not $expected", which a concurrent
+		// racer's own winning rotation, or a caller naming an epoch that
+		// was never real, would ALSO satisfy without this call's own
+		// write having landed at all — is what tells "my own ambiguous
+		// write actually committed" apart from either of those. Equal ⇒
+		// `rotated: true`, completing the rotation idempotently so the
+		// caller's `restamp_binding_epoch()` runs and the binding record
+		// stops naming an epoch this site no longer has (Ruling P91's own
+		// "half-done rebind"); anything else (still `$expected`, or a
+		// DIFFERENT value some other rotation produced) ⇒ `rotated:
+		// false`, this call's own mint demonstrably did not land.
+		$now = self::epoch_raw();
+		if ( null === $outcome['committed'] && $now === $new_epoch ) {
 			return array(
-				'rotated' => false,
-				'epoch'   => self::epoch_raw(),
+				'rotated' => true,
+				'epoch'   => $now,
 			);
 		}
-		return $outcome['result'];
+		return array(
+			'rotated' => false,
+			'epoch'   => $now,
+		);
 	}
 
 	/**
@@ -3596,16 +3631,28 @@ class Aura_Worker_Door_Log {
 	 * concept of (a nested one implicitly commits the outer). This method is
 	 * the shared write-only core both wrappers call into.
 	 *
-	 * @param string $expected The epoch the caller means to replace.
-	 * @param string $claim    Optional site-claim option name.
-	 * @param string $fence    Optional claim fence.
+	 * @param string      $expected  The epoch the caller means to replace.
+	 * @param string      $claim     Optional site-claim option name.
+	 * @param string      $fence     Optional claim fence.
+	 * @param string|null $new_epoch The replacement to mint, PRE-CHOSEN by
+	 *                                the caller (Ruling S62, Codex round-23
+	 *                                P2 on #88) — `rotate_epoch()` passes
+	 *                                its own pre-minted value so an
+	 *                                AMBIGUOUS commit can be completed
+	 *                                idempotently by comparing the epoch
+	 *                                raw against this EXACT target, never
+	 *                                merely "changed". Null (every OTHER
+	 *                                caller — `rotate_binding()` — and
+	 *                                every pre-S62 behaviour) mints one
+	 *                                internally, unchanged.
 	 * @return array{ mutated: bool, result: array{ rotated: bool, epoch: string } }
 	 */
-	private static function rotate_epoch_write( $expected, $claim = '', $fence = '' ) {
+	private static function rotate_epoch_write( $expected, $claim = '', $fence = '', $new_epoch = null ) {
 		global $wpdb;
-		$expected = (string) $expected;
-		$claim    = (string) $claim;
-		$fence    = (string) $fence;
+		$expected  = (string) $expected;
+		$claim     = (string) $claim;
+		$fence     = (string) $fence;
+		$new_epoch = null === $new_epoch ? wp_generate_uuid4() : (string) $new_epoch;
 		if ( '' === $expected ) {
 			return array(
 				'mutated' => false,
@@ -3664,7 +3711,7 @@ class Aura_Worker_Door_Log {
 			// read, but that mint is a versioned insert_unique() call and
 			// would nest a transaction. insert_unique_write() is the SAME
 			// mint, write-only, sharing this one.
-			if ( ! self::insert_unique_write( self::EPOCH, wp_generate_uuid4() ) ) {
+			if ( ! self::insert_unique_write( self::EPOCH, $new_epoch ) ) {
 				// Ruling S12 (Codex round-5 P2 on #88): the replacement
 				// insert failed — a lost race, a driver error. Left
 				// unchecked, the transaction would still bump the version
@@ -3706,7 +3753,7 @@ class Aura_Worker_Door_Log {
 		delete_option( self::FULL_MARKER );
 		delete_option( self::FULL_COUNTER );
 		// See the mint note on the claim-conditioned branch above.
-		if ( ! self::insert_unique_write( self::EPOCH, wp_generate_uuid4() ) ) {
+		if ( ! self::insert_unique_write( self::EPOCH, $new_epoch ) ) {
 			// Ruling S12 — see the claim-conditioned branch above.
 			return array(
 				'rollback' => true,

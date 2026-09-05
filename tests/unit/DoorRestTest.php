@@ -332,6 +332,45 @@ final class DoorRestTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S62 (Codex round-23 P2 on #88): an AMBIGUOUSLY committed
+	 * rotation that actually landed used to answer `rotated: false`, so
+	 * this route never called restamp_binding_epoch() at all -- the
+	 * binding record kept naming the OLD epoch, and the next
+	 * same-identity connect (Ruling P91) read that disagreement as a
+	 * half-done rebind. rotate_epoch() now completes the rotation
+	 * idempotently on an unknown commit, so this route's own
+	 * `! empty( $out['rotated'] )` check still fires and the restamp
+	 * still runs.
+	 */
+	public function test_an_ambiguous_rotation_that_landed_still_restamps_the_binding_witness(): void {
+		$this->enforce_grants();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$gen    = Aura_Worker_Door_Log::binding_raw();
+		$before = Aura_Worker_Door_Log::epoch();
+		$req    = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-s62-rest';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s62-rest';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertTrue( $res->data['rotated'], 'the ambiguous commit actually landed' );
+		$this->assertSame( 'nonce-s62-rest', $res->data['epoch'] );
+		$this->assertArrayNotHasKey( 'witness_stale', $res->data, 'restamp_binding_epoch() ran and landed' );
+		$this->assertSame( 'nonce-s62-rest', Aura_Worker_Door_Log::binding_record()['epoch'], 'the binding record names the new cursor, not the old one' );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation itself never moved -- only the epoch witness' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
 	 * Ruling P92 (F1): a rotation superseded mid-flight never stamps its stale
 	 * epoch over the winner's witness.
 	 *
