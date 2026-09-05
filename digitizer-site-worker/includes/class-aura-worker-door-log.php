@@ -52,6 +52,37 @@ class Aura_Worker_Door_Log {
 	 * docblock for why the target must be deterministic at all.
 	 */
 	const ROTATE_TARGET_NAMESPACE = '6f0a2b0e-6d43-5f1a-9c2e-2a9e8f7c4d31';
+	/**
+	 * Ruling S86 (Codex round-37 P1 on #88), the S80 pattern applied to
+	 * `open_pending()`'s own seq allocation: a FIXED namespace for the
+	 * derived RESERVATION identity — see `RESERVATION_PREFIX`'s own
+	 * docblock for the whole mechanism. Distinct from
+	 * `ROTATE_TARGET_NAMESPACE`/`Aura_Worker_Door_Holds::HOLD_REF_NAMESPACE`
+	 * (each a different derivation, a different purpose) — RFC 4122 §4.3
+	 * guarantees no two of these three ever collide with each other's
+	 * inputs by construction.
+	 */
+	const LOG_RESERVATION_NAMESPACE = '9c1e5a2d-4f7b-5e3a-8d6c-1b0f2a9e7c4d';
+	/**
+	 * One option row per RESERVED seq allocation (Ruling S86, Codex
+	 * round-37 P1 on #88) — `{ seq: int }`, named by a caller's derived
+	 * reservation identity (see `open_pending()`'s own docblock for the
+	 * bug this closes: an ambiguous pending-row INSERT used to leave a
+	 * retry with nothing to recognise its own prior attempt by, so it
+	 * allocated a SECOND seq behind the first, unadmitted one — blocking
+	 * `log_after()` for every later entry until the reconciler's
+	 * CLAIM_STALE_MS sweep). A retry supplying the SAME idempotency
+	 * material (`aura_ref` + a hash of `touches`, the identical
+	 * derivation `Aura_Worker_Door_Holds::HOLD_REF_NAMESPACE` uses for a
+	 * hold's own ref) regenerates the SAME reservation name, finds this
+	 * row, and — once it verifies the seq it names is a REAL row, never
+	 * blindly — recognises its own reservation instead of allocating
+	 * again. `insert_unique()`-written (a real conditional INSERT), so
+	 * two concurrent attempts under the SAME identity cannot both "win"
+	 * a DIFFERENT seq into it.
+	 */
+	const RESERVATION_PREFIX = 'aura_worker_door_log_rsv_';
+
 	/** The BINDING generation (Rulings P51/P58): minted like the epoch, rotated ONLY by a rebind. */
 	const BINDING      = 'aura_worker_door_binding';
 	/* The binding record's STATE (Ruling P61) — a lazy mint is never a stated identity. */
@@ -677,6 +708,71 @@ class Aura_Worker_Door_Log {
 		if ( null === $binding ) {
 			return new WP_Error( 'aura_log_failed', 'This site could not establish which Aura binding this call belongs to; it was not run.', array( 'status' => 503 ) );
 		}
+		// Ruling S86 (Codex round-37 P1 on #88): the S80 pattern applied
+		// here — see RESERVATION_PREFIX's own docblock for the whole
+		// mechanism, and this method's own updated docblock (below the
+		// class-level constants) for the bug it closes. Derived from the
+		// SAME two ingredients Aura_Worker_Door_Holds::hold() derives a
+		// hold's own ref from: `aura_ref` (Aura's own correlation id for
+		// the intercepted request, or any other identifier of the
+		// request itself) and a hash of `touches`.
+		$touches        = is_array( $entry['touches'] ?? null ) ? $entry['touches'] : array();
+		$aura_ref       = isset( $entry['aura_ref'] ) ? (string) $entry['aura_ref'] : '';
+		$reservation_id = '' !== $aura_ref
+			? self::derive_rotation_target( self::LOG_RESERVATION_NAMESPACE, $aura_ref . '|' . sha1( wp_json_encode( $touches ) ) )
+			: '';
+		if ( '' !== $reservation_id ) {
+			$reserved = self::find_reserved_seq( $reservation_id );
+			if ( 'unreadable' === $reserved ) {
+				return new WP_Error(
+					'aura_log_failed',
+					'This site could not prove whether the previous attempt landed; retry.',
+					array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+				);
+			}
+			if ( is_int( $reserved ) ) {
+				// PRESENT, and its row PROVEN still real (find_reserved_seq()
+				// never trusts a reservation whose row is gone): this
+				// request's own prior — possibly ambiguous — attempt
+				// already landed. Recognised, not re-allocated.
+				return $reserved;
+			}
+			// Proven absent (or the reservation named a row that no
+			// longer exists — already acked/purged, or never actually
+			// landed): fall through and allocate fresh, below.
+		}
+		// BELT-AND-BRACES, NEVER "ELSE" (Ruling S86): a caller may supply
+		// `reserved_seq` ALONGSIDE `aura_ref` — echoing back what an
+		// EARLIER ambiguous answer from THIS SAME call handed it — and
+		// this check runs regardless of whether the block above found
+		// anything. It matters even when `aura_ref` IS given: the
+		// reservation-index write above is itself best-effort (a SEPARATE
+		// statement from the pending row's own INSERT, so it can fail or
+		// go ambiguous independently of it) — `reserved_seq` names the
+		// row DIRECTLY, with no dependency on that second write having
+		// landed at all. It is ALSO the sound fallback for a caller with
+		// NO idempotency material to derive a reservation from in the
+		// first place (see this method's own docblock for why this is
+		// the answer, not S80's own unrecoverable random-ref fallback):
+		// `reserved_seq` is a PLAIN INTEGER this method already hands
+		// back in EVERY ambiguous answer below, regardless of whether
+		// `aura_ref` was ever given — a caller need only echo it back on
+		// its own retry, no derivation required.
+		if ( isset( $entry['reserved_seq'] ) && (int) $entry['reserved_seq'] > 0 ) {
+			$reserved_seq = (int) $entry['reserved_seq'];
+			$row_raw      = self::raw_option_for( self::PREFIX . $reserved_seq );
+			if ( self::raw_option_was_unreadable() ) {
+				return new WP_Error(
+					'aura_log_failed',
+					'This site could not prove whether the previous attempt landed; retry.',
+					array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+				);
+			}
+			if ( null !== $row_raw ) {
+				return $reserved_seq;
+			}
+			// Proven absent: fall through and allocate fresh.
+		}
 		for ( $try = 0; $try < self::ALLOC_TRIES; $try++ ) {
 			// CANNOT READ THE TOP, CANNOT ALLOCATE (Ruling P77). A null top used
 			// to cast to 0, so the next seq was computed from the floor alone —
@@ -701,6 +797,13 @@ class Aura_Worker_Door_Log {
 					'admitted' => false,
 				)
 			);
+			if ( '' !== $reservation_id ) {
+				// Stamped on the row itself too (forensics/verification —
+				// never read back by find_reserved_seq(), which only ever
+				// trusts the DEDICATED reservation-index row's own
+				// existence).
+				$row['reservation'] = $reservation_id;
+			}
 			$won = self::insert_unique( self::PREFIX . $seq, $row );
 			if ( null === $won ) {
 				// Ruling S63 (Codex round-24 P1 on #88): STOP — never
@@ -720,10 +823,28 @@ class Aura_Worker_Door_Log {
 				// stale-pending sweep (or a healthy retry of this SAME
 				// call, once state can be re-read) is what finds it
 				// either way — never a second, sibling row.
+				//
+				// Ruling S86 (Codex round-37 P1 on #88): best-effort
+				// registration of the reservation index BEFORE answering
+				// — whether or not THIS ambiguous insert actually landed,
+				// so a retry (with the SAME `aura_ref`, or echoing back
+				// `reserved_seq` from THIS error) can find $seq directly,
+				// never re-deriving a fresh one behind it. Never trusted
+				// blind: find_reserved_seq() re-verifies the row itself
+				// exists before ever recognising a reservation.
+				if ( '' !== $reservation_id ) {
+					self::insert_unique( self::RESERVATION_PREFIX . $reservation_id, array( 'seq' => $seq ) );
+				}
 				return new WP_Error(
 					'aura_log_failed',
 					'This site could not prove whether the previous attempt landed; retry.',
-					array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+					array(
+						'status'       => 503,
+						'retry_after'  => 5,
+						'may_have_run' => true,
+						'reserved_seq' => $seq,
+						'reservation'  => $reservation_id, // '' when the caller gave no aura_ref
+					)
 				);
 			}
 			if ( $won ) {
@@ -731,6 +852,14 @@ class Aura_Worker_Door_Log {
 				// option cache can still hold the value from before it.
 				wp_cache_delete( self::FLOOR, 'options' );
 				if ( $seq > self::floor() ) {
+					if ( '' !== $reservation_id ) {
+						// Registered on a CLEAN win too (Ruling S86): a
+						// response lost in transit between this write and
+						// Aura is the identical ambiguity from Aura's own
+						// point of view, and a retry deserves the SAME
+						// recognition either way.
+						self::insert_unique( self::RESERVATION_PREFIX . $reservation_id, array( 'seq' => $seq ) );
+					}
 					return $seq;
 				}
 				// Acked out from under this reservation: hand the number back
@@ -767,6 +896,46 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( $option, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		return 1 === (int) $gone;
+	}
+
+	/**
+	 * Ruling S86 (Codex round-37 P1 on #88): does a reservation identity
+	 * already name a REAL row — never trusted on the reservation-index
+	 * row's own say-so alone, since that row can outlive the pending row
+	 * it once named (already acked/purged since) or point at a seq an
+	 * ambiguous insert never actually landed at.
+	 *
+	 * @param string $reservation_id A derived reservation identity (see
+	 *                                `RESERVATION_PREFIX`'s own docblock).
+	 * @return int|string|null The seq, PROVEN still real; `'unreadable'`
+	 *                          when either raw read could not be proven
+	 *                          (the caller answers its own retryable
+	 *                          503); `null` when this identity has no
+	 *                          reservation on record, or the one it named
+	 *                          no longer points at a real row — either
+	 *                          way, the caller allocates fresh.
+	 */
+	private static function find_reserved_seq( $reservation_id ) {
+		$raw = self::raw_option_for( self::RESERVATION_PREFIX . $reservation_id );
+		if ( self::raw_option_was_unreadable() ) {
+			return 'unreadable';
+		}
+		if ( null === $raw ) {
+			return null;
+		}
+		$rec = maybe_unserialize( $raw );
+		$seq = is_array( $rec ) && isset( $rec['seq'] ) ? (int) $rec['seq'] : 0;
+		if ( $seq < 1 ) {
+			return null;
+		}
+		$row_raw = self::raw_option_for( self::PREFIX . $seq );
+		if ( self::raw_option_was_unreadable() ) {
+			return 'unreadable';
+		}
+		if ( null === $row_raw ) {
+			return null; // stale: the reservation outlived (or never landed at) the row it names
+		}
+		return $seq;
 	}
 
 	/** @param int $seq Seq. @return bool */

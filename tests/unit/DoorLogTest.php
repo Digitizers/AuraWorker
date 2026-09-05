@@ -2482,4 +2482,143 @@ final class DoorLogTest extends TestCase {
 		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $target_seq, $GLOBALS['_options'], 'the row this attempt actually wrote is exactly where it landed -- the real commit the ambiguous witness could not prove' );
 		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::PREFIX . ( $target_seq + 1 ), $GLOBALS['_options'], 'never a SECOND, sibling row allocated behind the ambiguous first one' );
 	}
+
+	/**
+	 * Ruling S86 (Codex round-37 P1 on #88), the S80 pattern applied to
+	 * open_pending()'s own seq allocation: the ambiguous case just above
+	 * left a retry with NOTHING to recognise its own prior attempt by,
+	 * so a caller retrying after `may_have_run` allocated a SECOND seq
+	 * behind the first, unadmitted one -- blocking log_after() (and
+	 * every later entry) until the reconciler's CLAIM_STALE_MS sweep.
+	 * With a derived reservation identity (`aura_ref` + a hash of
+	 * `touches`), the retry regenerates the SAME identity, finds the
+	 * reservation this attempt registered, verifies the row it names is
+	 * real, and recognises it -- no new allocation, and the row can be
+	 * admitted/executed normally from there.
+	 */
+	public function test_a_retry_of_an_ambiguous_open_pending_with_the_same_aura_ref_recognises_the_reservation(): void {
+		$entry = $this->entry( array( 'aura_ref' => 'aura-ref-s86' ) );
+		// An unarmed call first (different aura_ref, so it never touches
+		// the reservation this test cares about), so epoch/binding are
+		// already minted and primed before the armed call's own seam
+		// takes effect -- the SAME discipline the sibling S63 test above
+		// already uses.
+		Aura_Worker_Door_Log::open_pending( $this->entry( array( 'aura_ref' => 'aura-ref-s86-priming' ) ) );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s86';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s86';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$first = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( 'WP_Error', $first, 'the fixture assumption this test is built on -- the first attempt is ambiguous' );
+		$data = $first->get_error_data();
+		$this->assertTrue( $data['may_have_run'] );
+		$reserved_seq = $data['reserved_seq'];
+		$this->assertIsInt( $reserved_seq );
+		$this->assertNotSame( '', $data['reservation'], 'Ruling S86: the ambiguous error carries the reservation identity too' );
+		// The ambiguous attempt actually DID land underneath the
+		// unreadable witness.
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $reserved_seq, $GLOBALS['_options'] );
+
+
+		// The retry: same aura_ref, same touches, ALSO echoing back
+		// reserved_seq from the error above (Ruling S86's own
+		// belt-and-braces: the reservation-index write is itself a
+		// SEPARATE, best-effort statement that can go ambiguous
+		// independently of the pending row's own insert -- a robust
+		// caller sends both) -- no ambiguity seam of its own, exactly
+		// what a caller re-sending the SAME intercepted request after
+		// the first attempt's own 503 would do.
+		$retry_entry                 = $entry;
+		$retry_entry['reserved_seq'] = $reserved_seq;
+		$second                      = Aura_Worker_Door_Log::open_pending( $retry_entry );
+
+		$this->assertSame( $reserved_seq, $second, 'Ruling S86: the SAME aura_ref recognises the existing reservation -- never a second, sibling seq' );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::PREFIX . ( $reserved_seq + 1 ), $GLOBALS['_options'], 'no N+1 allocated behind the recognised reservation' );
+
+		// The recognised row admits and executes normally from here --
+		// this is a REAL row, not a placeholder.
+		$this->assertTrue( Aura_Worker_Door_Log::admit( $reserved_seq ) );
+		$this->assertTrue( Aura_Worker_Door_Log::settle( $reserved_seq, array( 'result' => 'ok' ) ) );
+	}
+
+	/**
+	 * Ruling S86: the OTHER half -- two genuinely DIFFERENT intercepted
+	 * requests (different `aura_ref`) must derive two DIFFERENT
+	 * reservations, so two distinct calls are never merged into one row.
+	 */
+	public function test_distinct_aura_refs_on_open_pending_derive_distinct_rows(): void {
+		$first  = Aura_Worker_Door_Log::open_pending( $this->entry( array( 'aura_ref' => 'aura-ref-one' ) ) );
+		$second = Aura_Worker_Door_Log::open_pending( $this->entry( array( 'aura_ref' => 'aura-ref-two' ) ) );
+
+		$this->assertIsInt( $first );
+		$this->assertIsInt( $second );
+		$this->assertNotSame( $first, $second );
+	}
+
+	/**
+	 * Ruling S86: a caller supplying `aura_ref` for the FIRST time (no
+	 * reservation on record yet) allocates exactly as it always has --
+	 * the mechanism only ever SHORT-CIRCUITS a genuine repeat, never
+	 * changes the ordinary, unambiguous path.
+	 */
+	public function test_open_pending_allocates_fresh_when_no_reservation_exists_yet(): void {
+		$entry = $this->entry( array( 'aura_ref' => 'aura-ref-brand-new' ) );
+		$seq   = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$this->assertIsInt( $seq );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'] );
+
+		// A CLEAN repeat (no ambiguity at all) with the SAME aura_ref
+		// recognises the reservation the first, successful call
+		// registered -- proving the pure derivation path on its own,
+		// independent of the reserved_seq echo-back the ambiguous-retry
+		// sibling test above also relies on.
+		$again = Aura_Worker_Door_Log::open_pending( $entry );
+		$this->assertSame( $seq, $again, 'the SAME aura_ref recognises the existing reservation on a clean repeat too, not only after an ambiguous one' );
+	}
+
+	/**
+	 * Ruling S86's own answer to "what does the reservation fall back to
+	 * with no idempotency material at all": NOT S80's own unrecoverable
+	 * random fallback -- `reserved_seq`, a plain integer this method
+	 * already hands back in EVERY ambiguous answer regardless of
+	 * `aura_ref`, is itself a usable retry key. A caller with nothing
+	 * else to derive from need only echo it back.
+	 */
+	public function test_a_retry_echoing_back_reserved_seq_recognises_it_with_no_aura_ref_at_all(): void {
+		Aura_Worker_Door_Log::open_pending( $this->entry() ); // primes epoch/binding, same discipline as above
+		$entry = $this->entry(); // no aura_ref at all
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s86-noref';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s86-noref';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$first = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( 'WP_Error', $first );
+		$data = $first->get_error_data();
+		$this->assertSame( '', $data['reservation'], 'no aura_ref was given -- no derived identity either' );
+		$reserved_seq = $data['reserved_seq'];
+
+		// The retry echoes reserved_seq back explicitly -- the ONLY
+		// correlation available to a caller with no idempotency material
+		// of its own.
+		$retry_entry                    = $this->entry();
+		$retry_entry['reserved_seq'] = $reserved_seq;
+		$second                          = Aura_Worker_Door_Log::open_pending( $retry_entry );
+
+		$this->assertSame( $reserved_seq, $second, 'Ruling S86: echoing reserved_seq back recognises it, even with zero derivable idempotency material' );
+	}
 }
