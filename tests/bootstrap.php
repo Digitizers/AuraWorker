@@ -2820,6 +2820,22 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$this->sa_txn_stack[ $top ]['savepoint'] = stripslashes( $m[1] );
 				return true;
 			}
+			// ROLLBACK TO SAVEPOINT (Ruling S21, 2.16.2) — `versioned()`'s
+			// verification, issued right after SAVEPOINT and before any
+			// callback write, that the savepoint just set really is open on
+			// THIS session. Unlike RELEASE SAVEPOINT below, this does NOT
+			// clear the frame's savepoint marker — a real ROLLBACK TO
+			// SAVEPOINT leaves the savepoint itself intact, valid for a
+			// later RELEASE. Same mismatch check, same MySQL error 1305.
+			if ( preg_match( '/^ROLLBACK TO SAVEPOINT (\w+)$/', $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				$top  = empty( $this->sa_txn_stack ) ? null : count( $this->sa_txn_stack ) - 1;
+				if ( null === $top || $this->sa_txn_stack[ $top ]['savepoint'] !== $name ) {
+					$this->last_error = "Error 1305: SAVEPOINT $name does not exist";
+					return false;
+				}
+				return true;
+			}
 			// The release this savepoint exists for: proves the CURRENT
 			// transaction frame still holds the savepoint this connection
 			// set — a reconnect anywhere in between (whether it skipped the

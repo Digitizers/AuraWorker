@@ -1162,10 +1162,13 @@ final class DoorLogTest extends TestCase {
 	 * — set immediately after START TRANSACTION, before the nonce — cannot
 	 * be silently re-created this way: an autocommit session that runs
 	 * SAVEPOINT outside any explicit transaction discards it the instant
-	 * that statement completes, so the RELEASE this method issues right
-	 * before COMMIT fails loudly (modelled as MySQL error 1305) instead of
-	 * quietly succeeding on a session that was never really in a
-	 * transaction.
+	 * that statement completes, so a later check against it fails loudly
+	 * (modelled as MySQL error 1305) instead of quietly succeeding on a
+	 * session that was never really in a transaction. As of Ruling S21
+	 * (Codex round-8 P1) that check is `ROLLBACK TO SAVEPOINT`, run
+	 * immediately after `SAVEPOINT` — BEFORE the callback below ever runs —
+	 * rather than `RELEASE SAVEPOINT` at the very end; see that ruling's own
+	 * test for the guarantee this reordering adds.
 	 */
 	public function test_a_reconnect_between_start_transaction_and_the_savepoint_reports_committed_false(): void {
 		$name = 'aura_worker_door_s17_test';
@@ -1208,6 +1211,40 @@ final class DoorLogTest extends TestCase {
 		$this->assertTrue( $outcome['committed'] );
 		$this->assertTrue( $outcome['result'] );
 		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * Ruling S21 (Codex round-8 P1 on #88): Ruling S17's `RELEASE SAVEPOINT`
+	 * catches a reconnect only at the CLOSE of the unit — after `$writes()`
+	 * and the version bump have both already run. On a real server that
+	 * already dropped the transaction, every statement they issued would
+	 * have autocommitted individually, un-transacted, immune to the
+	 * `ROLLBACK` this method issues once it finally notices — reporting
+	 * `committed: false` at that point is honest about the VERSION not
+	 * having advanced, but not about whether the state write itself landed
+	 * anyway. `ROLLBACK TO SAVEPOINT aura_door_tx`, issued immediately
+	 * after `SAVEPOINT` and BEFORE the nonce or `$writes()`, catches the
+	 * SAME reconnect before any of that can happen: this test proves
+	 * `$writes()` is never even invoked.
+	 */
+	public function test_a_reconnect_before_the_savepoint_never_runs_the_callback(): void {
+		$ran = false;
+
+		$GLOBALS['_sa_reconnect_before_savepoint'] = true;
+		$outcome                                   = Aura_Worker_Door_Log::versioned(
+			function () use ( &$ran ) {
+				$ran = true;
+				return array(
+					'mutated' => true,
+					'result'  => true,
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_savepoint'] = false;
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertFalse( $ran, 'the savepoint is verified before $writes() ever runs — a failure here means the callback was never invoked at all' );
 	}
 
 	/**

@@ -1926,6 +1926,29 @@ class Aura_Worker_Door_Log {
 	 * single statement completes. A failed `RELEASE` fails the whole unit
 	 * exactly like a failed bump: `ROLLBACK`, `committed: false`.
 	 *
+	 * THE SAVEPOINT IS VERIFIED BEFORE ANY CALLBACK WRITE, NOT ONLY AT THE
+	 * END (Ruling S21, Codex round-8 P1 on #88). Ruling S17's `RELEASE
+	 * SAVEPOINT` catches a reconnect only at the CLOSE of the unit — but a
+	 * reconnect landing between `START TRANSACTION` and the `SAVEPOINT`
+	 * statement above lands that `SAVEPOINT` itself on a fresh autocommit
+	 * session, where it opens and instantly closes its own one-statement
+	 * transaction and is discarded the moment that statement completes.
+	 * Nothing about issuing it fails — so without a check HERE, `$writes()`
+	 * and the version bump would both run un-transacted, autocommitting
+	 * each statement individually, before the LATER `RELEASE` finally
+	 * caught the problem — too late to stop either from having already
+	 * landed outside any transaction. `ROLLBACK TO SAVEPOINT aura_door_tx`,
+	 * issued immediately after the `SAVEPOINT` and before the nonce or
+	 * `$writes()`, closes this: on the real session it is a genuine no-op
+	 * (nothing has been written yet, and `ROLLBACK TO SAVEPOINT` — unlike
+	 * `RELEASE SAVEPOINT` — does not remove the savepoint, so it stays
+	 * valid for Ruling S17's own `RELEASE` later), but on a session where
+	 * the savepoint never really took, MySQL answers error 1305 there
+	 * instead. Caught before `$writes()` is ever called, so a failure here
+	 * means NOTHING ran at all — safer than every other failure path,
+	 * which must undo work already done — and the caller may retry
+	 * exactly as if `$writes()` had never been invoked.
+	 *
 	 * A ROLLBACK REPEATS THE CALLBACK'S EVICTIONS TOO (Ruling S18, Codex
 	 * round-7 P1 on #88). `$writes()` can — and `ack_write()` does —
 	 * evict an option's cache entry and then RE-READ it before this method
@@ -1962,18 +1985,19 @@ class Aura_Worker_Door_Log {
 	 *                         `result` is handed back to the CALLER of
 	 *                         versioned().
 	 * @return array{ committed: bool, result?: mixed, observation?: int|null }
-	 *         `committed` is false when $writes() asked for a rollback,
-	 *         reported a mutation whose version bump then failed its own
-	 *         WRITE, when the savepoint that proves the session held the
-	 *         transaction the whole time could not be released (Ruling S17),
-	 *         or when the final COMMIT could not be PROVEN to have run on
-	 *         the session that opened the transaction (Ruling S16) — every
-	 *         one of those rolls the WHOLE unit back (on a transactional
-	 *         engine only — see Ruling S13 above), including every
-	 *         statement $writes() itself ran AND every cache entry it
-	 *         evicted and re-read before this method decided to fail
-	 *         (Ruling S18), so the caller must treat this exactly like
-	 *         $writes() failing outright — and `result` is
+	 *         `committed` is false when the savepoint could not be PROVEN
+	 *         open before $writes() ever ran (Ruling S21), $writes() asked
+	 *         for a rollback, a mutation's version bump then failed its own
+	 *         WRITE, the savepoint could not be RELEASED at the close of
+	 *         the unit (Ruling S17), or the final COMMIT could not be
+	 *         PROVEN to have run on the session that opened the transaction
+	 *         (Ruling S16) — every one of those rolls the WHOLE unit back
+	 *         (on a transactional engine only — see Ruling S13 above),
+	 *         including every statement $writes() itself ran (nothing, for
+	 *         the S21 case, which is what makes it safe to retry outright)
+	 *         AND every cache entry it evicted and re-read before this
+	 *         method decided to fail (Ruling S18), so the caller must treat
+	 *         this exactly like $writes() failing outright — and `result` is
 	 *         ABSENT whenever `committed` is false (Ruling S15): never read
 	 *         it without checking `committed` first. `observation` is
 	 *         likewise absent on failure, and otherwise the witness THIS call
@@ -1992,11 +2016,35 @@ class Aura_Worker_Door_Log {
 			// savepoint, before anything else — see this method's own
 			// docblock for why the nonce below is not enough on its own.
 			$wpdb->query( 'SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			// Ruling S16 (Codex round-6 P1 on #88): the FIRST statement after
-			// the savepoint, so it is set on THIS session before anything
-			// else runs — the proof the final COMMIT below checks before this
-			// method ever reports `committed: true`. See that COMMIT's own
-			// comment for what it proves and why.
+			// Ruling S21 (Codex round-8 P1 on #88): VERIFY the savepoint
+			// BEFORE any callback write runs — not only right before the
+			// final COMMIT (Ruling S17's own RELEASE, below). A reconnect
+			// between START TRANSACTION and the SAVEPOINT statement above
+			// lands that SAVEPOINT on a fresh AUTOCOMMIT session, where it
+			// opens and instantly closes its own one-statement transaction
+			// — the savepoint is discarded the moment that statement
+			// completes, so it protects nothing, and everything $writes()
+			// is about to do would run un-transacted. `ROLLBACK TO
+			// SAVEPOINT` proves it here, immediately: on the real session
+			// this is a genuine no-op (nothing has been written yet to roll
+			// back — the savepoint is NOT released by this statement,
+			// unlike RELEASE SAVEPOINT, so it remains valid for later), but
+			// on a session where the savepoint never really took, MySQL
+			// answers error 1305 ("SAVEPOINT … does not exist") — caught
+			// here, BEFORE `$writes()` ever runs, so the whole unit fails
+			// with NOTHING written and the caller may safely retry.
+			$wpdb->query( 'ROLLBACK TO SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			if ( '' !== (string) $wpdb->last_error ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				return array(
+					'committed' => false,
+				);
+			}
+			// Ruling S16 (Codex round-6 P1 on #88): set only once the
+			// savepoint above is PROVEN — so it is set on THIS session
+			// before anything else runs — the proof the final COMMIT below
+			// checks before this method ever reports `committed: true`.
+			// See that COMMIT's own comment for what it proves and why.
 			$tx_nonce = wp_generate_uuid4();
 			$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 		}
