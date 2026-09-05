@@ -1806,4 +1806,44 @@ final class DoorLogTest extends TestCase {
 		$this->assertSame( 'engine', Aura_Worker_Door_Log::observation_unsupported_reason(), 'a DEFINITIVE non-transactional answer still reports the permanent reason' );
 		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
 	}
+
+	/**
+	 * Ruling S50 (Codex round-20 P1 on #88): a connection dropping WHILE
+	 * $writes() runs one of its OWN statements used to let
+	 * wpdb::check_connection() transparently reconnect and REPLAY that
+	 * exact statement on a fresh, autocommit session -- landing it
+	 * independently and permanently, invisible to $writes() (which saw an
+	 * ordinary success), before versioned()'s own SAVEPOINT/COMMIT
+	 * machinery ever ran. `reconnect_retries = 0` for the unit's own
+	 * duration makes check_connection() give up instead: the dropped
+	 * statement's own query() call just fails, so nothing lands and
+	 * versioned() reports the ordinary retryable `committed: false`.
+	 *
+	 * `insert_unique_write()`'s own "INSERT ... SELECT ... FROM DUAL WHERE
+	 * NOT EXISTS" statement is the target -- picked out by its distinctive
+	 * "FROM DUAL" fragment so this lands on $writes()'s OWN query, never
+	 * one of the fixed control statements (START TRANSACTION, SAVEPOINT,
+	 * the nonce SET) versioned() always issues first and already protects
+	 * a different way (Rulings S17/S21/S25).
+	 */
+	public function test_a_dropped_connection_mid_writes_never_replays_the_statement(): void {
+		$name           = 'aura_worker_door_log_test_s50';
+		$before_retries = $GLOBALS['wpdb']->reconnect_retries;
+
+		$GLOBALS['_sa_reconnect_mid_query'] = 'FROM DUAL';
+		$GLOBALS['_db_queries']             = array();
+
+		$won = Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) );
+
+		$this->assertFalse( $won, 'a dropped connection mid-write is retryable, never a silent success' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the row never landed -- a replay on a fresh session would have inserted it anyway' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_rows'], 'not even in the raw "database" -- nothing ran a second time' );
+		$this->assertSame( $before_retries, $GLOBALS['wpdb']->reconnect_retries, 'restored after the unit finished, whatever the outcome' );
+
+		// And the miss does not stick: a healthy retry afterwards succeeds
+		// normally, on the SAME connection, with reconnects unaffected.
+		$won_retry = Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) );
+		$this->assertTrue( $won_retry );
+		$this->assertSame( $before_retries, $GLOBALS['wpdb']->reconnect_retries );
+	}
 }

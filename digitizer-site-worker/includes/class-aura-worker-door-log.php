@@ -2374,284 +2374,343 @@ class Aura_Worker_Door_Log {
 			);
 		}
 		$tx_nonce = null;
-		if ( $transactional ) {
-			$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			// Ruling S17 (Codex round-7 P1 on #88): a REAL transactional
-			// savepoint, before anything else — see this method's own
-			// docblock for why the nonce below is not enough on its own.
-			$wpdb->query( 'SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			// Ruling S16 (Codex round-6 P1 on #88): the proof the final
-			// COMMIT below checks before this method ever reports
-			// `committed: true`. See that COMMIT's own comment for what it
-			// proves and why.
-			$tx_nonce = wp_generate_uuid4();
-			$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			// Ruling S25 (Codex round-11 P1 on #88): VERIFY the savepoint
-			// AFTER this SET, not before it (Ruling S21's own original
-			// position) — the SET is ITSELF the last reconnect-prone
-			// statement before `$writes()` runs. A reconnect landing WHILE
-			// this exact SET is being issued lets `wpdb` transparently
-			// retry it on a fresh AUTOCOMMIT session — one that never held
-			// the savepoint above — and the retried SET still assigns the
-			// nonce there, so a check placed only BEFORE the SET (as Ruling
-			// S21 had it) never sees this window at all: the callback
-			// writes and the bump would then run un-transacted, each
-			// autocommitting individually on a real server, before the
-			// LATER `RELEASE SAVEPOINT` (Ruling S17) finally caught the
-			// problem — too late to stop any of it from having already
-			// landed. `ROLLBACK TO SAVEPOINT`, run immediately after the
-			// SET and before `$writes()`, closes this the same way Ruling
-			// S21 closed the window before it: a genuine no-op on the real
-			// session (nothing written yet, and the savepoint survives for
-			// Ruling S17's own RELEASE later), but MySQL error 1305 on a
-			// session where the savepoint never really took — whether the
-			// reconnect landed before SAVEPOINT, during it, or during this
-			// SET makes no difference to this ONE check, which is why a
-			// single verification positioned AFTER the last such statement
-			// replaces Ruling S21's earlier, narrower one.
-			$wpdb->query( 'ROLLBACK TO SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			if ( '' !== (string) $wpdb->last_error ) {
-				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				return array(
-					'committed' => false,
-				);
-			}
-		}
+		$tx_nonce = null;
+		// Ruling S50 (Codex round-20 P1 on #88): no statement of this
+		// unit — not $writes()'s own queries, not START TRANSACTION,
+		// SAVEPOINT, the nonce SET, the bump, RELEASE or COMMIT — may
+		// run on a RECONNECTED session. A dropped connection mid-
+		// statement otherwise has wpdb::check_connection() transparently
+		// reconnect and REPLAY that exact query on a fresh, autocommit
+		// session — invisible to $writes(), which sees an ordinary
+		// success, but the statement has now landed independently and
+		// permanently, before this method's own SAVEPOINT/COMMIT
+		// machinery (Rulings S16/S17/S21/S25) ever gets a say — exactly
+		// the un-transacted-autocommit hazard Ruling S13 already names
+		// for a non-transactional ENGINE, reopened here by a transient
+		// CONNECTION drop on a genuinely transactional one. Setting
+		// `reconnect_retries` to 0 for this unit's own duration makes
+		// check_connection() attempt zero reconnects instead: the
+		// dropped statement's own query() call simply returns false,
+		// which every existing failure path below (the savepoint check,
+		// the bump's own write, RELEASE, COMMIT) already treats as a
+		// retryable `committed: false` — the SAME shape, not a new one.
+		// Saved and restored on EVERY exit from here down, including a
+		// rethrown exception (the `finally` below), so a caller
+		// elsewhere in this same request is never left running with
+		// reconnects disabled by a unit that already finished.
+		$prior_reconnect_retries = isset( $wpdb->reconnect_retries ) ? $wpdb->reconnect_retries : 3;
+		$wpdb->reconnect_retries = 0;
 		try {
-			$outcome = $writes();
-		} catch ( \Throwable $e ) {
 			if ( $transactional ) {
-				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				// Ruling S17 (Codex round-7 P1 on #88): a REAL transactional
+				// savepoint, before anything else — see this method's own
+				// docblock for why the nonce below is not enough on its own.
+				$wpdb->query( 'SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				// Ruling S16 (Codex round-6 P1 on #88): the proof the final
+				// COMMIT below checks before this method ever reports
+				// `committed: true`. See that COMMIT's own comment for what it
+				// proves and why.
+				$tx_nonce = wp_generate_uuid4();
+				$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				// Ruling S25 (Codex round-11 P1 on #88): VERIFY the savepoint
+				// AFTER this SET, not before it (Ruling S21's own original
+				// position) — the SET is ITSELF the last reconnect-prone
+				// statement before `$writes()` runs. A reconnect landing WHILE
+				// this exact SET is being issued lets `wpdb` transparently
+				// retry it on a fresh AUTOCOMMIT session — one that never held
+				// the savepoint above — and the retried SET still assigns the
+				// nonce there, so a check placed only BEFORE the SET (as Ruling
+				// S21 had it) never sees this window at all: the callback
+				// writes and the bump would then run un-transacted, each
+				// autocommitting individually on a real server, before the
+				// LATER `RELEASE SAVEPOINT` (Ruling S17) finally caught the
+				// problem — too late to stop any of it from having already
+				// landed. `ROLLBACK TO SAVEPOINT`, run immediately after the
+				// SET and before `$writes()`, closes this the same way Ruling
+				// S21 closed the window before it: a genuine no-op on the real
+				// session (nothing written yet, and the savepoint survives for
+				// Ruling S17's own RELEASE later), but MySQL error 1305 on a
+				// session where the savepoint never really took — whether the
+				// reconnect landed before SAVEPOINT, during it, or during this
+				// SET makes no difference to this ONE check, which is why a
+				// single verification positioned AFTER the last such statement
+				// replaces Ruling S21's earlier, narrower one.
+				$wpdb->query( 'ROLLBACK TO SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				if ( '' !== (string) $wpdb->last_error ) {
+					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					return array(
+						'committed' => false,
+					);
+				}
 			}
-			throw $e;
-		}
-		$outcome = is_array( $outcome ) ? $outcome : array();
-		if ( ! empty( $outcome['rollback'] ) ) {
-			// Ruling S12: $writes() itself demands the unit fail.
+			try {
+				$outcome = $writes();
+			} catch ( \Throwable $e ) {
+				if ( $transactional ) {
+					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				}
+				throw $e;
+			}
+			$outcome = is_array( $outcome ) ? $outcome : array();
+			// Ruling S18 (Codex round-7 P1 on #88): the evict list $writes()
+			// itself declared — extracted here, before EITHER the new S50
+			// nonce check below or the `rollback` branch just after it, so
+			// both can repeat it on their own rollback path exactly like
+			// every other failure branch in this method already does.
+			$evict = isset( $outcome['evict'] ) && is_array( $outcome['evict'] ) ? $outcome['evict'] : array();
 			if ( $transactional ) {
-				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				// Ruling S50, belt-and-braces: `reconnect_retries = 0` above
+				// is what actually PREVENTS a reconnect from replaying one
+				// of $writes()'s own statements on a fresh session — this
+				// is the independent PROOF that none slipped through
+				// anyway. The session nonce Ruling S16 set right after
+				// SAVEPOINT does not survive a reconnect; reading it back
+				// HERE, immediately after $writes() returns and BEFORE the
+				// version bump, catches a reconnected session at the
+				// earliest possible point — before the bump's own write
+				// can land on that same compromised session — rather than
+				// only much later, at COMMIT, by which time $writes() may
+				// already have run twice.
+				$post_writes_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				if ( ! is_string( $post_writes_nonce ) || $post_writes_nonce !== $tx_nonce ) {
+					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					self::evict_after_rollback( $evict ); // Ruling S18
+					return array(
+						'committed' => false,
+					);
+				}
+			}
+			if ( ! empty( $outcome['rollback'] ) ) {
+				// Ruling S12: $writes() itself demands the unit fail.
+				if ( $transactional ) {
+					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					return array(
+						'committed' => false,
+						'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
+					);
+				}
+				// Ruling S13: nothing CAN be rolled back here — whatever
+				// $writes() already ran landed the moment it ran. The most
+				// honest answer left is that the unit "committed", exactly as
+				// every other statement on this engine always has; $writes()'s
+				// own `result` already reflects what it could prove happened.
 				return array(
-					'committed' => false,
+					'committed' => true,
 					'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
 				);
 			}
-			// Ruling S13: nothing CAN be rolled back here — whatever
-			// $writes() already ran landed the moment it ran. The most
-			// honest answer left is that the unit "committed", exactly as
-			// every other statement on this engine always has; $writes()'s
-			// own `result` already reflects what it could prove happened.
-			return array(
-				'committed' => true,
-				'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
-			);
-		}
-		$mutated = ! empty( $outcome['mutated'] );
-		$result  = array_key_exists( 'result', $outcome ) ? $outcome['result'] : null;
-		$evict   = isset( $outcome['evict'] ) && is_array( $outcome['evict'] ) ? $outcome['evict'] : array();
-		if ( ! $mutated ) {
-			if ( $transactional ) {
-				$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			}
-			return array(
-				'committed' => true,
-				'result'    => $result,
-			);
-		}
-		if ( $transactional ) {
-			// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): a DURABLE
-			// commit witness, PER TRANSACTION, written INSIDE this
-			// transaction, BEFORE the version bump — see the post-COMMIT
-			// check below for the reconnect window this closes that the
-			// session-variable nonce (Ruling S16) cannot, and this
-			// method's own docblock for why the row is named BY this
-			// unit's own nonce rather than shared with every other unit.
-			// `option_value` is never compared — the row's mere EXISTENCE
-			// under this exact name is the proof — so it carries the
-			// write's own unix timestamp, which is all the later janitor
-			// sweep needs to judge a leaked row's age.
-			$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->prepare(
-					"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
-					self::LAST_TX_PREFIX . $tx_nonce,
-					(string) time()
-				)
-			);
-		}
-		$bump_ok = self::bump_door_version_write();
-		if ( ! $bump_ok && $transactional ) {
-			// Ruling S8: the bump's own WRITE failed, so the mutation must
-			// not land either — every statement $writes() ran is undone.
-			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			// Ruling S15 (Codex round-6 P2 on #88): `$result` above is the
-			// SUCCESS-shaped value $writes() already computed BEFORE the
-			// bump's write failed — ack_write()'s `acked`/`floor`,
-			// rotate_epoch_write()'s `rotated: true`/`epoch`, and so on.
-			// Handing it back here, after the ROLLBACK that just undid
-			// every statement behind it, told `ack()`/`rotate_epoch()` (both
-			// of which returned `$outcome['result']` unconditionally) that
-			// their write had gone through when nothing did. A rolled-back
-			// unit reports NOTHING it did — no `result` at all — so every
-			// caller must check `committed` first and build its own failure
-			// answer rather than trust a `result` that might be stale.
-			self::evict_after_rollback( $evict ); // Ruling S18
-			return array(
-				'committed' => false,
-			);
-		}
-		// Ruling S13: on a non-transactional engine the state write already
-		// landed, durably, whatever the bump did — there is no rollback to
-		// perform, so execution simply continues to the shared tail below.
-		if ( $transactional ) {
-			// Ruling S17 (Codex round-7 P1 on #88): RELEASE the savepoint
-			// BEFORE the COMMIT it is meant to protect. A reconnect ANYWHERE
-			// between START TRANSACTION and here — including one that let a
-			// retried `SET` land on a fresh autocommit session carrying the
-			// SAME nonce Ruling S16 checks below — leaves no savepoint for
-			// this statement to find: an autocommit session that ran
-			// SAVEPOINT outside any explicit transaction discards it the
-			// instant that single statement completes, so MySQL answers
-			// error 1305 ("SAVEPOINT … does not exist") here instead. That
-			// failure is treated exactly like the bump's own write failing.
-			$wpdb->query( 'RELEASE SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			if ( '' !== (string) $wpdb->last_error ) {
-				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				self::evict_after_rollback( $evict ); // Ruling S18
+			$mutated = ! empty( $outcome['mutated'] );
+			$result  = array_key_exists( 'result', $outcome ) ? $outcome['result'] : null;
+			// $evict was already extracted above (Ruling S50), before the
+			// nonce re-check that needed it too.
+			if ( ! $mutated ) {
+				if ( $transactional ) {
+					$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				}
 				return array(
-					'committed' => false,
+					'committed' => true,
+					'result'    => $result,
 				);
 			}
-			$commit_return     = $wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
-			$commit_last_error = (string) $wpdb->last_error;
-			// Ruling S40 (Codex round-17 P1 on #88): capture COMMIT's OWN
-			// return and last_error IMMEDIATELY — before any other
-			// statement runs, including the session-nonce and
-			// durable-witness reads below, either of which would reset
-			// $wpdb->last_error before this COMMIT's own outcome could
-			// ever be consulted. Rulings S16/S30/S32/S34 decided
-			// `committed` from a SEPARATE `SELECT @aura_door_tx`
-			// read-back ALONE: a matching session nonce proved the
-			// connection never dropped, and that alone reported
-			// committed:true — even across a COMMIT that had already
-			// reported failure on a connection that never moved. A
-			// matching nonce proves session CONTINUITY; it does not prove
-			// COMMIT SUCCESS, and the two are not the same fact — this
-			// gate now runs FIRST, and only a COMMIT that already looks
-			// clean gets to the nonce check at all.
-			$tx_witness = self::LAST_TX_PREFIX . $tx_nonce;
-			$commit_ok  = ( false !== $commit_return && '' === $commit_last_error );
-			if ( $commit_ok ) {
-				// Ruling S16 (Codex round-6 P1 on #88), preserved: a CLEAN
-				// return/last_error only proves the STATEMENT succeeded —
-				// not WHICH session it ran on. A reconnect landing exactly
-				// during this COMMIT call lands on a fresh, autocommit
-				// session with no transaction open, so the COMMIT it
-				// silently retries there is a harmless no-op that ALSO
-				// returns true with no error — passing the check above
-				// while the original session's transaction was rolled
-				// back the instant the connection dropped. Session (user)
-				// variables do not survive that reconnect, so reading the
-				// nonce back and comparing tells the two apart.
-				$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
-			}
-			if ( ! $commit_ok ) {
-				// Ruling S40: an EXPLICIT ROLLBACK, best effort, BEFORE the
-				// durable witness is ever read. Without it, a COMMIT that
-				// failed on a connection that never dropped can leave the
-				// transaction still OPEN on this very session — and a bare
-				// SELECT on that same, still-open connection reads back its
-				// OWN uncommitted witness row (ordinary read-your-own-writes
-				// visibility within an open transaction), reporting a row
-				// that was never made durable as if it already were. A
-				// no-op on a session whose COMMIT genuinely landed (nothing
-				// is left open to roll back); ends the transaction after one
-				// that did not, so this session can no longer see anything
-				// it never durably wrote.
-				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): the DURABLE
-				// witness, written BEFORE the bump inside this same
-				// transaction — a plain option row survives what neither a
-				// session variable nor an open-but-doomed transaction's own
-				// local view can be trusted for. Named BY this unit's own
-				// nonce (S32), so its mere EXISTENCE — never a value
-				// comparison — is the whole proof; a row a DIFFERENT,
-				// unrelated unit wrote can never share this exact name.
-				// Read RAW, and only now — AFTER the ROLLBACK above closed
-				// this session's own open transaction, if it had one — so
-				// this SELECT can only ever see what is genuinely durable.
-				$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			if ( $transactional ) {
+				// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): a DURABLE
+				// commit witness, PER TRANSACTION, written INSIDE this
+				// transaction, BEFORE the version bump — see the post-COMMIT
+				// check below for the reconnect window this closes that the
+				// session-variable nonce (Ruling S16) cannot, and this
+				// method's own docblock for why the row is named BY this
+				// unit's own nonce rather than shared with every other unit.
+				// `option_value` is never compared — the row's mere EXISTENCE
+				// under this exact name is the proof — so it carries the
+				// write's own unix timestamp, which is all the later janitor
+				// sweep needs to judge a leaked row's age.
+				$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$wpdb->prepare(
-						"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-						$tx_witness
+						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+						self::LAST_TX_PREFIX . $tx_nonce,
+						(string) time()
 					)
 				);
-				$commit_ok = is_string( $durable );
 			}
-			// Ruling S32: both branches above are now settled — clean up
-			// THIS unit's own witness row, best effort, OUTSIDE the
-			// transaction (which has already committed or rolled back by
-			// now, so this DELETE is its own separate, auto-committed
-			// statement). Only reached once a real COMMIT has actually
-			// been issued: the SAVEPOINT-release and bump-write failure
-			// branches above return before ever getting here, and in both
-			// of those the witness row this unit wrote was rolled back
-			// along with everything else, so there is nothing of THIS
-			// unit's own to delete.
-			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $tx_witness ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			// A BOUNDED JANITOR for whatever a DIED process left behind — a
-			// disconnect landing between ITS OWN COMMIT and ITS OWN delete
-			// above is the only way a witness row outlives the unit that
-			// wrote it. Runs on every mutating unit, so the bound
-			// (`self::LAST_TX_JANITOR_LIMIT` rows, older than
-			// `self::LAST_TX_MAX_AGE_S`) matters: this table must never be
-			// left to accumulate across restarts of the same fault, but
-			// nor may this sweep itself become a full-table scan on every
-			// single door mutation.
-			$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->prepare(
-					"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND CAST(option_value AS UNSIGNED) < %d LIMIT %d",
-					$wpdb->esc_like( self::LAST_TX_PREFIX ) . '%',
-					time() - self::LAST_TX_MAX_AGE_S,
-					self::LAST_TX_JANITOR_LIMIT
-				)
-			);
-			if ( ! $commit_ok ) {
-				// Ruling S15: no callback result — see the bump-failure
-				// branch above for why. Neither the session variable nor
-				// the durable witness could prove this COMMIT landed on a
-				// session that ever held this transaction; nothing here is
-				// trusted to have happened.
+			$bump_ok = self::bump_door_version_write();
+			if ( ! $bump_ok && $transactional ) {
+				// Ruling S8: the bump's own WRITE failed, so the mutation must
+				// not land either — every statement $writes() ran is undone.
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				// Ruling S15 (Codex round-6 P2 on #88): `$result` above is the
+				// SUCCESS-shaped value $writes() already computed BEFORE the
+				// bump's write failed — ack_write()'s `acked`/`floor`,
+				// rotate_epoch_write()'s `rotated: true`/`epoch`, and so on.
+				// Handing it back here, after the ROLLBACK that just undid
+				// every statement behind it, told `ack()`/`rotate_epoch()` (both
+				// of which returned `$outcome['result']` unconditionally) that
+				// their write had gone through when nothing did. A rolled-back
+				// unit reports NOTHING it did — no `result` at all — so every
+				// caller must check `committed` first and build its own failure
+				// answer rather than trust a `result` that might be stale.
 				self::evict_after_rollback( $evict ); // Ruling S18
 				return array(
 					'committed' => false,
 				);
 			}
+			// Ruling S13: on a non-transactional engine the state write already
+			// landed, durably, whatever the bump did — there is no rollback to
+			// perform, so execution simply continues to the shared tail below.
+			if ( $transactional ) {
+				// Ruling S17 (Codex round-7 P1 on #88): RELEASE the savepoint
+				// BEFORE the COMMIT it is meant to protect. A reconnect ANYWHERE
+				// between START TRANSACTION and here — including one that let a
+				// retried `SET` land on a fresh autocommit session carrying the
+				// SAME nonce Ruling S16 checks below — leaves no savepoint for
+				// this statement to find: an autocommit session that ran
+				// SAVEPOINT outside any explicit transaction discards it the
+				// instant that single statement completes, so MySQL answers
+				// error 1305 ("SAVEPOINT … does not exist") here instead. That
+				// failure is treated exactly like the bump's own write failing.
+				$wpdb->query( 'RELEASE SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				if ( '' !== (string) $wpdb->last_error ) {
+					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					self::evict_after_rollback( $evict ); // Ruling S18
+					return array(
+						'committed' => false,
+					);
+				}
+				$commit_return     = $wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
+				$commit_last_error = (string) $wpdb->last_error;
+				// Ruling S40 (Codex round-17 P1 on #88): capture COMMIT's OWN
+				// return and last_error IMMEDIATELY — before any other
+				// statement runs, including the session-nonce and
+				// durable-witness reads below, either of which would reset
+				// $wpdb->last_error before this COMMIT's own outcome could
+				// ever be consulted. Rulings S16/S30/S32/S34 decided
+				// `committed` from a SEPARATE `SELECT @aura_door_tx`
+				// read-back ALONE: a matching session nonce proved the
+				// connection never dropped, and that alone reported
+				// committed:true — even across a COMMIT that had already
+				// reported failure on a connection that never moved. A
+				// matching nonce proves session CONTINUITY; it does not prove
+				// COMMIT SUCCESS, and the two are not the same fact — this
+				// gate now runs FIRST, and only a COMMIT that already looks
+				// clean gets to the nonce check at all.
+				$tx_witness = self::LAST_TX_PREFIX . $tx_nonce;
+				$commit_ok  = ( false !== $commit_return && '' === $commit_last_error );
+				if ( $commit_ok ) {
+					// Ruling S16 (Codex round-6 P1 on #88), preserved: a CLEAN
+					// return/last_error only proves the STATEMENT succeeded —
+					// not WHICH session it ran on. A reconnect landing exactly
+					// during this COMMIT call lands on a fresh, autocommit
+					// session with no transaction open, so the COMMIT it
+					// silently retries there is a harmless no-op that ALSO
+					// returns true with no error — passing the check above
+					// while the original session's transaction was rolled
+					// back the instant the connection dropped. Session (user)
+					// variables do not survive that reconnect, so reading the
+					// nonce back and comparing tells the two apart.
+					$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
+				}
+				if ( ! $commit_ok ) {
+					// Ruling S40: an EXPLICIT ROLLBACK, best effort, BEFORE the
+					// durable witness is ever read. Without it, a COMMIT that
+					// failed on a connection that never dropped can leave the
+					// transaction still OPEN on this very session — and a bare
+					// SELECT on that same, still-open connection reads back its
+					// OWN uncommitted witness row (ordinary read-your-own-writes
+					// visibility within an open transaction), reporting a row
+					// that was never made durable as if it already were. A
+					// no-op on a session whose COMMIT genuinely landed (nothing
+					// is left open to roll back); ends the transaction after one
+					// that did not, so this session can no longer see anything
+					// it never durably wrote.
+					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): the DURABLE
+					// witness, written BEFORE the bump inside this same
+					// transaction — a plain option row survives what neither a
+					// session variable nor an open-but-doomed transaction's own
+					// local view can be trusted for. Named BY this unit's own
+					// nonce (S32), so its mere EXISTENCE — never a value
+					// comparison — is the whole proof; a row a DIFFERENT,
+					// unrelated unit wrote can never share this exact name.
+					// Read RAW, and only now — AFTER the ROLLBACK above closed
+					// this session's own open transaction, if it had one — so
+					// this SELECT can only ever see what is genuinely durable.
+					$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare(
+							"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+							$tx_witness
+						)
+					);
+					$commit_ok = is_string( $durable );
+				}
+				// Ruling S32: both branches above are now settled — clean up
+				// THIS unit's own witness row, best effort, OUTSIDE the
+				// transaction (which has already committed or rolled back by
+				// now, so this DELETE is its own separate, auto-committed
+				// statement). Only reached once a real COMMIT has actually
+				// been issued: the SAVEPOINT-release and bump-write failure
+				// branches above return before ever getting here, and in both
+				// of those the witness row this unit wrote was rolled back
+				// along with everything else, so there is nothing of THIS
+				// unit's own to delete.
+				$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $tx_witness ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				// A BOUNDED JANITOR for whatever a DIED process left behind — a
+				// disconnect landing between ITS OWN COMMIT and ITS OWN delete
+				// above is the only way a witness row outlives the unit that
+				// wrote it. Runs on every mutating unit, so the bound
+				// (`self::LAST_TX_JANITOR_LIMIT` rows, older than
+				// `self::LAST_TX_MAX_AGE_S`) matters: this table must never be
+				// left to accumulate across restarts of the same fault, but
+				// nor may this sweep itself become a full-table scan on every
+				// single door mutation.
+				$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->prepare(
+						"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND CAST(option_value AS UNSIGNED) < %d LIMIT %d",
+						$wpdb->esc_like( self::LAST_TX_PREFIX ) . '%',
+						time() - self::LAST_TX_MAX_AGE_S,
+						self::LAST_TX_JANITOR_LIMIT
+					)
+				);
+				if ( ! $commit_ok ) {
+					// Ruling S15: no callback result — see the bump-failure
+					// branch above for why. Neither the session variable nor
+					// the durable witness could prove this COMMIT landed on a
+					// session that ever held this transaction; nothing here is
+					// trusted to have happened.
+					self::evict_after_rollback( $evict ); // Ruling S18
+					return array(
+						'committed' => false,
+					);
+				}
+			}
+			// Ruling S11: repeat every eviction $writes() performed, now that
+			// the write is durable.
+			foreach ( $evict as $name ) {
+				wp_cache_delete( $name, 'options' );
+			}
+			wp_cache_delete( self::OBSERVATION, 'options' ); // the bump's own row
+			$observation = null;
+			if ( $transactional && $bump_ok ) {
+				// Ruling S10: best-effort, deliberately AFTER commit. Ruling
+				// S13: skipped on a non-transactional engine — the witness is
+				// disabled there regardless (see this method's own docblock),
+				// so reading it back would only prove what nothing may report.
+				$observation = self::bump_door_version_read_back();
+			}
+			return array(
+				'committed'   => true,
+				'result'      => $result,
+				// The witness THIS call produced, for a caller that wants it
+				// (none of today's choke points read it — the door version is
+				// reported separately, on demand, via door_version_raw()) and
+				// for tests: null whenever the read-back could not be proven —
+				// including a reconnect landing between the COMMIT above and
+				// the read-back (Ruling S10) — even though `committed` is true.
+				'observation' => $observation,
+			);
+		} finally {
+			$wpdb->reconnect_retries = $prior_reconnect_retries;
 		}
-		// Ruling S11: repeat every eviction $writes() performed, now that
-		// the write is durable.
-		foreach ( $evict as $name ) {
-			wp_cache_delete( $name, 'options' );
-		}
-		wp_cache_delete( self::OBSERVATION, 'options' ); // the bump's own row
-		$observation = null;
-		if ( $transactional && $bump_ok ) {
-			// Ruling S10: best-effort, deliberately AFTER commit. Ruling
-			// S13: skipped on a non-transactional engine — the witness is
-			// disabled there regardless (see this method's own docblock),
-			// so reading it back would only prove what nothing may report.
-			$observation = self::bump_door_version_read_back();
-		}
-		return array(
-			'committed'   => true,
-			'result'      => $result,
-			// The witness THIS call produced, for a caller that wants it
-			// (none of today's choke points read it — the door version is
-			// reported separately, on demand, via door_version_raw()) and
-			// for tests: null whenever the read-back could not be proven —
-			// including a reconnect landing between the COMMIT above and
-			// the read-back (Ruling S10) — even though `committed` is true.
-			'observation' => $observation,
-		);
 	}
 
 	/**

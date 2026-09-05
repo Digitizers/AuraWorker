@@ -1939,6 +1939,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		public bool $ready = true;
 		/**
+		 * wpdb::$reconnect_retries (Ruling S50, 2.16.2): how many times
+		 * check_connection() tries to reconnect a dropped connection before
+		 * giving up. Real wpdb defaults this to 3; modelled here so
+		 * Aura_Worker_Door_Log::versioned() setting it to 0 for its own
+		 * unit is something a test can actually observe and depend on.
+		 */
+		public int $reconnect_retries = 3;
+		/**
 		 * What the LAST statement that actually ran left behind — wpdb keeps
 		 * it in $last_result, and get_var() extracts from there whether or not
 		 * the statement it was handed ever reached the database.
@@ -1979,6 +1987,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * @var array<string, string>
 		 */
 		private $sa_session_vars = array();
+		/**
+		 * Has a COMMIT actually landed (the plain, no-seam-armed success
+		 * path) since the CURRENT transaction opened (Ruling S50, 2.16.2)?
+		 * Reset by START TRANSACTION, set by a genuinely landed COMMIT.
+		 * `_sa_reconnect_after_commit` gates on this so it fires on the
+		 * FIRST `SELECT @...` read that actually comes AFTER a commit —
+		 * versioned() now issues a SECOND such read (Ruling S50's own
+		 * belt-and-braces check) BEFORE the commit, which must never be
+		 * mistaken for the later, post-commit one this seam exists to
+		 * model.
+		 */
+		private $sa_commit_landed_this_txn = false;
 		/**
 		 * The same thing for get_row(). wpdb keeps ONE $last_result; modelling
 		 * the two separately is the harsher choice, because it means the stale
@@ -2373,7 +2393,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// untouched. Fires once.
 			if ( preg_match( '/^SELECT @(\w+)$/', (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
-				if ( ! empty( $GLOBALS['_sa_reconnect_after_commit'] ) ) {
+				// Gated on sa_commit_landed_this_txn (Ruling S50): this
+				// seam models a reconnect landing AFTER the real COMMIT,
+				// never versioned()'s own EARLIER, pre-commit nonce
+				// re-check (Ruling S50's own belt-and-braces read) — the
+				// two would otherwise be indistinguishable by query text
+				// alone, since both read the exact same session variable.
+				if ( ! empty( $GLOBALS['_sa_reconnect_after_commit'] ) && $this->sa_commit_landed_this_txn ) {
 					$GLOBALS['_sa_reconnect_after_commit'] = false; // fires once
 					$this->sa_session_vars = array();
 				}
@@ -2817,6 +2843,40 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
+			// Ruling S50 (Codex round-20 P1 on #88): models a connection
+			// dropping WHILE the very next statement is in flight — armed
+			// by a test to land on whichever query versioned()'s own
+			// $writes() callback happens to issue. A real dropped
+			// connection sends wpdb::check_connection() into up to
+			// `reconnect_retries` reconnect attempts: with retries left it
+			// reconnects and TRANSPARENTLY REPLAYS this exact statement on
+			// the fresh session — modelled by clearing session state
+			// exactly like every other reconnect seam here, then letting
+			// the statement run normally below (a replay on a fresh
+			// session still lands the same row). With `reconnect_retries`
+			// already at 0 — what Ruling S50 itself sets for versioned()'s
+			// whole unit — check_connection() gives up before ever
+			// retrying, and the ORIGINAL statement never runs at all: the
+			// honest "server has gone away" failure this seam reports
+			// instead. Fires once.
+			$reconnect_mid_query_armed = $GLOBALS['_sa_reconnect_mid_query'] ?? false;
+			// Either `true` (fires on the very next query, whatever it is)
+			// or a substring naming which query to land on — a test needs
+			// to pick $writes()'s OWN statement out of the fixed control
+			// statements (START TRANSACTION, SAVEPOINT, the nonce SET)
+			// versioned() always issues first, to prove Ruling S50's
+			// protection covers $writes() itself and not only those.
+			$reconnect_mid_query_hit = true === $reconnect_mid_query_armed
+				|| ( is_string( $reconnect_mid_query_armed ) && '' !== $reconnect_mid_query_armed && false !== strpos( $query, $reconnect_mid_query_armed ) );
+			if ( $reconnect_mid_query_hit ) {
+				$GLOBALS['_sa_reconnect_mid_query'] = false; // fires once
+				if ( 0 === (int) $this->reconnect_retries ) {
+					$this->last_error = 'MySQL server has gone away';
+					return false;
+				}
+				$this->sa_session_vars = array(); // the fresh, reconnected session
+			}
+
 			// Aura_Worker_Door_Log::versioned() (Ruling S8, 2.16.2): a state
 			// write and its door-version bump run inside ONE transaction, so
 			// the stub models START TRANSACTION/COMMIT/ROLLBACK by
@@ -2831,12 +2891,13 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				if ( ! empty( $this->sa_txn_stack ) ) {
 					throw new RuntimeException( 'wpdb stub: nested START TRANSACTION on the SAME connection — MySQL has none; this is a bug in the code under test, not something to model. A racer standing in for a second connection must swap $GLOBALS[\'wpdb\'] to a fresh SA_Test_Wpdb instead of reusing this one.' );
 				}
-				$this->sa_txn_stack[] = array(
+				$this->sa_txn_stack[]            = array(
 					'rows'       => $GLOBALS['_rows'],
 					'options'    => $GLOBALS['_options'],
 					'notoptions' => $GLOBALS['_notoptions'],
 					'savepoint'  => null,
 				);
+				$this->sa_commit_landed_this_txn = false;
 				return true;
 			}
 			// A real transactional SAVEPOINT (Ruling S17, 2.16.2) —
@@ -3015,6 +3076,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					throw new RuntimeException( 'wpdb stub: COMMIT with no open transaction on this connection' );
 				}
 				array_pop( $this->sa_txn_stack );
+				$this->sa_commit_landed_this_txn = true;
 				return true;
 			}
 			if ( 'ROLLBACK' === trim( $query ) ) {
@@ -3652,6 +3714,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_mid_query']      = false; // versioned()'s $writes() callback issues a statement while the connection drops (Ruling S50).
 	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
 	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
 	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
@@ -4929,6 +4992,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_mid_query']      = false; // versioned()'s $writes() callback issues a statement while the connection drops (Ruling S50).
 	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
 	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
 	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
