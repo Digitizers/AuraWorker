@@ -254,6 +254,12 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 
 = 2.16.2 =
 * `/status`'s door fragment carries `observation`, a per-site door-version witness bumped atomically by every door-state mutation (never by a mere poll) and clock-floored so a restored backup can never reissue a value it already served, so Aura can order overlapping polls by the site's own witness instead of request timestamps; `elementor.governor` reports the current value. The observation witness requires InnoDB for wp_options and 64-bit PHP; without them ordering falls back to Aura's own request order for that site (`elementor.governor` reports why via `observation_unsupported`: `engine` or `php32`).
+* `/status` also accepts `door_observation_seen` — Aura's own last accepted observation, echoed back — so the site can bump its witness forward, clock-floored, when a restore rewound its own copy behind Aura's; values above the cap are accepted (200) but not honoured (no bump, no error).
+* `elementor.governor` reports `counters_as_of` beside the four `_30d` rolling counters, which `observation` does not cover; the counters themselves are `int|null`.
+* `interrupted` / `running` / `held` are `null`, not `[]`, when their own queue could not be read, and `observation` is withheld entirely whenever any read behind the fragment was unreadable.
+* New `door_write_unsupported` reason `reconnect_guard_unavailable`: a governed write refuses outright on a `$wpdb` replacement that cannot disable reconnects, rather than risk a mutation replaying on a session this plugin no longer controls.
+* Door writes report a `committed` tri-state (`true` / `false` / unknown) and answer a retryable 503 with `may_have_run: true` whenever a commit cannot be proven — claims, holds, acks, and rotations alike; `replay()` now forwards `claim()`'s own error instead of a generic one.
+* Hold references and pending log-row reservations are derived from the request's own identity, so a retry after an ambiguous commit finds and reuses its own prior write instead of risking a duplicate.
 
 = 2.16.1 =
 * `/status` door fragment and `audit_mcp_exposure`'s `elementor.governor` carry `binding`, the site's current binding generation, so Aura can label a departed client's door-log entries without inferring the generation from the rows.
