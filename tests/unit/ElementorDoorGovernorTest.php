@@ -1862,4 +1862,57 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertNull( $block['binding'] );
 		$this->assertNull( $block['observation'], 'this audit reports the same binding field under the same rule' );
 	}
+
+	/**
+	 * Ruling S58 (Codex round-22 P2 on #88): governor_block()'s OWN
+	 * epoch_raw() read -- entirely separate from status_fragment()'s
+	 * (via detect_rewind()) -- never fed the verdict at all before this
+	 * ruling. `epoch: null` could be certified under a perfectly
+	 * ordinary, non-null observation.
+	 */
+	public function test_governor_block_withholds_observation_when_the_epoch_read_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::governor_block(); // mints the epoch for real, primes the object cache
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = 0;
+
+		$this->assertNull( $block['epoch'], 'never a stale epoch for a read this poll could not prove' );
+		$this->assertNull( $block['observation'] );
+
+		$again = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertIsInt( $again['observation'], 'a transient read failure is not cached against the next attempt' );
+	}
+
+	/**
+	 * Ruling S58 (Codex round-22 P2 on #88): Aura_Worker_Door_Holds::count()
+	 * already answers null when either of its own two internal reads (the
+	 * claimed queue, the held queue) fails -- but nothing downstream of
+	 * it withheld `observation` for that before this ruling: `held_count`/
+	 * `queue_full` could be certified as null right beside a perfectly
+	 * ordinary witness.
+	 */
+	public function test_governor_block_withholds_observation_when_holds_count_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$held_key = $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD );
+		$GLOBALS['_sa_rows_read_error'][ $held_key ] = true;
+		Aura_Worker_Door_Holds::forget_held(); // the FIRST call above already memoised a successful read
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_rows_read_error'] = array();
+
+		$this->assertNull( $block['held_count'], 'never a false zero for a queue this poll could not read' );
+		$this->assertNull( $block['queue_full'] );
+		$this->assertNull( $block['observation'] );
+
+		// held_rows() memoises for the WHOLE request (Ruling P71), failure
+		// included -- forget_held() is what a real WRITE (or a retry's own
+		// reset_request_caches()) would call; here it models a genuinely
+		// fresh read, not this same poison surviving by design.
+		Aura_Worker_Door_Holds::forget_held();
+		$again = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertIsInt( $again['observation'], 'a transient read failure is not cached against the next attempt' );
+	}
 }
