@@ -227,6 +227,39 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and so is the claimed twin' );
 	}
 
+	/**
+	 * Ruling S87 (Codex round-38 P1 on #88): S86's reservation mechanism
+	 * was unreachable in production -- govern_and_run() built its own
+	 * $entry with neither `aura_ref` nor `ref` mapped to it. Fixed via
+	 * open_pending_entry(), the ONE entry builder every open_pending()
+	 * call in this class now routes through: a replay's own admission
+	 * derives its reservation from the hold's OWN ref (already a
+	 * globally unique v4 UUID, minted once at hold time), and the
+	 * EARLIER terminal `held` record derives a DIFFERENT one -- the two
+	 * are namespaced apart (by purpose AND by outcome) so they never
+	 * collide into the SAME reservation despite sharing the SAME
+	 * underlying ref.
+	 */
+	public function test_the_held_record_and_the_replays_own_admission_carry_distinct_reservations(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		$GLOBALS['_current_user_id'] = 9;
+		$out                         = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$this->assertTrue( $out['ok'], 'the fixture assumption this test is built on' );
+
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertCount( 2, $log );
+		$this->assertNotEmpty( $log[0]['reservation'], 'Ruling S87: the held terminal record carries a reservation identity' );
+		$this->assertNotEmpty( $log[1]['reservation'], 'Ruling S87: the replay admission carries one too' );
+		$this->assertNotSame(
+			$log[0]['reservation'],
+			$log[1]['reservation'],
+			'the SAME underlying hold ref must derive DIFFERENT reservations for these two distinct log rows -- conflating them handed a later replay the ALREADY-terminal held row instead of a fresh admission'
+		);
+	}
+
 	// -----------------------------------------------------------------------
 	// (b) an unknown ref
 	// -----------------------------------------------------------------------
@@ -1594,7 +1627,13 @@ final class ElementorReplayTest extends TestCase {
 		// this run issues before that one is let through untouched, and
 		// only the LAST (release()'s) one is made to never land.
 		$GLOBALS['_db_queries']                 = array();
-		$GLOBALS['_sa_reconnect_before_commit']  = 3;
+		// Ruling S86/S87 (Codex rounds 37-38 on #88): open_pending()'s own
+		// reservation-index write adds a SEPARATE commit alongside every
+		// pending/terminal row it opens -- the count below (and the skip
+		// position, which must still land on release()'s own commit,
+		// the LAST one) moved accordingly. Re-counted, not merely bumped
+		// by guesswork.
+		$GLOBALS['_sa_reconnect_before_commit']  = 4;
 		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
 		$GLOBALS['_sa_reconnect_before_commit']  = false;
 
@@ -1606,7 +1645,7 @@ final class ElementorReplayTest extends TestCase {
 				}
 			)
 		);
-		$this->assertSame( 3, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+		$this->assertSame( 4, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
 
 		$this->assertFalse( $out['ok'] );
 		$this->assertSame( 'retry_later', $out['reason'], 'never the definitive refusal — the release that was supposed to spend the approval did not commit' );
@@ -1637,7 +1676,13 @@ final class ElementorReplayTest extends TestCase {
 
 		$GLOBALS['_current_user_id']            = 9;
 		$GLOBALS['_db_queries']                 = array();
-		$GLOBALS['_sa_reconnect_before_commit']  = 9;
+		// Ruling S86/S87 (Codex rounds 37-38 on #88): open_pending()'s own
+		// reservation-index write adds a SEPARATE commit alongside the
+		// pending row it opens -- the count below (and the skip
+		// position, which must still land on release()'s own commit,
+		// the LAST one) moved accordingly. Re-counted, not merely bumped
+		// by guesswork.
+		$GLOBALS['_sa_reconnect_before_commit']  = 10;
 		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
 		$GLOBALS['_sa_reconnect_before_commit']  = false;
 
@@ -1649,7 +1694,7 @@ final class ElementorReplayTest extends TestCase {
 				}
 			)
 		);
-		$this->assertSame( 9, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+		$this->assertSame( 10, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
 
 		// The ability genuinely ran, and its terminal 'ok' entry genuinely
 		// landed — proving the skip count let every EARLIER commit through

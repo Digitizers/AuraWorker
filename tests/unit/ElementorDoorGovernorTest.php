@@ -159,6 +159,31 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertTrue( $log[0]['admitted'] );
 	}
 
+	/**
+	 * Ruling S87 (Codex round-38 P1 on #88): a DIRECT (non-replay) write
+	 * carries no `aura_ref` -- no per-request nonce exists anywhere in
+	 * this codebase for that shape of call (this method's own docblock
+	 * on open_pending_entry() explains why one is not fabricated) --
+	 * except when it presented an approval grant, itself a unique,
+	 * call-bound token. open_pending_entry() falls back to it, so a
+	 * gated write's own admission is ALSO reachable by S86's reservation
+	 * mechanism, not only a replay's.
+	 */
+	public function test_a_direct_write_with_a_presented_grant_carries_it_as_the_reservation_identity(): void {
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-call-context.php';
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+
+		$_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] = 'grant-token-s87';
+		$out                                    = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+		unset( $_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] );
+
+		$this->assertSame( array( 'ok' => true, 'input' => array( 'post_id' => 7 ) ), $out );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertCount( 1, $log );
+		$this->assertNotEmpty( $log[0]['reservation'], 'Ruling S87: the presented grant is reachable as the reservation identity for a direct, non-replay write' );
+	}
+
 	public function test_a_snapshot_failure_refuses_before_the_inner_callback(): void {
 		$this->registerAll();
 		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );

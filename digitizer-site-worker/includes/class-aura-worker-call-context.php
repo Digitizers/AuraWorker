@@ -364,9 +364,15 @@ class Aura_Worker_Call_Context {
 	/**
 	 * The grant header as presented, or '' when absent.
 	 *
+	 * PUBLIC as of Ruling S87 (Codex round-38 P1 on #88): the ONE place
+	 * that reads and sanitises `X-Aura-Approval-Grant` — reused by
+	 * Aura_Worker_Elementor_Door::open_pending_entry() as an idempotency
+	 * key for a gated call's own log admission, rather than duplicating
+	 * this exact read/sanitise dance a second time.
+	 *
 	 * @return string
 	 */
-	private static function presented_grant() {
+	public static function presented_grant() {
 		if ( ! isset( $_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] ) ) {
 			return '';
 		}

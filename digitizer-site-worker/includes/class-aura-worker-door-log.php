@@ -768,10 +768,16 @@ class Aura_Worker_Door_Log {
 					array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
 				);
 			}
-			if ( null !== $row_raw ) {
+			// STILL PENDING, not merely present (Ruling S87 — the SAME
+			// reasoning find_reserved_seq() applies just below): a row
+			// this echoed seq once named that has since been admitted
+			// and settled is a genuinely NEW attempt's business, never
+			// this one's to recognise.
+			$row = null !== $row_raw ? maybe_unserialize( $row_raw ) : null;
+			if ( is_array( $row ) && 'pending' === ( $row['result'] ?? null ) ) {
 				return $reserved_seq;
 			}
-			// Proven absent: fall through and allocate fresh.
+			// Proven absent, or moved past pending: fall through and allocate fresh.
 		}
 		for ( $try = 0; $try < self::ALLOC_TRIES; $try++ ) {
 			// CANNOT READ THE TOP, CANNOT ALLOCATE (Ruling P77). A null top used
@@ -905,15 +911,33 @@ class Aura_Worker_Door_Log {
 	 * it once named (already acked/purged since) or point at a seq an
 	 * ambiguous insert never actually landed at.
 	 *
+	 * STILL PENDING, NOT MERELY PRESENT (Ruling S87, Codex round-38 P1 on
+	 * #88): a caller can legitimately reach `open_pending()` MORE THAN
+	 * ONCE with the SAME derived identity across genuinely SEPARATE
+	 * attempts — a replay whose FIRST try was settled terminally (a
+	 * snapshot failure, an interrupted claim) and is later retried fresh
+	 * derives the SAME `aura_ref` (the hold's own ref never changes)
+	 * both times. Recognising a reservation whose row has ALREADY moved
+	 * past `pending` handed the retry back the OLD, already-terminal
+	 * seq — `admit()`/`settle()` on it then correctly refuse (PENDING-ONLY,
+	 * Ruling P27), silently swallowing what should have been a brand
+	 * new attempt. Only a row STILL `pending` (never admitted, never
+	 * settled) is the SAME logical attempt an ambiguous insert leaves
+	 * behind — which is the ONLY case this mechanism exists to
+	 * recognise; anything further along is a genuinely new attempt
+	 * against an old identity, and allocates fresh exactly like a
+	 * proven-absent reservation would.
+	 *
 	 * @param string $reservation_id A derived reservation identity (see
 	 *                                `RESERVATION_PREFIX`'s own docblock).
-	 * @return int|string|null The seq, PROVEN still real; `'unreadable'`
-	 *                          when either raw read could not be proven
-	 *                          (the caller answers its own retryable
-	 *                          503); `null` when this identity has no
-	 *                          reservation on record, or the one it named
-	 *                          no longer points at a real row — either
-	 *                          way, the caller allocates fresh.
+	 * @return int|string|null The seq, PROVEN still real AND still
+	 *                          pending; `'unreadable'` when any raw read
+	 *                          could not be proven (the caller answers
+	 *                          its own retryable 503); `null` when this
+	 *                          identity has no reservation on record, or
+	 *                          the one it named no longer points at a
+	 *                          real, still-pending row — either way, the
+	 *                          caller allocates fresh.
 	 */
 	private static function find_reserved_seq( $reservation_id ) {
 		$raw = self::raw_option_for( self::RESERVATION_PREFIX . $reservation_id );
@@ -934,6 +958,10 @@ class Aura_Worker_Door_Log {
 		}
 		if ( null === $row_raw ) {
 			return null; // stale: the reservation outlived (or never landed at) the row it names
+		}
+		$row = maybe_unserialize( $row_raw );
+		if ( ! is_array( $row ) || 'pending' !== ( $row['result'] ?? null ) ) {
+			return null; // moved on: a genuinely new attempt, not the ambiguous one this mechanism recognises
 		}
 		return $seq;
 	}

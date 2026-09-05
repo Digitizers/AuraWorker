@@ -3328,6 +3328,88 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * Ruling S87 (Codex round-38 P1 on #88): the ONE entry builder every
+	 * `Aura_Worker_Door_Log::open_pending()` call in this class routes
+	 * through — see that method's own docblock (Ruling S86) for the
+	 * reservation mechanism the `aura_ref` field drives, and this
+	 * ruling's own finding for why the mechanism was UNREACHABLE in
+	 * production before this: every caller here built its own `$fields`
+	 * with no `aura_ref` at all, or (`open_restore_entry()`) had one in
+	 * hand and stored it under the wrong key (`ref`, not `aura_ref`).
+	 *
+	 * PRIORITY, highest first, whenever the caller has not already set
+	 * one explicitly:
+	 *  1. The REPLAY's own hold ref (`self::$replay_ack['ref']`) — ALREADY
+	 *     a globally unique v4 UUID minted once, at hold time
+	 *     (`Aura_Worker_Door_Holds::hold()`'s own conditional INSERT), so
+	 *     a replay of the SAME queued call always derives the SAME
+	 *     reservation, and a retried replay never opens a second pending
+	 *     row behind an ambiguous first one.
+	 *  2. The presented approval grant
+	 *     (`$_SERVER['HTTP_X_AURA_APPROVAL_GRANT']`) — itself a unique,
+	 *     call-bound token (`Aura_Worker_Call_Context`'s own memo key:
+	 *     the grant AND the exact call it is bound to), for a gated
+	 *     operation that presented one.
+	 *
+	 * ABSENT OTHERWISE — an ordinary, ungated, non-replay write. NO
+	 * per-request nonce exists ANYWHERE in this codebase today for that
+	 * shape of call: the MCP fleet gateway (a separate repository, Aura's
+	 * own) does not currently forward a tool-call id or any other
+	 * per-call correlation id to the site for an ordinary ability
+	 * invocation, unlike the restore route's own `aura_ref` REST
+	 * parameter. Inventing one here (a per-PHP-process nonce, say) would
+	 * look like protection while providing none across the one thing
+	 * that matters — a NEW HTTP request, which is what an actual retry
+	 * is. Left genuinely absent and documented, not silently worked
+	 * around: `open_pending()`'s own `reserved_seq` echo-back (Ruling
+	 * S86) is what a caller with nothing to derive from still has —
+	 * Aura's own retry of an ambiguous write already carries `seq`/`ref`
+	 * forward the SAME way for a HELD call (`replay()`'s own `ref`
+	 * parameter, class-aura-worker-api.php); the identical shape, once
+	 * the gateway is ready to send `reserved_seq` back on retry for a
+	 * DIRECT (non-replay) ambiguous write, closes this gap without any
+	 * further change on this side.
+	 *
+	 * @param array  $fields  Whatever the caller already built — ability,
+	 *                          actor, touches, and so on.
+	 * @param string $purpose Which of this class's OWN distinct
+	 *                          open_pending() call sites this is —
+	 *                          namespaces the derived reservation so the
+	 *                          SAME underlying ref/grant used for two
+	 *                          different log-row purposes never collides
+	 *                          (see this method's own docblock for the
+	 *                          held-terminal-vs-replay-admission case
+	 *                          that surfaced this).
+	 * @return int|WP_Error Same as `Aura_Worker_Door_Log::open_pending()`.
+	 */
+	private static function open_pending_entry( array $fields, $purpose = 'open_pending' ) {
+		if ( empty( $fields['aura_ref'] ) ) {
+			if ( null !== self::$replay_ack && ! empty( self::$replay_ack['ref'] ) ) {
+				$fields['aura_ref'] = (string) self::$replay_ack['ref'];
+			} elseif ( class_exists( 'Aura_Worker_Call_Context' ) && '' !== Aura_Worker_Call_Context::presented_grant() ) {
+				$fields['aura_ref'] = Aura_Worker_Call_Context::presented_grant();
+			}
+		}
+		// NAMESPACED BY PURPOSE, always — even a caller-supplied `aura_ref`
+		// (open_restore_entry()'s own real Aura correlation id,
+		// record_terminal_only()'s own `ref` mapping) is prefixed here,
+		// never used bare. The SAME underlying hold ref names TWO
+		// SEPARATE log rows across this class's own lifecycle — the
+		// terminal `held` record record_terminal_only() writes the
+		// MOMENT a call is first queued, and the entirely different
+		// PENDING admission govern_and_run() writes later, when that
+		// SAME hold is approved and replayed — and without this prefix
+		// both derive the IDENTICAL reservation identity, so a replay's
+		// own admission was wrongly "recognised" as the ORIGINAL held
+		// terminal row, handing back ITS seq instead of allocating a new
+		// one for the write actually running now.
+		if ( ! empty( $fields['aura_ref'] ) ) {
+			$fields['aura_ref'] = $purpose . ':' . (string) $fields['aura_ref'];
+		}
+		return Aura_Worker_Door_Log::open_pending( $fields );
+	}
+
+	/**
 	 * @param string        $slug  Ability.
 	 * @param callable|null $inner Inner.
 	 * @param array         $input Input.
@@ -3424,7 +3506,7 @@ class Aura_Worker_Elementor_Door {
 			// this field, is what authorised it.
 			$entry['approved_by'] = $approved_by;
 		}
-		$seq = Aura_Worker_Door_Log::open_pending( $entry );
+		$seq = self::open_pending_entry( $entry, 'write' );
 		if ( is_wp_error( $seq ) ) {
 			return $seq;
 		}
@@ -3937,16 +4019,38 @@ class Aura_Worker_Elementor_Door {
 			self::bump_counter( 'log_ungoverned' );
 			return false;
 		}
-		$seq = Aura_Worker_Door_Log::open_pending(
-			array_merge(
-				array(
-					'ability' => $slug,
-					'actor'   => $actor,
-					'touches' => $touches,
-				),
-				$extra
-			)
+		$fields = array_merge(
+			array(
+				'ability' => $slug,
+				'actor'   => $actor,
+				'touches' => $touches,
+			),
+			$extra
 		);
+		// Ruling S87 (Codex round-38 P1 on #88): several of this method's
+		// own callers already carry a `ref` in $extra (the block-refusal
+		// branches in govern_and_run()/open_restore_entry(), each a real
+		// hold or Aura correlation id) — echoed here under the key
+		// open_pending_entry()'s own reservation mechanism actually
+		// reads. A caller with no `ref` at all falls through to that
+		// helper's own replay/grant fallback, exactly like every other
+		// open_pending() call in this class.
+		//
+		// $result IS PART OF THE KEY, not merely the ref alone: THIS
+		// method alone is called with 'held', 'refused' AND
+		// 'interrupted' for the SAME underlying ref across one call's
+		// own lifecycle (queued 'held'; later, if the reconciler finds
+		// its claim abandoned, 'interrupted'; or if a replay's own
+		// permission check now refuses it, 'refused') — each a
+		// SEPARATE, real terminal row, never a retry of the SAME one.
+		// The bare ref alone would make a LATER, entirely different
+		// outcome for that ref look like a retry of the FIRST one ever
+		// written, and get "recognised" into ITS row instead of getting
+		// its own.
+		if ( ! empty( $fields['ref'] ) ) {
+			$fields['aura_ref'] = $result . ':' . (string) $fields['ref'];
+		}
+		$seq = self::open_pending_entry( $fields, 'terminal' );
 		if ( is_wp_error( $seq ) ) {
 			self::bump_counter( 'log_ungoverned' );
 			return false;
@@ -5654,7 +5758,7 @@ class Aura_Worker_Elementor_Door {
 		if ( null !== $over ) {
 			return $over;
 		}
-		$seq = Aura_Worker_Door_Log::open_pending(
+		$seq = self::open_pending_entry(
 			array(
 				'ability'    => 'aura/restore',
 				'actor'      => $actor,
@@ -5664,7 +5768,18 @@ class Aura_Worker_Elementor_Door {
 				'rule'       => null !== $verdict['rule'] ? self::rule_evidence( $verdict['rule'] ) : null,
 				'restore_of' => $restore_of,
 				'ref'        => $ref,
-			)
+				// Ruling S87 (Codex round-38 P1 on #88): the SAME value
+				// as `ref` just above, ALSO under the key
+				// open_pending()'s own S86 reservation mechanism actually
+				// reads (`aura_ref`) — before this ruling this call site
+				// had a REAL, already-available idempotency key in scope
+				// (Aura's own correlation id for this restore) and simply
+				// never handed it to the one place that could use it, so
+				// S86's reservation was unreachable on the restore path
+				// exactly as it was on the ordinary write path below.
+				'aura_ref'   => $ref,
+			),
+			'restore'
 		);
 		if ( is_wp_error( $seq ) ) {
 			return $seq;
