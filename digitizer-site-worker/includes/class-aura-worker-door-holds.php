@@ -689,19 +689,90 @@ class Aura_Worker_Door_Holds {
 		$ref     = self::clean( $ref );
 		$outcome = Aura_Worker_Door_Log::versioned(
 			function () use ( $ref ) {
-				$claimed_gone = (bool) delete_option( self::CLAIMED . $ref );
-				$held_gone    = (bool) delete_option( self::HELD . $ref );
+				$claimed_name = self::CLAIMED . $ref;
+				$held_name    = self::HELD . $ref;
+				// Ruling S60 (Codex round-23 P1 on #88): delete_option()
+				// answers `false` for BOTH "there was genuinely nothing
+				// to delete" and "the delete itself failed" — casting
+				// that straight to a boolean and OR-ing the two rows
+				// together let `$mutated` land on `false` for a row that
+				// actually still existed, which versioned() then reads
+				// as "nothing to do" and COMMITS trivially: release()
+				// reported `true` (or, worse, a caller-visible steady
+				// no-op) while the claimed or held row this call was
+				// supposed to remove sat there untouched.
+				// delete_row_provably() tells the two apart; `null`
+				// (unknown either way) demands the unit rolls back
+				// rather than certify a release that may not have
+				// happened.
+				$claimed_gone = self::delete_row_provably( $claimed_name );
+				if ( null === $claimed_gone ) {
+					return array( 'rollback' => true );
+				}
+				$held_gone = self::delete_row_provably( $held_name );
+				if ( null === $held_gone ) {
+					return array( 'rollback' => true );
+				}
 				return array(
 					'mutated' => $claimed_gone || $held_gone,
 					'result'  => null,
 					// Ruling S11 (Codex round-5 P1 on #88): repeated by
 					// versioned() after commit.
-					'evict'   => array( self::CLAIMED . $ref, self::HELD . $ref, 'notoptions' ),
+					'evict'   => array( $claimed_name, $held_name, 'notoptions' ),
 				);
 			}
 		);
 		self::forget_held();
 		return ! empty( $outcome['committed'] );
+	}
+
+	/**
+	 * Delete one option row, PROVABLY (Ruling S60, Codex round-23 P1 on
+	 * #88) — delete_option() itself answers `false` for BOTH "there was
+	 * genuinely nothing to delete" and "the delete failed", with no
+	 * reliable way to tell them apart from its own return value alone.
+	 *
+	 * TWO checks, either one enough to prove a genuine failure: `false`
+	 * WITH `$wpdb->last_error` set (the ordinary "the statement itself
+	 * errored" signal every other raw write in this codebase checks), OR
+	 * — even when `last_error` looks clean — a RAW re-read (the same
+	 * proven `raw_option_read()` idiom `Aura_Worker_Door_Log` uses
+	 * everywhere else, never this request's own object cache, which
+	 * `delete_option()` may already have evicted regardless of whether
+	 * the underlying row is actually gone) that still finds the row
+	 * sitting there. Either one is definitive; neither being true is
+	 * what makes "gone" provable rather than merely claimed.
+	 *
+	 * @param string $name Option name.
+	 * @return bool|null True when this row is gone (this call deleted it,
+	 *                    or the raw read proves it was already absent);
+	 *                    null — UNKNOWN, never a proven miss — when a
+	 *                    failure could be neither ruled out nor confirmed.
+	 */
+	private static function delete_row_provably( $name ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$deleted           = (bool) delete_option( $name );
+		if ( $deleted ) {
+			return true; // delete_option()'s own affirmative: a row really was removed
+		}
+		if ( '' !== (string) $wpdb->last_error ) {
+			return null; // the delete itself reported an error — unknown, never a proven miss
+		}
+		// delete_option() claims there was nothing to delete. Prove it,
+		// raw, rather than trust a `false` this codebase already knows
+		// is ambiguous.
+		$raw = Aura_Worker_Door_Log::raw_option_for( $name );
+		if ( Aura_Worker_Door_Log::raw_option_was_unreadable() ) {
+			return null; // cannot prove either way
+		}
+		if ( null !== $raw ) {
+			// The row is PROVABLY still there — delete_option()'s own
+			// `false` claimed otherwise, and this is exactly the case
+			// that claim cannot be trusted for.
+			return null;
+		}
+		return true; // the raw read itself proves it: genuinely absent, whatever delete_option() claimed to have done
 	}
 
 	/**

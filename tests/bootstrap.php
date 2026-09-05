@@ -712,6 +712,31 @@ if ( ! function_exists( 'wp_schedule_single_event' ) ) {
 
 if ( ! function_exists( 'delete_option' ) ) {
 	function delete_option( string $option ): bool {
+		// Ruling S60 (Codex round-23 P1 on #88): models delete_option()
+		// itself failing to remove a row that DOES exist -- the one case
+		// its own `false` return cannot be told apart from "there was
+		// genuinely nothing to delete". A test arms this by NAME; `true`
+		// (or a positive int, "let N through then fail") leaves the row
+		// standing and answers `false`, with `last_error` left EMPTY by
+		// default -- the harder, silent-failure case
+		// Aura_Worker_Door_Holds::delete_row_provably()'s own raw-read
+		// fallback exists to catch, since the visible-last_error case is
+		// already the ordinary failure signal every other raw write here
+		// checks. `_sa_delete_option_fail_with_error[$option]` additionally
+		// sets last_error too, for the OTHER half of that same check.
+		if ( ! empty( $GLOBALS['_sa_delete_option_fail'][ $option ] ) ) {
+			$fail = $GLOBALS['_sa_delete_option_fail'][ $option ];
+			if ( is_int( $fail ) && $fail > 1 ) {
+				$GLOBALS['_sa_delete_option_fail'][ $option ] = $fail - 1;
+			} else {
+				$GLOBALS['_sa_delete_option_fail'][ $option ] = false; // fires once (or N times, then clears)
+			}
+			if ( ! empty( $GLOBALS['_sa_delete_option_fail_with_error'][ $option ] ) ) {
+				global $wpdb;
+				$wpdb->last_error = 'delete failed';
+			}
+			return false; // the row is left standing
+		}
 		unset( $GLOBALS['_options'][ $option ] );
 		unset( $GLOBALS['_rows'][ $option ] );
 		unset( $GLOBALS['_rows_autoload'][ $option ] );
@@ -3829,6 +3854,8 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_lease_release_after_check'] = array(); // a lease that FLIPS on every read, forever, once armed for a name (Ruling S52).
+	$GLOBALS['_sa_delete_option_fail']            = array(); // delete_option() leaves a named row standing and answers false (Ruling S60).
+	$GLOBALS['_sa_delete_option_fail_with_error'] = array(); // ...and additionally sets last_error (Ruling S60).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).
@@ -5108,6 +5135,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_lease_release_after_check'] = array(); // a lease that FLIPS on every read, forever, once armed for a name (Ruling S52).
+	$GLOBALS['_sa_delete_option_fail']            = array(); // delete_option() leaves a named row standing and answers false (Ruling S60).
+	$GLOBALS['_sa_delete_option_fail_with_error'] = array(); // ...and additionally sets last_error (Ruling S60).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).

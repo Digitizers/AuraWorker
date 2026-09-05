@@ -1168,6 +1168,63 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S60 (Codex round-23 P1 on #88): delete_option() answers
+	 * `false` for BOTH "there was genuinely nothing to delete" and "the
+	 * delete failed" -- casting that straight to a boolean and OR-ing the
+	 * claimed/held rows together used to let `$mutated` land on `false`
+	 * for a row that actually still existed, which versioned() then read
+	 * as "nothing to do" and committed trivially: release() reported
+	 * `true` while the claimed row it was supposed to remove sat there
+	 * untouched. delete_row_provably()'s raw re-read now catches this
+	 * even when delete_option() leaves no visible last_error behind.
+	 */
+	public function test_a_failing_claimed_row_delete_aborts_release_leaving_the_row_intact(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+		$claimed_name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+		$this->assertArrayHasKey( $claimed_name, $GLOBALS['_options'] );
+
+		$GLOBALS['_sa_delete_option_fail'][ $claimed_name ] = true;
+		$version_before = Aura_Worker_Door_Log::door_version_raw();
+
+		$committed = Aura_Worker_Door_Holds::release( $ref );
+
+		$GLOBALS['_sa_delete_option_fail'] = array();
+
+		$this->assertFalse( $committed, 'a delete that could not be proven must not report success' );
+		$this->assertArrayHasKey( $claimed_name, $GLOBALS['_options'], 'the claimed row is still there — delete_option() never actually removed it' );
+		$this->assertSame( $version_before, Aura_Worker_Door_Log::door_version_raw(), 'no bump — nothing committed' );
+
+		// The miss must not stick: a healthy retry afterwards succeeds
+		// normally and actually removes the row.
+		$this->assertTrue( Aura_Worker_Door_Holds::release( $ref ) );
+		$this->assertArrayNotHasKey( $claimed_name, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * Ruling S60, the OTHER signal: delete_option() failing WITH
+	 * last_error set — the ordinary "the statement itself errored" case
+	 * every other raw write here already checks, exercised here for
+	 * release()'s own new check specifically.
+	 */
+	public function test_a_claimed_row_delete_that_sets_last_error_also_aborts_release(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+		$claimed_name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+
+		$GLOBALS['_sa_delete_option_fail'][ $claimed_name ]            = true;
+		$GLOBALS['_sa_delete_option_fail_with_error'][ $claimed_name ] = true;
+
+		$committed = Aura_Worker_Door_Holds::release( $ref );
+
+		$GLOBALS['_sa_delete_option_fail']            = array();
+		$GLOBALS['_sa_delete_option_fail_with_error'] = array();
+
+		$this->assertFalse( $committed );
+		$this->assertArrayHasKey( $claimed_name, $GLOBALS['_options'] );
+	}
+
+	/**
 	 * The internal hold-queue LOCK mutex is not door state Aura ever sees —
 	 * `insert_unique()`'s exemption list (Ruling S6) must not bump for its
 	 * acquisition. Tested directly on the primitive rather than through
