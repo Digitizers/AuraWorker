@@ -1227,6 +1227,85 @@ final class ElementorDoorGovernorTest extends TestCase {
 	 * must not itself advance the version, and neither does an ordinary
 	 * `status_fragment()` poll with nothing mutating in between (Ruling S6).
 	 */
+	/**
+	 * Ruling S43 (Codex round-18 P1 on #88): governor_block() used to read
+	 * the computed tuple, epoch, binding and held count BEFORE a single,
+	 * unbracketed `observation` read, then the backlog and 30-day counters
+	 * AFTER it — a torn audit under one witness, since nothing caught a
+	 * mutation landing anywhere in that window. It now shares
+	 * status_fragment()'s own version_bracketed() helper: a mutation
+	 * landing mid-build forces exactly one retry, which re-reads
+	 * everything (including `held_count`) against the version the retry
+	 * settles on.
+	 */
+	public function test_a_mutation_mid_build_of_the_audit_forces_a_retry_that_serves_the_new_state(): void {
+		$this->registerAll();
+		// A real poll first (Ruling S28) — this is what actually PERSISTS
+		// the computed tuple via a real conditional INSERT, so the racer's
+		// own direct write below lands on a row that already properly
+		// exists, not the "notoptions" miss-cache a never-persisted
+		// governor_block()-only fixture would leave stuck.
+		Aura_Worker_Elementor_Door::status_fragment();
+		$first  = Aura_Worker_Elementor_Door::governor_block();
+		$before = $first['observation'];
+		$this->assertSame( 'open', $first['door'], 'the fixture assumption this test is built on' );
+
+		// epoch_raw()'s own read is as EARLY as this racer can land —
+		// right after $active/$seam/$door are captured from the persisted
+		// tuple, and well before held_count/the backlog counters. A
+		// version WITHOUT the bracket would report the STALE 'open' this
+		// attempt already captured, alongside a bumped `observation` read
+		// at the very end — a torn mix, never one consistent version.
+		$GLOBALS['_sa_after_option_read'] = static function ( string $name ) {
+			if ( Aura_Worker_Door_Log::EPOCH !== $name ) {
+				return;
+			}
+			$GLOBALS['_sa_after_option_read'] = null; // fires once
+			$winner = array(
+				'active'     => true,
+				'seam'       => 'ok',
+				'door'       => 'closed',
+				'rewind_top' => null,
+			);
+			$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::COMPUTED ]    = maybe_serialize( $winner );
+			$GLOBALS['_options'][ Aura_Worker_Elementor_Door::COMPUTED ] = $winner;
+			Aura_Worker_Door_Log::bump_door_version(); // the racer's own transition, already committed
+		};
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_after_option_read'] = null;
+
+		$this->assertNotNull( $block['observation'], 'a single retry resolves this — never "torn twice"' );
+		$this->assertGreaterThan( $before, $block['observation'] );
+		$this->assertSame( 'closed', $block['door'], 'the retry re-read the PERSISTED tuple — never the stale "open" this attempt already captured before the racer landed' );
+	}
+
+	/**
+	 * The other half of Ruling S43: a mutation on EVERY attempt (the door
+	 * mutating faster than one audit can read it consistently) answers
+	 * `observation: null` — the SAME honest answer status_fragment()
+	 * already gives, never a guess built on either attempt's own
+	 * (possibly torn) reads.
+	 */
+	public function test_a_persistently_torn_audit_answers_observation_null(): void {
+		$this->registerAll();
+		$fires = 0;
+
+		$GLOBALS['_sa_after_option_read'] = function ( string $name ) use ( &$fires ) {
+			if ( Aura_Worker_Door_Log::BINDING !== $name ) {
+				return;
+			}
+			++$fires;
+			Aura_Worker_Door_Log::bump_door_version();
+		};
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_after_option_read'] = null;
+
+		$this->assertGreaterThanOrEqual( 2, $fires, 'the fixture assumption this test is built on — both attempts tore' );
+		$this->assertNull( $block['observation'], 'torn on both attempts — the honest answer is unordered, never a guess' );
+	}
+
 	public function test_governor_block_reports_the_current_observation_without_bumping_it(): void {
 		$this->registerAll();
 		$served = Aura_Worker_Elementor_Door::status_fragment()['observation'];

@@ -100,12 +100,18 @@ final class McpExposureGovernorTest extends TestCase {
 	public function test_every_key_appears_with_active_true_when_the_door_initialised(): void {
 		$this->bringUpTheDoor();
 		$b = $this->block();
+		// Ruling S43 (Codex round-18 P1 on #88): `observation` moves to the
+		// END of the array — version_bracketed() appends it once the
+		// bracket settles, after every OTHER field the builder returned.
+		// Key order carries no meaning over the wire (a JSON object is
+		// unordered); this test pins PHP's own array order only so a
+		// future field addition/removal is caught here rather than by a
+		// consumer.
 		$this->assertSame(
 			array(
 				'active',
 				'epoch',
 				'binding',
-				'observation',
 				'observation_unsupported',
 				'seam',
 				'door',
@@ -117,6 +123,7 @@ final class McpExposureGovernorTest extends TestCase {
 				'unknown_ability_30d',
 				'queue_full',
 				'log_full',
+				'observation',
 			),
 			array_keys( $b )
 		);

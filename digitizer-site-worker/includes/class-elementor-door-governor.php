@@ -418,116 +418,163 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return null;
 		}
-		for ( $attempt = 0; $attempt < 2; $attempt++ ) {
-			if ( $attempt > 0 ) {
-				// Ruling S20 (Codex round-8 P1 on #88): a retry MUST actually
-				// re-read, not just re-run the same builder over whatever it
-				// cached the first time through — see reset_request_caches()'s
-				// own docblock for the memo this closes.
+		$synced      = false;
+		$rewind_info = array( 'top_unreadable' => false );
+		return self::version_bracketed(
+			static function () {
+				// Ruling S20 (Codex round-8 P1 on #88): a retry MUST
+				// actually re-read, not just re-run the same builder over
+				// whatever it cached the first time through — see
+				// reset_request_caches()'s own docblock for the memo this
+				// closes.
 				self::reset_request_caches();
-			}
-			// Ruling S38 (Codex round-16 P1 on #88): reset UNCONDITIONALLY,
-			// on attempt 0 too — a floor-read failure belongs to the
-			// attempt that hit it, never carried in from a previous
-			// request or (after this reset) leaked out of a previous
-			// attempt this same call already handled.
-			Aura_Worker_Door_Log::reset_floor_unreadable_for_attempt();
-			// Ruling S33 (Codex round-15 P1 on #88): the bracket opens
-			// HERE, before detect_rewind() ever runs — not after it, as
-			// before. A rotation landing WHILE detect_rewind() reads the
-			// epoch/top, or while sync_computed_state() persists what it
-			// found, used to fall OUTSIDE the window the version compare
-			// protects: both the "before" and "after" reads would agree on
-			// the NEW version while the fragment itself still carried
-			// site/cursor/rewind values read against the OLD one. Every
-			// input the fragment serves — epoch/site, the cursor decision,
-			// the rewind verdict, the log rows, the persisted computed
-			// tuple — is now read strictly INSIDE this bracket, so a change
-			// during ANY of them is caught by the same before/after compare
-			// Ruling S6 already established, not a narrower one bolted on
-			// after the fact.
-			//
-			// Ruling S29 (Codex round-13 P1 on #88): rewind detection runs
-			// FIRST — sync_computed_state() needs to know about a DETECTED
-			// rewind to persist it as a state transition (see that method's
-			// own docblock), and build_status_fragment_state() must report
-			// the SAME detection, never a second, possibly different one.
-			$before_version = Aura_Worker_Door_Log::door_version_raw();
-			$rewind_info    = self::detect_rewind( (int) $after, $epoch );
-			// Ruling S22 (Codex round-9 P2 on #88): a COMPUTED transition —
-			// Elementor deactivating, the coverage seam changing, and now
-			// (Ruling S29) a newly DETECTED rewind — is state, and must
-			// land BEFORE the bracketed reads below can prove anything
-			// about it. See sync_computed_state()'s own docblock. Persisting
-			// THIS request's own freshly detected transition (the ordinary
-			// case, not a concurrent write) bumps the version between
-			// $before_version and $after_version too — correctly forcing
-			// one retry: sync_computed_state() is a fenced CAS (Rulings
-			// S24/S26), so the SECOND attempt finds its own write already
-			// there, persists nothing further, and the bracket closes clean.
-			$synced         = self::sync_computed_state( $rewind_info['rewind'] );
-			// Ruling S28 (Codex round-12 P1 on #88): INSIDE the bracket,
-			// after sync_computed_state() — read back whatever is actually
-			// PERSISTED now, not this request's own (possibly stale) live
-			// computation. See persisted_computed_state()'s own docblock for
-			// the race this closes. Only meaningful when $synced: on a lost
-			// fence or an uncommitted write (Rulings S24/S26) there is
-			// nothing this call may credit itself with, and the fragment
-			// falls back to live computation below.
-			$computed       = $synced ? self::persisted_computed_state() : null;
-			$fragment       = self::build_status_fragment_state( $rewind_info, $computed );
-			// Ruling S36 (Codex round-15 P1 on #88): read IMMEDIATELY after
-			// build_status_fragment_state() — the only thing between here
-			// and the log_after() call inside it — before anything else in
-			// this same attempt can run a second log_after() and overwrite
-			// it. A transient SELECT failure mid-walk is proven unreadable,
-			// never a hole (see log_after()'s own docblock); the rows read
-			// so far are still served, but this poll must not vouch for a
-			// log it knows it could not finish reading.
-			$log_unreadable   = Aura_Worker_Door_Log::log_walk_was_unreadable();
-			// Ruling S38 (Codex round-16 P1 on #88): same placement, same
-			// reasoning — read immediately after build_status_fragment_state()
-			// (which is what calls floor_raw(), both directly for the
-			// 'log_floor' field and inside log_after()), before anything
-			// else this attempt can read the floor again.
-			$floor_unreadable = Aura_Worker_Door_Log::floor_was_unreadable_this_attempt();
-			// Ruling S42 (Codex round-17 P2 on #88): same placement, same
-			// reasoning — build_status_fragment_state() is what calls
-			// full_report_raw() for the 'log_full' field, and this must be
-			// read before anything else this attempt can call it again.
-			$full_report_unreadable = Aura_Worker_Door_Log::full_report_raw_was_unreadable();
-			// Ruling S37 sweep, part 2 (Codex round-17 on #88): `$rewind_info`
-			// is already in scope from detect_rewind() above — its own
-			// `top_unreadable` is TRUE whenever the verdict it computed
-			// (rewind detected or not) could not actually be established,
-			// whether because highest_row_seq() failed (Ruling P77, the
-			// original case) or because the epoch read did. Either way the
-			// SAME reasoning as the log walk and the floor applies: an
-			// input the fragment's own rewind/cursor decision depends on
-			// was unproven, so this poll must not vouch for it.
-			$rewind_unreadable = (bool) $rewind_info['top_unreadable'];
-			$after_version          = Aura_Worker_Door_Log::door_version_raw();
-			if ( $log_unreadable || $floor_unreadable || $full_report_unreadable || $rewind_unreadable ) {
-				// Served immediately, never retried — the same shape as the
-				// `!$synced` branch just below: a retry re-runs the SAME
-				// walk against the SAME transient condition and, whether it
-				// clears or not, gains nothing a fresh poll would not also
-				// get. The fragment still carries whatever log_after()
-				// managed to read; only `observation` is withheld.
-				$fragment['observation'] = null;
-				return $fragment;
-			}
-			if ( ! $synced ) {
-				// Ruling S24 (Codex round-10 P2 on #88): the computed-state
-				// transition ITSELF could not be committed — see
-				// sync_computed_state()'s own docblock for why this fragment
-				// (built with the FRESH active/seam/door values, since
-				// $computed is null and build_status_fragment_state() falls
+			},
+			function () use ( $after, $epoch, &$synced, &$rewind_info ) {
+				// Ruling S38 (Codex round-16 P1 on #88): reset
+				// UNCONDITIONALLY, on attempt 0 too — a floor-read failure
+				// belongs to the attempt that hit it, never carried in
+				// from a previous request or (after this reset) leaked
+				// out of a previous attempt this same call already
+				// handled.
+				Aura_Worker_Door_Log::reset_floor_unreadable_for_attempt();
+				// Ruling S33 (Codex round-15 P1 on #88): the bracket opens
+				// BEFORE detect_rewind() ever runs — see
+				// version_bracketed()'s own docblock for the before/after
+				// reads this method's caller wraps around this WHOLE
+				// closure. A rotation landing WHILE detect_rewind() reads
+				// the epoch/top, or while sync_computed_state() persists
+				// what it found, used to fall OUTSIDE that window: both
+				// reads would agree on the NEW version while the fragment
+				// itself still carried site/cursor/rewind values read
+				// against the OLD one. Every input the fragment serves —
+				// epoch/site, the cursor decision, the rewind verdict, the
+				// log rows, the persisted computed tuple — is read
+				// strictly INSIDE the bracket, so a change during ANY of
+				// them is caught by the same before/after compare Ruling
+				// S6 already established, not a narrower one bolted on
+				// after the fact.
+				//
+				// Ruling S29 (Codex round-13 P1 on #88): rewind detection
+				// runs FIRST — sync_computed_state() needs to know about a
+				// DETECTED rewind to persist it as a state transition (see
+				// that method's own docblock), and
+				// build_status_fragment_state() must report the SAME
+				// detection, never a second, possibly different one.
+				$rewind_info = self::detect_rewind( (int) $after, $epoch );
+				// Ruling S22 (Codex round-9 P2 on #88): a COMPUTED
+				// transition — Elementor deactivating, the coverage seam
+				// changing, and now (Ruling S29) a newly DETECTED rewind —
+				// is state, and must land BEFORE the bracketed reads below
+				// can prove anything about it. See sync_computed_state()'s
+				// own docblock. Persisting THIS request's own freshly
+				// detected transition (the ordinary case, not a concurrent
+				// write) bumps the version between the bracket's before
+				// and after reads too — correctly forcing one retry:
+				// sync_computed_state() is a fenced CAS (Rulings S24/S26),
+				// so the SECOND attempt finds its own write already
+				// there, persists nothing further, and the bracket closes
+				// clean.
+				$synced   = self::sync_computed_state( $rewind_info['rewind'] );
+				// Ruling S28 (Codex round-12 P1 on #88): INSIDE the
+				// bracket, after sync_computed_state() — read back
+				// whatever is actually PERSISTED now, not this request's
+				// own (possibly stale) live computation. See
+				// persisted_computed_state()'s own docblock for the race
+				// this closes. Only meaningful when $synced: on a lost
+				// fence or an uncommitted write (Rulings S24/S26) there is
+				// nothing this call may credit itself with, and the
+				// fragment falls back to live computation below.
+				$computed = $synced ? self::persisted_computed_state() : null;
+				return self::build_status_fragment_state( $rewind_info, $computed );
+			},
+			function () use ( &$synced, &$rewind_info ) {
+				// Ruling S24 (Codex round-10 P2 on #88): the
+				// computed-state transition ITSELF could not be committed
+				// — see sync_computed_state()'s own docblock for why a
+				// fragment built with the FRESH active/seam/door values
+				// ($computed null, build_status_fragment_state() falling
 				// back to live computation) must not be paired with an
 				// observation the caller could read as proof it was
-				// witnessed. Served immediately, never retried: a retry
-				// re-attempts the same sync and, on the same underlying
-				// failure, would only repeat this outcome.
+				// witnessed.
+				//
+				// Ruling S36 (Codex round-15 P1 on #88): a transient
+				// SELECT failure mid log-walk is proven unreadable, never
+				// a hole (see log_after()'s own docblock); the rows read
+				// so far are still served, but this poll must not vouch
+				// for a log it knows it could not finish reading.
+				//
+				// Ruling S38 (Codex round-16 P1 on #88): the SAME
+				// reasoning for the ack floor — build_status_fragment_state()
+				// is what calls floor_raw(), both directly for the
+				// 'log_floor' field and inside log_after().
+				//
+				// Ruling S42 (Codex round-17 P2 on #88): the SAME
+				// reasoning for the closed-log report — build_status_fragment_state()
+				// is what calls full_report_raw() for the 'log_full'
+				// field.
+				//
+				// Ruling S37 sweep, part 2 (Codex round-17 on #88):
+				// `$rewind_info['top_unreadable']` is TRUE whenever the
+				// verdict detect_rewind() computed (rewind detected or
+				// not) could not actually be established, whether because
+				// highest_row_seq() failed (Ruling P77, the original
+				// case) or because the epoch read did.
+				return ! $synced
+					|| Aura_Worker_Door_Log::log_walk_was_unreadable()
+					|| Aura_Worker_Door_Log::floor_was_unreadable_this_attempt()
+					|| Aura_Worker_Door_Log::full_report_raw_was_unreadable()
+					|| (bool) $rewind_info['top_unreadable'];
+			}
+		);
+	}
+
+	/**
+	 * The version-bracket retry protocol EVERY consumer of
+	 * `door_version_raw()` as a witness must follow (Ruling S43, Codex
+	 * round-18 P1 on #88) — shared here so `status_fragment()` and
+	 * `governor_block()` run the exact SAME discipline rather than two
+	 * copies that could drift apart. See `status_fragment()`'s own
+	 * (pre-S43) docblock for the read protocol this generalises: read the
+	 * version, run $builder, read the version again. Equal, AND nothing
+	 * $builder read was marked unreadable, ⇒ the fragment truly describes
+	 * that version. A version mismatch ⇒ a mutation landed mid-build (a
+	 * TORN read) — retried ONCE, from a fresh pair of reads, after
+	 * $reset_memos drops whatever request-local memos $builder must not
+	 * reuse across attempts (see `reset_request_caches()`'s own docblock
+	 * for the memo this exists to drop). Still torn a second time ⇒
+	 * `observation: null`, the honest answer for a door mutating faster
+	 * than one request can read it consistently.
+	 *
+	 * UNREADABLE IS SERVED IMMEDIATELY, NEVER RETRIED: a retry re-reads
+	 * the SAME transient condition and gains nothing a fresh poll would
+	 * not also get — see each `$is_unreadable` callable's own call site
+	 * for the specific signals it checks (S24/S36/S38/S39/S42 and the
+	 * S37 sweep's `top_unreadable`, for `status_fragment()`; S39/S42 for
+	 * `governor_block()`).
+	 *
+	 * @param callable      $reset_memos   Called before each RETRY only
+	 *                                     (never before the first
+	 *                                     attempt).
+	 * @param callable      $builder       Runs this attempt's reads and
+	 *                                     returns the fragment array,
+	 *                                     WITHOUT an `observation` key.
+	 * @param callable|null $is_unreadable Called after $builder, before
+	 *                                     the after-version read. Returns
+	 *                                     true when this attempt's own
+	 *                                     reads are known unproven.
+	 * @return array $builder's array, plus `observation`.
+	 */
+	private static function version_bracketed( callable $reset_memos, callable $builder, $is_unreadable = null ) {
+		$fragment = array();
+		for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+			if ( $attempt > 0 ) {
+				$reset_memos();
+			}
+			$before_version = Aura_Worker_Door_Log::door_version_raw();
+			$fragment       = $builder();
+			$unreadable     = null !== $is_unreadable && (bool) $is_unreadable();
+			$after_version  = Aura_Worker_Door_Log::door_version_raw();
+			if ( $unreadable ) {
 				$fragment['observation'] = null;
 				return $fragment;
 			}
@@ -541,8 +588,12 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * Every request-local memo `build_status_fragment_state()` reads,
-	 * dropped before a retry (Ruling S20, Codex round-8 P1 on #88).
+	 * Every request-local memo `build_status_fragment_state()` — and,
+	 * since Ruling S43 (Codex round-18 P1 on #88), `governor_block()`'s
+	 * own builder, which reads `Aura_Worker_Door_Holds::count()` through
+	 * the SAME `held_rows()` memo — reads, dropped before a retry (Ruling
+	 * S20, Codex round-8 P1 on #88). Both callers reach this through
+	 * `version_bracketed()`'s shared `$reset_memos` parameter.
 	 *
 	 * THE BUG THIS CLOSES: `Aura_Worker_Door_Holds::held_rows()` memoises
 	 * its read "for the request", and is dropped by `forget_held()` —
@@ -3921,53 +3972,112 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
-		// Ruling S28 (Codex round-12 P1 on #88): the PERSISTED tuple, never
-		// this request's own live computation — see
-		// persisted_computed_state()'s own docblock for the race this
-		// closes, and build_status_fragment_state()'s `$computed` parameter
-		// for the identical treatment `/status` gives it. Null on a fresh
-		// site (no `/status` poll has ever run) falls back to live
-		// computation below, since there is nothing to read back yet.
-		$computed = self::persisted_computed_state();
-		$active   = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
-		$seam     = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
-		$door     = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
-		$epoch    = Aura_Worker_Door_Log::epoch();
-		$binding  = Aura_Worker_Door_Log::binding_raw();
-		// NULL when the queue could not be read (Ruling P57) — held_count and
-		// queue_full are the same fact, so both say "unknown" together rather
-		// than one of them inventing a zero.
-		$held  = Aura_Worker_Door_Holds::count(); // read once
-		return array(
-			'active'              => $active,
-			'epoch'               => '' === $epoch ? null : $epoch,
-			// The current binding generation, read RAW and NEVER minted
-			// (`Aura_Worker_Door_Log::binding_raw()`) — Aura compares
-			// `entry.binding` with it to label a departed client's entries;
-			// null when the record cannot be read (Ruling A5b).
-			'binding'             => '' === $binding ? null : $binding,
-			// READ-ONLY (Ruling A65), and — since Ruling S27 — NEVER preceded
-			// by a write of its own: this is an on-demand AUDIT, never a
-			// poll, and must not itself advance the counter Aura orders
-			// `/status` polls by. Null when the row cannot be proven read.
-			'observation'         => Aura_Worker_Door_Log::door_version_raw(),
-			// null when 'observation' is null for an ORDINARY (transient)
-			// reason; 'engine' or 'php32' when it is null for good — this
-			// site can never report a witness (Ruling S13).
-			'observation_unsupported' => Aura_Worker_Door_Log::observation_unsupported_reason(),
-			'seam'                => $seam,
-			'door'                => $door,
-			'held_count'          => $held,
-			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(), // null when unreadable (Ruling P53)
-			// Ruling S37 (Codex round-15 class sweep on #88): null when
-			// THIS count could not be read — joining log_unacked/held_count
-			// above rather than reporting a false zero.
-			'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),
-			'unobserved_30d'      => self::count_30d( 'unobserved' ),
-			'hook_missed_30d'     => self::count_30d( 'hook_missed' ),
-			'unknown_ability_30d' => self::count_30d( 'unknown_ability' ),
-			'queue_full'          => null === $held ? null : ( $held >= Aura_Worker_Door_Holds::CAP ),
-			'log_full'            => Aura_Worker_Door_Log::full_report(),
+		// Ruling S43 (Codex round-18 P1 on #88): the SAME version-bracket
+		// discipline status_fragment() already has, through the SAME
+		// shared helper (version_bracketed()'s own docblock) — every
+		// field this audit reports is read inside ONE before/after
+		// version bracket, retried once on a torn read, `observation:
+		// null` on a second disagreement or an unreadable input. Before
+		// this ruling `observation` was a single, UNBRACKETED read taken
+		// in the middle of everything else — the computed tuple, epoch,
+		// binding and held count read BEFORE it, the backlog and 30-day
+		// counters read AFTER — so a mutation landing anywhere in that
+		// window was invisible to a report claiming to describe ONE
+		// version.
+		return self::version_bracketed(
+			static function () {
+				// reset_request_caches() never calls sync_computed_state()
+				// (Ruling S27 stands: this audit still never WRITES) — it
+				// only drops the same in-object memos status_fragment()'s
+				// own retry drops, which this retry needs for the SAME
+				// reason (Aura_Worker_Door_Holds::count(), read below,
+				// goes through the identical held_rows() memo).
+				self::reset_request_caches();
+			},
+			static function () {
+				// Ruling S28 (Codex round-12 P1 on #88): the PERSISTED
+				// tuple, never this request's own live computation — see
+				// persisted_computed_state()'s own docblock for the race
+				// this closes, and build_status_fragment_state()'s
+				// `$computed` parameter for the identical treatment
+				// `/status` gives it. Null on a fresh site (no `/status`
+				// poll has ever run) falls back to live computation
+				// below, since there is nothing to read back yet.
+				$computed = self::persisted_computed_state();
+				$active   = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
+				$seam     = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
+				$door     = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
+				if ( null === $computed && Aura_Worker_Door_Log::closure_read_was_unreadable() ) {
+					// Ruling S39 (Codex round-16 P2 on #88), shared: the
+					// door_state() call above just hit an unreadable
+					// closure marker — its 'open'/'closed' answer cannot
+					// be trusted. Serve whatever this site last durably
+					// persisted instead of a value built on a read that
+					// could not be proven.
+					$stale = self::persisted_computed_state();
+					if ( is_array( $stale ) && isset( $stale['door'] ) ) {
+						$door = (string) $stale['door'];
+					}
+				}
+				// RAW (Ruling S43): epoch(), not epoch_raw() alone — the
+				// idempotent MINT (Ruling P35) a fresh site's first audit
+				// still needs — but the VALUE this reports is read back
+				// raw, the same "prime, then read raw" shape
+				// detect_rewind() already uses, never trusted from
+				// epoch()'s own possibly-cached return.
+				Aura_Worker_Door_Log::epoch();
+				$epoch   = Aura_Worker_Door_Log::epoch_raw();
+				$binding = Aura_Worker_Door_Log::binding_raw();
+				// NULL when the queue could not be read (Ruling P57) —
+				// held_count and queue_full are the same fact, so both
+				// say "unknown" together rather than one of them
+				// inventing a zero.
+				$held = Aura_Worker_Door_Holds::count(); // read once
+				return array(
+					'active'              => $active,
+					'epoch'               => '' === $epoch ? null : $epoch,
+					// The current binding generation, read RAW and NEVER
+					// minted (`Aura_Worker_Door_Log::binding_raw()`) —
+					// Aura compares `entry.binding` with it to label a
+					// departed client's entries; null when the record
+					// cannot be read (Ruling A5b).
+					'binding'             => '' === $binding ? null : $binding,
+					// null when 'observation' is null for an ORDINARY
+					// (transient) reason; 'engine' or 'php32' when it is
+					// null for good — this site can never report a
+					// witness (Ruling S13).
+					'observation_unsupported' => Aura_Worker_Door_Log::observation_unsupported_reason(),
+					'seam'                => $seam,
+					'door'                => $door,
+					'held_count'          => $held,
+					'log_unacked'         => Aura_Worker_Door_Log::count_unacked(), // null when unreadable (Ruling P53)
+					// Ruling S37 (Codex round-15 class sweep on #88): null
+					// when THIS count could not be read — joining
+					// log_unacked/held_count above rather than reporting
+					// a false zero.
+					'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),
+					'unobserved_30d'      => self::count_30d( 'unobserved' ),
+					'hook_missed_30d'     => self::count_30d( 'hook_missed' ),
+					'unknown_ability_30d' => self::count_30d( 'unknown_ability' ),
+					'queue_full'          => null === $held ? null : ( $held >= Aura_Worker_Door_Holds::CAP ),
+					// RAW (Ruling S43): full_report_raw(), not
+					// full_report() — the same reasoning as every other
+					// field here, and full_report_raw_was_unreadable()
+					// below is what makes it provable.
+					'log_full'            => Aura_Worker_Door_Log::full_report_raw(),
+				);
+			},
+			static function () {
+				// Ruling S43: the closure marker (feeds `door` above,
+				// through door_state()) and the closed-log report (Ruling
+				// S42) are the two raw reads this audit's OWN fields
+				// depend on — the same two `status_fragment()` already
+				// checks via build_status_fragment_state(). This audit
+				// never calls detect_rewind()/log_after(), so it has no
+				// floor, log-walk or rewind-top signal to join.
+				return Aura_Worker_Door_Log::closure_read_was_unreadable()
+					|| Aura_Worker_Door_Log::full_report_raw_was_unreadable();
+			}
 		);
 	}
 
