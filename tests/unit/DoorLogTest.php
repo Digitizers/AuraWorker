@@ -429,6 +429,24 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_rows'][ $name ]     = maybe_serialize( $row );
 	}
 
+	/**
+	 * rotate_epoch()'s own derived target (Ruling S78, Codex round-32 P1
+	 * on #88) — computed the SAME way `rotate_epoch()` itself does, from
+	 * `$expected` and the CURRENT binding generation, via Reflection on
+	 * the private `derive_rotation_target()` primitive.
+	 */
+	private function rotationTarget( string $expected ): string {
+		$m = new ReflectionMethod( Aura_Worker_Door_Log::class, 'derive_rotation_target' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		return $m->invoke(
+			null,
+			Aura_Worker_Door_Log::ROTATE_TARGET_NAMESPACE,
+			$expected . '|' . Aura_Worker_Door_Log::binding_raw()
+		);
+	}
+
 	/* ---- settle() is pending-only: the first terminal writer wins ---- */
 
 	/**
@@ -524,6 +542,11 @@ final class DoorLogTest extends TestCase {
 	 */
 	public function test_an_ambiguously_committed_rotation_that_actually_landed_completes_idempotently(): void {
 		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+		// Ruling S78: the ROTATION target is now DERIVED from $before, not
+		// wp_generate_uuid4() -- computed here, before the seam below fixes
+		// every uuid4() call, which now only names the WITNESS row (the
+		// commit-tx nonce), never the epoch itself.
+		$target = $this->rotationTarget( $before );
 
 		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s62';
 		// Reaches the durable-witness fallback: the COMMIT statement
@@ -544,8 +567,8 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_sa_option_read_fail'] = array();
 
 		$this->assertTrue( $out['rotated'], 'this call\'s own pre-minted target is exactly what the epoch now holds -- the ambiguous commit actually landed' );
-		$this->assertSame( 'nonce-s62', $out['epoch'] );
-		$this->assertSame( 'nonce-s62', get_option( Aura_Worker_Door_Log::EPOCH ) );
+		$this->assertSame( $target, $out['epoch'] );
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
 	}
 
 	/**
@@ -562,6 +585,9 @@ final class DoorLogTest extends TestCase {
 	 */
 	public function test_an_ambiguously_committed_rotation_whose_verify_also_fails_is_unknown_not_false(): void {
 		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+		// Ruling S78: the derived target, computed BEFORE the seam below
+		// fixes uuid4() (which now names only the witness row).
+		$target = $this->rotationTarget( $before );
 
 		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s77';
 		$GLOBALS['_sa_reconnect_after_commit'] = true;
@@ -583,18 +609,27 @@ final class DoorLogTest extends TestCase {
 		// The rotation actually DID land — this call's own mint really
 		// is what the epoch now holds, confirmed with a healthy read now
 		// that the seam is cleared.
-		$this->assertSame( 'nonce-s77', get_option( Aura_Worker_Door_Log::EPOCH ) );
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
 	}
 
 	/**
-	 * Ruling S62: a retry of the SAME logical rotation, once it has
-	 * genuinely landed (this models the caller re-deriving $expected
-	 * fresh and finding the epoch already rotated -- the ordinary,
-	 * ALREADY-correct "lost the fence" path, unaffected by this ruling):
-	 * no second rotation runs, and the epoch answered is the one already
-	 * in force.
+	 * Ruling S78 (Codex round-32 P1 on #88) supersedes this test's old
+	 * premise. Before S78 the target was `wp_generate_uuid4()` -- a fresh
+	 * RANDOM value every call -- so a retry naming the SAME (now stale)
+	 * `$expected` could never recognise its own first attempt: the fence
+	 * is lost (0 rows), `committed:true` runs directly, and the answer
+	 * was a definitive `rotated:false` forever, even though nothing was
+	 * actually wrong.
+	 *
+	 * With the target DERIVED from `$expected` (Ruling S78), a same-
+	 * `$expected` retry re-derives the IDENTICAL target the first call
+	 * already landed, so the "fence lost" branch now recognises
+	 * `current === $new_epoch` and correctly reports `rotated:true` --
+	 * this retry did not rotate anything itself, but it truthfully
+	 * recognises that the rotation it asked for already happened, rather
+	 * than reporting a lie.
 	 */
-	public function test_a_retry_of_an_already_landed_rotation_rotates_nothing_a_second_time(): void {
+	public function test_a_retry_of_an_already_landed_rotation_recognises_its_own_prior_work(): void {
 		$before = Aura_Worker_Door_Log::epoch();
 		$first  = Aura_Worker_Door_Log::rotate_epoch( $before );
 		$this->assertTrue( $first['rotated'] );
@@ -603,9 +638,72 @@ final class DoorLogTest extends TestCase {
 		// caller unaware the first attempt landed would send again.
 		$second = Aura_Worker_Door_Log::rotate_epoch( $before );
 
-		$this->assertFalse( $second['rotated'], 'the fence is genuinely lost -- nothing for THIS call to do' );
+		$this->assertTrue( $second['rotated'], 'Ruling S78: the retry derives the SAME target the first call already landed -- it recognises its own prior work, not a lost race to someone else' );
 		$this->assertSame( $first['epoch'], $second['epoch'], 'the epoch already in force, unchanged by the retry' );
 		$this->assertSame( $first['epoch'], get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S78: two DIFFERENT logical rotations (two different
+	 * `$expected` values) must derive two DIFFERENT targets -- the
+	 * derivation is keyed on `$expected`, so it never collides across
+	 * genuinely distinct rotations, only self-recognises a repeat of the
+	 * SAME one.
+	 */
+	public function test_two_successive_rotations_derive_distinct_targets(): void {
+		$first_expected = Aura_Worker_Door_Log::epoch();
+		$first          = Aura_Worker_Door_Log::rotate_epoch( $first_expected );
+		$this->assertTrue( $first['rotated'] );
+
+		$second_expected = $first['epoch']; // the epoch now in force
+		$second          = Aura_Worker_Door_Log::rotate_epoch( $second_expected );
+		$this->assertTrue( $second['rotated'] );
+
+		$this->assertNotSame( $first['epoch'], $second['epoch'], 'a later legitimate rotation starts from a new expected epoch and therefore derives a new target' );
+		$this->assertSame( $second['epoch'], get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S78's explicit "retry after ambiguous+unverifiable"
+	 * scenario: the FIRST attempt's commit is ambiguous AND its own
+	 * verify also fails (Ruling S77 -- `rotated:null`, genuinely
+	 * unknown). A caller retrying with the SAME `$expected` (e.g. after
+	 * the REST route's retryable 503) must recognise the first attempt's
+	 * own landed rotation and restamp, rather than losing the fence to
+	 * "someone else" forever.
+	 */
+	public function test_a_retry_after_an_ambiguous_and_unverifiable_rotation_recognises_and_restamps(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$target = $this->rotationTarget( $before );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s78-retry';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s78-retry';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+		// AND the FIRST attempt's own verifying epoch_raw() re-read also
+		// fails -- Ruling S77's genuinely-unknown case.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$first = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $first['rotated'], 'sanity: the first attempt is genuinely unknown, per Ruling S77' );
+		// The rotation actually DID land underneath the unreadable verify.
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+
+		// The retry names the SAME (still stale, from the retrying
+		// caller's point of view) $expected -- no ambiguity seam active
+		// on the retry itself, so it takes the "fence lost" branch
+		// directly. Ruling S78: it must recognise current === its own
+		// derived target and report true, restamping rather than lying.
+		$retry = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$this->assertTrue( $retry['rotated'], 'Ruling S78: the retry derives the SAME target the ambiguous-but-landed first attempt already wrote, and recognises it' );
+		$this->assertSame( $target, $retry['epoch'] );
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
 	}
 
 	public function test_stale_pending_finds_only_pending_rows_older_than_the_cutoff(): void {

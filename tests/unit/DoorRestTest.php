@@ -58,6 +58,24 @@ final class DoorRestTest extends TestCase {
 	/** @var string|null the gateway secret key, once enforce_grants() has run */
 	private $grant_secret = null;
 
+	/**
+	 * rotate_epoch()'s own derived target (Ruling S78, Codex round-32 P1
+	 * on #88) — computed the SAME way `rotate_epoch()` itself does, from
+	 * `$expected` and the CURRENT binding generation, via Reflection on
+	 * the private `derive_rotation_target()` primitive.
+	 */
+	private function rotationTarget( string $expected ): string {
+		$m = new ReflectionMethod( Aura_Worker_Door_Log::class, 'derive_rotation_target' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		return $m->invoke(
+			null,
+			Aura_Worker_Door_Log::ROTATE_TARGET_NAMESPACE,
+			$expected . '|' . Aura_Worker_Door_Log::binding_raw()
+		);
+	}
+
 	/** Provisions a real gateway pubkey, turning on grant enforcement. */
 	private function enforce_grants(): void {
 		if ( ! function_exists( 'sodium_crypto_sign_keypair' ) ) {
@@ -348,6 +366,9 @@ final class DoorRestTest extends TestCase {
 		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
 		$gen    = Aura_Worker_Door_Log::binding_raw();
 		$before = Aura_Worker_Door_Log::epoch();
+		// Ruling S78: the derived target, computed before the seam below
+		// fixes uuid4() (which now names only the witness row).
+		$target = $this->rotationTarget( $before );
 		$req    = $this->request( array( 'epoch' => $before ) );
 		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
 
@@ -363,9 +384,9 @@ final class DoorRestTest extends TestCase {
 		$GLOBALS['_sa_option_read_fail'] = array();
 
 		$this->assertTrue( $res->data['rotated'], 'the ambiguous commit actually landed' );
-		$this->assertSame( 'nonce-s62-rest', $res->data['epoch'] );
+		$this->assertSame( $target, $res->data['epoch'] );
 		$this->assertArrayNotHasKey( 'witness_stale', $res->data, 'restamp_binding_epoch() ran and landed' );
-		$this->assertSame( 'nonce-s62-rest', Aura_Worker_Door_Log::binding_record()['epoch'], 'the binding record names the new cursor, not the old one' );
+		$this->assertSame( $target, Aura_Worker_Door_Log::binding_record()['epoch'], 'the binding record names the new cursor, not the old one' );
 		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation itself never moved -- only the epoch witness' );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
@@ -395,6 +416,9 @@ final class DoorRestTest extends TestCase {
 		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
 		$gen    = Aura_Worker_Door_Log::binding_raw();
 		$before = Aura_Worker_Door_Log::epoch();
+		// Ruling S78: the derived target, computed before the seam below
+		// fixes uuid4() (which now names only the witness row).
+		$target = $this->rotationTarget( $before );
 		$req    = $this->request( array( 'epoch' => $before ) );
 		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
 
@@ -418,7 +442,7 @@ final class DoorRestTest extends TestCase {
 		// The rotation actually DID land — confirmed with a healthy read
 		// now that the seams are cleared, the SAME way the docblock's own
 		// sibling test proves it for the healthy-verify case.
-		$this->assertSame( 'nonce-s77-rest', get_option( Aura_Worker_Door_Log::EPOCH ) );
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
 		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation itself never moved' );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}

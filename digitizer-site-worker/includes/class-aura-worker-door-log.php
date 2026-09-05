@@ -22,6 +22,16 @@ class Aura_Worker_Door_Log {
 	const PREFIX       = 'aura_worker_door_log_';
 	const FLOOR        = 'aura_worker_door_log_acked';
 	const EPOCH        = 'aura_worker_door_epoch';
+	/**
+	 * A FIXED namespace for `rotate_epoch()`'s own derived rotation target
+	 * (Ruling S78, Codex round-32 P1 on #88) — an arbitrary but CONSTANT
+	 * UUID, never regenerated, so `derive_rotation_target()` is a pure,
+	 * repeatable function of its own two inputs across every call this
+	 * plugin ever makes. Its own bytes carry no meaning beyond "this
+	 * plugin's own rotate-target derivation" — see that method's own
+	 * docblock for why the target must be deterministic at all.
+	 */
+	const ROTATE_TARGET_NAMESPACE = '6f0a2b0e-6d43-5f1a-9c2e-2a9e8f7c4d31';
 	/** The BINDING generation (Rulings P51/P58): minted like the epoch, rotated ONLY by a rebind. */
 	const BINDING      = 'aura_worker_door_binding';
 	/* The binding record's STATE (Ruling P61) — a lazy mint is never a stated identity. */
@@ -3683,6 +3693,67 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * `rotate_epoch()`'s own rotation TARGET, DERIVED rather than randomly
+	 * minted (Ruling S78, Codex round-32 P1 on #88) — a version-5 UUID
+	 * (RFC 4122), so it stays a valid epoch string, over
+	 * `self::ROTATE_TARGET_NAMESPACE` and `$name`.
+	 *
+	 * THE BUG THIS CLOSES: `wp_generate_uuid4()` (Ruling S62's own choice)
+	 * mints a FRESH, unrepeatable value every call — so a retry of the
+	 * SAME logical rotation (the caller naming the SAME `$expected`, after
+	 * an ambiguous commit whose OWN verifying re-read ALSO failed, Ruling
+	 * S77) minted a DIFFERENT target than the first attempt did. The
+	 * retry's own fenced delete then found the epoch already replaced —
+	 * by ITS OWN prior attempt — and had no way to tell that apart from a
+	 * genuinely UNRELATED racer's rotation: both look identical, a fence
+	 * miss against a target that is not this call's own. `restamp_binding_epoch()`
+	 * never ran, and the binding record was left naming an epoch the site
+	 * had already left (Ruling P91's own "half-done rebind").
+	 *
+	 * A DETERMINISTIC target closes it: the SAME `$expected` (and the SAME
+	 * binding generation) always derives the SAME target, so a retry
+	 * recomputes exactly what its own prior attempt already minted and
+	 * recognises `epoch_raw() === $target` as ITS OWN landed rotation
+	 * (`rotate_epoch_write()`'s own fence-miss branches, below) — no
+	 * different from Ruling S62's own idempotent-completion check, just
+	 * reachable on a SECOND call instead of needing the first call's own
+	 * verify to succeed. A LATER, genuinely different rotation starts from
+	 * a NEW `$expected` (the epoch this call is now asked to replace is
+	 * not the one the earlier rotation replaced), so it derives a
+	 * DIFFERENT target — nothing collides across two real, sequential
+	 * rotations. A genuinely UNRELATED racer's own epoch — an arbitrary
+	 * value, or a DIFFERENT caller's own derived target for a DIFFERENT
+	 * `$expected` — is vanishingly unlikely to equal THIS derivation
+	 * (a full SHA-1 space), so the two long-standing tests this ruling
+	 * does not touch (a racer's own winning rotation, a caller naming an
+	 * epoch that was never real) still answer `rotated: false`.
+	 *
+	 * @param string $namespace A fixed UUID (`self::ROTATE_TARGET_NAMESPACE`).
+	 * @param string $name      The value this target is derived FROM —
+	 *                          `$expected . '|' . $binding_generation`.
+	 * @return string A version-5 UUID string.
+	 */
+	private static function derive_rotation_target( $namespace, $name ) {
+		$nhex = str_replace( array( '-', '{', '}' ), '', $namespace );
+		$nbytes = '';
+		for ( $i = 0; $i < 32; $i += 2 ) {
+			$nbytes .= chr( hexdec( substr( $nhex, $i, 2 ) ) );
+		}
+		$hash = sha1( $nbytes . $name );
+		return sprintf(
+			'%08s-%04s-%04x-%02x%02s-%012s',
+			substr( $hash, 0, 8 ),
+			substr( $hash, 8, 4 ),
+			// Version 5, in the high nibble of the time-hi field.
+			( hexdec( substr( $hash, 12, 4 ) ) & 0x0fff ) | 0x5000,
+			// Variant 1 (RFC 4122), in the top bits of the clock-seq-hi octet.
+			( hexdec( substr( $hash, 16, 2 ) ) & 0x3f ) | 0x80,
+			substr( $hash, 18, 2 ),
+			substr( $hash, 20, 12 )
+		);
+	}
+
+	/**
 	 * Mints a new epoch, clears the closure state, and leaves every log row
 	 * — and the ACK FLOOR — in place: the recovery from a rewound log, which
 	 * `/status` REPORTS (`rewind.detected`) and Aura DECIDES, through the
@@ -3732,7 +3803,7 @@ class Aura_Worker_Door_Log {
 		// own docblock). Idempotent either way: an epoch that already exists
 		// is untouched, exactly like every other caller of epoch().
 		self::epoch();
-		// Ruling S62 (Codex round-23 P2 on #88): minted HERE, before
+		// Ruling S62 (Codex round-23 P2 on #88): computed HERE, before
 		// versioned() ever runs — the ONE fixed TARGET this call's own
 		// attempt means to reach, threaded into rotate_epoch_write() so an
 		// AMBIGUOUS commit can be completed idempotently below by asking
@@ -3742,7 +3813,19 @@ class Aura_Worker_Door_Log {
 		// this ruling does not touch: a racer's own epoch winning the
 		// fence, and a caller naming an epoch that was never real to begin
 		// with, both still report `rotated: false`, exactly as before).
-		$new_epoch = wp_generate_uuid4();
+		//
+		// Ruling S78 (Codex round-32 P1 on #88): DERIVED, never a fresh
+		// random `wp_generate_uuid4()` mint — see `derive_rotation_target()`'s
+		// own docblock for the retry-after-ambiguous bug a random target
+		// could never let a second call recognise as its own. Keyed on
+		// `$expected` (which real, sequential rotation this is) and the
+		// binding generation (so a rebind installing a brand-new binding
+		// mid-sequence still derives a fresh target, never reusing one a
+		// PREVIOUS binding's own rotation already reached).
+		$new_epoch = self::derive_rotation_target(
+			self::ROTATE_TARGET_NAMESPACE,
+			(string) $expected . '|' . self::binding_raw()
+		);
 		$outcome   = self::versioned(
 			function () use ( $expected, $claim, $fence, $new_epoch ) {
 				return self::rotate_epoch_write( $expected, $claim, $fence, $new_epoch );
@@ -3892,11 +3975,19 @@ class Aura_Worker_Door_Log {
 			wp_cache_delete( self::EPOCH, 'options' );
 			wp_cache_delete( 'notoptions', 'options' );
 			if ( 1 !== (int) $gone ) {
+				// Ruling S78 (Codex round-32 P1 on #88): a fence miss whose
+				// CURRENT epoch already equals THIS call's own $new_epoch
+				// is not a lost race to some OTHER rotation — it is this
+				// SAME logical rotation's own prior attempt (possibly
+				// ambiguous) having already landed. See
+				// derive_rotation_target()'s own docblock for why only a
+				// retry naming the SAME inputs can ever reach this.
+				$now_claimed = self::epoch_raw(); // never epoch() — see the docblock above
 				return array(
 					'mutated' => false,
 					'result'  => array(
-						'rotated' => false,
-						'epoch'   => self::epoch_raw(), // never epoch() — see the docblock above
+						'rotated' => ( $now_claimed === $new_epoch ),
+						'epoch'   => $now_claimed,
 					),
 				);
 			}
@@ -3939,11 +4030,17 @@ class Aura_Worker_Door_Log {
 		wp_cache_delete( self::EPOCH, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
 		if ( 1 !== (int) $gone ) {
+			// Ruling S78 (Codex round-32 P1 on #88): the SAME recognition
+			// as the claim-conditioned branch above — this is the branch
+			// `rotate_epoch()`'s own `/door/rotate` route actually reaches
+			// (it passes no claim/fence), so THIS is the one a retry after
+			// an ambiguous-and-unverifiable commit (Ruling S77) needs.
+			$now = self::epoch_raw();
 			return array(
 				'mutated' => false,
 				'result'  => array(
-					'rotated' => false,
-					'epoch'   => self::epoch_raw(),
+					'rotated' => ( $now === $new_epoch ),
+					'epoch'   => $now,
 				),
 			);
 		}
