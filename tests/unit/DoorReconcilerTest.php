@@ -432,6 +432,53 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S79 (Codex round-32 P2 on #88): the OTHER half of Ruling S75's
+	 * own `audit_identity` comparison this file's sibling test just above
+	 * exercises. That ruling reasoned a genuinely ABSENT persisted
+	 * identity — a fresh site, no `/status` poll has EVER run — "is not
+	 * itself a mismatch: there is nothing yet to disagree with", and
+	 * certified live computation in that case. Ruling S79 overturns
+	 * exactly that carve-out: an absent baseline never AUTHORISES a
+	 * witness either — there is simply no proof yet, in either
+	 * direction — so a fresh site's audit now withholds `observation`
+	 * (never certifies) until a real `/status` poll has actually
+	 * persisted one to pair with, exactly like a proven mismatch already
+	 * did. Two DIRECT audits (never a `/status` poll) straddling a hold
+	 * expiry both answer `observation: null` — the SAME honest
+	 * "unwitnessed" answer whether or not anything actually changed
+	 * underneath, because there is no baseline for either one to be
+	 * compared against. Only once a real poll persists one does the
+	 * NEXT audit certify.
+	 */
+	public function test_governor_block_withholds_observation_on_a_fresh_site_with_no_status_poll_ever_run(): void {
+		$ref = $this->hold();
+		// NO status_fragment() call anywhere above this line — a fresh
+		// site's `Aura_Worker_Elementor_Door::COMPUTED` option has never
+		// been written by anything at all yet.
+		$first = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 1, $first['held_count'], 'the fixture assumption this test is built on' );
+		$this->assertNull( $first['observation'], 'Ruling S79: no audit_identity baseline has ever been persisted, so this direct audit cannot vouch for a pairing nobody has witnessed' );
+
+		// The hold expires — still no `/status` poll runs; nothing here
+		// ever writes a baseline either (Ruling S27: governor_block()
+		// never writes).
+		$this->patchOption( Aura_Worker_Door_Holds::HELD . $ref, array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+		Aura_Worker_Door_Holds::forget_held(); // see this file's own sibling test for why this line is needed
+
+		$second = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 0, $second['held_count'], 'the expiry is reflected live regardless -- this audit never lies about its OWN content' );
+		$this->assertNull( $second['observation'], 'still no baseline to pair with -- withheld exactly like the FIRST call, for the identical reason' );
+
+		// A real `/status` poll finally runs, persisting the first-ever
+		// audit_identity baseline for this site.
+		$this->assertSame( array(), $this->fragment()['held'] );
+
+		$third = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 0, $third['held_count'] );
+		$this->assertNotNull( $third['observation'], 'the /status poll persisted a baseline matching this audit\'s own (unchanged) live content -- certified for the first time' );
+	}
+
+	/**
 	 * Ruling S66 (Codex round-25 P1 on #88): `version_bracketed()` reset
 	 * every builder memo only from attempt 1 onward — never attempt 0. The
 	 * `/status` route calls `reconcile()` BEFORE `status_fragment()`, and

@@ -5026,18 +5026,35 @@ class Aura_Worker_Elementor_Door {
 				// wrote? A mismatch withholds `observation` (the SAME
 				// mark_unreadable() mechanism every other unproven read
 				// here already uses) — never certifying a pairing this
-				// read-only audit has no way to make true. A genuinely
-				// ABSENT persisted identity (no /status poll has EVER
-				// run) is not itself a mismatch: there is nothing yet to
-				// disagree with, so live computation is certified exactly
-				// as it always was before this ruling.
+				// read-only audit has no way to make true.
+				//
+				// Ruling S79 (Codex round-32 P2 on #88) OVERTURNS this
+				// ruling's own carve-out for a genuinely ABSENT baseline.
+				// S75 reasoned "nothing yet to disagree with" and
+				// certified live computation whenever `$persisted_for_audit`
+				// lacked an `audit_identity` key at all — but "nothing to
+				// disagree with" is not the same fact as "proven to
+				// match": a door that already has SOME persisted computed
+				// state (`sync_computed_state()`'s own `{active,seam,door}`
+				// tuple, written on an ordinary build with no /status poll
+				// having run yet to add `audit_identity`) is exactly this
+				// case, and the old guard skipped the comparison entirely
+				// and certified a pairing nobody had ever witnessed. An
+				// absent baseline never AUTHORISES a witness — there is
+				// simply no proof yet, in either direction — so this now
+				// withholds `observation` (mark_unreadable(), same as a
+				// proven mismatch) whenever no `audit_identity` baseline
+				// exists, and only certifies once one has been persisted
+				// (by a /status poll — see `sync_served_identities()`) AND
+				// it matches this audit's own live identity.
 				$live_audit_identity = self::served_identity(
 					self::audit_identity_payload( $active, $epoch, $binding, $seam, $door, $held, $log_unacked, $log_full )
 				);
 				$persisted_for_audit = get_option( self::COMPUTED, null );
-				if ( is_array( $persisted_for_audit )
-					&& array_key_exists( 'audit_identity', $persisted_for_audit )
-					&& $persisted_for_audit['audit_identity'] !== $live_audit_identity
+				$has_audit_baseline = is_array( $persisted_for_audit )
+					&& array_key_exists( 'audit_identity', $persisted_for_audit );
+				if ( ! $has_audit_baseline
+					|| $persisted_for_audit['audit_identity'] !== $live_audit_identity
 				) {
 					self::mark_unreadable( 'audit_identity' );
 				}

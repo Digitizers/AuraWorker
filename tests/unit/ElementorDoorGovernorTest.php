@@ -1233,12 +1233,36 @@ final class ElementorDoorGovernorTest extends TestCase {
 	 * unbracketed `observation` read, then the backlog and 30-day counters
 	 * AFTER it — a torn audit under one witness, since nothing caught a
 	 * mutation landing anywhere in that window. It now shares
-	 * status_fragment()'s own version_bracketed() helper: a mutation
-	 * landing mid-build forces exactly one retry, which re-reads
-	 * everything (including `held_count`) against the version the retry
-	 * settles on.
+	 * status_fragment()'s own version_bracketed() helper.
+	 *
+	 * Ruling S79 (Codex round-32 P2 on #88) SUPERSEDES this test's
+	 * original "clean retry serves the new state" premise for the exact
+	 * race modelled here. `version_bracketed()`'s loop checks `$unreadable`
+	 * BEFORE it ever compares before/after door versions — and attempt
+	 * 0's `audit_identity` comparison (Ruling S75) runs at the very END
+	 * of the SAME attempt that captured active/seam/door EARLY (Ruling
+	 * S43's own read order). A competing write landing in between (as
+	 * this racer models) is therefore caught by THAT comparison first:
+	 * attempt 0's own live identity — built from the door state it read
+	 * before the race — can never match what the race just persisted,
+	 * whether the persisted state carries a matching `audit_identity` (a
+	 * mismatch) or none at all (Ruling S79's own "absent baseline" case
+	 * — this racer, like a partial/legacy write, never calls the real
+	 * `sync_served_identities()`). Either way `mark_unreadable()` fires
+	 * and the loop returns immediately with THIS attempt's own
+	 * (necessarily pre-race) content — never reaching the version-tear
+	 * retry this test used to exercise in isolation.
+	 *
+	 * This is not a new hole: a REAL competing `status_fragment()` write
+	 * (which always persists a matching `audit_identity`) already took
+	 * this exact path under Ruling S75 alone — this synthetic racer
+	 * merely dodged it by omitting the key, a loophole Ruling S79
+	 * closes for every shape of missing baseline, not only this one.
+	 * The honest outcome is `door: 'open'` (this attempt's own capture)
+	 * with `observation: null` — never a false witness over content
+	 * half of which predates the race.
 	 */
-	public function test_a_mutation_mid_build_of_the_audit_forces_a_retry_that_serves_the_new_state(): void {
+	public function test_a_mutation_mid_build_of_the_audit_withholds_observation_rather_than_serve_a_torn_mix(): void {
 		$this->registerAll();
 		// A real poll first (Ruling S28) — this is what actually PERSISTS
 		// the computed tuple via a real conditional INSERT, so the racer's
@@ -1246,16 +1270,13 @@ final class ElementorDoorGovernorTest extends TestCase {
 		// exists, not the "notoptions" miss-cache a never-persisted
 		// governor_block()-only fixture would leave stuck.
 		Aura_Worker_Elementor_Door::status_fragment();
-		$first  = Aura_Worker_Elementor_Door::governor_block();
-		$before = $first['observation'];
+		$first = Aura_Worker_Elementor_Door::governor_block();
 		$this->assertSame( 'open', $first['door'], 'the fixture assumption this test is built on' );
+		$this->assertIsInt( $first['observation'], 'the fixture assumption this test is built on -- a real baseline is certified' );
 
 		// epoch_raw()'s own read is as EARLY as this racer can land —
 		// right after $active/$seam/$door are captured from the persisted
-		// tuple, and well before held_count/the backlog counters. A
-		// version WITHOUT the bracket would report the STALE 'open' this
-		// attempt already captured, alongside a bumped `observation` read
-		// at the very end — a torn mix, never one consistent version.
+		// tuple, and well before held_count/the backlog counters.
 		$GLOBALS['_sa_after_option_read'] = static function ( string $name ) {
 			if ( Aura_Worker_Door_Log::EPOCH !== $name ) {
 				return;
@@ -1275,9 +1296,8 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$block = Aura_Worker_Elementor_Door::governor_block();
 		$GLOBALS['_sa_after_option_read'] = null;
 
-		$this->assertNotNull( $block['observation'], 'a single retry resolves this — never "torn twice"' );
-		$this->assertGreaterThan( $before, $block['observation'] );
-		$this->assertSame( 'closed', $block['door'], 'the retry re-read the PERSISTED tuple — never the stale "open" this attempt already captured before the racer landed' );
+		$this->assertNull( $block['observation'], 'Ruling S79: this attempt cannot prove its own (necessarily pre-race) content pairs with what the race just persisted' );
+		$this->assertSame( 'open', $block['door'], 'the honest content: THIS attempt\'s own capture, taken before the race landed -- never the race\'s "closed", which this attempt never actually re-read' );
 	}
 
 	/**
@@ -1289,6 +1309,17 @@ final class ElementorDoorGovernorTest extends TestCase {
 	 */
 	public function test_a_persistently_torn_audit_answers_observation_null(): void {
 		$this->registerAll();
+		// Ruling S79 (Codex round-32 P2 on #88): a real baseline first —
+		// without one, a fresh site's very first audit withholds
+		// `observation` on attempt 0 already (no `audit_identity` to
+		// pair with), which would report `$fires === 1` here for the
+		// WRONG reason and never actually exercise this test's own
+		// "torn on both attempts" premise. The racer below only ever
+		// touches `BINDING`/the door version — never `COMPUTED` — so
+		// this baseline's `audit_identity` stays valid and matching
+		// throughout, and pure version-tear detection is what both
+		// attempts exhaust.
+		Aura_Worker_Elementor_Door::status_fragment();
 		$fires = 0;
 
 		$GLOBALS['_sa_after_option_read'] = function ( string $name ) use ( &$fires ) {
@@ -1873,6 +1904,14 @@ final class ElementorDoorGovernorTest extends TestCase {
 	public function test_governor_block_withholds_observation_when_the_epoch_read_fails(): void {
 		$this->registerAll();
 		Aura_Worker_Elementor_Door::governor_block(); // mints the epoch for real, primes the object cache
+		// Ruling S79 (Codex round-32 P2 on #88): a real `audit_identity`
+		// baseline too — governor_block() alone never writes one
+		// (Ruling S27), so without this poll BOTH calls below would
+		// withhold `observation` for the "no baseline yet" reason, and
+		// the final `$again` assertion (a transient failure is not
+		// cached against the NEXT attempt) would never actually get to
+		// prove that once a baseline exists.
+		Aura_Worker_Elementor_Door::status_fragment();
 
 		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
 		$block = Aura_Worker_Elementor_Door::governor_block();

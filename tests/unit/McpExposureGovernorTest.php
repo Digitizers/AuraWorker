@@ -136,11 +136,19 @@ final class McpExposureGovernorTest extends TestCase {
 		// THIS call is the one that mints the epoch (asserted non-empty just
 		// above), and minting a virgin site's epoch is ITSELF a door-state
 		// mutation (Ruling S6: insert_unique() bumps on any new door-prefixed
-		// row) — so a fresh site's first governor_block() legitimately reports
-		// a real version, not null. door_version_raw() reads whatever THIS
-		// call just wrote; the audit itself never bumps beyond that.
-		$this->assertIsInt( $b['observation'], "this call's own epoch mint is a real mutation (Ruling S6), not the audit itself bumping anything" );
-		$this->assertSame( Aura_Worker_Door_Log::door_version_raw(), $b['observation'], 'a second read of the row changes nothing' );
+		// row) — a version-tear consideration Ruling S79 does not touch.
+		//
+		// Ruling S79 (Codex round-32 P2 on #88) SUPERSEDES this test's own
+		// prior expectation here. `governor_block()` never writes an
+		// `audit_identity` baseline itself (Ruling S27 — only a `/status`
+		// poll's own `sync_served_identities()` does), and THIS is that
+		// audit's very first call on a virgin site: no baseline exists yet
+		// to pair with, in either direction. An absent baseline never
+		// authorises a witness — this call's content is live and correct
+		// (every field above is asserted against it), but the version it
+		// would otherwise be served under is withheld until a real
+		// `/status` poll persists one.
+		$this->assertNull( $b['observation'], 'Ruling S79: a fresh site has no audit_identity baseline yet, so this first-ever audit withholds a witness it cannot back' );
 		$this->assertNull( $b['observation_unsupported'], 'a normal test run is on a transactional engine and 64-bit PHP, so nothing is unsupported (Ruling S13)' );
 		$this->assertNull( $b['door_write_unsupported'], 'the test double declares reconnect_retries same as real core, so writes are supported (Ruling S65)' );
 		$this->assertSame( 'ok', $b['seam'], 'verify_coverage() ran and every registered elementor/* ability is wrapped' );
