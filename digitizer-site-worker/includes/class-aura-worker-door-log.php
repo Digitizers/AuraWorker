@@ -3477,7 +3477,24 @@ class Aura_Worker_Door_Log {
 		// (Codex round-5 P2). FLOOR is version-exempt (see
 		// VERSION_EXEMPT_INSERTS), so this does not open a nested transaction.
 		self::insert_unique( self::FLOOR, 0 );
-		$prev_floor_before_raise = self::floor();
+		// Ruling S68 (Codex round-25 P1 on #88 — the S31 class applied to
+		// the WRITE side): EVERY floor read in this unit is now RAW, never
+		// `self::floor()` — WordPress's default object cache is per-request,
+		// so a DIFFERENT request's own ack_write() evicting ITS cache after
+		// raising the floor never reaches THIS request's already-cached
+		// copy. That gap is not academic: it is the exact mechanism the
+		// S67 regression test poisons to make THIS SAME METHOD skip its own
+		// purge below (#88 round-25) — a stale floor here does not merely
+		// risk a reporting glitch, it decides how much of the log this call
+		// destructively deletes. An unreadable raw read aborts the WHOLE
+		// unit (Ruling S12's `rollback`) rather than proceed on a floor
+		// nothing here can prove — at THIS point nothing has been written
+		// yet, so the abort is free.
+		self::reset_floor_unreadable_for_attempt();
+		$prev_floor_before_raise = self::floor_raw();
+		if ( self::floor_was_unreadable_this_attempt() ) {
+			return array( 'rollback' => true );
+		}
 		// JOINED TO THE EPOCH ROW (Ruling P90). The check in ack() reads the
 		// epoch and then lets go of it, so a `/door/rotate` or a rebind
 		// installing a new epoch in between still had this ack advance the
@@ -3505,16 +3522,25 @@ class Aura_Worker_Door_Log {
 			// ordinary idempotent repeat — the floor is already at or above
 			// this cursor — and still falls through to the delete, which is how
 			// a previous ack's unfinished purge is completed.
+			self::reset_floor_unreadable_for_attempt();
+			$floor_at_bailout = self::floor_raw();
+			if ( self::floor_was_unreadable_this_attempt() ) {
+				return array( 'rollback' => true );
+			}
 			return array(
 				'mutated' => false,
 				'result'  => array(
 					'acked' => 0,
-					'floor' => self::floor(),
+					'floor' => $floor_at_bailout,
 				),
 				'evict'   => $evict,
 			);
 		}
-		$floor = self::floor();
+		self::reset_floor_unreadable_for_attempt();
+		$floor = self::floor_raw();
+		if ( self::floor_was_unreadable_this_attempt() ) {
+			return array( 'rollback' => true );
+		}
 		$acked = 0;
 		if ( $floor > 0 ) {
 			$prev_floor = $prev_floor_before_raise; // read BEFORE the raise, below
@@ -3543,9 +3569,22 @@ class Aura_Worker_Door_Log {
 		// unreadable one used to cast to 0 and delete the marker over a
 		// backlog that was still full — the door open again with nothing
 		// having been acked.
-		$unacked  = self::count_unacked();
+		//
+		// Ruling S68: `count_unacked()` now takes the PROVEN `$floor` this
+		// unit already read above — never a second, independent
+		// `self::floor()` call (count_unacked()'s own get_option()-cached
+		// default) that could disagree with it. `is_closed()` is likewise
+		// replaced with `is_closed_raw()`: a cached FULL_MARKER read deciding
+		// whether to reopen the log is the SAME class of bug as the floor
+		// reads above, just on the other option this method's reopen
+		// decision reads.
+		$closed = self::is_closed_raw();
+		if ( self::closure_read_was_unreadable() ) {
+			return array( 'rollback' => true );
+		}
+		$unacked  = self::count_unacked( $floor );
 		$reopened = false;
-		if ( self::is_closed() && null !== $unacked && $unacked < self::MAX_UNACKED ) {
+		if ( $closed && null !== $unacked && $unacked < self::MAX_UNACKED ) {
 			delete_option( self::FULL_MARKER );
 			delete_option( self::FULL_COUNTER );
 			$reopened = true;

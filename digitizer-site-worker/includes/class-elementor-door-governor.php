@@ -1679,7 +1679,25 @@ class Aura_Worker_Elementor_Door {
 	private static function settle_stale_claim( $ref, array $claim, array &$out ) {
 		$seq = (int) ( isset( $claim['terminal_seq'] ) ? $claim['terminal_seq'] : 0 );
 		if ( $seq > 0 ) {
-			if ( $seq <= Aura_Worker_Door_Log::floor() ) {
+			// Ruling S68 (Codex round-25 P1 on #88 — the S31 class applied
+			// to the reconciler's own mutating sweep): floor_raw(), never
+			// self::floor()'s get_option()-cached read. A request that
+			// cached the floor before a DIFFERENT request's ack() raised
+			// and purged past $seq would otherwise see $seq as still ABOVE
+			// its own stale floor, fall through to row_for_fence() below,
+			// find the row genuinely gone (already purged), and — via the
+			// "no evidence, write one" fallback at the bottom of this
+			// method — mint a BRAND NEW `interrupted` entry for a call the
+			// log already recorded as finished. Unreadable retains the
+			// claim and writes nothing, the SAME treatment
+			// row_for_fence()'s own unreadable case gets below: the next
+			// sweep, with a working read, settles it properly.
+			Aura_Worker_Door_Log::reset_floor_unreadable_for_attempt();
+			$floor = Aura_Worker_Door_Log::floor_raw();
+			if ( Aura_Worker_Door_Log::floor_was_unreadable_this_attempt() ) {
+				return;
+			}
+			if ( $seq <= $floor ) {
 				// Ruling S35 (Codex round-15 P1 on #88): count this claim
 				// settled only once release() PROVES it committed — never
 				// on the strength of having merely called it.

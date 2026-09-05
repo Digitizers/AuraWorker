@@ -466,16 +466,25 @@ final class DoorReconcilerTest extends TestCase {
 	 * sees a DIFFERENT request's `ack()` move it, the same class of race
 	 * Ruling S66 closed for the held queue: `wp_cache_delete()` invalidates
 	 * only the PROCESS that calls it, never a sibling's already-cached
-	 * copy (WordPress's default object cache is per-request). Below,
-	 * poisoning this process's own cache models exactly that — and, since
-	 * `ack_write()` itself reads `self::floor()` to decide whether its own
-	 * purge should run, the SAME poison leaves the just-acked row
-	 * physically un-purged too, so a stale floor filter does not merely
-	 * risk being off by a window that a thorough purge would otherwise
-	 * paper over: it counts a row Aura's log already considers acked.
+	 * copy (WordPress's default object cache is per-request).
+	 *
+	 * Ruling S68 (Codex round-25 P1 on #88) later closed the sibling bug
+	 * this test originally exploited to construct its fixture: `ack_write()`
+	 * itself used to read the SAME `self::floor()` to decide whether its
+	 * own purge should run, so a poisoned cache used to leave the
+	 * just-acked row physically un-purged as a side effect. Now that
+	 * `ack_write()` reads the floor RAW too, its purge is unconditional on
+	 * this process's cache — see
+	 * test_ack_write_purges_the_acked_row_even_with_a_stale_floor_cache()
+	 * below for that guarantee on its own. This test now isolates
+	 * `count_unacked()`'s OWN read-side behaviour instead, constructing
+	 * directly the state a race could still leave: the raw floor moved,
+	 * but the row below it has not (yet) been purged from THIS read's point
+	 * of view — the raw floor read is what stops it being recounted, not
+	 * a purge this test no longer depends on.
 	 */
 	public function test_an_acked_row_survives_a_stale_floor_cache_and_is_not_recounted(): void {
-		$seq1 = $this->entry(); // will be acked below
+		$seq1 = $this->entry(); // will be "acked" below
 		$seq2 = $this->entry(); // stays pending throughout
 
 		// Establish a persisted baseline first (Ruling S22's own first-ever
@@ -487,40 +496,78 @@ final class DoorReconcilerTest extends TestCase {
 		// Mirrors the real /status route: reconcile() runs next.
 		Aura_Worker_Elementor_Door::reconcile();
 
-		// This process's OWN get_option() cache, poisoned to the
-		// PRE-ack floor — modelling a read this request already made
-		// (reconcile()'s, or an earlier poll's) before a concurrent ack()
-		// commits. `_sa_option_cache_honors_wp_cache_delete` is left at
-		// its default `false` (set in sa_reset_state()), so ack_write()'s
-		// own `wp_cache_delete( FLOOR, 'options' )` — which a real,
-		// same-process cache WOULD clear — never touches this poison
-		// either, exactly the cross-process gap being modelled.
+		// The raw floor moves to $seq1, written straight into the fixture's
+		// "database" — the shape a real ack()'s raw UPDATE takes, never
+		// through update_option() — while $seq1's own row is deliberately
+		// LEFT physically present: this test isolates count_unacked()'s own
+		// floor selection from ack_write()'s separately-tested purge
+		// guarantee, so a row genuinely below the true floor but not yet
+		// purged (a purge still in flight elsewhere, a restore, or simply
+		// this construction) is the thing a raw floor read must still
+		// exclude on its own, without relying on the row being gone.
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::FLOOR ] = (string) $seq1;
+		// This process's OWN get_option() cache stays at the PRE-move
+		// floor — modelling a read this request already made (reconcile()'s,
+		// or an earlier poll's) before the floor moved elsewhere.
 		$GLOBALS['_sa_option_cache'][ Aura_Worker_Door_Log::FLOOR ] = 0;
-
-		$epoch = Aura_Worker_Door_Log::epoch();
-		$this->assertIsString( $epoch );
-		$ack = Aura_Worker_Door_Log::ack( $epoch, $seq1 );
-		$this->assertTrue( $ack['committed'] ?? true, 'the fixture assumption this test is built on' );
 
 		// The raw floor genuinely moved...
 		$this->assertSame( $seq1, Aura_Worker_Door_Log::floor_raw(), 'the fixture assumption this test is built on' );
-		// ...while this process's OWN cached floor() did not, and — because
-		// ack_write() reads that SAME poisoned self::floor() to decide
-		// whether to purge — seq1's row was never physically deleted
-		// either, exactly the shape a request holding a stale floor would
-		// leave behind for a sibling request to find.
+		// ...while this process's OWN cached floor() did not...
 		$this->assertSame( 0, Aura_Worker_Door_Log::floor(), 'the fixture assumption this test is built on' );
+		// ...and $seq1's row is still physically there for a naive scan to
+		// find, exactly as constructed above.
 		$this->assertIsArray( Aura_Worker_Door_Log::get( $seq1 ), 'the fixture assumption this test is built on' );
 
 		// The bracket must count against the PROVEN floor — never the
 		// poisoned one — so only $seq2 (still genuinely pending) is
-		// unacked, not $seq1 (already acked, merely un-purged).
+		// unacked, not $seq1 (below the true floor, merely un-purged).
 		$fragment = $this->fragment();
 		$this->assertNotNull( $fragment['observation'] );
 		$this->assertSame( 1, $fragment['log_unacked'], 'the acked row is not recounted from a stale floor read' );
 
 		// governor_block() shares the same fix.
 		$this->assertSame( 1, Aura_Worker_Elementor_Door::governor_block()['log_unacked'] );
+	}
+
+	/**
+	 * Ruling S68 (Codex round-25 P1 on #88 — the S31 class applied to the
+	 * WRITE side): `ack_write()` used to read `self::floor()` — the SAME
+	 * `get_option()`-cached accessor Ruling S67 fixed on the reporting
+	 * side — to decide whether its OWN purge should run. A request whose
+	 * cache had gone stale (this same test's own trick, before Ruling S68)
+	 * saw its just-raised floor as still zero, skipped the purge entirely,
+	 * and left the acked row physically present for a sibling request to
+	 * recount — exactly the fixture test_an_acked_row_survives_a_stale_
+	 * floor_cache_and_is_not_recounted() above now has to construct BY
+	 * HAND, because this method no longer produces it as a side effect.
+	 * Every floor read inside ack_write() is raw now, so a poisoned cache
+	 * changes nothing about what it does: the purge runs, and the row is
+	 * gone.
+	 */
+	public function test_ack_write_purges_the_acked_row_even_with_a_stale_floor_cache(): void {
+		$seq1 = $this->entry();
+
+		// A prior read (this test stands in for reconcile()'s own, or an
+		// earlier poll's) cached the floor before it was ever raised.
+		$GLOBALS['_sa_option_cache'][ Aura_Worker_Door_Log::FLOOR ] = 0;
+
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$this->assertIsString( $epoch );
+		$ack = Aura_Worker_Door_Log::ack( $epoch, $seq1 );
+		$this->assertSame( 1, $ack['acked'] ?? null, 'the purge ran despite the poisoned cache' );
+		$this->assertSame( $seq1, $ack['floor'] ?? null, 'the reported floor is the proven one, not the poisoned one' );
+
+		// The raw floor moved...
+		$this->assertSame( $seq1, Aura_Worker_Door_Log::floor_raw() );
+		// ...this process's cached floor() is STILL poisoned (nothing here
+		// ever clears `_sa_option_cache` — see DoorLogTest.php's own
+		// precedent for this seam) — proving the purge below did not
+		// merely happen to run because the cache was secretly fresh...
+		$this->assertSame( 0, Aura_Worker_Door_Log::floor() );
+		// ...and yet the row is PHYSICALLY GONE: ack_write()'s purge ran
+		// against the proven raw floor, never the poisoned one.
+		$this->assertNull( Aura_Worker_Door_Log::get( $seq1 ), 'the acked row is purged even though this process\'s floor cache never learned the floor moved' );
 	}
 
 	/**
