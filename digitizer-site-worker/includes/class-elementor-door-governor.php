@@ -510,6 +510,22 @@ class Aura_Worker_Elementor_Door {
 	 * (`govern()`, `judge_collateral()`) — `build_status_fragment_state()`
 	 * never reads it, so it is not one of "the builder's" memos at all.
 	 *
+	 * SCOPED TO IN-OBJECT MEMOS ONLY (Ruling S31, Codex round-14 P1 on
+	 * #88). `Aura_Worker_Door_Holds::$held_rows`/`$held_read` and
+	 * `self::$active` are PHP statics with no equivalent in WordPress's own
+	 * object cache — nothing else evicts them, so this method is the only
+	 * place that can. Everything else the builder reads (log rows, the
+	 * floor, the closure marker, the epoch, the persisted computed tuple,
+	 * the door version) now reads RAW at the point of use instead —
+	 * `Aura_Worker_Door_Log::get_raw()`/`floor_raw()`/`is_closed_raw()`/
+	 * `epoch_raw()`/`full_report_raw()`, `persisted_computed_state()`,
+	 * `door_version_raw()` — which makes a SECOND reset entry for each of
+	 * them both unnecessary and the wrong shape of fix: an evict LIST here
+	 * would enumerate cache keys by hand and silently drift the moment a
+	 * new raw read is added to the builder without a matching line added
+	 * here; a raw read cannot drift, because there is no cached copy for
+	 * this method to have forgotten to clear.
+	 *
 	 * @return void
 	 */
 	private static function reset_request_caches() {
@@ -793,7 +809,25 @@ class Aura_Worker_Elementor_Door {
 	 */
 	private static function detect_rewind( $after, $epoch ) {
 		$after  = (int) $after;
-		$site   = Aura_Worker_Door_Log::epoch();
+		// A DOOR THAT EXISTS HAS AN EPOCH — MINTED HERE IF NOTHING ELSE HAS
+		// (Ruling P35): `present()` gates this whole method on `active()`
+		// ALONE, so a site whose Elementor just activated and has never
+		// mutated the door reaches here with no epoch row at all, and this
+		// has been the one place a fresh site's epoch is minted since
+		// before this ruling. `epoch()` is idempotent — a no-op once the
+		// row exists — so calling it unconditionally is always safe.
+		//
+		// RAW AFTERWARDS (Ruling S31, Codex round-14 P1 on #88): the VALUE
+		// this method uses and reports is read back with `epoch_raw()`,
+		// never trusted from `epoch()`'s own possibly-cached return — the
+		// same "prime, then read raw" shape `rotate_epoch()`/
+		// `rotate_binding()` already use for the identical reason. This
+		// result feeds BOTH `sync_computed_state()` (which may version a
+		// newly detected rewind) and the served fragment's own
+		// `epoch`/`rewind` fields, so neither may read an epoch or a top
+		// this request cached before a DIFFERENT request rotated or purged.
+		Aura_Worker_Door_Log::epoch();
+		$site   = Aura_Worker_Door_Log::epoch_raw();
 		$rewind = null;
 		$top_unreadable = false;
 		if ( (string) $epoch !== $site ) {
@@ -801,7 +835,7 @@ class Aura_Worker_Elementor_Door {
 		} else {
 			$max = Aura_Worker_Door_Log::highest_row_seq();
 			$top_unreadable = ( null === $max );
-			$top = $top_unreadable ? 0 : max( $max, Aura_Worker_Door_Log::floor() );
+			$top = $top_unreadable ? 0 : max( $max, Aura_Worker_Door_Log::floor_raw() );
 			if ( ! $top_unreadable && $after > $top ) {
 				$rewind = array(
 					'detected' => true,
@@ -911,12 +945,17 @@ class Aura_Worker_Elementor_Door {
 			// `rewind` is null because nothing could be established — never
 			// because nothing was rewound. Aura must not rotate on this.
 			'log_top_unreadable' => $top_unreadable,
+			// RAW throughout (Ruling S31, Codex round-14 P1 on #88):
+			// log_after() is already raw internally (see its own docblock);
+			// floor_raw()/full_report_raw() here for the same reason —
+			// count_unacked() needs no raw twin, since it was never routed
+			// through get_option() to begin with.
 			'log'         => Aura_Worker_Door_Log::log_after( $after ),
-			'log_floor'   => Aura_Worker_Door_Log::floor(),
+			'log_floor'   => Aura_Worker_Door_Log::floor_raw(),
 			// NULL when the backlog could not be counted (Ruling P53): Aura is
 			// told "unknown", never a false zero it would read as an empty log.
 			'log_unacked' => Aura_Worker_Door_Log::count_unacked(),
-			'log_full'    => Aura_Worker_Door_Log::full_report(),
+			'log_full'    => Aura_Worker_Door_Log::full_report_raw(),
 		);
 	}
 
@@ -3592,10 +3631,17 @@ class Aura_Worker_Elementor_Door {
 	 * Public because the ack route answers with it too: three readers, one
 	 * answer.
 	 *
+	 * RAW (Ruling S31, Codex round-14 P1 on #88): `is_closed_raw()`, not
+	 * `is_closed()` — every caller here (sync_computed_state()'s own
+	 * comparison, the fragment builder's live fallback, governor_block()'s)
+	 * needs the closure marker as the DATABASE holds it right now, never a
+	 * `false`/`true` this request's object cache is still holding from
+	 * before a DIFFERENT request closed or reopened the log.
+	 *
 	 * @return string `open` or `closed`.
 	 */
 	public static function door_state() {
-		return ( self::active() && 'ok' === self::$seam && ! Aura_Worker_Door_Log::is_closed() ) ? 'open' : 'closed';
+		return ( self::active() && 'ok' === self::$seam && ! Aura_Worker_Door_Log::is_closed_raw() ) ? 'open' : 'closed';
 	}
 
 	/**

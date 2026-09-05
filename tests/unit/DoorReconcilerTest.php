@@ -1375,6 +1375,60 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( $second['observation'], $third['observation'], 'the rewind is already recorded — a repeat detection does not bump again' );
 	}
 
+	/**
+	 * Ruling S31 (Codex round-14 P1 on #88): on the default non-persistent
+	 * object cache, a `pending` log row this PROCESS already read through
+	 * `Aura_Worker_Door_Log::get()` stays cached for the rest of the
+	 * request — a DIFFERENT request settling that same row and bumping the
+	 * observation does not, and cannot, evict THIS process's own copy.
+	 * `status_fragment()`'s retry reset (Ruling S20) only ever cleared the
+	 * held-row memo and `$active`, so a poll built after such a settle
+	 * could still agree its bracket reads landed on the NEW version while
+	 * serving the STALE cached row underneath it — the version comparison
+	 * only proves the version did not move mid-build, never that
+	 * everything read to build the fragment was fresh. Every read the
+	 * builder performs is RAW now (never routed through `get_option()`),
+	 * so there is no cache for a stale value to survive in.
+	 */
+	public function test_the_builder_never_serves_a_row_this_process_already_cached_as_pending(): void {
+		$seq   = $this->entry(); // admitted, still pending
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$name  = Aura_Worker_Door_Log::PREFIX . $seq;
+
+		// Prime THIS process's own object cache with the row's PENDING
+		// state — modelling an earlier get() read in this same request
+		// that a non-persistent object cache would keep answering for the
+		// rest of it, whatever any OTHER process does afterwards.
+		$pending_row = Aura_Worker_Door_Log::get( $seq );
+		$this->assertSame( 'pending', $pending_row['result'] );
+		$GLOBALS['_sa_option_cache'][ $name ] = $pending_row;
+
+		$before = Aura_Worker_Door_Log::door_version_raw();
+
+		// A DIFFERENT, faster request: settles the row for real, straight
+		// into the "database", and bumps the version. Its own
+		// wp_cache_delete() calls (inside a real settle()) would only ever
+		// evict ITS OWN process's cache — never this one's — so this is
+		// modelled as a raw write, exactly as a separate process's commit
+		// would land from this process's point of view.
+		$terminal_row = array_merge( $pending_row, array( 'result' => 'ok' ) );
+		$GLOBALS['_rows'][ $name ]    = maybe_serialize( $terminal_row );
+		$GLOBALS['_options'][ $name ] = $terminal_row;
+		Aura_Worker_Door_Log::bump_door_version();
+
+		$GLOBALS['_db_queries'] = array();
+		$frag                   = $this->fragment( 0, $epoch );
+
+		$this->assertNotSame( $before, $frag['observation'], 'the racer really did bump the version — otherwise this test proves nothing' );
+		$this->assertCount( 1, $frag['log'] );
+		$this->assertSame( 'ok', $frag['log'][0]['result'], 'the TERMINAL state is served, never the pending row this process cached earlier' );
+		$this->assertContains(
+			"SELECT option_value FROM {$GLOBALS['wpdb']->options} WHERE option_name = '$name' LIMIT 1",
+			$GLOBALS['_db_queries'],
+			'the row was read RAW — a real statement, never satisfied from this process\'s own cache'
+		);
+	}
+
 	public function test_get_status_reads_the_cursor_and_the_epoch_from_the_request(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );

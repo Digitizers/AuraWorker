@@ -1343,6 +1343,23 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * One log row, RAW — never this request's own object cache (Ruling S31,
+	 * Codex round-14 P1 on #88). `get()` above goes through `get_option()`,
+	 * which on the default non-persistent cache answers whatever THIS
+	 * request already cached — a `pending` row read on an earlier attempt,
+	 * say — even after a DIFFERENT request has since settled it and moved
+	 * the door version. `log_after()` uses this, never `get()`, for exactly
+	 * that reason. Shares `row_from_db()` — the same primitive `patch()`'s
+	 * own CAS already reads through.
+	 *
+	 * @param int $seq Seq.
+	 * @return array|null
+	 */
+	public static function get_raw( $seq ) {
+		return self::row_from_db( self::PREFIX . (int) $seq );
+	}
+
+	/**
 	 * Conditional in-place update: compare-and-set on the bytes read a moment
 	 * ago, so a row another writer deleted is never recreated and a row it
 	 * changed is never overwritten blind.
@@ -1480,6 +1497,23 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * The ack floor as the DATABASE holds it, RAW — never this request's own
+	 * object cache (Ruling S31, Codex round-14 P1 on #88). `floor()` above
+	 * goes through `get_option()`, which — on the default non-persistent
+	 * cache — answers whatever THIS request already cached from an EARLIER
+	 * read, even after a DIFFERENT request has since moved the floor. A
+	 * caller building state that must be provably paired with a specific
+	 * door version (status_fragment()'s own bracket) cannot risk that: see
+	 * `raw_option()`'s own docblock for the proof this shares.
+	 *
+	 * @return int
+	 */
+	public static function floor_raw() {
+		$raw = self::raw_option( self::FLOOR );
+		return null === $raw ? 0 : (int) $raw;
+	}
+
+	/**
 	 * The highest seq that has a row — or NULL when that cannot be established
 	 * (Ruling P77).
 	 *
@@ -1556,6 +1590,20 @@ class Aura_Worker_Door_Log {
 	/** @return bool */
 	public static function is_closed() {
 		return false !== get_option( self::FULL_MARKER, false );
+	}
+
+	/**
+	 * Whether the closure marker exists, RAW — never this request's own
+	 * object cache (Ruling S31, Codex round-14 P1 on #88). Same reasoning as
+	 * `floor_raw()`'s own docblock: used by `door_state()`, whose callers
+	 * (the fragment builder's live fallback, `sync_computed_state()`'s own
+	 * comparison) must not read a `false` this request cached before some
+	 * OTHER request closed the log, or a `true` cached before it reopened.
+	 *
+	 * @return bool
+	 */
+	public static function is_closed_raw() {
+		return null !== self::raw_option( self::FULL_MARKER );
 	}
 
 	/** One owner: the INSERT. */
@@ -2378,6 +2426,26 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * The SAME report, RAW — never this request's own object cache (Ruling
+	 * S31, Codex round-14 P1 on #88). See `floor_raw()`'s own docblock for
+	 * the reasoning; used by the fragment builder in place of
+	 * `full_report()`.
+	 *
+	 * @return array{ since: string|null, refused: int }|null
+	 */
+	public static function full_report_raw() {
+		if ( ! self::is_closed_raw() ) {
+			return null;
+		}
+		$since   = self::raw_option( self::FULL_MARKER );
+		$refused = self::raw_option( self::FULL_COUNTER );
+		return array(
+			'since'   => (string) ( $since ?? '' ),
+			'refused' => (int) ( $refused ?? 0 ),
+		);
+	}
+
+	/**
 	 * Aura committed everything up to $seq: raise the floor (upward only,
 	 * BEFORE the delete), delete the rows, reopen if under the bound.
 	 *
@@ -2579,12 +2647,28 @@ class Aura_Worker_Door_Log {
 	 * Terminal entries with seq > $after, ascending, stopping at the first
 	 * pending or un-admitted row — the site-side contiguous prefix.
 	 *
+	 * EVERY READ HERE IS RAW (Ruling S31, Codex round-14 P1 on #88) — this
+	 * is `status_fragment()`'s own reader, called ONCE per poll from inside
+	 * its version bracket, and its ONLY production caller. `floor()`/`get()`
+	 * go through `get_option()`, which — on the default non-persistent
+	 * object cache — can answer whatever THIS request already cached on an
+	 * EARLIER attempt (a `pending` row, a since-superseded floor) even after
+	 * a DIFFERENT request has settled that row and bumped the door version:
+	 * the bracket's own before/after reads would then agree on the NEW
+	 * version while this method served the STALE row underneath it, with no
+	 * torn read to catch the mismatch — the version comparison only proves
+	 * the VERSION didn't change mid-build, never that everything read to
+	 * build the fragment was fresh. `floor_raw()`/`get_raw()` bypass that
+	 * cache the same way `raw_option_read()` (Ruling S1) always has;
+	 * `highest_row_seq()` is unaffected — it was never routed through
+	 * `get_option()` to begin with.
+	 *
 	 * @param int $after Aura's cursor.
 	 * @param int $limit Page size.
 	 * @return array[]
 	 */
 	public static function log_after( $after, $limit = self::PAGE ) {
-		$after = max( (int) $after, self::floor() );
+		$after = max( (int) $after, self::floor_raw() );
 		$out   = array();
 		$seq   = $after;
 		// An unreadable top does not bound the walk (Ruling P77) — the hole
@@ -2594,7 +2678,7 @@ class Aura_Worker_Door_Log {
 		$unbounded = ( null === $top );
 		while ( count( $out ) < $limit && ( $unbounded || $seq < $top ) ) {
 			$seq++;
-			$row = self::get( $seq );
+			$row = self::get_raw( $seq );
 			if ( null === $row ) {
 				break; // a number with no row is a hole — cannot happen by construction; stop rather than skip
 			}
