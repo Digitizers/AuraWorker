@@ -1951,9 +1951,26 @@ class Aura_Worker_Door_Log {
 	 * Null is therefore its own answer, and every caller has to decide what to
 	 * do about not knowing. None of them may treat it as zero.
 	 *
+	 * `$floor` (Ruling S67, Codex round-25 P2 on #88): the ack floor to
+	 * filter above, when the caller already has one it can PROVE. A caller
+	 * inside a `status_fragment()`/`governor_block()` version bracket must
+	 * pass its own `floor_raw()` read (registering that read's unreadable
+	 * state itself, exactly as it does for every other raw field the
+	 * bracket reports) — never this method's own default, which falls
+	 * back to `floor()`'s get_option()-cached value. A concurrent `ack()`
+	 * that moves the floor between `reconcile()` and the bracket opening
+	 * left that cache stale, the same shape of race Ruling S66 closed for
+	 * the held queue: the count then filtered above a floor already known
+	 * to be behind, silently over-counting rows the log itself considers
+	 * already acked. Null (the default) is correct for every OTHER
+	 * caller — outside a bracket, `floor()`'s cache is this request's best
+	 * available answer and a raw read buys nothing worth its own query.
+	 *
+	 * @param int|null $floor The proven ack floor to filter above, or null
+	 *                        to fall back to `floor()`.
 	 * @return int|null
 	 */
-	public static function count_unacked() {
+	public static function count_unacked( $floor = null ) {
 		global $wpdb;
 		$like             = $wpdb->esc_like( self::PREFIX ) . '%';
 		$wpdb->last_error = '';
@@ -1963,7 +1980,7 @@ class Aura_Worker_Door_Log {
 				$like,
 				self::ROW_REGEXP,
 				strlen( self::PREFIX ) + 1,
-				self::floor()
+				null === $floor ? self::floor() : (int) $floor
 			)
 		);
 		if ( null === $n || false === $n || '' !== (string) $wpdb->last_error ) {

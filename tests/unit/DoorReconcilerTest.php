@@ -458,6 +458,72 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S67 (Codex round-25 P2 on #88): `count_unacked()` used to
+	 * filter its own COUNT against `self::floor()` — `get_option()`'s
+	 * cached read — rather than the proven `floor_raw()` a version bracket
+	 * already takes for its own `log_floor` field. A request that cached
+	 * the floor early (its own `reconcile()`, or an earlier poll) never
+	 * sees a DIFFERENT request's `ack()` move it, the same class of race
+	 * Ruling S66 closed for the held queue: `wp_cache_delete()` invalidates
+	 * only the PROCESS that calls it, never a sibling's already-cached
+	 * copy (WordPress's default object cache is per-request). Below,
+	 * poisoning this process's own cache models exactly that — and, since
+	 * `ack_write()` itself reads `self::floor()` to decide whether its own
+	 * purge should run, the SAME poison leaves the just-acked row
+	 * physically un-purged too, so a stale floor filter does not merely
+	 * risk being off by a window that a thorough purge would otherwise
+	 * paper over: it counts a row Aura's log already considers acked.
+	 */
+	public function test_an_acked_row_survives_a_stale_floor_cache_and_is_not_recounted(): void {
+		$seq1 = $this->entry(); // will be acked below
+		$seq2 = $this->entry(); // stays pending throughout
+
+		// Establish a persisted baseline first (Ruling S22's own first-ever
+		// bump, exactly the reason test_a_hold_landing_between_reconcile_
+		// and_the_bracket_is_not_served_stale() above establishes one too),
+		// so the measurement below is a steady-state poll.
+		$this->assertSame( 2, $this->fragment()['log_unacked'], 'the fixture assumption this test is built on' );
+
+		// Mirrors the real /status route: reconcile() runs next.
+		Aura_Worker_Elementor_Door::reconcile();
+
+		// This process's OWN get_option() cache, poisoned to the
+		// PRE-ack floor — modelling a read this request already made
+		// (reconcile()'s, or an earlier poll's) before a concurrent ack()
+		// commits. `_sa_option_cache_honors_wp_cache_delete` is left at
+		// its default `false` (set in sa_reset_state()), so ack_write()'s
+		// own `wp_cache_delete( FLOOR, 'options' )` — which a real,
+		// same-process cache WOULD clear — never touches this poison
+		// either, exactly the cross-process gap being modelled.
+		$GLOBALS['_sa_option_cache'][ Aura_Worker_Door_Log::FLOOR ] = 0;
+
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$this->assertIsString( $epoch );
+		$ack = Aura_Worker_Door_Log::ack( $epoch, $seq1 );
+		$this->assertTrue( $ack['committed'] ?? true, 'the fixture assumption this test is built on' );
+
+		// The raw floor genuinely moved...
+		$this->assertSame( $seq1, Aura_Worker_Door_Log::floor_raw(), 'the fixture assumption this test is built on' );
+		// ...while this process's OWN cached floor() did not, and — because
+		// ack_write() reads that SAME poisoned self::floor() to decide
+		// whether to purge — seq1's row was never physically deleted
+		// either, exactly the shape a request holding a stale floor would
+		// leave behind for a sibling request to find.
+		$this->assertSame( 0, Aura_Worker_Door_Log::floor(), 'the fixture assumption this test is built on' );
+		$this->assertIsArray( Aura_Worker_Door_Log::get( $seq1 ), 'the fixture assumption this test is built on' );
+
+		// The bracket must count against the PROVEN floor — never the
+		// poisoned one — so only $seq2 (still genuinely pending) is
+		// unacked, not $seq1 (already acked, merely un-purged).
+		$fragment = $this->fragment();
+		$this->assertNotNull( $fragment['observation'] );
+		$this->assertSame( 1, $fragment['log_unacked'], 'the acked row is not recounted from a stale floor read' );
+
+		// governor_block() shares the same fix.
+		$this->assertSame( 1, Aura_Worker_Elementor_Door::governor_block()['log_unacked'] );
+	}
+
+	/**
 	 * Ruling S61 (Codex round-23 P1 on #88): a wp_options RESTORE that
 	 * happens to keep the epoch, the door version, and every field
 	 * sync_computed_state()'s tuple already tracked (active/seam/door,

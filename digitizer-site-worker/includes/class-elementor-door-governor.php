@@ -565,19 +565,15 @@ class Aura_Worker_Elementor_Door {
 				if ( $synced && Aura_Worker_Door_Log::raw_option_was_unreadable() ) {
 					self::mark_unreadable( 'computed' );
 				}
-				// Ruling S55 (Codex round-21 P2 on #88): read ONCE, here,
-				// before build_status_fragment_state() reports it. Ruling
-				// S58: registered directly, replacing the reference
-				// variable the is_unreadable closure used to check.
-				// count_unacked() never returns null for a genuine zero
-				// backlog (only for a failed read, per its own docblock),
-				// so `null === $log_unacked` is the complete signal — no
-				// separate flag/getter needed the way a get_option()-routed
-				// field would.
-				$log_unacked = Aura_Worker_Door_Log::count_unacked();
-				if ( null === $log_unacked ) {
-					self::mark_unreadable( 'backlog' );
-				}
+				// Ruling S67 (Codex round-25 P2 on #88): count_unacked()'s
+				// own backlog count is now computed INSIDE
+				// build_status_fragment_state(), against the SAME proven
+				// floor_raw() read that method already takes for its own
+				// `log_floor` field — never a second, separate call here
+				// against `floor()`'s get_option()-cached value, which a
+				// concurrent ack() committed between reconcile() and this
+				// bracket could leave stale (see build_status_fragment_state()'s
+				// own docblock for why one shared raw read replaces both).
 				// Ruling S57 (Codex round-22 P2 on #88): read ONCE, here,
 				// with its OWN unreadable flag captured IMMEDIATELY after
 				// — `Aura_Worker_Door_Log::raw_option_was_unreadable()`
@@ -594,7 +590,7 @@ class Aura_Worker_Elementor_Door {
 				if ( Aura_Worker_Door_Log::raw_option_was_unreadable() ) {
 					self::mark_unreadable( 'binding' );
 				}
-				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now, $log_unacked, $binding );
+				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now, $binding );
 			}
 		);
 	}	/**
@@ -1344,15 +1340,6 @@ class Aura_Worker_Elementor_Door {
 	 *                                     own return, the SAME shape and
 	 *                                     the SAME treatment (Ruling S46,
 	 *                                     Codex round-19, S45 class).
-	 * @param int|null   $log_unacked     `Aura_Worker_Door_Log::count_unacked()`'s
-	 *                                     own return, read ONCE by the
-	 *                                     caller (Ruling S55, Codex
-	 *                                     round-21 P2 on #88) — before this
-	 *                                     method — so the caller's
-	 *                                     `is_unreadable` check sees the
-	 *                                     SAME null-or-int this method
-	 *                                     reports, never a second,
-	 *                                     possibly different read.
 	 * @param string     $binding         `Aura_Worker_Door_Log::binding_raw()`'s
 	 *                                     own return, read ONCE by the
 	 *                                     caller (Ruling S57, Codex
@@ -1363,9 +1350,19 @@ class Aura_Worker_Elementor_Door {
 	 *                                     possibly different read whose
 	 *                                     own unreadable flag the caller
 	 *                                     never sees.
+	 * `log_unacked` is computed IN HERE, not passed in (Ruling S67, Codex
+	 * round-25 P2 on #88): it is `Aura_Worker_Door_Log::count_unacked()`'s
+	 * own backlog count, filtered against the SAME `floor_raw()` read this
+	 * method already takes for `log_floor` below — never a second,
+	 * independent read of `floor()`'s get_option()-cached value, which a
+	 * concurrent `ack()` landing between `reconcile()` and this bracket
+	 * left stale for exactly the shape of race Ruling S66 closed for the
+	 * held queue. One raw floor read now backs both fields, so they can
+	 * never disagree about which floor they were computed against.
+	 *
 	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
 	 */
-	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array(), array $interrupted_now = array(), $log_unacked = null, $binding = '' ) {
+	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array(), array $interrupted_now = array(), $binding = '' ) {
 		$after          = (int) $rewind_info['after'];
 		$site           = (string) $rewind_info['site'];
 		$rewind         = $rewind_info['rewind'];
@@ -1467,6 +1464,19 @@ class Aura_Worker_Elementor_Door {
 			// Ruling S38 (Codex round-16 P1 on #88).
 			self::mark_unreadable( 'floor' );
 		}
+		// Ruling S67 (Codex round-25 P2 on #88): filtered against THIS
+		// proven raw floor — never `count_unacked()`'s own get_option()-
+		// cached default — so a concurrent ack() that moved the floor
+		// between reconcile() and this bracket cannot leave the backlog
+		// count answering against a floor this poll already proved stale
+		// for `log_floor` above. count_unacked() never returns null for a
+		// genuine zero backlog (only for a failed COUNT), so
+		// `null === $log_unacked` is the complete signal — no separate
+		// flag/getter needed the way a get_option()-routed field would.
+		$log_unacked = Aura_Worker_Door_Log::count_unacked( $log_floor );
+		if ( null === $log_unacked ) {
+			self::mark_unreadable( 'backlog' );
+		}
 		$log_full = Aura_Worker_Door_Log::full_report_raw();
 		if ( Aura_Worker_Door_Log::full_report_raw_was_unreadable() ) {
 			// Ruling S42 (Codex round-17 P2 on #88).
@@ -1522,16 +1532,19 @@ class Aura_Worker_Elementor_Door {
 			'log_top_unreadable' => $top_unreadable,
 			// RAW throughout (Ruling S31, Codex round-14 P1 on #88):
 			// log_after() is already raw internally (see its own docblock);
-			// floor_raw()/full_report_raw() here for the same reason —
-			// count_unacked() needs no raw twin, since it was never routed
-			// through get_option() to begin with.
+			// floor_raw()/full_report_raw() here for the same reason.
+			// count_unacked() USED to need no raw twin of its own (it never
+			// routes its COUNT through get_option()) — but its floor
+			// FILTER did, until Ruling S67 (Codex round-25 P2 on #88) made
+			// it take `$log_floor` above explicitly, so the backlog count
+			// is filtered against the SAME proven read `log_floor` itself
+			// reports, never a second, possibly-stale `floor()` call.
 			'log'         => $log,
 			'log_floor'   => $log_floor,
 			// NULL when the backlog could not be counted (Ruling P53): Aura is
 			// told "unknown", never a false zero it would read as an empty log.
-			// The CALLER's own read (Ruling S55, Codex round-21 P2 on
-			// #88), never a second one here — see this method's own
-			// `$log_unacked` parameter docblock.
+			// Computed just above, against `$log_floor` (Ruling S67) — see
+			// this method's own docblock.
 			'log_unacked' => $log_unacked,
 			'log_full'    => $log_full,
 		);
@@ -4536,13 +4549,27 @@ class Aura_Worker_Elementor_Door {
 				if ( null === $held ) {
 					self::mark_unreadable( 'holds_count' );
 				}
+				// Ruling S38 (Codex round-16 P1 on #88), the same read
+				// status_fragment()'s own build_status_fragment_state()
+				// takes for `log_floor` — this audit reports no
+				// `log_floor` field of its own, so this read exists
+				// SOLELY to give count_unacked() below a proven floor.
+				$backlog_floor = Aura_Worker_Door_Log::floor_raw();
+				if ( Aura_Worker_Door_Log::floor_was_unreadable_this_attempt() ) {
+					self::mark_unreadable( 'floor' );
+				}
 				// Ruling S55 (Codex round-21 P2 on #88): read ONCE, here
 				// — the SAME "read once, register immediately" shape
-				// held_count/queue_full above already use. count_unacked()
+				// held_count/queue_full above already use. Ruling S67
+				// (Codex round-25 P2 on #88): filtered against
+				// `$backlog_floor` above — the PROVEN raw read — never
+				// count_unacked()'s own get_option()-cached default,
+				// which a concurrent ack() landing between reconcile()
+				// and this bracket could leave stale. count_unacked()
 				// never returns null for a genuine zero backlog (only for
 				// a failed read), so `null === $log_unacked` is the
 				// complete signal.
-				$log_unacked = Aura_Worker_Door_Log::count_unacked();
+				$log_unacked = Aura_Worker_Door_Log::count_unacked( $backlog_floor );
 				if ( null === $log_unacked ) {
 					self::mark_unreadable( 'backlog' );
 				}
