@@ -817,6 +817,68 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayHasKey( $witness, $GLOBALS['_options'] );
 	}
 
+	/**
+	 * Ruling S80 (Codex round-33 P1 on #88): `hold_locked()`'s pre-ruling
+	 * ref was `wp_generate_uuid4()` -- a FRESH RANDOM value every call --
+	 * so a retry of the SAME logical call (the SAME `aura_ref`) after an
+	 * ambiguous insert minted a DIFFERENT ref and, if the first attempt
+	 * actually landed, queued a SECOND, duplicate approval. With the ref
+	 * DERIVED from `aura_ref` + a hash of `touches`, the retry regenerates
+	 * the IDENTICAL ref: `insert_unique()` finds the name already taken
+	 * (a proven `false`, not the ambiguous `null` the first attempt saw),
+	 * and `hold_locked()`'s own already-queued check recognises it,
+	 * returning the EXISTING ref rather than erroring or duplicating.
+	 */
+	public function test_a_retry_of_an_ambiguous_hold_with_the_same_aura_ref_recognises_the_existing_hold(): void {
+		$call = $this->call( array( 'aura_ref' => 'aura-ref-s80' ) );
+		Aura_Worker_Door_Log::epoch();   // mints it for real, priming the cache before the seam below
+		Aura_Worker_Door_Log::binding(); // same -- binding_record() lazily mints too
+
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-hold-s80';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-hold-s80';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$first = Aura_Worker_Door_Holds::hold( $call );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( WP_Error::class, $first, 'the fixture assumption this test is built on -- the first attempt is ambiguous' );
+		$this->assertTrue( $first->get_error_data()['may_have_run'] );
+		$attempted_ref = $first->get_error_data()['ref'];
+		$this->assertMatchesRegularExpression( '/^door_[0-9a-f-]{36}$/', $attempted_ref, 'Ruling S80: the ambiguous error carries the ref this attempt tried' );
+		// The ambiguous attempt actually DID land underneath the unreadable
+		// witness -- confirmed with a healthy read now that the seam is
+		// cleared.
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $attempted_ref, $GLOBALS['_options'] );
+
+		// The retry: same aura_ref, same touches, no ambiguity seam of its
+		// own -- exactly what a caller re-sending the SAME intercepted
+		// request after the first attempt's own 503 would do.
+		$second = Aura_Worker_Door_Holds::hold( $call );
+
+		$this->assertIsString( $second, 'recognised, not a second error' );
+		$this->assertSame( $attempted_ref, $second, 'Ruling S80: the SAME aura_ref derives the SAME ref, recognising the existing hold' );
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count(), 'exactly one row -- never a duplicate approval for the same call' );
+	}
+
+	/**
+	 * Ruling S80: the OTHER half -- two genuinely DIFFERENT intercepted
+	 * requests (different `aura_ref`) must derive two DIFFERENT refs, so
+	 * two distinct calls are never merged into one hold.
+	 */
+	public function test_distinct_aura_refs_derive_distinct_hold_refs(): void {
+		$first  = Aura_Worker_Door_Holds::hold( $this->call( array( 'aura_ref' => 'aura-ref-one' ) ) );
+		$second = Aura_Worker_Door_Holds::hold( $this->call( array( 'aura_ref' => 'aura-ref-two' ) ) );
+
+		$this->assertIsString( $first );
+		$this->assertIsString( $second );
+		$this->assertNotSame( $first, $second );
+		$this->assertSame( 2, Aura_Worker_Door_Holds::count() );
+	}
+
 	public function test_a_claim_that_finds_the_held_row_gone_backs_out(): void {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
 		// A reject wins the race between the replay's read and its claim.

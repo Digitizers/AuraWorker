@@ -79,7 +79,81 @@ class Aura_Worker_Door_Holds {
 	const LOCK_S  = 30;
 
 	/**
-	 * @param array $call { ability, input, touches, actor, verdict, rule }.
+	 * A FIXED namespace for a derived hold ref (Ruling S80, Codex round-33
+	 * P1 on #88) — an arbitrary but CONSTANT UUID, never regenerated, so
+	 * `derive_hold_ref()` is a pure, repeatable function of its own two
+	 * inputs across every call this plugin ever makes. Distinct from
+	 * `Aura_Worker_Door_Log::ROTATE_TARGET_NAMESPACE` (a different
+	 * derivation, a different purpose) — the two must never collide with
+	 * each other's inputs, which two different namespace constants
+	 * guarantee by construction (RFC 4122 §4.3: same namespace + name is
+	 * the only way to reproduce a v5 UUID).
+	 */
+	const HOLD_REF_NAMESPACE = 'b3f4c8a1-2e6d-4a9f-8c1b-7d5e9a3f0c62';
+
+	/**
+	 * Ruling S80 (Codex round-33 P1 on #88): `hold_locked()`'s ref used to
+	 * be `wp_generate_uuid4()` — a FRESH RANDOM value every call. An
+	 * insert whose own commit is unprovable (`insert_unique()` returning
+	 * `null`, Ruling S51) left a caller with nothing to recognise a retry
+	 * against: a retry (the SAME logical call, re-sent because the first
+	 * attempt's outcome was unknown) minted a DIFFERENT random ref, so if
+	 * the first attempt actually landed, the retry's own insert under its
+	 * own NEW ref succeeded too — queuing a SECOND, duplicate approval for
+	 * one mutation.
+	 *
+	 * DERIVED instead, from the caller's own idempotency material (Aura's
+	 * `aura_ref` correlation id, or any other identifier of the
+	 * INTERCEPTED REQUEST itself — never of its content alone) plus a
+	 * hash of `touches` (so two DIFFERENT calls sharing one `aura_ref` —
+	 * unlikely, but not this method's business to assume impossible —
+	 * still derive different refs): a retry supplying the SAME material
+	 * regenerates the IDENTICAL ref, and `hold_locked()`'s own
+	 * already-queued check (see its docblock) recognises it.
+	 *
+	 * Same RFC 4122 v5 algorithm as
+	 * `Aura_Worker_Door_Log::derive_rotation_target()` — duplicated
+	 * rather than shared across classes: this is a single, small, pure
+	 * primitive, and reaching across classes for it would trade a few
+	 * lines of duplication for a coupling neither class otherwise has.
+	 *
+	 * @param string $namespace HOLD_REF_NAMESPACE.
+	 * @param string $name      The idempotency material this ref is derived from.
+	 * @return string A 36-character RFC 4122 v5 UUID string.
+	 */
+	private static function derive_hold_ref( $namespace, $name ) {
+		$nhex   = str_replace( array( '-', '{', '}' ), '', $namespace );
+		$nbytes = '';
+		for ( $i = 0; $i < 32; $i += 2 ) {
+			$nbytes .= chr( hexdec( substr( $nhex, $i, 2 ) ) );
+		}
+		$hash = sha1( $nbytes . $name );
+		return sprintf(
+			'%08s-%04s-%04x-%02x%02s-%012s',
+			substr( $hash, 0, 8 ),
+			substr( $hash, 8, 4 ),
+			( hexdec( substr( $hash, 12, 4 ) ) & 0x0fff ) | 0x5000,
+			( hexdec( substr( $hash, 16, 2 ) ) & 0x3f ) | 0x80,
+			substr( $hash, 18, 2 ),
+			substr( $hash, 20, 12 )
+		);
+	}
+
+	/**
+	 * @param array $call { ability, input, touches, actor, verdict, rule,
+	 *   aura_ref? }. `aura_ref` (Ruling S80, Codex round-33 P1 on #88) is
+	 *   OPTIONAL — Aura's own correlation id for the intercepted request,
+	 *   or any other identifier of the request itself, when the caller has
+	 *   one to give. Present: the hold's ref is DERIVED from it (see
+	 *   `derive_hold_ref()`), so a caller retrying the SAME call after an
+	 *   ambiguous insert (`hold_locked()`'s own docblock) regenerates the
+	 *   IDENTICAL ref and is recognised rather than queuing a duplicate.
+	 *   Absent — today's only caller, `hold_call()` in
+	 *   class-elementor-door-governor.php, has no such identifier to give
+	 *   yet — falls back to a fresh random ref exactly as before this
+	 *   ruling; a retry in that case is NOT self-recognising, and the
+	 *   caller must act on the ambiguous error's own `ref` (see
+	 *   `retry_may_have_run()`) rather than blindly retrying.
 	 * @return string|WP_Error ref, or aura_hold_queue_full / aura_hold_failed.
 	 */
 	public static function hold( array $call ) {
@@ -203,7 +277,15 @@ class Aura_Worker_Door_Holds {
 		if ( $queued >= self::CAP ) {
 			return new WP_Error( 'aura_hold_queue_full', 'Aura\'s approval queue for this site is full (50 held calls); ask the operator to act on it.', array( 'status' => 503 ) );
 		}
-		$ref = 'door_' . wp_generate_uuid4();
+		$touches  = is_array( $call['touches'] ?? null ) ? $call['touches'] : array();
+		$aura_ref = isset( $call['aura_ref'] ) ? (string) $call['aura_ref'] : '';
+		// Ruling S80 (Codex round-33 P1 on #88): DERIVED from the caller's
+		// own idempotency material when it has any to give — see
+		// `derive_hold_ref()`'s own docblock. Falls back to the pre-ruling
+		// random mint when it does not (this method's own docblock).
+		$ref = '' !== $aura_ref
+			? 'door_' . self::derive_hold_ref( self::HOLD_REF_NAMESPACE, $aura_ref . '|' . sha1( wp_json_encode( $touches ) ) )
+			: 'door_' . wp_generate_uuid4();
 		// WHOSE QUEUE THIS ROW JOINS, before anything is written (Ruling P72).
 		// An empty stamp used to read as "queued before the generation
 		// existed" — permanently current — so a hold taken during a
@@ -223,7 +305,7 @@ class Aura_Worker_Door_Holds {
 			'binding'    => $binding,
 			'ability'    => (string) $call['ability'],
 			'input'      => is_array( $call['input'] ?? null ) ? $call['input'] : array(),
-			'touches'    => is_array( $call['touches'] ?? null ) ? $call['touches'] : array(),
+			'touches'    => $touches,
 			'actor'      => is_array( $call['actor'] ?? null ) ? $call['actor'] : array(),
 			'verdict'    => in_array( $call['verdict'] ?? '', array( 'none', 'warn', 'rules_unavailable' ), true ) ? $call['verdict'] : 'none',
 			'rule'       => is_array( $call['rule'] ?? null ) ? self::rule_fields( $call['rule'] ) : null,
@@ -248,18 +330,41 @@ class Aura_Worker_Door_Holds {
 		$queued = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $row );
 		self::forget_held();
 		if ( null === $queued ) {
-			// Ruling S51 (Codex round-20 P1 on #88): $ref is a fresh random
-			// UUID EVERY call (unlike claim()'s CLAIMED insert, which is
-			// keyed by the caller-supplied $ref) — a caller retrying on an
-			// ordinary `false` from below inserts a brand-new row and is
-			// safe. Retrying blind on an UNPROVEN outcome is not: if this
-			// attempt's own insert actually landed, a retry queues a SECOND,
-			// duplicate approval for the same call under a different ref.
-			// `may_have_run` is what tells the caller not to just retry —
-			// check whether this call was already admitted first.
-			return self::retry_may_have_run();
+			// Ruling S51 (Codex round-20 P1 on #88): with a RANDOM $ref
+			// (no `aura_ref` given), a caller retrying on an ordinary
+			// `false` from below inserts a brand-new row and is safe, but
+			// retrying blind on this UNPROVEN outcome is not: if this
+			// attempt's own insert actually landed, a retry mints a
+			// DIFFERENT random ref and queues a SECOND, duplicate
+			// approval for the same call.
+			//
+			// Ruling S80 (Codex round-33 P1 on #88): the error now carries
+			// this attempt's own `ref` regardless of how it was minted —
+			// with a DERIVED ref, a caller retrying with the SAME
+			// `aura_ref` regenerates this EXACT ref and is recognised by
+			// the `! $queued` branch below, rather than needing to poll
+			// this one first; with a random ref, the caller has nothing
+			// to derive, but at least knows which ref this UNPROVEN
+			// attempt would have landed under, and can query it directly.
+			// `may_have_run` is what tells the caller not to just retry
+			// blind either way.
+			return self::retry_may_have_run( array( 'ref' => $ref ) );
 		}
 		if ( ! $queued ) {
+			// Ruling S80: with a DERIVED ref, a fenced INSERT finding the
+			// name already taken is not a random-UUID-space collision (as
+			// it would have been before this ruling) — it is a retry of
+			// the SAME logical call (the SAME `aura_ref` + `touches`)
+			// recognising a hold this site already queued, whether from
+			// an earlier clean success or an earlier attempt's own
+			// ambiguous-but-landed insert (Ruling S51 above). Idempotent:
+			// the existing hold is returned, never a duplicate.
+			if ( '' !== $aura_ref ) {
+				$existing = self::get_held( $ref );
+				if ( null !== $existing ) {
+					return $ref;
+				}
+			}
 			return new WP_Error( 'aura_hold_failed', 'This site could not store the call for approval; it was not run.', array( 'status' => 503 ) );
 		}
 		return $ref;
@@ -1936,13 +2041,21 @@ class Aura_Worker_Door_Holds {
 	 * in the error data is the flag every such caller carries this signal
 	 * through with.
 	 *
+	 * @param array $extra Ruling S80 (Codex round-33 P1 on #88): additional
+	 *   error-data fields merged in on top of the defaults below — used
+	 *   by `hold_locked()`'s own ambiguous-insert branch to carry the
+	 *   attempted `ref` back to the caller. Defaults to none, unchanged
+	 *   for this method's other callers.
 	 * @return WP_Error
 	 */
-	private static function retry_may_have_run() {
+	private static function retry_may_have_run( array $extra = array() ) {
 		return new WP_Error(
 			'aura_hold_failed',
 			'This site could not prove whether the previous attempt landed; retry.',
-			array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+			array_merge(
+				array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true ),
+				$extra
+			)
 		);
 	}
 }
