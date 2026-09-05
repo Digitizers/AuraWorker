@@ -1939,27 +1939,33 @@ class Aura_Worker_Door_Log {
 	 * exactly like a failed bump: `ROLLBACK`, `committed: false`.
 	 *
 	 * THE SAVEPOINT IS VERIFIED BEFORE ANY CALLBACK WRITE, NOT ONLY AT THE
-	 * END (Ruling S21, Codex round-8 P1 on #88). Ruling S17's `RELEASE
-	 * SAVEPOINT` catches a reconnect only at the CLOSE of the unit — but a
-	 * reconnect landing between `START TRANSACTION` and the `SAVEPOINT`
-	 * statement above lands that `SAVEPOINT` itself on a fresh autocommit
-	 * session, where it opens and instantly closes its own one-statement
-	 * transaction and is discarded the moment that statement completes.
-	 * Nothing about issuing it fails — so without a check HERE, `$writes()`
-	 * and the version bump would both run un-transacted, autocommitting
-	 * each statement individually, before the LATER `RELEASE` finally
-	 * caught the problem — too late to stop either from having already
-	 * landed outside any transaction. `ROLLBACK TO SAVEPOINT aura_door_tx`,
-	 * issued immediately after the `SAVEPOINT` and before the nonce or
-	 * `$writes()`, closes this: on the real session it is a genuine no-op
-	 * (nothing has been written yet, and `ROLLBACK TO SAVEPOINT` — unlike
-	 * `RELEASE SAVEPOINT` — does not remove the savepoint, so it stays
-	 * valid for Ruling S17's own `RELEASE` later), but on a session where
-	 * the savepoint never really took, MySQL answers error 1305 there
-	 * instead. Caught before `$writes()` is ever called, so a failure here
-	 * means NOTHING ran at all — safer than every other failure path,
-	 * which must undo work already done — and the caller may retry
-	 * exactly as if `$writes()` had never been invoked.
+	 * END (Ruling S21, Codex round-8 P1; repositioned by Ruling S25, Codex
+	 * round-11 P1 — both on #88). Ruling S17's `RELEASE SAVEPOINT` catches a
+	 * reconnect only at the CLOSE of the unit — but a reconnect landing
+	 * ANYWHERE between `START TRANSACTION` and the last statement before
+	 * `$writes()` lands `SAVEPOINT` (or the nonce `SET` right after it) on a
+	 * fresh autocommit session, where either opens and instantly closes its
+	 * own one-statement transaction and is discarded the moment that
+	 * statement completes. Nothing about issuing either fails — so without
+	 * a check HERE, `$writes()` and the version bump would both run
+	 * un-transacted, autocommitting each statement individually, before the
+	 * LATER `RELEASE` finally caught the problem — too late to stop either
+	 * from having already landed outside any transaction. `ROLLBACK TO
+	 * SAVEPOINT aura_door_tx`, issued immediately after the nonce `SET` —
+	 * Ruling S21 originally placed it right after `SAVEPOINT`, BEFORE the
+	 * `SET`, which left the `SET` itself as a reconnect-prone statement this
+	 * check never covered; Ruling S25 moved it to run AFTER the `SET`
+	 * instead, the true last reconnect-prone statement before `$writes()` —
+	 * closes this: on the real session it is a genuine no-op (nothing has
+	 * been written yet, and `ROLLBACK TO SAVEPOINT` — unlike `RELEASE
+	 * SAVEPOINT` — does not remove the savepoint, so it stays valid for
+	 * Ruling S17's own `RELEASE` later), but on a session where the
+	 * savepoint never really took — whether the reconnect happened before
+	 * `SAVEPOINT`, during it, or during the `SET` — MySQL answers error
+	 * 1305 there instead. Caught before `$writes()` is ever called, so a
+	 * failure here means NOTHING ran at all — safer than every other
+	 * failure path, which must undo work already done — and the caller may
+	 * retry exactly as if `$writes()` had never been invoked.
 	 *
 	 * A ROLLBACK REPEATS THE CALLBACK'S EVICTIONS TOO (Ruling S18, Codex
 	 * round-7 P1 on #88). `$writes()` can — and `ack_write()` does —
@@ -2028,23 +2034,35 @@ class Aura_Worker_Door_Log {
 			// savepoint, before anything else — see this method's own
 			// docblock for why the nonce below is not enough on its own.
 			$wpdb->query( 'SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-			// Ruling S21 (Codex round-8 P1 on #88): VERIFY the savepoint
-			// BEFORE any callback write runs — not only right before the
-			// final COMMIT (Ruling S17's own RELEASE, below). A reconnect
-			// between START TRANSACTION and the SAVEPOINT statement above
-			// lands that SAVEPOINT on a fresh AUTOCOMMIT session, where it
-			// opens and instantly closes its own one-statement transaction
-			// — the savepoint is discarded the moment that statement
-			// completes, so it protects nothing, and everything $writes()
-			// is about to do would run un-transacted. `ROLLBACK TO
-			// SAVEPOINT` proves it here, immediately: on the real session
-			// this is a genuine no-op (nothing has been written yet to roll
-			// back — the savepoint is NOT released by this statement,
-			// unlike RELEASE SAVEPOINT, so it remains valid for later), but
-			// on a session where the savepoint never really took, MySQL
-			// answers error 1305 ("SAVEPOINT … does not exist") — caught
-			// here, BEFORE `$writes()` ever runs, so the whole unit fails
-			// with NOTHING written and the caller may safely retry.
+			// Ruling S16 (Codex round-6 P1 on #88): the proof the final
+			// COMMIT below checks before this method ever reports
+			// `committed: true`. See that COMMIT's own comment for what it
+			// proves and why.
+			$tx_nonce = wp_generate_uuid4();
+			$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// Ruling S25 (Codex round-11 P1 on #88): VERIFY the savepoint
+			// AFTER this SET, not before it (Ruling S21's own original
+			// position) — the SET is ITSELF the last reconnect-prone
+			// statement before `$writes()` runs. A reconnect landing WHILE
+			// this exact SET is being issued lets `wpdb` transparently
+			// retry it on a fresh AUTOCOMMIT session — one that never held
+			// the savepoint above — and the retried SET still assigns the
+			// nonce there, so a check placed only BEFORE the SET (as Ruling
+			// S21 had it) never sees this window at all: the callback
+			// writes and the bump would then run un-transacted, each
+			// autocommitting individually on a real server, before the
+			// LATER `RELEASE SAVEPOINT` (Ruling S17) finally caught the
+			// problem — too late to stop any of it from having already
+			// landed. `ROLLBACK TO SAVEPOINT`, run immediately after the
+			// SET and before `$writes()`, closes this the same way Ruling
+			// S21 closed the window before it: a genuine no-op on the real
+			// session (nothing written yet, and the savepoint survives for
+			// Ruling S17's own RELEASE later), but MySQL error 1305 on a
+			// session where the savepoint never really took — whether the
+			// reconnect landed before SAVEPOINT, during it, or during this
+			// SET makes no difference to this ONE check, which is why a
+			// single verification positioned AFTER the last such statement
+			// replaces Ruling S21's earlier, narrower one.
 			$wpdb->query( 'ROLLBACK TO SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 			if ( '' !== (string) $wpdb->last_error ) {
 				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -2052,13 +2070,6 @@ class Aura_Worker_Door_Log {
 					'committed' => false,
 				);
 			}
-			// Ruling S16 (Codex round-6 P1 on #88): set only once the
-			// savepoint above is PROVEN — so it is set on THIS session
-			// before anything else runs — the proof the final COMMIT below
-			// checks before this method ever reports `committed: true`.
-			// See that COMMIT's own comment for what it proves and why.
-			$tx_nonce = wp_generate_uuid4();
-			$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 		}
 		try {
 			$outcome = $writes();

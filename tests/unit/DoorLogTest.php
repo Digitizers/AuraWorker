@@ -1248,6 +1248,40 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S25 (Codex round-11 P1 on #88): Ruling S21's own verification
+	 * ran BEFORE the nonce `SET` — which left that `SET` itself as a
+	 * reconnect-prone statement the check never covered. A reconnect
+	 * landing WHILE the SET is being issued lets `wpdb` retry it on a fresh
+	 * autocommit session that never held the savepoint, and the retried SET
+	 * still assigns the SAME nonce this method later compares — so
+	 * `$writes()` and the bump would run un-transacted, each autocommitting
+	 * individually, before Ruling S17's own `RELEASE SAVEPOINT` finally
+	 * caught it at the close. `ROLLBACK TO SAVEPOINT`, moved to run
+	 * immediately AFTER the SET instead, catches the SAME reconnect before
+	 * `$writes()` ever runs: this test proves the callback is never invoked
+	 * and nothing landed.
+	 */
+	public function test_a_reconnect_during_the_nonce_set_never_runs_the_callback(): void {
+		$ran = false;
+
+		$GLOBALS['_sa_reconnect_during_set'] = true;
+		$outcome                             = Aura_Worker_Door_Log::versioned(
+			function () use ( &$ran ) {
+				$ran = true;
+				return array(
+					'mutated' => true,
+					'result'  => true,
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_during_set'] = false;
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertFalse( $ran, 'the savepoint is re-verified after the SET, before $writes() ever runs' );
+	}
+
+	/**
 	 * Ruling S18 (Codex round-7 P1 on #88): `ack_write()` evicts the floor's
 	 * cache entry and then re-reads it via `self::floor()` (to compute the
 	 * response it hands back) BEFORE this method decides whether to commit —

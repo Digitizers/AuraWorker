@@ -2863,10 +2863,27 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return true;
 			}
 			// A MySQL session (user) variable assignment (Ruling S16,
-			// 2.16.2) — `versioned()`'s per-unit nonce, set as the first
-			// statement after START TRANSACTION so a later reconnect can be
-			// told apart from the session that opened the transaction.
+			// 2.16.2) — `versioned()`'s per-unit nonce, set right after the
+			// savepoint so a later reconnect can be told apart from the
+			// session that opened the transaction.
+			//
+			// `_sa_reconnect_during_set` (Ruling S25, 2.16.2) models a
+			// reconnect landing WHILE this exact SET is being issued: on a
+			// real server, `wpdb` can transparently retry the statement on
+			// a fresh session, which still assigns the nonce there (this is
+			// what makes the nonce ALONE insufficient proof) but never held
+			// the savepoint from the OLD session — so the frame's own
+			// savepoint marker is cleared here, and the `ROLLBACK TO
+			// SAVEPOINT` that Ruling S25 moved to run right after this
+			// statement finds the mismatch. Fires once.
 			if ( preg_match( "/^SET @(\w+) = '(.*)'$/s", $query, $m ) ) {
+				if ( ! empty( $GLOBALS['_sa_reconnect_during_set'] ) ) {
+					$GLOBALS['_sa_reconnect_during_set'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						$top                                      = count( $this->sa_txn_stack ) - 1;
+						$this->sa_txn_stack[ $top ]['savepoint'] = null;
+					}
+				}
 				$this->sa_session_vars[ $m[1] ] = stripslashes( $m[2] );
 				return true;
 			}
@@ -3469,6 +3486,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
+	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
@@ -4739,6 +4757,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
+	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
