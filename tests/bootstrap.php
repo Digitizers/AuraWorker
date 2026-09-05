@@ -3498,6 +3498,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
 	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
+	$GLOBALS['_sa_after_computed_state_steady'] = null; // Fires once right after sync_computed_state()'s own steady-state verdict (Ruling S28).
 	$GLOBALS['_sa_after_rows_read'] = array(); // Keyed by PREFIX: runs immediately after that rows-by-prefix read completes, once (Ruling S20).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
@@ -4769,6 +4770,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
 	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
+	$GLOBALS['_sa_after_computed_state_steady'] = null; // Fires once right after sync_computed_state()'s own steady-state verdict (Ruling S28).
 	$GLOBALS['_sa_after_rows_read'] = array(); // Keyed by PREFIX: runs immediately after that rows-by-prefix read completes, once (Ruling S20).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's

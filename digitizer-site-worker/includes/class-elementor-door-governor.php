@@ -432,18 +432,28 @@ class Aura_Worker_Elementor_Door {
 			// anything about it. See sync_computed_state()'s own docblock.
 			$synced         = self::sync_computed_state();
 			$before_version = Aura_Worker_Door_Log::door_version_raw();
-			$fragment       = self::build_status_fragment_state( (int) $after, $epoch );
+			// Ruling S28 (Codex round-12 P1 on #88): INSIDE the bracket,
+			// after sync_computed_state() — read back whatever is actually
+			// PERSISTED now, not this request's own (possibly stale) live
+			// computation. See persisted_computed_state()'s own docblock for
+			// the race this closes. Only meaningful when $synced: on a lost
+			// fence or an uncommitted write (Rulings S24/S26) there is
+			// nothing this call may credit itself with, and the fragment
+			// falls back to live computation below.
+			$computed       = $synced ? self::persisted_computed_state() : null;
+			$fragment       = self::build_status_fragment_state( (int) $after, $epoch, $computed );
 			$after_version  = Aura_Worker_Door_Log::door_version_raw();
 			if ( ! $synced ) {
 				// Ruling S24 (Codex round-10 P2 on #88): the computed-state
 				// transition ITSELF could not be committed — see
 				// sync_computed_state()'s own docblock for why this fragment
-				// (already built with the FRESH active/seam/door values,
-				// since those are read live, not from the persisted option)
-				// must not be paired with an observation the caller could
-				// read as proof it was witnessed. Served immediately, never
-				// retried: a retry re-attempts the same sync and, on the
-				// same underlying failure, would only repeat this outcome.
+				// (built with the FRESH active/seam/door values, since
+				// $computed is null and build_status_fragment_state() falls
+				// back to live computation) must not be paired with an
+				// observation the caller could read as proof it was
+				// witnessed. Served immediately, never retried: a retry
+				// re-attempts the same sync and, on the same underlying
+				// failure, would only repeat this outcome.
 				$fragment['observation'] = null;
 				return $fragment;
 			}
@@ -602,6 +612,18 @@ class Aura_Worker_Elementor_Door {
 		// option, so there is nothing a loose comparison would need to
 		// tolerate that a strict one would wrongly reject.
 		if ( is_array( $persisted ) && $persisted === $current ) {
+			// Test seam only: fires immediately after this steady-state
+			// verdict, modelling a racer landing in the exact window Ruling
+			// S28 (Codex round-12 P1 on #88) closes — a DIFFERENT process
+			// persisting a newer tuple and bumping the version between THIS
+			// call's own (unaware) comparison and its caller's bracketed
+			// reads. Never armed by production code, and never cleared
+			// here either — the callable clearing itself, like every other
+			// "fires once" seam's own callback does, is what keeps this
+			// READ-ONLY from this file's point of view.
+			if ( isset( $GLOBALS['_sa_after_computed_state_steady'] ) && is_callable( $GLOBALS['_sa_after_computed_state_steady'] ) ) {
+				( $GLOBALS['_sa_after_computed_state_steady'] )();
+			}
 			return true; // steady state: nothing to version, nothing unproven
 		}
 		$outcome = Aura_Worker_Door_Log::versioned(
@@ -664,6 +686,54 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * The PERSISTED `{ active, seam, door }` tuple, read back RAW — the
+	 * value `status_fragment()`/`governor_block()` actually SERVE (Ruling
+	 * S28, Codex round-11 P1 on #88), never this request's own live
+	 * computation (`self::active()`/`self::$seam`/`self::door_state()`),
+	 * which the CAS in `sync_computed_state()` only ever uses as its WRITE
+	 * input.
+	 *
+	 * THE BUG THIS CLOSES: poll A starts before Elementor deactivates, so
+	 * its request-local `active()` memoises `true` for the rest of A's
+	 * process. If A's OWN `sync_computed_state()` compares against a
+	 * `$persisted` it read BEFORE a faster poll B observes the real
+	 * deactivation, persists `inactive/closed`, and bumps the version to
+	 * N, A's comparison may already have concluded "steady state" (matching
+	 * A's own stale `$current`) and returned WITHOUT ever reaching the CAS
+	 * — the fence protects nothing here, because A never attempted a write
+	 * to fence. A's bracketing version reads then BOTH land on B's new
+	 * version N (nothing further mutates during A's own build), so the old
+	 * check — reporting A's LIVE `active: true` / `door: open` paired with
+	 * version N — served exactly the state B's own transition just
+	 * corrected, under B's own witness. If A's response reached Aura
+	 * first, its strictly-greater comparison accepted A's stale state
+	 * under N and rejected B's later, EQUAL-version, correct answer as not
+	 * newer — permanently.
+	 *
+	 * Reading the PERSISTED tuple back here — fresh, cache evicted first so
+	 * a value this request may have already cached (inside
+	 * `sync_computed_state()`'s own read) cannot stand in for what a
+	 * DIFFERENT process's write has since superseded — and serving ITS
+	 * fields instead closes this: whatever this call reports is provably
+	 * the same state the version it pairs with actually describes, because
+	 * both are read from the SAME row, and any write racing this read is
+	 * caught by `status_fragment()`'s own bracketing version reads
+	 * (Ruling S6) exactly as any other torn read is.
+	 *
+	 * Returns null when nothing has ever been persisted (a fresh site, or
+	 * `governor_block()` called before this site's first `/status` poll) —
+	 * callers fall back to live computation in that case, since there is
+	 * nothing to read back yet.
+	 *
+	 * @return array{ active: bool, seam: string, door: string }|null
+	 */
+	private static function persisted_computed_state() {
+		wp_cache_delete( self::COMPUTED, 'options' );
+		$persisted = get_option( self::COMPUTED, null );
+		return is_array( $persisted ) ? $persisted : null;
+	}
+
+	/**
 	 * Every state read `status_fragment()` reports, EXCEPT `observation` —
 	 * split out so that method can run it TWICE, bracketed by the version
 	 * reads that decide whether either run is trustworthy (Ruling S6, see
@@ -671,12 +741,22 @@ class Aura_Worker_Elementor_Door {
 	 * other semantic — absence, the cursor/epoch rule, rewind detection —
 	 * which is unchanged from before that ruling and not repeated here).
 	 *
-	 * @param int    $after Already normalised to (int) by the caller.
-	 * @param string $epoch The epoch that cursor belongs to.
+	 * @param int        $after    Already normalised to (int) by the caller.
+	 * @param string     $epoch    The epoch that cursor belongs to.
+	 * @param array|null $computed Ruling S28: the PERSISTED { active, seam,
+	 *                              door } tuple, read inside the caller's
+	 *                              version bracket — served AS IS when given;
+	 *                              null falls back to this request's own
+	 *                              live computation (the only case: the
+	 *                              caller's sync could not be trusted at all,
+	 *                              Rulings S24/S26).
 	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
 	 */
-	private static function build_status_fragment_state( $after, $epoch ) {
+	private static function build_status_fragment_state( $after, $epoch, $computed = null ) {
 		$after   = (int) $after;
+		$active  = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
+		$seam    = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
+		$door    = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
 		$site    = Aura_Worker_Door_Log::epoch();
 		$binding = Aura_Worker_Door_Log::binding_raw();
 		$rewind  = null;
@@ -726,16 +806,21 @@ class Aura_Worker_Elementor_Door {
 		}
 		return array(
 			// Is Elementor STILL here? A fragment with `active: false` is a
-			// door reported from its own persisted state (Ruling P28).
-			'active'      => self::active(),
+			// door reported from its own persisted state (Ruling P28) — and,
+			// since Ruling S28, `$active` here is the PERSISTED value this
+			// call read back inside its own version bracket, not this
+			// request's own live computation (see build_status_fragment_state()'s
+			// own docblock for the `$computed` parameter, and
+			// persisted_computed_state() for why).
+			'active'      => $active,
 			'epoch'       => $site,
 			// The current binding generation, read RAW and NEVER minted
 			// (`Aura_Worker_Door_Log::binding_raw()`) — Aura compares
 			// `entry.binding` with it to label a departed client's entries;
 			// null when the record cannot be read (Ruling A5b).
 			'binding'     => ( '' === $binding ) ? null : $binding,
-			'seam'        => self::$seam,
-			'door'        => self::door_state(),
+			'seam'        => $seam,
+			'door'        => $door,
 			'held'        => Aura_Worker_Door_Holds::listing(),
 			// TRUE when `held` is empty because the queue could not be READ,
 			// not because it is empty (Ruling P57). Aura must never take an
@@ -3482,14 +3567,25 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
-		$epoch   = Aura_Worker_Door_Log::epoch();
-		$binding = Aura_Worker_Door_Log::binding_raw();
+		// Ruling S28 (Codex round-12 P1 on #88): the PERSISTED tuple, never
+		// this request's own live computation — see
+		// persisted_computed_state()'s own docblock for the race this
+		// closes, and build_status_fragment_state()'s `$computed` parameter
+		// for the identical treatment `/status` gives it. Null on a fresh
+		// site (no `/status` poll has ever run) falls back to live
+		// computation below, since there is nothing to read back yet.
+		$computed = self::persisted_computed_state();
+		$active   = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
+		$seam     = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
+		$door     = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
+		$epoch    = Aura_Worker_Door_Log::epoch();
+		$binding  = Aura_Worker_Door_Log::binding_raw();
 		// NULL when the queue could not be read (Ruling P57) — held_count and
 		// queue_full are the same fact, so both say "unknown" together rather
 		// than one of them inventing a zero.
 		$held  = Aura_Worker_Door_Holds::count(); // read once
 		return array(
-			'active'              => self::active(),
+			'active'              => $active,
 			'epoch'               => '' === $epoch ? null : $epoch,
 			// The current binding generation, read RAW and NEVER minted
 			// (`Aura_Worker_Door_Log::binding_raw()`) — Aura compares
@@ -3505,8 +3601,8 @@ class Aura_Worker_Elementor_Door {
 			// reason; 'engine' or 'php32' when it is null for good — this
 			// site can never report a witness (Ruling S13).
 			'observation_unsupported' => Aura_Worker_Door_Log::observation_unsupported_reason(),
-			'seam'                => self::$seam,
-			'door'                => self::door_state(),
+			'seam'                => $seam,
+			'door'                => $door,
 			'held_count'          => $held,
 			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(), // null when unreadable (Ruling P53)
 			'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),

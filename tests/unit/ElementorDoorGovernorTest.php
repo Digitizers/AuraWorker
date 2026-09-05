@@ -1516,16 +1516,22 @@ final class ElementorDoorGovernorTest extends TestCase {
 	 * Ruling S27 (Codex round-11 P2 on #88): governor_block() is an
 	 * on-demand AUDIT, never a poll — and it never runs
 	 * verify_coverage() of its own, so `self::$seam` here is typically the
-	 * documented request-local `unchecked`. A PRIOR `/status` request on
-	 * a DIFFERENT process would have persisted `seam: 'ok'` (its own,
-	 * freshly-verified value) — so if this method called
-	 * sync_computed_state() the way status_fragment() does, the mismatch
-	 * between the persisted `ok` and this request's own `unchecked` would
-	 * look like a real transition and version it, advancing the
-	 * observation on nothing but a READ. governor_block() must never
-	 * write at all: it reports the CURRENT door version exactly as
-	 * Aura_Worker_Door_Log::door_version_raw() already documents it, and
-	 * `seam: unchecked` stays the honest, unforced answer.
+	 * documented request-local `unchecked`. Calling sync_computed_state()
+	 * the way status_fragment() does would compare a PRIOR `/status`
+	 * request's persisted `seam: 'ok'` against THIS request's own
+	 * `unchecked`, look like a real transition, and version it, advancing
+	 * the observation on nothing but a READ. governor_block() must never
+	 * write at all: it reports the current door version exactly as
+	 * Aura_Worker_Door_Log::door_version_raw() already documents it.
+	 *
+	 * Ruling S28 (Codex round-12 P1 on #88) additionally has
+	 * governor_block() report the PERSISTED `seam` (this request's OWN
+	 * possibly-stale `unchecked` is never served) — the same
+	 * persisted-over-live rule status_fragment() now follows for its
+	 * bracketed fragment, for the identical reason: a live value this
+	 * request happens to hold is not provably paired with the version
+	 * being reported alongside it, while the persisted one, by
+	 * construction, is.
 	 */
 	public function test_an_audit_read_does_not_change_the_observation(): void {
 		$this->registerAll();
@@ -1540,11 +1546,71 @@ final class ElementorDoorGovernorTest extends TestCase {
 
 		$block = Aura_Worker_Elementor_Door::governor_block();
 
-		$this->assertSame( 'unchecked', $block['seam'], 'the documented request-local value, never forced or persisted' );
+		$this->assertSame( 'ok', $block['seam'], 'the PERSISTED value (Ruling S28) — this request\'s own live, unforced "unchecked" is never served' );
 		$this->assertSame(
 			$first['observation'],
 			$block['observation'],
 			'an audit read must not advance the observation merely by reading a seam that differs from what was last persisted'
 		);
+	}
+
+	/**
+	 * Ruling S28 (Codex round-12 P1 on #88): poll A starts before Elementor
+	 * deactivates, so its request-local `active()` stays memoised `true`
+	 * for the rest of A's process. If a racer (a DIFFERENT, faster process
+	 * observing the real deactivation) persists `inactive/closed` and
+	 * bumps the version in the window between A's OWN steady-state check
+	 * — which matched A's stale `active: true` against a `$persisted` read
+	 * BEFORE the racer landed, so A never even reached the CAS — and A's
+	 * bracketed reads, BOTH of A's bracket reads land on the racer's NEW
+	 * version (nothing mutates further during A's own build), so the old
+	 * code's fragment (built from A's LIVE `active()`/`door_state()`)
+	 * reported the STALE `active: true` / `door: open` under the racer's
+	 * own witness — contradicting the racer's own, correct answer under
+	 * the SAME version. Reading the PERSISTED tuple back INSIDE the
+	 * bracket instead serves the racer's winning state, consistent with
+	 * whatever version is actually being reported.
+	 */
+	public function test_a_racer_landing_between_the_steady_check_and_the_bracket_is_served(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+
+		// THIS request's own live computation never changes — it never
+		// observes any deactivation — so sync_computed_state()'s own
+		// steady-state check (comparing its live active:true against
+		// whatever is persisted AT THAT MOMENT, also active:true) matches
+		// and returns via the fast path, never reaching the CAS at all.
+		$GLOBALS['_sa_after_computed_state_steady'] = static function () {
+			$GLOBALS['_sa_after_computed_state_steady'] = null; // fires once
+			// The racer: lands in the window between that steady-state
+			// verdict and this call's own bracketed reads.
+			$winner = array(
+				'active' => false,
+				'seam'   => 'ok',
+				'door'   => 'closed',
+			);
+			$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::COMPUTED ]    = maybe_serialize( $winner );
+			$GLOBALS['_options'][ Aura_Worker_Elementor_Door::COMPUTED ] = $winner;
+			Aura_Worker_Door_Log::bump_door_version(); // the racer's own transition, already committed
+		};
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertNotSame( $first['observation'], $second['observation'], 'the racer really did bump the version — otherwise this test proves nothing' );
+		$this->assertNotNull( $second['observation'], 'both of this call\'s own bracket reads land on the racer\'s new version — no torn read here' );
+		$this->assertFalse( $second['active'], 'the PERSISTED (winning) state is served, never this request\'s own stale live computation' );
+		$this->assertSame( 'closed', $second['door'] );
+	}
+
+	/** A steady poll with no racer at all must still report the same, unchanged state. */
+	public function test_a_steady_poll_with_no_racer_is_unaffected(): void {
+		$this->registerAll();
+		$first  = Aura_Worker_Elementor_Door::status_fragment();
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertSame( $first['active'], $second['active'] );
+		$this->assertSame( $first['door'], $second['door'] );
+		$this->assertSame( $first['observation'], $second['observation'] );
 	}
 }
