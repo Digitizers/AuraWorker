@@ -527,9 +527,15 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * Called from `status_fragment()` before its bracketed version reads —
 	 * on EVERY attempt, not only a retry, since the bug bites on the very
-	 * first attempt with no torn read required — and from
-	 * `governor_block()` before it reads `door_version_raw()`; both report
-	 * these same three fields.
+	 * first attempt with no torn read required.
+	 *
+	 * NEVER CALLED FROM `governor_block()` (Ruling S27, Codex round-11 P2 on
+	 * #88) — see that method's own docblock for why: an AUDIT request has
+	 * typically never run `verify_coverage()`, so `self::$seam` there is
+	 * the documented request-local `unchecked`, which almost never matches
+	 * a prior `/status` poll's persisted `ok` — every audit read would
+	 * therefore look like a transition and version one, advancing the
+	 * observation on nothing but a READ.
 	 *
 	 * THE RETURN VALUE MUST BE HEEDED (Ruling S24, Codex round-10 P2 on
 	 * #88). When a transition WAS needed but `versioned()` could not commit
@@ -3451,16 +3457,31 @@ class Aura_Worker_Elementor_Door {
 	 * `unchecked` when that has not run in this request is an honest answer,
 	 * not a gap; the audit never forces a coverage check of its own.
 	 *
+	 * THIS METHOD NEVER WRITES (Ruling S27, Codex round-11 P2 on #88). It
+	 * used to call `sync_computed_state()` before reading `observation`
+	 * (Ruling S22) — but an AUDIT request has typically never run
+	 * `verify_coverage()` at all, so `self::$seam` here is the documented
+	 * request-local `unchecked`, which almost never matches whatever a
+	 * PRIOR `/status` poll last persisted (commonly `ok`). Every audit call
+	 * therefore looked like a real transition and versioned one, advancing
+	 * the observation on nothing but a READ — the exact hazard Ruling A65
+	 * exists to prevent for every OTHER read in this file
+	 * (`door_version_raw()`'s own docblock: never allocated by a read).
+	 * `status_fragment()` is the one and only writer of computed state,
+	 * because it is the one caller for whom `seam` is always FRESH (this
+	 * same request's own coverage check, gated on `active()`, has already
+	 * run by the time `/status` calls it — see `verify_coverage()`'s own
+	 * call site). This method instead reports the door version exactly as
+	 * `Aura_Worker_Door_Log::door_version_raw()` already documents it: the
+	 * observation of the last state transition, on-demand, never allocated
+	 * by this read.
+	 *
 	 * @return array { active, epoch, binding, observation, observation_unsupported, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full }
 	 */
 	public static function governor_block() {
 		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
-		// Ruling S22 (Codex round-9 P2 on #88): a computed transition is
-		// state, and must land BEFORE `observation` below is read — see
-		// sync_computed_state()'s own docblock.
-		$synced  = self::sync_computed_state();
 		$epoch   = Aura_Worker_Door_Log::epoch();
 		$binding = Aura_Worker_Door_Log::binding_raw();
 		// NULL when the queue could not be read (Ruling P57) — held_count and
@@ -3475,15 +3496,11 @@ class Aura_Worker_Elementor_Door {
 			// `entry.binding` with it to label a departed client's entries;
 			// null when the record cannot be read (Ruling A5b).
 			'binding'             => '' === $binding ? null : $binding,
-			// READ-ONLY (Ruling A65): this is an on-demand AUDIT, never a
+			// READ-ONLY (Ruling A65), and — since Ruling S27 — NEVER preceded
+			// by a write of its own: this is an on-demand AUDIT, never a
 			// poll, and must not itself advance the counter Aura orders
-			// `/status` polls by. Null when the row cannot be proven read —
-			// including when sync_computed_state() above needed to commit a
-			// transition and could not (Ruling S24, Codex round-10 P2 on
-			// #88): the `active`/`door` fields below are already the FRESH
-			// values, but nothing proves they landed paired with any
-			// version, so none is reported alongside them.
-			'observation'         => $synced ? Aura_Worker_Door_Log::door_version_raw() : null,
+			// `/status` polls by. Null when the row cannot be proven read.
+			'observation'         => Aura_Worker_Door_Log::door_version_raw(),
 			// null when 'observation' is null for an ORDINARY (transient)
 			// reason; 'engine' or 'php32' when it is null for good — this
 			// site can never report a witness (Ruling S13).

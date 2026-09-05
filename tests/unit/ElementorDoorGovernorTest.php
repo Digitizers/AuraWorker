@@ -1511,4 +1511,40 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertNotSame( 'racer-seam', $second['seam'], 'the reported seam is THIS process own, never the racer persisted value' );
 		$this->assertNull( $second['observation'], 'the fence lost — a newer transition already won, and this call may not claim credit for any version' );
 	}
+
+	/**
+	 * Ruling S27 (Codex round-11 P2 on #88): governor_block() is an
+	 * on-demand AUDIT, never a poll — and it never runs
+	 * verify_coverage() of its own, so `self::$seam` here is typically the
+	 * documented request-local `unchecked`. A PRIOR `/status` request on
+	 * a DIFFERENT process would have persisted `seam: 'ok'` (its own,
+	 * freshly-verified value) — so if this method called
+	 * sync_computed_state() the way status_fragment() does, the mismatch
+	 * between the persisted `ok` and this request's own `unchecked` would
+	 * look like a real transition and version it, advancing the
+	 * observation on nothing but a READ. governor_block() must never
+	 * write at all: it reports the CURRENT door version exactly as
+	 * Aura_Worker_Door_Log::door_version_raw() already documents it, and
+	 * `seam: unchecked` stays the honest, unforced answer.
+	 */
+	public function test_an_audit_read_does_not_change_the_observation(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertSame( 'ok', $first['seam'] );
+
+		// The next request: an AUDIT call in which verify_coverage() has
+		// never run — the documented request-local default.
+		$prop = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'seam' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, 'unchecked' );
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+
+		$this->assertSame( 'unchecked', $block['seam'], 'the documented request-local value, never forced or persisted' );
+		$this->assertSame(
+			$first['observation'],
+			$block['observation'],
+			'an audit read must not advance the observation merely by reading a seam that differs from what was last persisted'
+		);
+	}
 }
