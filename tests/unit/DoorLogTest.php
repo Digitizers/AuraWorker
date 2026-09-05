@@ -2751,4 +2751,96 @@ final class DoorLogTest extends TestCase {
 		}
 		$this->assertContains( 'ROLLBACK', $GLOBALS['_db_queries'], 'the transaction START TRANSACTION opened is closed, not left dangling' );
 	}
+
+	/* ------------------------------------------------------------------ */
+	/* Ruling S93 (Codex round-41 P1 on #88): the FLOOR seed insert inside */
+	/* ack_write() is guarded like every other statement in the unit.     */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * `ack_write()`'s FLOOR seed insert is `insert_unique_write()`, the
+	 * SAME dual-context primitive `insert_unique()` uses for every
+	 * non-exempt name -- exempted from Ruling S84's must_succeed() sweep
+	 * because it ALSO runs OUTSIDE any transaction (the ordinary
+	 * `insert_unique( self::FLOOR, ... )` call from other sites). Called
+	 * from INSIDE `ack_write()`'s own already-open `versioned()` unit, its
+	 * raw `false` used to be silently swallowed -- indistinguishable from
+	 * the ORDINARY "floor already exists" miss -- so the floor raise and
+	 * the purge that follow it ran as the unit's own next statements
+	 * regardless. Ruling S93's `$in_unit` flag routes the raw query
+	 * result through `must_succeed()` before it collapses to that bool,
+	 * so a real failure THROWS immediately, caught by `versioned()`'s own
+	 * `$writes()` try/catch as `{ rollback: true }` -- before the floor
+	 * raise or the purge ever run.
+	 *
+	 * Proven by blanking the EXACT seed-insert statement (a `query`
+	 * filter returning `false` with `last_error` left clean, the same
+	 * mechanism Ruling S91 introduced) and confirming: `ack()` reports
+	 * `committed: false`, `acked: 0`; the floor option is never created
+	 * (no raise, since there was nothing to raise FROM); and the settled
+	 * row this ack would have purged survives untouched.
+	 */
+	public function test_a_suppressed_floor_seed_insert_aborts_ack_before_the_raise_or_purge(): void {
+		global $wpdb;
+
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::FLOOR, $GLOBALS['_options'], 'the fixture assumption this test is built on -- no floor row exists yet, so the seed insert is a genuine attempt, not a no-op' );
+
+		// The EXACT statement insert_unique_write() issues for the FLOOR
+		// seed -- built the same way the production code builds it, so
+		// this test breaks loudly (never silently stops matching) if that
+		// statement's shape ever changes.
+		$seed_sql = $wpdb->prepare(
+			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+			Aura_Worker_Door_Log::FLOOR,
+			maybe_serialize( 0 ),
+			'no',
+			Aura_Worker_Door_Log::FLOOR
+		);
+
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = trim( $seed_sql );
+		$out                                      = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // fires once, but tidy regardless
+
+		$this->assertSame( false, $out['committed'], 'Ruling S93: a suppressed seed insert is a proven abort, not the ordinary idempotent no-op' );
+		$this->assertSame( 0, $out['acked'] );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::FLOOR, $GLOBALS['_options'], 'no raise -- the unit aborted before the floor was ever seeded, let alone raised' );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'], 'no purge -- the settled row this ack would have deleted survives untouched' );
+	}
+
+	/**
+	 * The other half of Ruling S93's own test recipe: an OUT-OF-UNIT
+	 * VERSION_EXEMPT_INSERTS call -- `insert_unique()` with no `$in_unit`
+	 * argument at all, exactly as every caller besides `ack_write()`
+	 * already uses it -- is completely unaffected. A suppressed seed
+	 * insert here answers the SAME plain `false` it always has (routed
+	 * through no `must_succeed()` at all, since there is no enclosing
+	 * unit for a thrown exception to abort), never a thrown exception
+	 * that would surprise a caller with no `versioned()` unit around it.
+	 */
+	public function test_an_out_of_unit_version_exempt_insert_is_unaffected_by_the_in_unit_flag(): void {
+		global $wpdb;
+
+		$name = 'aura_worker_door_hold_lock';
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'] );
+
+		$seed_sql = $wpdb->prepare(
+			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+			$name,
+			maybe_serialize( 'a-token' ),
+			'no',
+			$name
+		);
+
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = trim( $seed_sql );
+		$result                                   = Aura_Worker_Door_Log::insert_unique( $name, 'a-token' ); // no $in_unit -- the default, unchanged behaviour
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = '';
+
+		$this->assertFalse( $result, 'Ruling S93: unchanged -- a suppressed insert out-of-unit is still the ordinary plain false, never a thrown exception' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'] );
+	}
 }

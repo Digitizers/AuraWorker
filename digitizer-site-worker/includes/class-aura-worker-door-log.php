@@ -303,14 +303,37 @@ class Aura_Worker_Door_Log {
 	 * transaction's overhead. Bumping here, ONCE, covers every one of those
 	 * callers without instrumenting each of them separately.
 	 *
-	 * NEVER CALL THIS FROM INSIDE AN ALREADY-OPEN TRANSACTION (see
-	 * `versioned()`'s own docblock) — `rotate_binding()` needs an insert
-	 * shaped exactly like this one's, from inside its OWN transaction, and
-	 * uses a private write-only twin (`bindingless_insert()`) rather than
-	 * this method for exactly that reason.
+	 * NEVER CALL THIS FROM INSIDE AN ALREADY-OPEN TRANSACTION for a
+	 * NON-EXEMPT name (see `versioned()`'s own docblock) — `rotate_binding()`
+	 * needs an insert shaped exactly like this one's, from inside its OWN
+	 * transaction, and uses a private write-only twin
+	 * (`bindingless_insert()`) rather than this method for exactly that
+	 * reason. A VERSION_EXEMPT_INSERTS name is the ONE exception: it skips
+	 * `versioned()` entirely (no nested transaction to collide with), so
+	 * `ack_write()` calls it from inside its OWN already-open unit with
+	 * `$in_unit = true` (Ruling S93, Codex round-41 P1 on #88) precisely so
+	 * that a real failure aborts THAT unit rather than running unnoticed.
 	 *
-	 * @param string $name  Option name.
-	 * @param mixed  $value Value; serialized like an option.
+	 * @param string $name    Option name.
+	 * @param mixed  $value   Value; serialized like an option.
+	 * @param bool   $in_unit Ruling S93 (Codex round-41 P1 on #88):
+	 *                   ONLY meaningful for a VERSION_EXEMPT_INSERTS name
+	 *                   called from INSIDE a caller's own already-open
+	 *                   `versioned()` unit (the ONLY reason a caller is
+	 *                   allowed to reach this method for such a name in
+	 *                   the first place — see `ack_write()`). Routes the
+	 *                   raw `$wpdb->query()` result through
+	 *                   `must_succeed()` (return value AND `last_error`)
+	 *                   before it collapses to the bool this method
+	 *                   returns, so a real failure THROWS immediately —
+	 *                   caught by the enclosing `versioned()`'s own
+	 *                   `$writes()` try/catch as `{ rollback: true }` —
+	 *                   rather than being silently read as an ordinary
+	 *                   "already exists" miss and letting the unit's
+	 *                   LATER statements run uncounted. Ignored (and
+	 *                   never passed) for a non-exempt name, which
+	 *                   already gets this same protection by running
+	 *                   inside its OWN `versioned()` call below.
 	 * @return bool|null True only when exactly one row was inserted (and,
 	 *              for a non-exempt name, its version bump also landed);
 	 *              false for a PROVEN miss (a real name collision, or
@@ -323,9 +346,9 @@ class Aura_Worker_Door_Log {
 	 *              must not read null that way — see each such caller for
 	 *              its own retryable answer.
 	 */
-	public static function insert_unique( $name, $value ) {
+	public static function insert_unique( $name, $value, $in_unit = false ) {
 		if ( in_array( $name, self::VERSION_EXEMPT_INSERTS, true ) ) {
-			return self::insert_unique_write( $name, $value );
+			return self::insert_unique_write( $name, $value, $in_unit );
 		}
 		$outcome = self::versioned(
 			function () use ( $name, $value ) {
@@ -353,11 +376,14 @@ class Aura_Worker_Door_Log {
 	 * versioned wrapper (this class's own `insert_unique()`, and
 	 * `rotate_binding()`'s inline mint) actually issues.
 	 *
-	 * @param string $name  Option name.
-	 * @param mixed  $value Value; serialized like an option.
+	 * @param string $name    Option name.
+	 * @param mixed  $value   Value; serialized like an option.
+	 * @param bool   $in_unit Ruling S93: see `insert_unique()`'s own
+	 *                   docblock for this flag's meaning — must_succeed()
+	 *                   the raw query result before collapsing it.
 	 * @return bool True only when exactly one row was inserted.
 	 */
-	private static function insert_unique_write( $name, $value ) {
+	private static function insert_unique_write( $name, $value, $in_unit = false ) {
 		global $wpdb;
 		$rows = $wpdb->query(
 			$wpdb->prepare(
@@ -368,6 +394,18 @@ class Aura_Worker_Door_Log {
 				$name
 			)
 		);
+		if ( $in_unit ) {
+			// Ruling S93: a real query failure (the raw `false` this
+			// dual-context primitive otherwise collapses into the SAME
+			// bool an ordinary "row already exists" miss returns) THROWS
+			// here instead — the caller is inside its own already-open
+			// `versioned()` unit (the only reason an exempt name reaches
+			// this method with `$in_unit` at all), and a caught throw
+			// aborts that unit BEFORE any statement after this one runs.
+			// `$rows` legitimately being `0` (int) for the ordinary
+			// no-op case passes straight through unharmed.
+			self::must_succeed( $rows );
+		}
 		// EVICTED ON BOTH OUTCOMES (Ruling P72). A LOST insert means somebody
 		// else's row is under this name RIGHT NOW — and this request has very
 		// likely just cached the name as absent (`notoptions`) on the read that
@@ -4061,7 +4099,7 @@ class Aura_Worker_Door_Log {
 		// newly acked range — never 1..seq on a site with a long history
 		// (Codex round-5 P2). FLOOR is version-exempt (see
 		// VERSION_EXEMPT_INSERTS), so this does not open a nested transaction.
-		self::insert_unique( self::FLOOR, 0 );
+		self::insert_unique( self::FLOOR, 0, true ); // Ruling S93 (Codex round-41 P1 on #88): a real failure here now aborts the WHOLE unit before the floor raise or purge ever run.
 		// Ruling S68 (Codex round-25 P1 on #88 — the S31 class applied to
 		// the WRITE side): EVERY floor read in this unit is now RAW, never
 		// `self::floor()` — WordPress's default object cache is per-request,
