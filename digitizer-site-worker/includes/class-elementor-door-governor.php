@@ -426,19 +426,40 @@ class Aura_Worker_Elementor_Door {
 				// own docblock for the memo this closes.
 				self::reset_request_caches();
 			}
+			// Ruling S33 (Codex round-15 P1 on #88): the bracket opens
+			// HERE, before detect_rewind() ever runs — not after it, as
+			// before. A rotation landing WHILE detect_rewind() reads the
+			// epoch/top, or while sync_computed_state() persists what it
+			// found, used to fall OUTSIDE the window the version compare
+			// protects: both the "before" and "after" reads would agree on
+			// the NEW version while the fragment itself still carried
+			// site/cursor/rewind values read against the OLD one. Every
+			// input the fragment serves — epoch/site, the cursor decision,
+			// the rewind verdict, the log rows, the persisted computed
+			// tuple — is now read strictly INSIDE this bracket, so a change
+			// during ANY of them is caught by the same before/after compare
+			// Ruling S6 already established, not a narrower one bolted on
+			// after the fact.
+			//
 			// Ruling S29 (Codex round-13 P1 on #88): rewind detection runs
 			// FIRST — sync_computed_state() needs to know about a DETECTED
 			// rewind to persist it as a state transition (see that method's
 			// own docblock), and build_status_fragment_state() must report
 			// the SAME detection, never a second, possibly different one.
-			$rewind_info = self::detect_rewind( (int) $after, $epoch );
+			$before_version = Aura_Worker_Door_Log::door_version_raw();
+			$rewind_info    = self::detect_rewind( (int) $after, $epoch );
 			// Ruling S22 (Codex round-9 P2 on #88): a COMPUTED transition —
 			// Elementor deactivating, the coverage seam changing, and now
 			// (Ruling S29) a newly DETECTED rewind — is state, and must
 			// land BEFORE the bracketed reads below can prove anything
-			// about it. See sync_computed_state()'s own docblock.
+			// about it. See sync_computed_state()'s own docblock. Persisting
+			// THIS request's own freshly detected transition (the ordinary
+			// case, not a concurrent write) bumps the version between
+			// $before_version and $after_version too — correctly forcing
+			// one retry: sync_computed_state() is a fenced CAS (Rulings
+			// S24/S26), so the SECOND attempt finds its own write already
+			// there, persists nothing further, and the bracket closes clean.
 			$synced         = self::sync_computed_state( $rewind_info['rewind'] );
-			$before_version = Aura_Worker_Door_Log::door_version_raw();
 			// Ruling S28 (Codex round-12 P1 on #88): INSIDE the bracket,
 			// after sync_computed_state() — read back whatever is actually
 			// PERSISTED now, not this request's own (possibly stale) live
@@ -449,7 +470,26 @@ class Aura_Worker_Elementor_Door {
 			// falls back to live computation below.
 			$computed       = $synced ? self::persisted_computed_state() : null;
 			$fragment       = self::build_status_fragment_state( $rewind_info, $computed );
+			// Ruling S36 (Codex round-15 P1 on #88): read IMMEDIATELY after
+			// build_status_fragment_state() — the only thing between here
+			// and the log_after() call inside it — before anything else in
+			// this same attempt can run a second log_after() and overwrite
+			// it. A transient SELECT failure mid-walk is proven unreadable,
+			// never a hole (see log_after()'s own docblock); the rows read
+			// so far are still served, but this poll must not vouch for a
+			// log it knows it could not finish reading.
+			$log_unreadable = Aura_Worker_Door_Log::log_walk_was_unreadable();
 			$after_version  = Aura_Worker_Door_Log::door_version_raw();
+			if ( $log_unreadable ) {
+				// Served immediately, never retried — the same shape as the
+				// `!$synced` branch just below: a retry re-runs the SAME
+				// walk against the SAME transient condition and, whether it
+				// clears or not, gains nothing a fresh poll would not also
+				// get. The fragment still carries whatever log_after()
+				// managed to read; only `observation` is withheld.
+				$fragment['observation'] = null;
+				return $fragment;
+			}
 			if ( ! $synced ) {
 				// Ruling S24 (Codex round-10 P2 on #88): the computed-state
 				// transition ITSELF could not be committed — see

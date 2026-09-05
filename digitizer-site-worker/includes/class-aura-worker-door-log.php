@@ -33,6 +33,15 @@ class Aura_Worker_Door_Log {
 	private static $binding_adopt_tried = false;
 	/** @var int Monotonic counter feeding raw_option_read()'s per-call proof nonce (Ruling S1). */
 	private static $raw_read_seq = 0;
+	/**
+	 * @var bool Set by log_after() (Ruling S36, Codex round-15 P1 on #88):
+	 * did its walk stop on a row it could not PROVE readable, rather than a
+	 * genuine hole? Reset at the start of every log_after() call — this is
+	 * a per-call outcome, not a cross-request memo — and read by
+	 * status_fragment() immediately afterwards, before anything else can
+	 * run a second log_after() and overwrite it.
+	 */
+	private static $log_walk_unreadable = false;
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
 	/**
@@ -1363,14 +1372,29 @@ class Aura_Worker_Door_Log {
 	 * request already cached — a `pending` row read on an earlier attempt,
 	 * say — even after a DIFFERENT request has since settled it and moved
 	 * the door version. `log_after()` uses this, never `get()`, for exactly
-	 * that reason. Shares `row_from_db()` — the same primitive `patch()`'s
-	 * own CAS already reads through.
+	 * that reason.
+	 *
+	 * THREE ANSWERS (Ruling S36, Codex round-15 P1 on #88), the same shape
+	 * `row_for_fence()` already uses and for the same reason: the row
+	 * (array), NULL for a seq that genuinely has no row (a hole — only an
+	 * ack deletes one, and it raises the floor first, so this cannot happen
+	 * by construction while walking forward from the floor), and FALSE for
+	 * a read that could not be PROVEN (Ruling S1's nonce probe) — a
+	 * transient SELECT failure, indistinguishable from a hole to a caller
+	 * that only checks `null`. `log_after()`'s walk used to treat both the
+	 * same way — silently truncating the log under a witness that still
+	 * claimed to be current — which is exactly the bug this closes.
 	 *
 	 * @param int $seq Seq.
-	 * @return array|null
+	 * @return array|null|false
 	 */
 	public static function get_raw( $seq ) {
-		return self::row_from_db( self::PREFIX . (int) $seq );
+		$read = self::raw_option_read( self::PREFIX . (int) $seq );
+		if ( ! $read['ok'] ) {
+			return false;
+		}
+		$val = null === $read['value'] ? null : maybe_unserialize( $read['value'] );
+		return is_array( $val ) ? $val : null;
 	}
 
 	/**
@@ -2726,11 +2750,23 @@ class Aura_Worker_Door_Log {
 	 * `highest_row_seq()` is unaffected — it was never routed through
 	 * `get_option()` to begin with.
 	 *
+	 * Ruling S36 (Codex round-15 P1 on #88): a row `get_raw()` could not
+	 * PROVE readable stops the walk exactly like a hole does — it cannot be
+	 * skipped past, the same as any other hole — but it is not one, and
+	 * `self::$log_walk_unreadable` records the difference for
+	 * `status_fragment()` to read immediately afterwards
+	 * (`log_walk_was_unreadable()`): the rows collected so far are still
+	 * served (a transient failure must not turn into an emptier page than
+	 * a 2.16.1 site — one with no raw reads at all — would have served),
+	 * but the poll's `observation` is forced null rather than vouching for
+	 * a log this call knows it could not finish reading.
+	 *
 	 * @param int $after Aura's cursor.
 	 * @param int $limit Page size.
 	 * @return array[]
 	 */
 	public static function log_after( $after, $limit = self::PAGE ) {
+		self::$log_walk_unreadable = false;
 		$after = max( (int) $after, self::floor_raw() );
 		$out   = array();
 		$seq   = $after;
@@ -2742,6 +2778,14 @@ class Aura_Worker_Door_Log {
 		while ( count( $out ) < $limit && ( $unbounded || $seq < $top ) ) {
 			$seq++;
 			$row = self::get_raw( $seq );
+			if ( false === $row ) {
+				// A transient SELECT failure, PROVEN unreadable rather than
+				// proven absent (Ruling S36) — never treated as the hole
+				// below, which would silently truncate the log under a
+				// witness that still claimed to be current.
+				self::$log_walk_unreadable = true;
+				break;
+			}
 			if ( null === $row ) {
 				break; // a number with no row is a hole — cannot happen by construction; stop rather than skip
 			}
@@ -2751,6 +2795,20 @@ class Aura_Worker_Door_Log {
 			$out[] = $row;
 		}
 		return $out;
+	}
+
+	/**
+	 * Whether the MOST RECENT `log_after()` call stopped on a row it could
+	 * not prove readable, rather than a genuine hole (Ruling S36, Codex
+	 * round-15 P1 on #88). `status_fragment()`'s own caller reads this
+	 * immediately after `build_status_fragment_state()` returns — before
+	 * anything else in this same request can call `log_after()` again and
+	 * overwrite it.
+	 *
+	 * @return bool
+	 */
+	public static function log_walk_was_unreadable() {
+		return self::$log_walk_unreadable;
 	}
 
 	/**

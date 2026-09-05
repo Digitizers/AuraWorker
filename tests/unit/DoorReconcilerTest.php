@@ -1422,10 +1422,98 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertNotSame( $before, $frag['observation'], 'the racer really did bump the version — otherwise this test proves nothing' );
 		$this->assertCount( 1, $frag['log'] );
 		$this->assertSame( 'ok', $frag['log'][0]['result'], 'the TERMINAL state is served, never the pending row this process cached earlier' );
-		$this->assertContains(
-			"SELECT option_value FROM {$GLOBALS['wpdb']->options} WHERE option_name = '$name' LIMIT 1",
-			$GLOBALS['_db_queries'],
-			'the row was read RAW — a real statement, never satisfied from this process\'s own cache'
+		// Ruling S36 (Codex round-15 P1 on #88): get_raw() now reads through
+		// the SAME proven nonce-probe raw_option_read() uses (Ruling S1),
+		// not a bare `SELECT option_value ...` — the query shape changed,
+		// the guarantee (a real statement, never this process's own cache)
+		// did not.
+		$found = false;
+		foreach ( $GLOBALS['_db_queries'] as $q ) {
+			if ( preg_match( "/^SELECT '[^']*' AS probe, \(SELECT option_value FROM \S+ WHERE option_name = '" . preg_quote( $name, '/' ) . "' LIMIT 1\) AS v\$/", (string) $q ) ) {
+				$found = true;
+				break;
+			}
+		}
+		$this->assertTrue( $found, 'the row was read RAW — a real, proven statement, never satisfied from this process\'s own cache' );
+	}
+
+	/**
+	 * Ruling S33 (Codex round-15 P1 on #88): `status_fragment()`'s version
+	 * bracket used to open AFTER `detect_rewind()` had already run — so a
+	 * rotation landing WHILE that method (or the reads immediately after
+	 * it) executed fell entirely outside the window the before/after
+	 * version compare protects. Both reads would agree on the NEW version
+	 * while the fragment served epoch/site/rewind values `detect_rewind()`
+	 * read against the OLD one. The bracket now opens before
+	 * `detect_rewind()` runs at all, so this exact race is now INSIDE it:
+	 * the mismatch forces a retry, and the retry re-reads a fresh epoch.
+	 */
+	public function test_a_rotation_during_detect_rewind_is_caught_and_the_retry_serves_the_new_epoch(): void {
+		$old_epoch = Aura_Worker_Door_Log::epoch();
+		$new_epoch = 'rotated-epoch-' . wp_generate_uuid4();
+
+		// floor_raw() is the LAST raw read detect_rewind() performs before
+		// returning — firing the racer here models a rotation landing right
+		// as detect_rewind() finishes, the exact window this ruling closes.
+		$GLOBALS['_sa_after_option_read'] = static function ( string $name ) use ( $new_epoch ) {
+			if ( Aura_Worker_Door_Log::FLOOR !== $name ) {
+				return;
+			}
+			$GLOBALS['_sa_after_option_read'] = null; // fires once
+
+			$epoch_name                            = Aura_Worker_Door_Log::EPOCH;
+			$GLOBALS['_rows'][ $epoch_name ]        = $new_epoch;
+			$GLOBALS['_options'][ $epoch_name ]     = $new_epoch;
+			Aura_Worker_Door_Log::bump_door_version();
+		};
+
+		$frag = $this->fragment( 0, $old_epoch );
+
+		$GLOBALS['_sa_after_option_read'] = null;
+
+		$this->assertNotNull( $frag['observation'], 'a single retry resolves this — never "torn twice"' );
+		$this->assertSame(
+			$new_epoch,
+			$frag['epoch'],
+			'the served fragment carries the POST-rotation epoch — the retry re-ran detect_rewind() inside the (correctly widened) bracket, never the stale value the first pass read'
+		);
+		$this->assertNotSame( $old_epoch, $frag['epoch'] );
+	}
+
+	/**
+	 * Ruling S36 (Codex round-15 P1 on #88): a transient SELECT failure on
+	 * ONE row mid-`log_after()`-walk used to read exactly like a hole —
+	 * `get_raw()` answered `null` either way — so the walk silently stopped
+	 * short while the bracket's before/after version reads still agreed,
+	 * serving a TRUNCATED log under a witness that claimed to be current.
+	 * `get_raw()` now proves the row unreadable (`false`, never `null`) and
+	 * the fragment withholds `observation` for that poll instead — the
+	 * rows read before the failure are still served, exactly as a site
+	 * with no raw reads at all would have served them.
+	 */
+	public function test_an_unreadable_row_mid_walk_withholds_observation_but_still_serves_the_rows_read_so_far(): void {
+		$before_reason = Aura_Worker_Door_Log::observation_unsupported_reason();
+
+		$one = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
+		$two = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $two, array( 'result' => 'ok' ) );
+		$three = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $three, array( 'result' => 'ok' ) );
+
+		// The THIRD row's own SELECT never proves readable — a transient
+		// driver failure, never a genuine hole (the row is right there).
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::PREFIX . $three ] = true;
+
+		$frag = $this->fragment( 0, Aura_Worker_Door_Log::epoch() );
+
+		$this->assertNull( $frag['observation'], 'a log walk that could not finish must not vouch for what it read' );
+		$this->assertCount( 2, $frag['log'], 'the rows read BEFORE the failure are still served — never an emptier page than a site with no raw reads at all would serve' );
+		$this->assertSame( array( $one, $two ), array_column( $frag['log'], 'seq' ) );
+		$this->assertSame(
+			$before_reason,
+			Aura_Worker_Door_Log::observation_unsupported_reason(),
+			'a per-row read failure is not an engine-level reason — that field is untouched by this'
 		);
 	}
 

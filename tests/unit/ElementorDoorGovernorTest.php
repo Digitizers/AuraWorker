@@ -1557,30 +1557,49 @@ final class ElementorDoorGovernorTest extends TestCase {
 	/**
 	 * Ruling S28 (Codex round-12 P1 on #88): poll A starts before Elementor
 	 * deactivates, so its request-local `active()` stays memoised `true`
-	 * for the rest of A's process. If a racer (a DIFFERENT, faster process
+	 * for the rest of A's process. A racer (a DIFFERENT, faster process
 	 * observing the real deactivation) persists `inactive/closed` and
 	 * bumps the version in the window between A's OWN steady-state check
-	 * — which matched A's stale `active: true` against a `$persisted` read
-	 * BEFORE the racer landed, so A never even reached the CAS — and A's
-	 * bracketed reads, BOTH of A's bracket reads land on the racer's NEW
-	 * version (nothing mutates further during A's own build), so the old
-	 * code's fragment (built from A's LIVE `active()`/`door_state()`)
-	 * reported the STALE `active: true` / `door: open` under the racer's
-	 * own witness — contradicting the racer's own, correct answer under
-	 * the SAME version. Reading the PERSISTED tuple back INSIDE the
-	 * bracket instead serves the racer's winning state, consistent with
-	 * whatever version is actually being reported.
+	 * and A's bracketed reads.
+	 *
+	 * Ruling S33 (Codex round-15 P1 on #88) moved where that bracket
+	 * OPENS -- before detect_rewind()/sync_computed_state() run at all,
+	 * not after -- so this exact racer now lands INSIDE attempt 0's
+	 * bracket from the start, forcing a retry (attempt 0's own before/after
+	 * disagree). On attempt 1, A's live view is STILL stale (active:
+	 * true -- nothing in this test ever makes A observe the real
+	 * deactivation), so sync_computed_state() no longer takes the steady
+	 * fast path: it now MISMATCHES the racer's persisted tuple, reaches
+	 * its own fenced CAS, and -- since nothing else has touched the row
+	 * since the racer's write -- that CAS succeeds, overwriting the
+	 * racer's tuple with A's own stale one and bumping the version a
+	 * SECOND time. Attempt 1 is therefore torn too, and status_fragment()
+	 * reports the only honest answer left: observation: null -- TWO real
+	 * mutations landed while this one poll tried to read a consistent
+	 * snapshot, exactly the "mutating faster than one request can read
+	 * it" case that method's own docblock already names.
+	 *
+	 * This is not a regression from the OLD (narrower) bracket: that CAS
+	 * has no way to know its OWN view is stale, only whether the bytes it
+	 * read still match what's there now, so A would have overwritten the
+	 * racer's tuple with its own stale one on its VERY NEXT poll anyway.
+	 * S33 only means THIS poll now witnesses the collision instead of
+	 * reporting an observation it was not entitled to -- a single-pass
+	 * "success" that was really a coincidence of how narrow the old
+	 * bracket was, not evidence the read was actually consistent.
 	 */
-	public function test_a_racer_landing_between_the_steady_check_and_the_bracket_is_served(): void {
+	public function test_a_racer_landing_between_the_steady_check_and_the_bracket_forces_a_second_collision(): void {
 		$this->registerAll();
 		$first = Aura_Worker_Elementor_Door::status_fragment();
 		$this->assertTrue( $first['active'] );
 
-		// THIS request's own live computation never changes — it never
-		// observes any deactivation — so sync_computed_state()'s own
+		// THIS request's own live computation never changes -- it never
+		// observes any deactivation -- so sync_computed_state()'s own
 		// steady-state check (comparing its live active:true against
 		// whatever is persisted AT THAT MOMENT, also active:true) matches
-		// and returns via the fast path, never reaching the CAS at all.
+		// and returns via the fast path, never reaching the CAS at all --
+		// on attempt 0. Fires once, so attempt 1's own steady check runs
+		// unarmed and genuinely mismatches instead.
 		$GLOBALS['_sa_after_computed_state_steady'] = static function () {
 			$GLOBALS['_sa_after_computed_state_steady'] = null; // fires once
 			// The racer: lands in the window between that steady-state
@@ -1597,10 +1616,10 @@ final class ElementorDoorGovernorTest extends TestCase {
 
 		$second = Aura_Worker_Elementor_Door::status_fragment();
 
-		$this->assertNotSame( $first['observation'], $second['observation'], 'the racer really did bump the version — otherwise this test proves nothing' );
-		$this->assertNotNull( $second['observation'], 'both of this call\'s own bracket reads land on the racer\'s new version — no torn read here' );
-		$this->assertFalse( $second['active'], 'the PERSISTED (winning) state is served, never this request\'s own stale live computation' );
-		$this->assertSame( 'closed', $second['door'] );
+		$this->assertNotSame( $first['observation'], $second['observation'], 'the racer really did bump the version -- otherwise this test proves nothing' );
+		$this->assertNull( $second['observation'], "a SECOND real mutation (this request's own stale CAS, on the retry) landed during this poll too -- never a confident observation over two collisions" );
+		$this->assertTrue( $second['active'], "A's own stale CAS won the race on retry and overwrote the racer's tuple -- the served fields reflect that write, not the racer's, which is exactly why observation is null rather than trusted" );
+		$this->assertSame( 'open', $second['door'] );
 	}
 
 	/** A steady poll with no racer at all must still report the same, unchanged state. */
