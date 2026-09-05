@@ -414,6 +414,13 @@ class Aura_Worker_Elementor_Door {
 			return null;
 		}
 		for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+			if ( $attempt > 0 ) {
+				// Ruling S20 (Codex round-8 P1 on #88): a retry MUST actually
+				// re-read, not just re-run the same builder over whatever it
+				// cached the first time through — see reset_request_caches()'s
+				// own docblock for the memo this closes.
+				self::reset_request_caches();
+			}
 			$before_version = Aura_Worker_Door_Log::door_version_raw();
 			$fragment       = self::build_status_fragment_state( (int) $after, $epoch );
 			$after_version  = Aura_Worker_Door_Log::door_version_raw();
@@ -424,6 +431,50 @@ class Aura_Worker_Elementor_Door {
 		}
 		$fragment['observation'] = null; // torn twice: unordered this poll
 		return $fragment;
+	}
+
+	/**
+	 * Every request-local memo `build_status_fragment_state()` reads,
+	 * dropped before a retry (Ruling S20, Codex round-8 P1 on #88).
+	 *
+	 * THE BUG THIS CLOSES: `Aura_Worker_Door_Holds::held_rows()` memoises
+	 * its read "for the request", and is dropped by `forget_held()` —
+	 * called by every held WRITE, so a reader AFTER a write in the SAME
+	 * process never sees the queue as it was before it. But a write from a
+	 * DIFFERENT request calls `forget_held()` on THAT process's own static,
+	 * never on this one's. When a hold mutation lands after this request's
+	 * FIRST attempt has already called `listing()` — which is exactly the
+	 * window between `status_fragment()`'s two bracketing version reads —
+	 * the version mismatch triggers a retry, but the retry's own build call
+	 * reused the FIRST attempt's memo unchanged: its own bracketing reads
+	 * could both land on the NEW version (nothing mutates a second time),
+	 * so the loop returned a fragment reporting the new version with `held`
+	 * still missing the hold that caused it. The bracketing reads only
+	 * prove state didn't change WHILE this build ran — not that the build
+	 * itself read anything fresh; this is what makes the second attempt
+	 * capable of actually doing that.
+	 *
+	 * `self::$active` is included defensively: it is a request-local
+	 * memo the builder reads (`active()`, and `door_state()` through it),
+	 * and though nothing a hold or log mutation does can change whether
+	 * Elementor's module exists, dropping it costs one cheap re-check and
+	 * keeps this method the single place a future builder-read memo gets
+	 * added, rather than a per-call-site judgement call about which ones
+	 * "probably" cannot go stale.
+	 *
+	 * DELIBERATELY NOT RESET: `self::$seam`, set once per request by
+	 * `verify_coverage()` on `wp_abilities_api_init` — nothing in this
+	 * retry re-verifies it, so clearing it here would report `seam:
+	 * 'unchecked'` on the second attempt instead of the real answer.
+	 * `self::$pinned_ruleset`, read only by the WRITE-side judgement calls
+	 * (`govern()`, `judge_collateral()`) — `build_status_fragment_state()`
+	 * never reads it, so it is not one of "the builder's" memos at all.
+	 *
+	 * @return void
+	 */
+	private static function reset_request_caches() {
+		Aura_Worker_Door_Holds::forget_held();
+		self::$active = null;
 	}
 
 	/**

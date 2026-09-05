@@ -1308,4 +1308,48 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$GLOBALS['_sa_after_option_read'] = null;
 		$this->assertNull( $frag['observation'], 'torn on the retry too: unordered this poll, never a guess' );
 	}
+
+	/**
+	 * Ruling S20 (Codex round-8 P1 on #88): `Aura_Worker_Door_Holds::
+	 * held_rows()` memoises its read "for the request" — correct across
+	 * two DIFFERENT reading requests, wrong for a SINGLE request that
+	 * retries its own build after a torn read. A hold landing the instant
+	 * the FIRST attempt's own `listing()` call finishes capturing its
+	 * snapshot (still pre-hold) bumps the version, which triggers the
+	 * retry — but without resetting the memo first, the retry's own
+	 * `listing()` call reused that SAME pre-hold snapshot: its bracketing
+	 * reads both land on the NEW (post-hold) version, so the loop returns
+	 * successfully with a fragment reporting the new version and a `held`
+	 * list still missing the hold that caused it.
+	 */
+	public function test_a_hold_landing_right_after_the_first_listing_read_is_in_the_rebuilt_fragment(): void {
+		$this->registerAll();
+		$before = Aura_Worker_Door_Log::door_version_raw();
+
+		$GLOBALS['_sa_after_rows_read'][ Aura_Worker_Door_Holds::HELD ] = static function () {
+			// Fires the instant held_rows()'s own read completes, inside
+			// the FIRST attempt's build — exactly the window Ruling S20
+			// closes: the memo this call is about to populate is already
+			// the LAST pre-hold snapshot this process will ever take
+			// without an explicit reset.
+			Aura_Worker_Door_Holds::hold(
+				array(
+					'ability' => 'elementor/publish-document',
+					'input'   => array( 'post_id' => 7 ),
+					'touches' => array( array( 'type' => 'page', 'id' => '7' ) ),
+					'actor'   => array( 'user_id' => 3, 'login' => 'bot' ),
+					'verdict' => 'none',
+					'rule'    => null,
+				)
+			);
+		};
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_after_rows_read'] = array();
+		$after                          = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertNotSame( $before, $after, 'the hold really did bump the version — otherwise this test proves nothing' );
+		$this->assertSame( $after, $frag['observation'], 'the rebuild found an agreeing pair of reads under the NEW version' );
+		$this->assertCount( 1, $frag['held'], 'the hold that caused the retry is IN the rebuilt fragment, not missing from a stale memo' );
+	}
 }

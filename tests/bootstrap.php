@@ -2045,6 +2045,27 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 						);
 					}
 				}
+				// A hook keyed by PREFIX, firing right after this exact read
+				// completes (Ruling S20, 2.16.2) — for a test modelling a
+				// mutation landing the instant a memoising reader
+				// (Aura_Worker_Door_Holds::held_rows()) finishes capturing
+				// its snapshot, before that memo is used or dropped. Fires
+				// once per prefix.
+				//
+				// `stripslashes()` TWICE: prepare()'s addslashes() escaped
+				// esc_like()'s own backslash before substitution — the same
+				// double escaping a real wpdb::prepare()/esc_like() pair
+				// produces — so the captured group still carries ONE level
+				// of LIKE-escaping after a single stripslashes() (which is
+				// exactly what `sa_like_to_regex()` above wants). A plain
+				// prefix constant has neither, so comparing against one
+				// needs both levels removed.
+				$prefix = stripslashes( stripslashes( $m[1] ) );
+				if ( isset( $GLOBALS['_sa_after_rows_read'][ $prefix ] ) && is_callable( $GLOBALS['_sa_after_rows_read'][ $prefix ] ) ) {
+					$fn = $GLOBALS['_sa_after_rows_read'][ $prefix ];
+					unset( $GLOBALS['_sa_after_rows_read'][ $prefix ] );
+					$fn();
+				}
 				return $out;
 			}
 			// Aura_Worker_Door_Log::stale_pending() (2.16.0): the numeric log
@@ -3434,6 +3455,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
 	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
+	$GLOBALS['_sa_after_rows_read'] = array(); // Keyed by PREFIX: runs immediately after that rows-by-prefix read completes, once (Ruling S20).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
@@ -4703,6 +4725,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
 	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
+	$GLOBALS['_sa_after_rows_read'] = array(); // Keyed by PREFIX: runs immediately after that rows-by-prefix read completes, once (Ruling S20).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
