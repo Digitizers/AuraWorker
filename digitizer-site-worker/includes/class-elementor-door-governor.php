@@ -1006,6 +1006,23 @@ class Aura_Worker_Elementor_Door {
 	 *    function's own callers' bailout checks — so this exclusion only
 	 *    ever matters for the narrow case where the REST of the payload
 	 *    is fully proven.)
+	 * - `log`, `rewind` (Ruling S76, Codex round-31 P2 on #88) —
+	 *    REQUEST-derived, never site state: both are computed from the
+	 *    CALLER's own `door_after`/`door_epoch` cursor (`log_after($after)`'s
+	 *    own projection; `detect_rewind($after, $epoch)`'s own verdict),
+	 *    not from anything the site itself holds. Two requests polling
+	 *    the IDENTICAL underlying state with two different cursors
+	 *    served two different `log` arrays and (whenever one had rewound
+	 *    past the other's remembered epoch) two different `rewind`
+	 *    verdicts — hashing either meant an ordinary drain (Aura simply
+	 *    advancing its own cursor between polls) looked like a state
+	 *    transition and bumped the version on nothing, and two polls
+	 *    with overlapping cursors each other's brackets torn by a
+	 *    "change" that was never state at all. `sync_served_identities()`
+	 *    folds `log_shape_raw()` in alongside the fragment instead — the
+	 *    CURSOR-INDEPENDENT log shape (Rulings S61/S64) — as the
+	 *    STATE-level input these two request-relative fields are excluded
+	 *    in favour of.
 	 *
 	 * @param array $payload The array a caller is ABOUT TO RETURN (or an
 	 *                        equivalent shape — see `audit_identity_payload()`
@@ -1025,6 +1042,8 @@ class Aura_Worker_Elementor_Door {
 			'unknown_ability_30d',
 			'held_unreadable',
 			'log_top_unreadable',
+			'log',    // request-derived (Ruling S76): log_after($after)'s own cursor projection
+			'rewind', // request-derived (Ruling S76): detect_rewind($after,$epoch)'s own verdict
 		);
 		foreach ( $excluded as $key ) {
 			unset( $payload[ $key ] );
@@ -1382,7 +1401,29 @@ class Aura_Worker_Elementor_Door {
 	 *              own failure already gets.
 	 */
 	private static function sync_served_identities( array $fragment, array $audit_preview ) {
-		$fragment_identity = self::served_identity( $fragment );
+		// Ruling S76 (Codex round-31 P2 on #88): log_shape_raw() — the
+		// CURSOR-INDEPENDENT log shape (top/floor/pending/terminal counts
+		// and a per-row fingerprint above the floor, Rulings S61/S64) —
+		// folded in here, alongside the fragment, as the STATE-level
+		// replacement for `log`/`rewind`, which served_identity() now
+		// excludes outright (both are projections of the CALLER's own
+		// door_after/door_epoch cursor, never site state — see that
+		// method's own docblock). Dropping log tracking entirely (Ruling
+		// S74's own accidental regression: the fragment carries no
+		// `log_shape` field of its own for a plain hash to pick up) would
+		// reopen the S61/S64 hole a row's own verdict flipping above the
+		// floor left. An unreadable shape here refuses the WHOLE write:
+		// persisting a hash built on a fabricated `null` shape would
+		// itself become the NEXT healthy poll's own false "the shape
+		// changed" signal — Ruling S61's own reasoning, one door down.
+		$log_shape = Aura_Worker_Door_Log::log_shape_raw();
+		if ( Aura_Worker_Door_Log::log_shape_was_unreadable() ) {
+			self::mark_unreadable( 'log_shape' );
+			return false;
+		}
+		$fragment_state                = $fragment;
+		$fragment_state['log_shape']   = $log_shape;
+		$fragment_identity = self::served_identity( $fragment_state );
 		$audit_identity    = self::served_identity( $audit_preview );
 		$persisted          = get_option( self::COMPUTED, null );
 		if ( ! is_array( $persisted ) ) {

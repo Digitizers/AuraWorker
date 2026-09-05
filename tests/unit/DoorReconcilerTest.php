@@ -2105,56 +2105,62 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
-	 * Ruling S29 (Codex round-13 P1 on #88): `wp_options` restored to a
-	 * snapshot whose persisted computed tuple `{ active, seam, door }`
-	 * still matches today's LIVE values takes `sync_computed_state()`'s
-	 * steady-state fast path — nothing versions, so both of
-	 * `status_fragment()`'s bracket reads answer the restored, LOWER
-	 * version, and the fragment (including `rewind.detected`) is REJECTED
-	 * by Aura's strictly-greater comparison: recovery stalls until some
-	 * UNRELATED mutation happens to advance the version again.
+	 * Ruling S29 (Codex round-13 P1 on #88) established that a DETECTED
+	 * rewind is a state transition worth versioning — but its own
+	 * mechanism (`rewind_top`, folded into the persisted tuple) was
+	 * RETIRED by Ruling S76 (Codex round-31 P2 on #88): `rewind` is a
+	 * REQUEST-derived verdict — `detect_rewind($after, $epoch)`'s own
+	 * comparison against the CALLER's cursor — never site state. Two
+	 * requests polling the IDENTICAL log with two different `door_after`
+	 * values produced two different `rewind` verdicts (one might see
+	 * "ahead of the real top", the other not), so hashing it meant an
+	 * ORDINARY drain — Aura simply advancing its own cursor between polls
+	 * — looked like a state transition and bumped the version on nothing.
 	 *
-	 * `rewind_top` — the top the fragment builder observed WHEN a rewind is
-	 * detected — is folded into that same tuple, so the FIRST serve that
-	 * detects one looks like a real transition and is versioned through the
-	 * SAME fenced CAS, which bumps via `Aura_Worker_Door_Log::versioned()`'s
-	 * ordinary CLOCK-FLOORED bump (Ruling S4) — a restore rolls the STORED
-	 * counter back but never the WALL CLOCK, so this one bump already lands
-	 * above the restored value.
+	 * What Ruling S29 actually needed protecting is still protected: a
+	 * GENUINE state-level rewind — the log's own top actually resetting,
+	 * which only a real restore or a real `/door/rotate` can do — changes
+	 * `log_shape_raw()`'s own `top` field, and THAT is what
+	 * `sync_served_identities()` now hashes in `log_shape`'s place
+	 * (Ruling S76). This test's own "restore" leaves the log's real top
+	 * completely untouched (still 1) and only changes the CALLER's own
+	 * cursor between polls — exactly the request-relative case Ruling
+	 * S76 says must NOT bump.
 	 */
-	public function test_a_detected_rewind_persists_as_a_transition_and_bumps_above_the_restored_version(): void {
+	public function test_a_rewind_detected_purely_from_a_different_cursor_does_not_bump(): void {
 		$one = $this->entry( array(), true, false ); // seq 1, admitted and settled below
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
 		$epoch = Aura_Worker_Door_Log::epoch();
 
 		// A steady poll first — no rewind — to establish a persisted
-		// computed tuple (rewind_top: null) at some version X.
+		// identity at some version X.
 		$first = $this->fragment( 0, $epoch );
 		$this->assertNull( $first['rewind'] );
 		$x = $first['observation'];
-		$this->assertIsInt( $x, 'a real witness to restore "back to"' );
+		$this->assertIsInt( $x, 'a real witness to compare against' );
 
-		// Simulate the restore: the door version reads X again — the SAME
-		// value this call just saw — while the persisted computed tuple is
-		// UNTOUCHED (still matches today's live active/seam/door): exactly
-		// the condition that took the OLD code's steady-state fast path
-		// and skipped the bump entirely.
-		$GLOBALS['_rows'][ Aura_Worker_Door_Log::OBSERVATION ]    = (string) $x;
-		$GLOBALS['_options'][ Aura_Worker_Door_Log::OBSERVATION ] = $x;
-
-		// Aura's cursor is now above the site's real top (seq 1) — a rewind.
+		// The SAME site state — the log's own top is still 1 — polled with
+		// a DIFFERENT cursor (40, above the real top): detect_rewind()
+		// reports a rewind for THIS caller, but nothing about the site
+		// itself changed.
 		$second = $this->fragment( 40, $epoch );
 
-		$this->assertSame( array( 'detected' => true, 'top' => 1 ), $second['rewind'] );
-		$this->assertIsInt( $second['observation'] );
-		$this->assertGreaterThan( $x, $second['observation'], 'the rewind is a transition and must bump ABOVE the restored value, clock-floored' );
+		$this->assertSame( array( 'detected' => true, 'top' => 1 ), $second['rewind'], 'reported to THIS caller — still an honest answer to what it asked' );
+		$this->assertSame( $x, $second['observation'], 'no state changed — a different cursor alone must not bump' );
 
-		// A second serve of the SAME rewind condition is now a steady
-		// state: the tuple (rewind_top included) already matches what was
-		// just persisted, so nothing bumps again.
-		$third = $this->fragment( 40, $epoch );
-		$this->assertSame( array( 'detected' => true, 'top' => 1 ), $third['rewind'], 'still reported — Aura has not rotated' );
-		$this->assertSame( $second['observation'], $third['observation'], 'the rewind is already recorded — a repeat detection does not bump again' );
+		// A THIRD poll, back at cursor 0 (or any other value), over the
+		// SAME unchanged state: still no bump, whatever door_after says.
+		$third = $this->fragment( 0, $epoch );
+		$this->assertNull( $third['rewind'] );
+		$this->assertSame( $x, $third['observation'], 'still steady — cursor-only differences never touch the observation' );
+
+		// A REAL state-level change — a NEW row lands — still bumps,
+		// regardless of which cursor happens to poll it.
+		$two = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $two, array( 'result' => 'ok' ) );
+		$fourth = $this->fragment( 40, $epoch );
+		$this->assertNotNull( $fourth['observation'] );
+		$this->assertGreaterThan( $x, $fourth['observation'], 'a genuine state change — a new row — still advances the observation' );
 	}
 
 	/**
@@ -2794,6 +2800,14 @@ final class DoorReconcilerTest extends TestCase {
 	 * cannot be silently left out of this test either — changing ANY one
 	 * of them alone (every key except the documented exclusions) must
 	 * change the hash.
+	 *
+	 * `log`/`rewind` joined the exclusion list under Ruling S76 (Codex
+	 * round-31 P2 on #88): both are REQUEST-derived (projections of the
+	 * caller's own door_after/door_epoch cursor), never site state — see
+	 * `test_a_rewind_detected_purely_from_a_different_cursor_does_not_bump()`
+	 * and the two dedicated tests below for the state-vs-request
+	 * distinction itself; this test only proves `served_identity()`'s own
+	 * mechanism treats every OTHER key as significant.
 	 */
 	public function test_served_identity_changes_for_every_real_fragment_field_except_the_excluded_ones(): void {
 		$this->hold();
@@ -2809,6 +2823,8 @@ final class DoorReconcilerTest extends TestCase {
 			'unknown_ability_30d',
 			'held_unreadable',
 			'log_top_unreadable',
+			'log',
+			'rewind',
 		);
 		$this->assertGreaterThan(
 			count( $excluded ),
