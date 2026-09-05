@@ -42,6 +42,30 @@ class Aura_Worker_Door_Log {
 	 * run a second log_after() and overwrite it.
 	 */
 	private static $log_walk_unreadable = false;
+	/**
+	 * @var bool Set by floor_raw() (Ruling S38, Codex round-16 P1 on #88):
+	 * did ANY floor_raw() call THIS ATTEMPT fail to prove its read, rather
+	 * than finding the floor genuinely at 0? Accumulates (OR) across every
+	 * floor_raw() call within one status_fragment() attempt — detect_rewind()
+	 * and build_status_fragment_state() (via log_after() and its own
+	 * 'log_floor' field) each call it once per attempt — and is reset once,
+	 * at the top of that attempt, by reset_floor_unreadable_for_attempt().
+	 */
+	private static $floor_unreadable_this_attempt = false;
+	/**
+	 * @var bool Set by is_closed_raw() (Ruling S39, Codex round-16 P2 on
+	 * #88): did the MOST RECENT call fail to prove its read, rather than
+	 * finding the closure marker genuinely absent? Reset at the start of
+	 * every such read.
+	 */
+	private static $closure_read_unreadable = false;
+	/**
+	 * @var bool Set by row_from_db() (Ruling S37, Codex round-15 class
+	 * sweep on #88): did the MOST RECENT call fail to prove its read,
+	 * rather than finding the row genuinely absent? Reset at the start of
+	 * every such read — checked by patch() immediately afterwards.
+	 */
+	private static $row_from_db_unreadable = false;
 	const FULL_MARKER  = 'aura_worker_door_log_full_since';
 	const FULL_COUNTER = 'aura_worker_door_log_full_refused';
 	/**
@@ -1343,20 +1367,57 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * @var bool Set by raw_option() (Ruling S37/S38/S39, Codex round-15
+	 * class sweep + round-16 on #88): did the MOST RECENT call fail to
+	 * prove its read, rather than finding the option genuinely absent?
+	 * Reset at the start of every such read — a per-call outcome, meant to
+	 * be checked by the caller IMMEDIATELY afterwards, before anything else
+	 * in this same request can issue a second raw_option() read and
+	 * overwrite it.
+	 */
+	private static $raw_option_unreadable = false;
+
+	/**
 	 * One option's raw, still-serialised bytes from the DATABASE — never this
 	 * request's cache. The predicate a compare-and-swap fences on.
 	 *
 	 * UNPROVEN collapses into the same `null` a genuinely absent row answers
-	 * (Ruling S1) — every caller here already treats null as "cannot
-	 * establish" and fails closed on it; only `fence_identity()` and
-	 * `row_for_fence()` need the two told apart, and read `raw_option_read()`
-	 * directly for that.
+	 * — this method's own array|null CONTRACT is unchanged, for every caller
+	 * that already fails closed on null exactly as it should (a CAS whose
+	 * predicate cannot be read simply does not match, and refuses to write,
+	 * whether the row is absent or merely unreadable). `fence_identity()`
+	 * and `row_for_fence()` still read `raw_option_read()` directly when
+	 * they need the two told apart at the CALL SITE.
+	 *
+	 * Some callers, though, do not fail closed on this null — they read it
+	 * as a POSITIVE fact (`floor_raw()`'s "no floor" collapsing an
+	 * unreadable floor to 0; `is_closed_raw()`'s "not closed" collapsing an
+	 * unreadable marker to "open") and that fact then feeds a DEFINITIVE
+	 * report or gets PERSISTED (Rulings S38/S39, Codex round-16 P1/P2 on
+	 * #88). `raw_option_was_unreadable()` is the signal those specific
+	 * callers consult, ALONGSIDE this method's unchanged return, to refuse
+	 * that step instead.
 	 *
 	 * @param string $name Option name.
 	 * @return string|null
 	 */
 	private static function raw_option( $name ) {
-		return self::raw_option_read( $name )['value'];
+		$read                          = self::raw_option_read( $name );
+		self::$raw_option_unreadable = ! $read['ok'];
+		return $read['value'];
+	}
+
+	/**
+	 * Whether the MOST RECENT `raw_option()` call could not prove its read
+	 * (Ruling S37/S38/S39, Codex round-15 class sweep + round-16 on #88).
+	 * The caller must read this immediately after — before anything else in
+	 * this same request can issue a second `raw_option()` read and
+	 * overwrite it.
+	 *
+	 * @return bool
+	 */
+	public static function raw_option_was_unreadable() {
+		return self::$raw_option_unreadable;
 	}
 
 	/** @param int $seq Seq. @return array|null */
@@ -1410,10 +1471,30 @@ class Aura_Worker_Door_Log {
 		$option = self::PREFIX . $seq;
 		$before = self::row_from_db( $option );
 		if ( null === $before ) {
+			// Ruling S37 (Codex round-15 class sweep on #88): whether this
+			// is a genuinely absent row or a read that could not be proven
+			// (row_from_db_was_unreadable() distinguishes them), the answer
+			// is the SAME refusal either way — false, which admit() (this
+			// method's only caller) already turns into the retryable
+			// `aura_log_failed` 503 rather than a silent no-op. Documented
+			// here so the two cases are never conflated by a FUTURE caller
+			// that might otherwise treat "nothing to patch" as fine to
+			// ignore.
 			return false;
 		}
 		$after = array_merge( $before, $fields );
 		return self::write_option_where( $option, $after, $before );
+	}
+
+	/**
+	 * Whether the MOST RECENT `row_from_db()` call (via `patch()`) could
+	 * not prove its read, rather than finding the row genuinely absent
+	 * (Ruling S37, Codex round-15 class sweep on #88).
+	 *
+	 * @return bool
+	 */
+	public static function row_from_db_was_unreadable() {
+		return self::$row_from_db_unreadable;
 	}
 
 	/**
@@ -1487,7 +1568,13 @@ class Aura_Worker_Door_Log {
 	 */
 	private static function row_from_db( $option ) {
 		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		self::$row_from_db_unreadable = false;
+		$wpdb->last_error              = '';
+		$raw                            = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			self::$row_from_db_unreadable = true;
+			return null;
+		}
 		if ( null === $raw ) {
 			return null;
 		}
@@ -1548,7 +1635,41 @@ class Aura_Worker_Door_Log {
 	 */
 	public static function floor_raw() {
 		$raw = self::raw_option( self::FLOOR );
+		if ( self::raw_option_was_unreadable() ) {
+			// Ruling S38 (Codex round-16 P1 on #88): a transient failure
+			// here used to convert a POSITIVE ack floor to 0 — never
+			// "fails closed", the opposite: log_after() then started its
+			// walk from row 1, mistook the first already-acked (purged)
+			// row for a hole, and returned no terminal rows at all, while
+			// still reporting the CURRENT observation as if that empty
+			// page were proven complete. Sticky per attempt — see the
+			// property's own docblock.
+			self::$floor_unreadable_this_attempt = true;
+		}
 		return null === $raw ? 0 : (int) $raw;
+	}
+
+	/**
+	 * Whether ANY `floor_raw()` call this attempt could not prove its read
+	 * (Ruling S38, Codex round-16 P1 on #88). Checked by `status_fragment()`
+	 * once, immediately after `build_status_fragment_state()` returns —
+	 * exactly like `log_walk_was_unreadable()`.
+	 *
+	 * @return bool
+	 */
+	public static function floor_was_unreadable_this_attempt() {
+		return self::$floor_unreadable_this_attempt;
+	}
+
+	/**
+	 * Reset at the top of EVERY `status_fragment()` attempt — both the
+	 * first and any retry — so a failure from a PREVIOUS attempt (already
+	 * accounted for by that attempt's own `observation: null`) never leaks
+	 * into this one, and a failure from a PREVIOUS, unrelated request never
+	 * lingers into this one either.
+	 */
+	public static function reset_floor_unreadable_for_attempt() {
+		self::$floor_unreadable_this_attempt = false;
 	}
 
 	/**
@@ -1641,7 +1762,25 @@ class Aura_Worker_Door_Log {
 	 * @return bool
 	 */
 	public static function is_closed_raw() {
-		return null !== self::raw_option( self::FULL_MARKER );
+		$marker                       = self::raw_option( self::FULL_MARKER );
+		self::$closure_read_unreadable = self::raw_option_was_unreadable();
+		return null !== $marker;
+	}
+
+	/**
+	 * Whether the MOST RECENT `is_closed_raw()` call could not prove its
+	 * read, rather than finding the marker genuinely absent (Ruling S39,
+	 * Codex round-16 P2 on #88): an unreadable marker used to answer
+	 * `false` here — read as "not closed" by `door_state()` — a fabricated
+	 * "open" a full log's `sync_computed_state()` would then persist and
+	 * bump the observation for. Checked by `door_state()`'s own callers
+	 * immediately after calling it, before anything else in this same
+	 * request can issue a second `is_closed_raw()` read and overwrite it.
+	 *
+	 * @return bool
+	 */
+	public static function closure_read_was_unreadable() {
+		return self::$closure_read_unreadable;
 	}
 
 	/** One owner: the INSERT. */
@@ -3048,13 +3187,22 @@ class Aura_Worker_Door_Log {
 	 * Ordered by seq ascending, as the walk was — the reconciler settles in
 	 * that order and its counters are reported in it.
 	 *
+	 * UNREADABLE IS NOT EMPTY (Ruling S37, Codex round-15 class sweep on
+	 * #88): `get_results()` answers its cleared `$last_result` — an empty
+	 * array — for a statement that failed at the driver, indistinguishable
+	 * from "nothing here is stale". The reconciler must not read a failed
+	 * scan as a clean one: `null` here means the caller skips THIS pass
+	 * entirely, rather than concluding no rows need recovering when the
+	 * scan never actually ran.
+	 *
 	 * @param int $ms Age in milliseconds.
-	 * @return array[]
+	 * @return array[]|null Null when the scan itself could not be read.
 	 */
 	public static function stale_pending( $ms ) {
 		global $wpdb;
 		$cut  = time() - (int) floor( $ms / 1000 );
 		$like = $wpdb->esc_like( self::PREFIX ) . '%';
+		$wpdb->last_error = '';
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s AND option_name REGEXP %s AND CAST(SUBSTRING(option_name, %d) AS UNSIGNED) > %d",
@@ -3065,6 +3213,9 @@ class Aura_Worker_Door_Log {
 			),
 			ARRAY_A
 		);
+		if ( ! is_array( $rows ) || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
 		$out = array();
 		foreach ( (array) $rows as $r ) {
 			if ( ! isset( $r['option_name'], $r['option_value'] ) ) {

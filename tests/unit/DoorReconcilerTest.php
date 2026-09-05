@@ -346,6 +346,32 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array( $seq ), array_column( Aura_Worker_Door_Log::log_after( 0 ), 'seq' ) );
 	}
 
+	/**
+	 * Ruling S37/S38 (Codex round-15 class sweep on #88): stale_pending()'s
+	 * own `get_results()` failing at the driver used to answer `array()` —
+	 * the exact same shape as a scan that genuinely found nothing stale —
+	 * so a failed scan and a healthy empty one were reported identically:
+	 * `reconcile()` iterated zero rows either way and moved on. The stale
+	 * row this scan would have found is left exactly as it was; the next
+	 * clean sweep discards it.
+	 */
+	public function test_a_failed_stale_pending_scan_skips_the_pass_rather_than_discarding_nothing(): void {
+		$seq = $this->entry( array(), false ); // un-admitted, stale — stale_pending() would normally find this
+		$GLOBALS['_sa_stale_pending_read_error'] = true;
+
+		$out = Aura_Worker_Elementor_Door::reconcile();
+
+		$GLOBALS['_sa_stale_pending_read_error'] = false;
+		$this->assertSame( 0, $out['discarded'], 'the scan never ran — nothing was concluded about it' );
+		$this->assertSame( 0, $out['interrupted'] );
+		$row = $this->row( $seq );
+		$this->assertSame( 'pending', $row['result'], 'the row is untouched, exactly as a skipped pass leaves it' );
+
+		// A healthy sweep right afterwards still finds and discards it.
+		$out2 = Aura_Worker_Elementor_Door::reconcile();
+		$this->assertSame( 1, $out2['discarded'] );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (f) a stale creation                                                */
 	/* ------------------------------------------------------------------ */
@@ -660,6 +686,28 @@ final class DoorReconcilerTest extends TestCase {
 	/* ------------------------------------------------------------------ */
 	/* (h) the creation mutex                                              */
 	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): a driver failure on
+	 * the mutex's own read must not be read as "no mutex" (which the OLD
+	 * code already handled the same as this — nothing here changes THAT
+	 * answer) but the sweep must also never act on a read it cannot prove,
+	 * so a genuinely stale mutex is left exactly as it was rather than
+	 * evaluated against a value this call cannot trust.
+	 */
+	public function test_an_unreadable_creation_mutex_is_left_alone_this_pass(): void {
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => $this->longAgo() ) );
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::CREATING ] = true;
+
+		Aura_Worker_Elementor_Door::reconcile();
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertIsArray( get_option( Aura_Worker_Elementor_Door::CREATING, null ), 'left untouched — this pass could not prove anything about it' );
+
+		// A healthy sweep right afterwards still clears it.
+		Aura_Worker_Elementor_Door::reconcile();
+		$this->assertFalse( get_option( Aura_Worker_Elementor_Door::CREATING, false ) );
+	}
 
 	public function test_a_stale_creation_mutex_is_cleared_and_a_live_one_is_kept(): void {
 		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Elementor_Door::CREATING, array( 'seq' => 9, 'started_at' => gmdate( 'c' ) ) );
@@ -1157,6 +1205,34 @@ final class DoorReconcilerTest extends TestCase {
 	 * and the ack response both say `closed` — the status fragment went on
 	 * reporting `open` because its own field only ever described the seam.
 	 */
+	/**
+	 * Ruling S39 (Codex round-16 P2 on #88): is_closed_raw() answering
+	 * `false` for both "genuinely not closed" and "the read could not be
+	 * proven" used to feed door_state() a fabricated "open" on a log that
+	 * is actually FULL — sync_computed_state() would then compare that
+	 * fabrication against the persisted (correctly `closed`) tuple, see
+	 * what looks like a real transition, persist the fabrication, and bump
+	 * the observation for it. Neither may happen: the read failure must
+	 * leave the persisted `closed` value standing and withhold the witness
+	 * for this one poll.
+	 */
+	public function test_a_suppressed_closure_marker_read_never_fabricates_open_over_a_persisted_closed(): void {
+		$this->assertSame( 'open', $this->fragment()['door'], 'nothing is wrong yet' );
+
+		Aura_Worker_Door_Log::close();
+		$frag2 = $this->fragment();
+		$this->assertSame( 'closed', $frag2['door'], 'the fixture assumption this test is built on — closed is genuinely PERSISTED now' );
+		$version_before = Aura_Worker_Door_Log::door_version_raw();
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::FULL_MARKER ] = true;
+		$frag3 = $this->fragment();
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $frag3['observation'], 'an unreadable closure marker must not be paired with a confident observation' );
+		$this->assertSame( 'closed', $frag3['door'], 'the PERSISTED value stands — never the fabricated "open" a false is_closed_raw() would compute live' );
+		$this->assertSame( $version_before, Aura_Worker_Door_Log::door_version_raw(), 'no CAS write landed — the version never moved' );
+	}
+
 	public function test_a_closed_log_is_reported_as_a_closed_door(): void {
 		$this->assertSame( 'open', $this->fragment()['door'], 'nothing is wrong yet' );
 
@@ -1517,6 +1593,32 @@ final class DoorReconcilerTest extends TestCase {
 		);
 	}
 
+	/**
+	 * Ruling S38 (Codex round-16 P1 on #88): floor_raw() answering `null`
+	 * for both "no floor" and "the read could not be proven" used to
+	 * collapse a transient failure to 0 — log_after() then started ITS
+	 * walk at row 1, mistook the first already-acked (purged) row for a
+	 * hole, and returned no terminal rows at all, while `observation`
+	 * still carried the current witness as if that empty page were
+	 * proven complete.
+	 */
+	public function test_a_failing_floor_read_withholds_observation_and_never_misreads_purged_rows_as_a_hole(): void {
+		$one = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
+		Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), $one ); // floor moves past row 1
+		$two = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $two, array( 'result' => 'ok' ) );
+		$this->assertSame( array( $two ), array_column( $this->fragment( 0, Aura_Worker_Door_Log::epoch() )['log'], 'seq' ), 'the fixture assumption this test is built on — floor_raw() is genuinely > 0' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::FLOOR ] = true;
+
+		$frag = $this->fragment( 0, Aura_Worker_Door_Log::epoch() );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertNull( $frag['observation'], 'an unreadable floor must not be paired with a confident observation' );
+		$this->assertNull( $frag['rewind'], 'the floor failure must not be misread as evidence of a rewind' );
+	}
+
 	public function test_get_status_reads_the_cursor_and_the_epoch_from_the_request(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
@@ -1688,6 +1790,56 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/** One counter bucket, in the "database" get_col() reads and the cache alike. */
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): count_30d()'s own
+	 * `get_results()` failing at the driver used to answer 0 — the exact
+	 * same shape as "no events in the last 30 days", a real, meaningful
+	 * fact that this window's failure gets wrongly credited with. It now
+	 * joins `governor_block()`'s `log_unacked`/`held_count` in answering
+	 * null instead.
+	 */
+	public function test_a_failed_count_30d_scan_answers_null_never_a_false_zero(): void {
+		$now  = time();
+		$hour = (int) floor( $now / HOUR_IN_SECONDS );
+		$this->seedBucket( 'log_ungoverned', $hour, 42 );
+		$this->assertSame( 42, Aura_Worker_Elementor_Door::count_30d( 'log_ungoverned', $now ), 'the fixture assumption this test is built on' );
+
+		$key = $GLOBALS['wpdb']->esc_like( Aura_Worker_Elementor_Door::COUNTER_PREFIX . 'log_ungoverned_h' );
+		$GLOBALS['_sa_rows_read_error'][ $key ] = true;
+
+		$this->assertNull( Aura_Worker_Elementor_Door::count_30d( 'log_ungoverned', $now ), 'never a false zero over 42 real events this call could not read' );
+
+		$GLOBALS['_sa_rows_read_error'] = array();
+		$this->assertSame( 42, Aura_Worker_Elementor_Door::count_30d( 'log_ungoverned', $now ), 'a healthy read afterwards still sums correctly' );
+	}
+
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): prune_counters()'s
+	 * own `get_col()` failing at the driver used to answer an empty list —
+	 * indistinguishable from "nothing is expired" — so a failed listing
+	 * deleted nothing while claiming the pass ran clean. It now skips the
+	 * pass instead, leaving genuinely expired buckets for the next one.
+	 */
+	public function test_a_failed_prune_counters_listing_skips_rather_than_pruning_nothing(): void {
+		$now     = time();
+		$outside = (int) floor( ( $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS ) - 1;
+		$this->seedBucket( 'log_ungoverned', $outside, 100 ); // genuinely expired
+
+		$GLOBALS['_sa_wpdb_error'] = 'get_col failed';
+		$out                        = Aura_Worker_Elementor_Door::reconcile();
+		$GLOBALS['_sa_wpdb_error'] = '';
+
+		$this->assertSame( 0, $out['pruned_counters'], 'the listing never ran — nothing was concluded about it' );
+		$this->assertArrayHasKey( 'aura_worker_door_c_log_ungoverned_h' . $outside, $GLOBALS['_rows'], 'the expired bucket is untouched — the next sweep gets it' );
+
+		// A healthy sweep right afterwards still prunes it (past the
+		// PRUNE_INTERVAL_S gate, which the failed pass above already
+		// crossed once).
+		update_option( Aura_Worker_Elementor_Door::PRUNED_AT, gmdate( 'c', time() - Aura_Worker_Elementor_Door::PRUNE_INTERVAL_S - 60 ) );
+		$out2 = Aura_Worker_Elementor_Door::reconcile();
+		$this->assertSame( 1, $out2['pruned_counters'] );
+	}
+
 	private function seedBucket( string $name, int $hour, int $value ): void {
 		$option                          = 'aura_worker_door_c_' . $name . '_h' . $hour;
 		$GLOBALS['_rows'][ $option ]    = (string) $value;

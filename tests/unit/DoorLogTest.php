@@ -137,6 +137,30 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_sa_door_unacked_error'] = false;
 	}
 
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): row_from_db() answering
+	 * `null` for both "the row is genuinely absent" and "the read could not
+	 * be proven" both make patch()/admit() answer `false` — the SAME safe
+	 * refusal either way, and admit()'s own caller already turns a false
+	 * into the retryable `aura_log_failed` 503 rather than a silent no-op.
+	 * row_from_db_was_unreadable() is what makes the two provably distinct
+	 * for the first time, even though neither's EXTERNAL answer changes.
+	 */
+	public function test_an_unreadable_row_and_a_genuinely_absent_one_both_refuse_admit_but_are_provably_distinct(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::PREFIX . $seq ] = true;
+
+		$this->assertFalse( Aura_Worker_Door_Log::admit( $seq ), 'refuses exactly like a genuinely absent row would' );
+		$this->assertTrue( Aura_Worker_Door_Log::row_from_db_was_unreadable(), 'but the read is now provably AMBIGUOUS, not absent' );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		// A genuinely absent row (never allocated) refuses the SAME way…
+		$this->assertFalse( Aura_Worker_Door_Log::admit( 999999 ) );
+		// …but is now provably NOT ambiguous — the read succeeded and found nothing.
+		$this->assertFalse( Aura_Worker_Door_Log::row_from_db_was_unreadable() );
+	}
+
 	public function test_seq_is_allocated_by_the_insert_and_is_contiguous(): void {
 		$s1 = Aura_Worker_Door_Log::open_pending( $this->entry() );
 		$s2 = Aura_Worker_Door_Log::open_pending( $this->entry() );

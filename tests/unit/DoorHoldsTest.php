@@ -641,6 +641,28 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ) ); // …and the lock is still released
 	}
 
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): raw_bytes() answering
+	 * `null` for both "the lock row vanished" and "the read could not be
+	 * proven" used to mean take_lock() looped back and raced straight to
+	 * insert_unique() as if the lock had already gone — the opposite of
+	 * what an UNREADABLE lock proves. It now backs off exactly like a
+	 * lock it can see is fresh, and never seizes it.
+	 */
+	public function test_take_lock_does_not_seize_a_lock_it_cannot_prove_stale(): void {
+		$stale = time() - Aura_Worker_Door_Holds::LOCK_S - 1;
+		add_option( Aura_Worker_Door_Holds::LOCK, $stale, '', 'no' ); // genuinely stale, if only it could be read
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Holds::LOCK ] = true; // every read of it fails
+
+		$err = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $err );
+		$this->assertSame( 'aura_hold_busy', $err->get_error_code(), 'never seizes a lock it could not prove stale' );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::count(), 'nothing was admitted while the lock could not be evaluated' );
+		$this->assertSame( (string) $stale, (string) $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ], 'the original lock row is untouched' );
+	}
+
 	public function test_two_racers_on_a_stale_lock_only_one_of_them_takes_it(): void {
 		$stale = time() - Aura_Worker_Door_Holds::LOCK_S - 1;
 		add_option( Aura_Worker_Door_Holds::LOCK, $stale, '', 'no' );
@@ -736,6 +758,30 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayHasKey( 'aura_worker_door_claimed_' . $ref, $GLOBALS['_options'] );
 		$again = Aura_Worker_Door_Holds::claim( $ref );
 		$this->assertSame( 'not_held', $again->get_error_code() );
+	}
+
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): from_db() answering
+	 * `null` for both "the row is genuinely absent" and "the read could
+	 * not be proven" used to mean claim() answered `not_held` — a 404
+	 * Aura reads as "this approval no longer exists" — for a hold that
+	 * was, in fact, sitting right there, unreadable rather than gone.
+	 * from_db()'s read_was_unreadable() signal now lets claim() answer the
+	 * RETRYABLE path instead, and touch nothing.
+	 */
+	public function test_a_claim_answers_retryably_when_the_held_read_is_unreadable_never_not_held(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Holds::HELD . $ref ] = true;
+
+		$out = Aura_Worker_Door_Holds::claim( $ref );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_failed', $out->get_error_code(), 'never `not_held` — that would tell Aura the approval is gone' );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		// The hold is untouched — a HEALTHY claim() right afterwards still
+		// finds and moves it, proving nothing was spent on the failed read.
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
 	}
 
 	public function test_a_claim_that_finds_the_held_row_gone_backs_out(): void {

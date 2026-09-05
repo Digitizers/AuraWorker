@@ -2078,6 +2078,16 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// the same one every other door-log branch reads.
 			if ( preg_match( "/^SELECT option_name, option_value FROM \\S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\\(SUBSTRING\\(option_name, \\d+\\) AS UNSIGNED\\) > (\\d+)$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				// Ruling S37/S38 (Codex round-15 class sweep on #88):
+				// Aura_Worker_Door_Log::stale_pending()'s own scan failing
+				// at the driver — real wpdb answers its cleared
+				// $last_result (an empty array) with last_error the only
+				// tell, exactly like every other get_results() failure
+				// modelled in this stub.
+				if ( ! empty( $GLOBALS['_sa_stale_pending_read_error'] ) ) {
+					$this->last_error = 'stale pending scan failed';
+					return array();
+				}
 				$floor = (int) $m[3];
 				$out   = array();
 				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
@@ -2662,6 +2672,19 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public function get_col( $query = null, $x = 0 ) {
 			$this->last_query         = (string) $query;
 			$GLOBALS['_db_queries'][] = (string) $query;
+			// Ruling S37 (Codex round-15 class sweep on #88): real
+			// wpdb::get_col() answers its own cleared $last_result — an
+			// empty array, never null or false — for a statement that
+			// failed at the driver, with last_error the only tell. Not
+			// modelled before this ruling because nothing needed to break
+			// a get_col() call on its own; scoped to $_sa_wpdb_error so it
+			// shares the SAME global every other read-failure seam already
+			// uses, rather than adding a get_col()-specific one.
+			if ( ! empty( $GLOBALS['_sa_wpdb_error'] ) ) {
+				$this->last_error = (string) $GLOBALS['_sa_wpdb_error'];
+				return array();
+			}
+			$this->last_error = '';
 			// The unbounded prefix listing uninstall.php issues (#434 Task 10).
 			// Read against $_rows — the "database" — so a row written by raw SQL
 			// (the rule counters) is as visible to the sweep here as it is on a
@@ -3614,6 +3637,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
+	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
@@ -4889,6 +4913,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
+	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.

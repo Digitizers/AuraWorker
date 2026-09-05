@@ -426,6 +426,12 @@ class Aura_Worker_Elementor_Door {
 				// own docblock for the memo this closes.
 				self::reset_request_caches();
 			}
+			// Ruling S38 (Codex round-16 P1 on #88): reset UNCONDITIONALLY,
+			// on attempt 0 too — a floor-read failure belongs to the
+			// attempt that hit it, never carried in from a previous
+			// request or (after this reset) leaked out of a previous
+			// attempt this same call already handled.
+			Aura_Worker_Door_Log::reset_floor_unreadable_for_attempt();
 			// Ruling S33 (Codex round-15 P1 on #88): the bracket opens
 			// HERE, before detect_rewind() ever runs — not after it, as
 			// before. A rotation landing WHILE detect_rewind() reads the
@@ -478,9 +484,15 @@ class Aura_Worker_Elementor_Door {
 			// never a hole (see log_after()'s own docblock); the rows read
 			// so far are still served, but this poll must not vouch for a
 			// log it knows it could not finish reading.
-			$log_unreadable = Aura_Worker_Door_Log::log_walk_was_unreadable();
-			$after_version  = Aura_Worker_Door_Log::door_version_raw();
-			if ( $log_unreadable ) {
+			$log_unreadable   = Aura_Worker_Door_Log::log_walk_was_unreadable();
+			// Ruling S38 (Codex round-16 P1 on #88): same placement, same
+			// reasoning — read immediately after build_status_fragment_state()
+			// (which is what calls floor_raw(), both directly for the
+			// 'log_floor' field and inside log_after()), before anything
+			// else this attempt can read the floor again.
+			$floor_unreadable = Aura_Worker_Door_Log::floor_was_unreadable_this_attempt();
+			$after_version    = Aura_Worker_Door_Log::door_version_raw();
+			if ( $log_unreadable || $floor_unreadable ) {
 				// Served immediately, never retried — the same shape as the
 				// `!$synced` branch just below: a retry re-runs the SAME
 				// walk against the SAME transient condition and, whether it
@@ -696,6 +708,19 @@ class Aura_Worker_Elementor_Door {
 			// before this ruling.
 			'rewind_top' => ( is_array( $rewind ) && isset( $rewind['top'] ) ) ? (int) $rewind['top'] : null,
 		);
+		if ( Aura_Worker_Door_Log::closure_read_was_unreadable() ) {
+			// Ruling S39 (Codex round-16 P2 on #88): the door_state() call
+			// just above could not prove the closure marker either way —
+			// an unreadable marker used to read as "not closed", so
+			// $current['door'] here may be a fabricated "open" on a log
+			// that is actually full. Comparing THAT against what is
+			// persisted (a genuinely CLOSED tuple) would look like a real
+			// transition, persist the fabrication, and bump the
+			// observation for it. Neither persist nor bump: exactly like
+			// Rulings S24/S26, return false and let the caller withhold
+			// `observation` for this poll.
+			return false;
+		}
 		$persisted = get_option( self::COMPUTED, null );
 		// Strict: both sides are built from the SAME literal key order every
 		// time (this array literal, and PHP's serialize()/unserialize()
@@ -925,6 +950,21 @@ class Aura_Worker_Elementor_Door {
 		$active  = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
 		$seam    = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
 		$door    = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
+		if ( null === $computed && Aura_Worker_Door_Log::closure_read_was_unreadable() ) {
+			// Ruling S39 (Codex round-16 P2 on #88): the door_state() call
+			// just above hit the SAME unreadable closure marker
+			// sync_computed_state() already saw — its 'open'/'closed'
+			// answer cannot be trusted (an unreadable marker reads as
+			// "open"). Serve whatever this site last durably PERSISTED
+			// instead of a value built on a read that could not be
+			// proven; a site that has never persisted a tuple at all has
+			// nothing better to fall back to, and keeps the fabricated
+			// live value — the only case this cannot improve on.
+			$stale = self::persisted_computed_state();
+			if ( is_array( $stale ) && isset( $stale['door'] ) ) {
+				$door = (string) $stale['door'];
+			}
+		}
 		$binding = Aura_Worker_Door_Log::binding_raw();
 		// THE SAME PREDICATE THE RECONCILER ACTS ON (Ruling P54). Reporting from
 		// `stale_claims()` — age alone — while reconcile() skipped anything
@@ -1051,7 +1091,12 @@ class Aura_Worker_Elementor_Door {
 			self::settle_stale_claim( (string) $ref, (array) $claim, $out );
 		}
 
-		foreach ( Aura_Worker_Door_Log::stale_pending( self::CLAIM_STALE_MS ) as $row ) {
+		// Ruling S37 (Codex round-15 class sweep on #88): null means the scan
+		// itself could not be read — skip this pass rather than treat an
+		// unreadable scan as "nothing is stale". The NEXT reconcile() run
+		// tries again; nothing here is lost, only deferred.
+		$stale_rows = Aura_Worker_Door_Log::stale_pending( self::CLAIM_STALE_MS );
+		foreach ( ( null === $stale_rows ? array() : $stale_rows ) as $row ) {
 			$seq = (int) ( isset( $row['seq'] ) ? $row['seq'] : 0 );
 			if ( $seq <= 0 ) {
 				continue;
@@ -1428,7 +1473,17 @@ class Aura_Worker_Elementor_Door {
 	 */
 	private static function clear_stale_creation_mutex( $now ) {
 		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::CREATING ) );
+		$wpdb->last_error = '';
+		$raw              = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::CREATING ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			// Ruling S37 (Codex round-15 class sweep on #88): unreadable is
+			// not "no mutex" — a driver failure here must not be read as
+			// "nothing to clear" (which would look identical to a genuinely
+			// absent mutex) any more than it may be read as evidence the
+			// mutex IS stale. Skip this sweep pass; reconcile() runs again
+			// on the next poll and re-reads.
+			return;
+		}
 		if ( null === $raw ) {
 			return;
 		}
@@ -3603,13 +3658,22 @@ class Aura_Worker_Elementor_Door {
 	 */
 	private static function prune_counters( $now ) {
 		global $wpdb;
-		$oldest = (int) floor( ( (int) $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
-		$names  = $wpdb->get_col(
+		$oldest           = (int) floor( ( (int) $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		$wpdb->last_error = '';
+		$names            = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
 				$wpdb->esc_like( self::COUNTER_PREFIX ) . '%'
 			)
 		);
+		if ( '' !== (string) $wpdb->last_error ) {
+			// Ruling S37 (Codex round-15 class sweep on #88): `get_col()`
+			// answers its cleared `$last_result` — an empty array — for a
+			// statement that failed, indistinguishable from "nothing is
+			// expired". Skip this sweep pass rather than conclude that;
+			// reconcile()'s own PRUNE_INTERVAL_S gate tries again later.
+			return 0;
+		}
 		$expired = array();
 		foreach ( (array) $names as $name ) {
 			// The hour suffix, whatever counter name sits between it and the
@@ -3670,22 +3734,34 @@ class Aura_Worker_Elementor_Door {
 	 * non-numeric suffix, but a row that somehow did must be skipped rather
 	 * than miscounted.
 	 *
+	 * UNREADABLE IS NOT ZERO (Ruling S37, Codex round-15 class sweep on
+	 * #88): `get_results()` answers its cleared `$last_result` — an empty
+	 * array — for a statement that failed, indistinguishable from "no
+	 * events this name". `governor_block()`'s own `held_count`/`log_unacked`
+	 * fields already report `null` for exactly this reason (Rulings
+	 * P53/P57) — this joins them rather than inventing a fourth
+	 * convention for the SAME array.
+	 *
 	 * @param string   $name log_ungoverned|unobserved|hook_missed|unknown_ability.
 	 * @param int|null $now  Unix time; injected for tests.
-	 * @return int
+	 * @return int|null Null when this count could not be read.
 	 */
 	public static function count_30d( $name, $now = null ) {
 		global $wpdb;
-		$now    = null === $now ? time() : (int) $now;
-		$oldest = (int) floor( ( $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
-		$prefix = self::COUNTER_PREFIX . $name . '_h';
-		$rows   = $wpdb->get_results(
+		$now              = null === $now ? time() : (int) $now;
+		$oldest           = (int) floor( ( $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		$prefix           = self::COUNTER_PREFIX . $name . '_h';
+		$wpdb->last_error = '';
+		$rows             = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
 				$wpdb->esc_like( $prefix ) . '%'
 			),
 			ARRAY_A
 		);
+		if ( '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
 		$sum = 0;
 		foreach ( (array) $rows as $row ) {
 			if ( ! isset( $row['option_name'], $row['option_value'] ) ) {
@@ -3825,6 +3901,9 @@ class Aura_Worker_Elementor_Door {
 			'door'                => $door,
 			'held_count'          => $held,
 			'log_unacked'         => Aura_Worker_Door_Log::count_unacked(), // null when unreadable (Ruling P53)
+			// Ruling S37 (Codex round-15 class sweep on #88): null when
+			// THIS count could not be read — joining log_unacked/held_count
+			// above rather than reporting a false zero.
 			'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),
 			'unobserved_30d'      => self::count_30d( 'unobserved' ),
 			'hook_missed_30d'     => self::count_30d( 'hook_missed' ),

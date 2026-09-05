@@ -23,6 +23,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Aura_Worker_Door_Holds {
 
+	/**
+	 * @var bool Set by from_db()/raw_bytes() (Ruling S37, Codex round-15
+	 * class sweep on #88): did the MOST RECENT read fail to prove itself
+	 * (a driver error), rather than the option genuinely being absent?
+	 * Reset at the start of every such read — a per-call outcome, checked
+	 * by the caller immediately afterwards, before anything else in this
+	 * same request can issue a second read and overwrite it.
+	 */
+	private static $option_read_unreadable = false;
+
 	const HELD    = 'aura_worker_door_held_';
 	const CLAIMED = 'aura_worker_door_claimed_';
 	const TTL_S   = 604800;
@@ -129,6 +139,16 @@ class Aura_Worker_Door_Holds {
 			}
 			wp_cache_delete( self::LOCK, 'options' );
 			$raw = self::raw_bytes( self::LOCK );
+			if ( self::read_was_unreadable() ) {
+				// Ruling S37 (Codex round-15 class sweep on #88): ambiguous —
+				// this read cannot prove the lock vanished, only that it
+				// could not be read. Treated exactly like a lock that is
+				// there and not yet stale: back off and let the next
+				// iteration re-read, never race to take over a lock this
+				// call never actually proved gone.
+				usleep( 50000 );
+				continue;
+			}
 			if ( null === $raw ) {
 				continue; // the row vanished between the failed insert and this read
 			}
@@ -431,6 +451,15 @@ class Aura_Worker_Door_Holds {
 	public static function claim( $ref ) {
 		$ref  = self::clean( $ref );
 		$held = self::from_db( self::HELD . $ref );
+		if ( self::read_was_unreadable() ) {
+			// Ruling S37 (Codex round-15 class sweep on #88): a driver
+			// failure here used to read exactly like the hold being gone —
+			// `not_held()`'s 404, which Aura reads as "this approval no
+			// longer exists" and never asks about again. The hold is
+			// untouched (nothing above this point has written anything),
+			// so the honest answer is retryable, not a refusal.
+			return new WP_Error( 'aura_hold_failed', 'This site could not read its approval queue; the claim was not attempted — retry.', array( 'status' => 503, 'retry_after' => 5 ) );
+		}
 		if ( null === $held ) {
 			return self::not_held();
 		}
@@ -1434,15 +1463,45 @@ class Aura_Worker_Door_Holds {
 		return $out;
 	}
 
-	/** @param string $option Option. @return array|null the DATABASE's row. */
+	/**
+	 * UNREADABLE IS NOT ABSENT (Ruling S37, Codex round-15 class sweep on
+	 * #88): a driver failure and a genuinely missing row both used to
+	 * answer `null` here — indistinguishable to a caller like `claim()`,
+	 * which decided "not held" (a WP_Error the operator's approval never
+	 * comes back from) on either. The array|null contract stays exactly
+	 * as it was for every existing caller; `self::$option_read_unreadable`
+	 * carries the distinction ALONGSIDE it for the callers that must act
+	 * on ambiguity differently from absence — see `read_was_unreadable()`.
+	 *
+	 * @param string $option Option. @return array|null the DATABASE's row.
+	 */
 	private static function from_db( $option ) {
 		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		self::$option_read_unreadable = false;
+		$wpdb->last_error              = '';
+		$raw                            = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			self::$option_read_unreadable = true;
+			return null;
+		}
 		if ( null === $raw ) {
 			return null;
 		}
 		$val = maybe_unserialize( $raw );
 		return is_array( $val ) ? $val : null;
+	}
+
+	/**
+	 * Whether the MOST RECENT `from_db()`/`raw_bytes()` call could not
+	 * prove its read, rather than finding the row genuinely absent (Ruling
+	 * S37, Codex round-15 class sweep on #88). The caller must read this
+	 * immediately after — before anything else in this same request can
+	 * issue a second read and overwrite it.
+	 *
+	 * @return bool
+	 */
+	public static function read_was_unreadable() {
+		return self::$option_read_unreadable;
 	}
 
 	/**
@@ -1453,12 +1512,24 @@ class Aura_Worker_Door_Holds {
 	 * fence can only match the row this call actually read, never a fresher
 	 * one a racer already installed.
 	 *
+	 * UNREADABLE IS NOT ABSENT (Ruling S37, Codex round-15 class sweep on
+	 * #88): shares `self::$option_read_unreadable`/`read_was_unreadable()`
+	 * with `from_db()` — see that method's own docblock. `take_lock()`
+	 * consults it before ever treating a null answer here as "the row
+	 * vanished".
+	 *
 	 * @param string $option Option.
 	 * @return string|null
 	 */
 	private static function raw_bytes( $option ) {
 		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		self::$option_read_unreadable = false;
+		$wpdb->last_error              = '';
+		$raw                            = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			self::$option_read_unreadable = true;
+			return null;
+		}
 		return null === $raw ? null : (string) $raw;
 	}
 
