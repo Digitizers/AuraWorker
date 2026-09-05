@@ -1621,6 +1621,18 @@ class Aura_Worker_Door_Log {
 	 * the opposite is exactly what would silently lose writes on an engine
 	 * that cannot honour them.
 	 *
+	 * EXACT MATCH, NEVER `LIKE` (Ruling S23, Codex round-9 P2 on #88).
+	 * `SHOW TABLE STATUS LIKE '%s'` treats the pattern as a real MySQL LIKE
+	 * expression, in which `_` is a single-character WILDCARD and `%` is a
+	 * multi-character one — both of which appear in ordinary table names
+	 * (`wp_options` carries an unescaped `_`). Unescaped, that LIKE could
+	 * match a DIFFERENT table whose name merely has the same length with
+	 * any character standing in for the underscore (`wpXoptions`), and this
+	 * method would report — and cache for the whole request — THAT table's
+	 * engine instead of `wp_options`'s own. `WHERE Name = %s` is a plain
+	 * equality comparison: no metacharacters, no possibility of matching
+	 * anything but the exact table this method means to ask about.
+	 *
 	 * @return bool
 	 */
 	private static function engine_is_transactional() {
@@ -1629,7 +1641,7 @@ class Aura_Worker_Door_Log {
 		}
 		global $wpdb;
 		$wpdb->last_error = '';
-		$row    = $wpdb->get_row( $wpdb->prepare( 'SHOW TABLE STATUS LIKE %s', $wpdb->options ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
+		$row    = $wpdb->get_row( $wpdb->prepare( 'SHOW TABLE STATUS WHERE Name = %s', $wpdb->options ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
 		$engine = ( is_object( $row ) && isset( $row->Engine ) ) ? strtoupper( (string) $row->Engine ) : '';
 		self::$engine_transactional = ( '' === (string) $wpdb->last_error && 'INNODB' === $engine );
 		return self::$engine_transactional;

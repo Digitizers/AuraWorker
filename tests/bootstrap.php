@@ -2508,17 +2508,26 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return null;
 			}
 			// Aura_Worker_Door_Log::engine_is_transactional()'s own probe
-			// (Ruling S13, 2.16.2): SHOW TABLE STATUS LIKE 'wp_options'.
-			// Answers InnoDB by default — a test arms
-			// $GLOBALS['_sa_table_engine'] to model a different engine (or
-			// an unreadable answer, via $GLOBALS['_sa_wpdb_error'] above,
-			// which this branch never reaches).
-			if ( preg_match( "/^SHOW TABLE STATUS LIKE '([^']*)'$/", (string) $query, $m ) ) {
+			// (Ruling S13, 2.16.2; queried by EXACT name, never LIKE, as of
+			// Ruling S23, Codex round-9 P2 on #88 — see that method's own
+			// docblock for why LIKE was wrong). A real multi-table model:
+			// $GLOBALS['_sa_table_engines'] maps table name => engine, so a
+			// test can seed a DECOY table (e.g. 'wpXoptions', a single-char
+			// LIKE-wildcard collision with 'wp_options') on a DIFFERENT
+			// engine and prove the exact-match query is never confused by
+			// it — a table not in the map does not exist, matching what a
+			// real WHERE Name = … would answer for one (no row, not an
+			// error).
+			if ( preg_match( "/^SHOW TABLE STATUS WHERE Name = '([^']*)'$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
-				$engine                   = isset( $GLOBALS['_sa_table_engine'] ) ? (string) $GLOBALS['_sa_table_engine'] : 'InnoDB';
+				$name                     = stripslashes( $m[1] );
+				$engines                  = (array) ( $GLOBALS['_sa_table_engines'] ?? array() );
+				if ( ! array_key_exists( $name, $engines ) ) {
+					return null; // no such table
+				}
 				return (object) array(
-					'Name'   => stripslashes( $m[1] ),
-					'Engine' => $engine,
+					'Name'   => $name,
+					'Engine' => (string) $engines[ $name ],
 				);
 			}
 			// The one shape app_password_row_state() issues (#434 N1): the
@@ -4827,7 +4836,7 @@ function sa_reset_state(): void {
 		// transactional-engine answer.
 		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
 	}
-	$GLOBALS['_sa_table_engine'] = null; // engine_is_transactional()'s SHOW TABLE STATUS answer (Ruling S13); null ⇒ the stub's own InnoDB default.
+	$GLOBALS['_sa_table_engines'] = array( $GLOBALS['wpdb']->options => 'InnoDB' ); // engine_is_transactional()'s SHOW TABLE STATUS WHERE Name = ... answer (Rulings S13/S23) - a test adds more table names to model a decoy.
 	// Update-tool fixtures: a test that seeds these and forgets to clear them
 	// would otherwise leak into every later test's get_plugins()/
 	// get_core_updates()/wp_get_theme() stub, in place of the intended

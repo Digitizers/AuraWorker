@@ -1306,16 +1306,19 @@ final class DoorLogTest extends TestCase {
 
 	/**
 	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
-	 * `SHOW TABLE STATUS LIKE 'wp_options'` ONCE per request and caches the
-	 * answer — a second call must not re-issue the probe.
+	 * `SHOW TABLE STATUS WHERE Name = 'wp_options'` ONCE per request (an
+	 * EXACT match, never `LIKE` — Ruling S23, Codex round-9 P2 on #88, since
+	 * `_` in a LIKE pattern is a single-character wildcard that an ordinary
+	 * table name like `wp_options` already contains) and caches the answer
+	 * — a second call must not re-issue the probe.
 	 */
 	public function test_the_engine_detection_reads_show_table_status_once_and_caches_it(): void {
-		$GLOBALS['_sa_table_engine'] = 'MyISAM';
-		$GLOBALS['_db_queries']      = array();
+		$GLOBALS['_sa_table_engines'][ $GLOBALS['wpdb']->options ] = 'MyISAM';
+		$GLOBALS['_db_queries']                                    = array();
 
 		$first = Aura_Worker_Door_Log::bump_door_version();
 		$this->assertNull( $first, 'MyISAM is not transactional, so the read-back refuses to report a witness' );
-		$this->assertContains( "SHOW TABLE STATUS LIKE 'wp_options'", $GLOBALS['_db_queries'] );
+		$this->assertContains( "SHOW TABLE STATUS WHERE Name = 'wp_options'", $GLOBALS['_db_queries'] );
 
 		$probes = static function ( array $log ): int {
 			return count(
@@ -1332,6 +1335,33 @@ final class DoorLogTest extends TestCase {
 		Aura_Worker_Door_Log::bump_door_version();
 
 		$this->assertSame( $before_second_call, $probes( $GLOBALS['_db_queries'] ), 'checked once per request, then cached' );
+	}
+
+	/**
+	 * Ruling S23 (Codex round-9 P2 on #88): `SHOW TABLE STATUS LIKE
+	 * '%s'` treated the table name as a real MySQL LIKE pattern, in which
+	 * `_` is a single-character WILDCARD — and `wp_options` carries one,
+	 * unescaped. A decoy table whose name is the same length with any
+	 * other character standing in for that underscore (`wpXoptions`) would
+	 * therefore ALSO match, and if such a table happened to exist with a
+	 * different engine, this method could report — and cache for the whole
+	 * request — the DECOY's engine instead of `wp_options`'s own. The fix
+	 * queries `WHERE Name = %s`, a plain equality with no metacharacters:
+	 * this test seeds exactly that decoy, on the OPPOSITE (non-
+	 * transactional) engine from the real `wp_options`, and proves it is
+	 * never matched.
+	 */
+	public function test_the_engine_detection_is_never_confused_by_a_like_wildcard_collision(): void {
+		$decoy = 'wpXoptions'; // same length as 'wp_options', 'X' standing in for the LIKE-wildcard '_'
+		$GLOBALS['_sa_table_engines'][ $GLOBALS['wpdb']->options ] = 'InnoDB';
+		$GLOBALS['_sa_table_engines'][ $decoy ]                    = 'MyISAM';
+		$GLOBALS['_db_queries']                                    = array();
+
+		$out = Aura_Worker_Door_Log::bump_door_version();
+
+		$this->assertIsInt( $out, 'wp_options is InnoDB - the decoy engine must not have been matched instead' );
+		$this->assertContains( "SHOW TABLE STATUS WHERE Name = 'wp_options'", $GLOBALS['_db_queries'] );
+		$this->assertNotContains( "SHOW TABLE STATUS WHERE Name = '$decoy'", $GLOBALS['_db_queries'], 'production code only ever asks about its own table, by exact name' );
 	}
 
 	/**
