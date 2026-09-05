@@ -2552,7 +2552,154 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( 1, $out2['pruned_counters'] );
 	}
 
+	/**
+	 * Ruling S73 (Codex round-29 P2 on #88), the log_full finding: a
+	 * closed log's own `since`/`refused` fields were served but never
+	 * folded into ANY persisted identity — a wp_options RESTORE to an
+	 * older snapshot (an earlier `since`, a smaller `refused` count)
+	 * bumps no version of its own and passed the steady-state comparison
+	 * unnoticed, serving the restored `log_full` under an observation
+	 * that had already moved past it. `served_identity()`'s hashed
+	 * snapshot now includes `log_full` whole.
+	 */
+	public function test_a_restored_older_log_full_still_advances_the_observation(): void {
+		Aura_Worker_Door_Log::close();
+		Aura_Worker_Door_Log::bump_refused();
+		Aura_Worker_Door_Log::bump_refused();
+		Aura_Worker_Door_Log::bump_refused();
+
+		$baseline = $this->fragment();
+		$this->assertIsArray( $baseline['log_full'], 'the fixture assumption this test is built on' );
+		$this->assertSame( 3, $baseline['log_full']['refused'], 'the fixture assumption this test is built on' );
+		$v1 = $baseline['observation'];
+		$this->assertIsInt( $v1 );
+
+		// An older snapshot's own since/refused, written RAW — no version
+		// bump of its own, modelling a wp_options RESTORE landing on this
+		// exact pair of options. Neither option's own VALUE is an array
+		// (a date string, a bare int), so this writes the fixture store
+		// directly rather than through patchOption()'s array-merge shape.
+		$older_since = gmdate( 'c', time() - HOUR_IN_SECONDS );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::FULL_MARKER ] = $older_since;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::FULL_MARKER ]    = $older_since;
+		unset( $GLOBALS['_notoptions'][ Aura_Worker_Door_Log::FULL_MARKER ] );
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::FULL_COUNTER ] = 1;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::FULL_COUNTER ]    = '1';
+		unset( $GLOBALS['_notoptions'][ Aura_Worker_Door_Log::FULL_COUNTER ] );
+
+		$crossed = $this->fragment();
+		$this->assertSame( 1, $crossed['log_full']['refused'], 'the restored content is served' );
+		$this->assertNotNull( $crossed['observation'] );
+		$this->assertGreaterThan( $v1, $crossed['observation'], 'served under a witness strictly greater than the pre-restore poll' );
+
+		$again = $this->fragment();
+		$this->assertSame( $crossed['observation'], $again['observation'], 'the restored content is already recorded — a repeat serve does not bump again' );
+	}
+
+	/**
+	 * Ruling S73 (Codex round-29 P2 on #88), the held_count finding: a
+	 * claim too young for either of partition_stale_claims()'s own
+	 * buckets (`running`/`stale`) is invisible to BOTH — yet
+	 * `governor_block()`'s own `held_count` counts it regardless (it
+	 * merges the FULL claimed set, any age). A wp_options RESTORE (or any
+	 * raw write) adding or removing such a young claim bumps no version
+	 * of its own and was invisible to every persisted identity before
+	 * this ruling. `partition_stale_claims()`'s own `'all'` key now feeds
+	 * `served_identity()`'s hashed snapshot too.
+	 */
+	public function test_a_young_claim_added_raw_still_advances_the_observation(): void {
+		$ref1 = $this->hold();
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref1 ) );
+
+		$baseline = $this->fragment();
+		$this->assertNotNull( $baseline['observation'] );
+		$v1 = $baseline['observation'];
+		$block1 = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 1, $block1['held_count'], 'the fixture assumption this test is built on' );
+
+		// A second, YOUNG claim — freshly claimed_at, so partition_stale_claims()
+		// puts it in neither running nor stale — written RAW, no version
+		// bump of its own, modelling a concurrent claim() (or a restore).
+		$binding = Aura_Worker_Door_Log::binding();
+		$this->assertIsString( $binding );
+		$ref2 = 'door_' . wp_generate_uuid4();
+		$this->patchOption(
+			Aura_Worker_Door_Holds::CLAIMED . $ref2,
+			array(
+				'ref'        => $ref2,
+				'binding'    => $binding,
+				'ability'    => 'elementor/publish-document',
+				'input'      => array(),
+				'touches'    => array(),
+				'actor'      => array( 'user_id' => 3, 'login' => 'bot' ),
+				'verdict'    => 'none',
+				'rule'       => null,
+				'created_at' => gmdate( 'c' ),
+				'claimed_at' => gmdate( 'c' ), // fresh — young, not stale
+			)
+		);
+
+		$crossed = $this->fragment();
+		$this->assertNotNull( $crossed['observation'] );
+		$this->assertGreaterThan( $v1, $crossed['observation'], 'served under a witness strictly greater than the pre-claim poll' );
+		$block2 = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 2, $block2['held_count'], 'the young claim is counted' );
+		$this->assertGreaterThan( $v1, $block2['observation'] );
+
+		$again = $this->fragment();
+		$this->assertSame( $crossed['observation'], $again['observation'], 'the young claim is already recorded — a repeat serve does not bump again' );
+	}
+
+	/**
+	 * Ruling S73 (Codex round-29 P2 on #88), mechanism: `served_identity()`
+	 * strips the excluded fields BEFORE hashing — a change confined to
+	 * one of them must never look like a different identity. Tested
+	 * directly on the primitive (PHP 7.4 compat: ReflectionMethod, not
+	 * the 8.1+ first-class-callable syntax), the same idiom this file
+	 * already uses for other private static helpers.
+	 */
+	public function test_served_identity_ignores_the_excluded_fields(): void {
+		$m = new ReflectionMethod( Aura_Worker_Elementor_Door::class, 'served_identity' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		$base = array(
+			'held'                => array( 'ref1' => array( 'a' => 1 ) ),
+			'observation'         => 1,
+			'counters_as_of'      => 'x',
+			'log_ungoverned_30d'  => 1,
+			'unobserved_30d'      => 2,
+			'hook_missed_30d'     => 3,
+			'unknown_ability_30d' => 4,
+			'held_unreadable'     => false,
+			'log_top_unreadable'  => false,
+		);
+		$changed                          = $base;
+		$changed['observation']           = 999;
+		$changed['counters_as_of']        = 'y';
+		$changed['log_ungoverned_30d']    = 100;
+		$changed['unobserved_30d']        = 200;
+		$changed['hook_missed_30d']       = 300;
+		$changed['unknown_ability_30d']   = 400;
+		$changed['held_unreadable']       = true;
+		$changed['log_top_unreadable']    = true;
+
+		$this->assertSame(
+			$m->invoke( null, $base ),
+			$m->invoke( null, $changed ),
+			'every excluded field changing leaves the identity unchanged'
+		);
+
+		$changed['held'] = array( 'ref1' => array( 'a' => 2 ) );
+		$this->assertNotSame(
+			$m->invoke( null, $base ),
+			$m->invoke( null, $changed ),
+			'a real (non-excluded) field changing DOES change the identity'
+		);
+	}
+
 	private function seedBucket( string $name, int $hour, int $value ): void {
+
 		$option                          = 'aura_worker_door_c_' . $name . '_h' . $hour;
 		$GLOBALS['_rows'][ $option ]    = (string) $value;
 		$GLOBALS['_options'][ $option ] = (string) $value;

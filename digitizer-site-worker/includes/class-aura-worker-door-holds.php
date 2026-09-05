@@ -1367,16 +1367,22 @@ class Aura_Worker_Door_Holds {
 	 * calls this method directly instead of them.
 	 *
 	 * @param int $ms Age bound in milliseconds.
-	 * @return array{ stale: array[], running: array[] } Both keyed by ref,
-	 *         from the exact SAME read and the exact SAME lease check per
-	 *         row — a ref can never appear in both, or in neither, because
-	 *         its lease moved between two answers this method never took
-	 *         twice.
+	 * @return array{ stale: array[], running: array[], all: array[] } `stale`
+	 *         and `running` keyed by ref, from the exact SAME read and the
+	 *         exact SAME lease check per row — a ref can never appear in
+	 *         both, or in neither, because its lease moved between two
+	 *         answers this method never took twice. `all` (Ruling S73,
+	 *         Codex round-29 P2 on #88) is the SAME read's own raw claimed
+	 *         map, EVERY ref regardless of age — a claim too young for
+	 *         either bucket above (still "just in progress") still counts
+	 *         toward `Aura_Worker_Elementor_Door::governor_block()`'s own
+	 *         `held_count`, so a caller building that fingerprint needs
+	 *         this too, from the SAME scan, never a second one.
 	 */
 	public static function partition_stale_claims( $ms ) {
 		$cut  = time() - (int) floor( (int) $ms / 1000 );
 		$cap  = time() - self::LEASE_HARD_CAP_S;
-		$out  = array( 'stale' => array(), 'running' => array() );
+		$out  = array( 'stale' => array(), 'running' => array(), 'all' => array() );
 		$rows = self::rows( self::CLAIMED );
 		if ( null === $rows ) {
 			// Ruling S44 (Codex round-18 P2 on #88): a transient failure
@@ -1387,6 +1393,7 @@ class Aura_Worker_Door_Holds {
 			// rest of this attempt: see the property's own docblock.
 			self::$claimed_queue_unreadable_this_attempt = true;
 		}
+		$out['all'] = (array) $rows;
 		foreach ( (array) $rows as $ref => $row ) { // null ⇒ nothing stale (Ruling P57) — see also claimed_queue_was_unreadable_this_attempt()
 			if ( ! ( strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) ) <= $cut ) ) {
 				continue; // young: not stale, and not "running" either — just in progress
