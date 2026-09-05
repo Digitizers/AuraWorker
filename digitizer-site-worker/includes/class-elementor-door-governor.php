@@ -475,12 +475,31 @@ class Aura_Worker_Elementor_Door {
 				// build_status_fragment_state() too, so neither disagrees
 				// with the other about which claims are running right now,
 				// and this attempt never reads the claimed queue twice.
-				$running_now = Aura_Worker_Door_Holds::running_claims( self::CLAIM_STALE_MS );
+				//
+				// Ruling S52 (Codex round-20 P2 on #88): `running` and
+				// `interrupted` used to come from TWO separate calls —
+				// running_claims() and stale_unleased_claims() — each its
+				// OWN fresh scan of the claimed queue and its OWN fresh
+				// lease check per row. A lease released (or taken) between
+				// those two calls put the same ref on BOTH sides, or on
+				// NEITHER: `build_status_fragment_state()` would then
+				// report a ref as both running and interrupted at once (or
+				// silently drop it from both), certified under a
+				// perfectly ordinary, non-null `observation` — nothing
+				// about that scenario looks torn to `version_bracketed()`,
+				// because nothing here bumps the version for a lease
+				// changing. `partition_stale_claims()` is now called
+				// EXACTLY ONCE and its single snapshot feeds both arrays —
+				// ONE scan, ONE lease check per row, so a ref's SIDE is
+				// decided once and reported consistently, whichever side
+				// that turns out to be.
+				$claim_partition  = Aura_Worker_Door_Holds::partition_stale_claims( self::CLAIM_STALE_MS );
+				$running_now      = $claim_partition['running'];
 				// Ruling S46 (Codex round-19, S45 class): the SAME
 				// shape, for `interrupted` and `held` — read ONCE, here,
 				// before sync_computed_state() needs their identities and
 				// before build_status_fragment_state() reports them.
-				$interrupted_now = Aura_Worker_Door_Holds::stale_unleased_claims( self::CLAIM_STALE_MS );
+				$interrupted_now = $claim_partition['stale'];
 				$held_identity   = Aura_Worker_Door_Holds::held_identity();
 				// Ruling S22 (Codex round-9 P2 on #88): a COMPUTED
 				// transition — Elementor deactivating, the coverage seam

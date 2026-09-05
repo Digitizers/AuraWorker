@@ -234,6 +234,46 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S52 (Codex round-20 P2 on #88): `running` and `interrupted`
+	 * used to come from TWO separate calls -- running_claims() then
+	 * stale_unleased_claims() -- each its OWN fresh scan of the claimed
+	 * queue and its OWN fresh lease check per row. A lease released
+	 * between those two calls put the SAME ref on BOTH sides at once,
+	 * certified under a perfectly ordinary observation -- nothing about a
+	 * lease changing bumps the door version, so version_bracketed() never
+	 * saw this as torn. status_fragment() now reads
+	 * Aura_Worker_Door_Holds::partition_stale_claims() exactly ONCE per
+	 * attempt, so a single read's own lease check can never disagree with
+	 * itself.
+	 */
+	public function test_a_lease_change_never_leaves_the_same_claim_running_and_interrupted_at_once(): void {
+		$ref = $this->hold();
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) ); // fresh — NOT backdated
+		$lease = Aura_Worker_Door_Holds::lease_name( $ref );
+		$GLOBALS['_sa_named_locks'][ $lease ] = true;
+
+		$young = $this->fragment();
+		$this->assertSame( array(), $young['running'], 'the fixture assumption this test is built on — too young to be running yet' );
+
+		// The clock advances past CLAIM_STALE_MS — nothing else mutates.
+		$this->patchOption( Aura_Worker_Door_Holds::CLAIMED . $ref, array( 'claimed_at' => $this->longAgo() ) );
+		// Ruling S52's own regression: the lease self-releases the INSTANT
+		// after its FIRST read this poll — modelling exactly the race two
+		// SEPARATE scans (the pre-S52 running_claims()/
+		// stale_unleased_claims() call pair) used to open.
+		$GLOBALS['_sa_lease_release_after_check'][ $lease ] = true;
+
+		$crossed = $this->fragment();
+
+		$running_refs     = array_column( $crossed['running'], 'ref' );
+		$interrupted_refs = array_column( $crossed['interrupted'], 'ref' );
+		$this->assertFalse(
+			in_array( $ref, $running_refs, true ) && in_array( $ref, $interrupted_refs, true ),
+			'ONE scan, ONE lease check per row (Ruling S52): the same ref must never be reported on BOTH sides from a single read'
+		);
+	}
+
+	/**
 	 * Ruling S45 (Codex round-18 P2 on #88): a claim enters `running`
 	 * SOLELY by its own `claimed_at` crossing CLAIM_STALE_MS — no
 	 * mutation, no version bump of its own — so the fragment used to

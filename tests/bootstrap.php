@@ -2338,10 +2338,30 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					$this->last_error = 'no such function';
 					return null;
 				}
+				$held = ! empty( $GLOBALS['_sa_named_locks'][ $name ] );
+				// Ruling S52 (Codex round-20 P2 on #88): models a lease
+				// that FLIPS on every read this name is armed for — a
+				// test's only lever to prove two SEPARATE reads of the
+				// SAME ref's lease can disagree with EACH OTHER (the race
+				// two separate running_claims()/stale_unleased_claims()
+				// calls used to open), while a SINGLE read inside
+				// partition_stale_claims() never can. Alternates FOREVER
+				// once armed, not just once — a version_bracketed() retry
+				// re-reads from scratch, and the bug this models must
+				// still be there to find on attempt 2 exactly as it was on
+				// attempt 1, or a retry born of the SAME lease churn could
+				// coincidentally "fix" the very race being tested.
+				if ( ! empty( $GLOBALS['_sa_lease_release_after_check'][ $name ] ) ) {
+					if ( $held ) {
+						unset( $GLOBALS['_sa_named_locks'][ $name ] );
+					} else {
+						$GLOBALS['_sa_named_locks'][ $name ] = true;
+					}
+				}
 				// A connection id when held; NULL when free — the same shape,
 				// which is why production consults last_error to tell a free
 				// lock from a broken statement.
-				return empty( $GLOBALS['_sa_named_locks'][ $name ] ) ? null : '77';
+				return $held ? '77' : null;
 			}
 			// The liveness probe Aura_Worker_Health::check_db_connection() issues.
 			// A reachable database answers '1' — a string, which is what the
@@ -3723,6 +3743,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_lease_release_after_check'] = array(); // a lease that FLIPS on every read, forever, once armed for a name (Ruling S52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).
@@ -5001,6 +5022,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_lease_release_after_check'] = array(); // a lease that FLIPS on every read, forever, once armed for a name (Ruling S52).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
 	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).

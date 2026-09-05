@@ -1152,10 +1152,21 @@ class Aura_Worker_Door_Holds {
 	 * alone. A claim younger than the bound is in neither — it is simply not
 	 * old enough to be anybody's business yet.
 	 *
+	 * PUBLIC as of Ruling S52 (Codex round-20 P2 on #88): ONE snapshot, ONE
+	 * scan, ONE lease check per row, for a caller that needs BOTH sides
+	 * together — see `stale_unleased_claims()`/`running_claims()`'s own
+	 * docblocks for the race two SEPARATE calls (each its own fresh scan)
+	 * used to open, and `status_fragment()`'s own call site for why it now
+	 * calls this method directly instead of them.
+	 *
 	 * @param int $ms Age bound in milliseconds.
-	 * @return array{ stale: array[], running: array[] } Both keyed by ref.
+	 * @return array{ stale: array[], running: array[] } Both keyed by ref,
+	 *         from the exact SAME read and the exact SAME lease check per
+	 *         row — a ref can never appear in both, or in neither, because
+	 *         its lease moved between two answers this method never took
+	 *         twice.
 	 */
-	private static function partition_stale_claims( $ms ) {
+	public static function partition_stale_claims( $ms ) {
 		$cut  = time() - (int) floor( (int) $ms / 1000 );
 		$cap  = time() - self::LEASE_HARD_CAP_S;
 		$out  = array( 'stale' => array(), 'running' => array() );
