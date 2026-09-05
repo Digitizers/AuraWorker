@@ -3738,6 +3738,40 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				}
 				return 1;
 			}
+			// Aura_Worker_Door_Log::restamp_observation_forward()'s own
+			// upsert (Ruling S82/S83, 2.16.2): the SAME create-or-increment
+			// shape as bump_door_version()'s own statement just above, but
+			// with ONE more clock-floor term — the caller's own capped
+			// `$seen + 1` (a plain %d — Ruling S83 already proved this
+			// value can never approach PHP_INT_MAX, so it is safe as a
+			// genuine PHP int, unlike the %s-bound clock string above,
+			// which Ruling S7 still requires stay text). No
+			// LAST_INSERT_ID() wrapping here — this method's own caller
+			// never reads a per-connection witness back (its own docblock:
+			// every outcome is treated identically), so the simpler
+			// three-way GREATEST alone is what production actually issues.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', GREATEST\(1, (\d+), '(\d+)'\), 'no'\) ON DUPLICATE KEY UPDATE option_value = GREATEST\(CAST\(option_value AS UNSIGNED\) \+ 1, (\d+), '(\d+)'\)$/", $query, $m ) ) {
+				$name      = stripslashes( $m[1] );
+				$seen_plus = (int) $m[2]; // == $m[4] -- the SAME capped $seen + 1 bound into both clauses
+				$clock     = (int) $m[3]; // == $m[5] -- the SAME clock string bound into both clauses
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( null ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						$this->last_error = 'write failed';
+						return false;
+					}
+				}
+				$current                      = isset( $GLOBALS['_rows'][ $name ] ) ? (int) $GLOBALS['_rows'][ $name ] : 0;
+				$next                         = max( $current + 1, $seen_plus, $clock );
+				$GLOBALS['_rows'][ $name ]    = (string) $next;
+				$GLOBALS['_options'][ $name ] = (string) $next;
+				return 1;
+			}
 			// The conditional DELETE a magic-link claim release issues: the row
 			// goes only while it still carries THIS handler's fence, so a
 			// double release can never remove somebody else's claim.

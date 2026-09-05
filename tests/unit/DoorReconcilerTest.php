@@ -2549,6 +2549,71 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( $current, Aura_Worker_Door_Log::door_version_raw() );
 	}
 
+	/**
+	 * Ruling S83 (Codex round-34 P1 on #88): `door_observation_seen =
+	 * PHP_INT_MAX - 1` (accepted by the PRE-ruling validator) made
+	 * `restamp_observation_forward()`'s own `$seen + 1` reach exactly
+	 * PHP_INT_MAX -- a value that then floats through a `%d` placeholder
+	 * uncontrolled the moment anything adds to it again. The route's own
+	 * REST arg `validate_callback` now refuses anything at or above
+	 * `Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN` outright, through the
+	 * REAL registered route (`sa_dispatch_route()`, never the handler
+	 * called directly) -- arg validation runs BEFORE the permission
+	 * callback, so this refusal needs no authenticated request at all.
+	 */
+	public function test_door_observation_seen_at_php_int_max_minus_one_is_refused_with_400(): void {
+		$this->fragment(); // establishes a real baseline
+		$epoch   = Aura_Worker_Door_Log::epoch();
+		$current = Aura_Worker_Door_Log::door_version_raw();
+
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', PHP_INT_MAX - 1 );
+		$resp = sa_dispatch_route( $req );
+
+		$this->assertSame( 400, $resp->get_status() );
+		$this->assertSame( 'aura_invalid_param', $resp->get_data()['code'] );
+		$this->assertSame( $current, Aura_Worker_Door_Log::door_version_raw(), 'refused before the handler -- let alone restamp_observation_forward() -- is ever reached; the version is completely untouched' );
+	}
+
+	/** The other named value, the same ruling: PHP_INT_MAX itself. */
+	public function test_door_observation_seen_at_php_int_max_is_refused_with_400(): void {
+		$this->fragment();
+		$epoch   = Aura_Worker_Door_Log::epoch();
+		$current = Aura_Worker_Door_Log::door_version_raw();
+
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', PHP_INT_MAX );
+		$resp = sa_dispatch_route( $req );
+
+		$this->assertSame( 400, $resp->get_status() );
+		$this->assertSame( 'aura_invalid_param', $resp->get_data()['code'] );
+		$this->assertSame( $current, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/**
+	 * The other half of Ruling S83: the cap refuses only what is
+	 * ACTUALLY above it -- an ordinary, legitimate value slightly above
+	 * what this site can currently prove is honoured exactly as Ruling
+	 * S82 already established, undisturbed by the new ceiling.
+	 */
+	public function test_door_observation_seen_slightly_above_current_is_still_honoured(): void {
+		$this->fragment();
+		$epoch   = Aura_Worker_Door_Log::epoch();
+		$current = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertIsInt( $current, 'the fixture assumption this test is built on' );
+
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', $current + 1 );
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
+
+		$this->assertIsInt( $door['observation'] );
+		$this->assertGreaterThan( $current + 1, $door['observation'], 'Ruling S82: honoured exactly as before -- the S83 cap does not interfere with an ordinary, in-range value' );
+		$this->assertGreaterThan( $current + 1, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (k) a claim whose entry cannot be written is KEPT                   */
 	/* ------------------------------------------------------------------ */

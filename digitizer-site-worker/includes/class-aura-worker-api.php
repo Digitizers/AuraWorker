@@ -110,13 +110,35 @@ class Aura_Worker_API {
 				// Aura_Worker_Elementor_Door::maybe_restamp_observation_forward()'s
 				// own docblock for the whole-DB-restore hole this closes
 				// and why only Aura's own record can name it.
+				//
+				// Ruling S83 (Codex round-34 P1 on #88): CAPPED at
+				// Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN, never
+				// merely "a non-negative integer" — an UNCAPPED
+				// `PHP_INT_MAX - 1` (which the pre-ruling check above
+				// happily accepted) made `restamp_observation_forward()`'s
+				// own `$seen + 1` overflow a 64-bit int into a FLOAT,
+				// which then floated straight through a `%d` placeholder
+				// in `$wpdb->prepare()` uncontrolled — pinning every
+				// LATER version this site could ever report. A custom
+				// `aura_invalid_param` WP_Error (never a bare `false`,
+				// which core would answer with its own generic
+				// `rest_invalid_param`) names the actual reason plainly.
 				'door_observation_seen' => array(
 					'required'          => false,
 					'type'              => 'integer',
 					'validate_callback' => function( $value ) {
-						return null === $value || ( is_numeric( $value ) && (int) $value == $value && (int) $value >= 0 ); // phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
+						if ( null === $value ) {
+							return true;
+						}
+						if ( ! is_numeric( $value ) || (int) $value != $value || (int) $value < 0 ) { // phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
+							return new WP_Error( 'aura_invalid_param', 'door_observation_seen must be a non-negative integer.', array( 'status' => 400 ) );
+						}
+						if ( (int) $value >= Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN ) {
+							return new WP_Error( 'aura_invalid_param', 'door_observation_seen exceeds the maximum accepted value.', array( 'status' => 400 ) );
+						}
+						return true;
 					},
-					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — a non-negative integer. When it EXCEEDS this site's current door version under that SAME epoch, the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored when it is not greater than the current version, or when `door_epoch` does not name this site's CURRENT epoch.", 'digitizer-site-worker' ),
+					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — a non-negative integer, capped at Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN (2^62). When it EXCEEDS this site's current door version under that SAME epoch, the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored (never honoured, never a bump) when it is not greater than the current version, or when `door_epoch` does not name this site's CURRENT epoch. A value above the cap is refused outright with a 400 `aura_invalid_param`, never honoured.", 'digitizer-site-worker' ),
 				),
 			),
 		) );

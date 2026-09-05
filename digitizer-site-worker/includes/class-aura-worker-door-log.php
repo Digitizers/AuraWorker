@@ -114,6 +114,31 @@ class Aura_Worker_Door_Log {
 	 */
 	const OBSERVATION  = 'aura_worker_door_observation';
 	/**
+	 * Ruling S83 (Codex round-34 P1 on #88): the ceiling
+	 * `restamp_observation_forward()` (and the `/status` route's own
+	 * `door_observation_seen` REST arg validator) refuses ABOVE — never
+	 * PHP_INT_MAX itself, which `$seen + 1` can overflow past on a
+	 * 64-bit build (integer arithmetic overflowing to a FLOAT, which
+	 * then floats straight through a `%d` placeholder in
+	 * `$wpdb->prepare()` uncontrolled), and never merely "large", which
+	 * would leave headroom too thin to reason about by inspection.
+	 *
+	 * 2^62 (4,611,686,018,427,387,904) — half of PHP_INT_MAX's own range
+	 * on a 64-bit build (2^63 - 1), so `$seen + 1` can never approach,
+	 * let alone reach, PHP_INT_MAX no matter how this constant is used.
+	 * Checked against the OTHER floor `restamp_observation_forward()`
+	 * already applies — the µs wall-clock value
+	 * `bump_door_version_write()`'s own clock floor produces, currently
+	 * ~1.7e15 (17 digits) and growing by roughly one digit every 3200
+	 * years — this ceiling (19 digits) sits more than three decimal
+	 * orders of magnitude above it: no legitimate clock-derived value
+	 * this millennium is anywhere near this cap, so no real
+	 * `door_observation_seen` Aura could ever legitimately send is
+	 * refused by it.
+	 */
+	const MAX_OBSERVATION_SEEN = 4611686018427387904; // 2^62
+
+	/**
 	 * The DURABLE commit witness `versioned()` writes inside its own
 	 * transaction, before the version bump (Ruling S30, Codex round-13 P1;
 	 * PER-TRANSACTION as of Ruling S32, Codex round-14 P1 — both on #88) —
@@ -2297,22 +2322,40 @@ class Aura_Worker_Door_Log {
 	 * which callers already invoke from INSIDE their own open
 	 * transaction and therefore cannot re-wrap.
 	 *
+	 * REFUSES AT OR ABOVE `MAX_OBSERVATION_SEEN` (Ruling S83, Codex
+	 * round-34 P1 on #88), belt-and-braces: the `/status` route's own
+	 * `door_observation_seen` REST arg `validate_callback` already
+	 * refuses anything above that cap with a `400` before this method is
+	 * ever reached in production — but this is a PUBLIC method, and the
+	 * cap is checked HERE too, before `$seen + 1` is ever computed, so no
+	 * caller (present or future) can reach the unchecked arithmetic that
+	 * let `$seen + 1` overflow a 64-bit int into a float and float
+	 * straight through this query's `%d` placeholders uncontrolled.
+	 * Refuses PLAINLY — no write attempted, no `versioned()` unit even
+	 * opened — with the exact same `{ committed: false }` shape a caller
+	 * already treats identically to "nothing happened" on any other
+	 * refusal path.
+	 *
 	 * @param int $seen A non-negative observation AURA has already
 	 *                   accepted for the door epoch this call concerns —
-	 *                   validated non-negative by the caller (the REST
-	 *                   arg's own `validate_callback`); clamped to zero
-	 *                   here regardless, defensively.
+	 *                   validated non-negative (and, since Ruling S83,
+	 *                   capped) by the caller (the REST arg's own
+	 *                   `validate_callback`); clamped to zero here
+	 *                   regardless, defensively.
 	 * @return array{ committed: bool|null } versioned()'s own outcome
 	 *              shape — the caller (`Aura_Worker_Elementor_Door`'s own
 	 *              `maybe_restamp_observation_forward()`) does not act
 	 *              differently on any of the three outcomes: an
-	 *              ambiguous or failed restamp simply means the version
-	 *              this poll serves may still be stale, exactly as if
-	 *              this call had never been made — the NEXT poll
+	 *              ambiguous, refused or failed restamp simply means the
+	 *              version this poll serves may still be stale, exactly
+	 *              as if this call had never been made — the NEXT poll
 	 *              carrying the same `$observation_seen` tries again.
 	 */
 	public static function restamp_observation_forward( $seen ) {
 		$seen = max( 0, (int) $seen );
+		if ( $seen >= self::MAX_OBSERVATION_SEEN ) {
+			return array( 'committed' => false );
+		}
 		return self::versioned(
 			function () use ( $seen ) {
 				global $wpdb;

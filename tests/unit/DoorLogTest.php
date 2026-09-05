@@ -926,6 +926,31 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S83 (Codex round-34 P1 on #88): a `door_observation_seen` at
+	 * or above `MAX_OBSERVATION_SEEN` made `$seen + 1` overflow a 64-bit
+	 * int into a FLOAT, which then floated straight through this query's
+	 * `%d` placeholders uncontrolled -- the `/status` route's own REST
+	 * arg validator refuses this before the handler is ever reached, but
+	 * this PUBLIC method refuses it too, belt-and-braces, for any caller
+	 * that reaches it directly.
+	 */
+	public function test_restamp_observation_forward_refuses_at_or_above_the_cap(): void {
+		$before = Aura_Worker_Door_Log::bump_door_version();
+
+		$at_cap   = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN );
+		$php_max  = Aura_Worker_Door_Log::restamp_observation_forward( PHP_INT_MAX );
+
+		$this->assertFalse( $at_cap['committed'], 'refused plainly at the cap itself -- never merely "large"' );
+		$this->assertFalse( $php_max['committed'], 'PHP_INT_MAX refused outright -- never an overflowing $seen + 1' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'no write attempted -- the version this site holds is completely untouched' );
+
+		// One below the cap is honoured exactly as this method always has.
+		$under_cap = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 1 );
+		$this->assertTrue( $under_cap['committed'] );
+		$this->assertGreaterThan( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 1, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/**
 	 * The clock floor applies even to a row that has NEVER existed (Ruling
 	 * S4): the first-ever bump on a fresh site still answers the clock
 	 * value, not a bare `1` — a value any restored backup could trivially
