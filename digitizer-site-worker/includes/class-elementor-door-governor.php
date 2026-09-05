@@ -551,7 +551,7 @@ class Aura_Worker_Elementor_Door {
 				// (Rulings S24/S26), so the SECOND attempt finds its own
 				// write already there, persists nothing further, and the
 				// bracket closes clean.
-				$synced = self::sync_computed_state( $rewind_info['rewind'], $running_now, $interrupted_now, $held_identity );
+				$synced = self::sync_computed_state( $rewind_info['rewind'], $running_now, $interrupted_now, $held_snapshot );
 				if ( ! $synced ) {
 					self::mark_unreadable( 'computed' ); // Ruling S24/S58: the transition itself could not be committed
 				}
@@ -847,22 +847,65 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * A claim SET's own IDENTITY, for `sync_computed_state()`'s own
-	 * comparison (Ruling S45, Codex round-18 P2 on #88; generalised to
-	 * `interrupted` too by Ruling S46, Codex round-19): every ref in
-	 * `running_claims()`'s or `stale_unleased_claims()`'s own answer,
-	 * sorted so the SAME set always serialises the same way regardless of
-	 * which order the underlying scan happened to return them in.
+	 * One claim row, in the EXACT shape `build_status_fragment_state()`
+	 * serves it (Ruling S71, Codex round-28 P2 on #88) — the SAME
+	 * transformation `sync_computed_state()`'s own fingerprint is computed
+	 * over, so the two can never drift: whatever is fingerprinted for the
+	 * persisted identity comparison is EXACTLY what a caller goes on to
+	 * serve moments later in the same attempt.
 	 *
-	 * @param array $claims_now `Aura_Worker_Door_Holds::running_claims()`'s
-	 *                           or `stale_unleased_claims()`'s own return,
-	 *                           keyed by ref.
-	 * @return string[]
+	 * @param string $ref   The claim's ref.
+	 * @param array  $claim The raw claimed row (`partition_stale_claims()`'s
+	 *                       own entry for it).
+	 * @return array{ ref: string, claimed_at: string }
 	 */
-	private static function claim_ref_identity( array $claims_now ) {
-		$refs = array_map( 'strval', array_keys( $claims_now ) );
-		sort( $refs, SORT_STRING );
-		return $refs;
+	private static function served_claim_row( $ref, array $claim ) {
+		return array(
+			'ref'        => (string) $ref,
+			'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
+		);
+	}
+
+	/**
+	 * A deterministic fingerprint over a served collection's own CONTENT
+	 * (Ruling S71, Codex round-28 P2 on #88) — sha1 over sorted
+	 * `ref|sha1(canonical row JSON)` tuples, hashed as ONE string.
+	 * Generalises `Aura_Worker_Door_Log::log_shape_raw()`'s own per-row
+	 * fingerprint (Ruling S64) from log rows to every OTHER collection
+	 * `sync_computed_state()` folds an identity for: WHAT IS SERVED IS
+	 * WHAT IS IDENTIFIED. A ref-only identity (Rulings S45/S46, this
+	 * method's own predecessor `claim_ref_identity()`) catches a ref
+	 * entering or leaving a set, but not that ref's OWN row content
+	 * changing while it stays put — a held row's `touches` rewritten by
+	 * `refresh_touches()`, its `verdict`/`rule` rewritten by
+	 * `refresh_rule()`, or (in principle) a claim's own `claimed_at` —
+	 * none of which mutate anything the door version's own bump already
+	 * covers, since none of them are new WRITES this fold did not already
+	 * exist to catch for the ref-entering-or-leaving case. A wp_options
+	 * RESTORE landing on the SAME set of refs, with OLDER row content,
+	 * passed the ref-only comparison and served the restored details
+	 * under an observation that had already moved past them — the SAME
+	 * hole Ruling S61 closed for log rows, generalised here to every
+	 * other served collection.
+	 *
+	 * @param array<string,array> $rows_by_ref Ref => the EXACT row this
+	 *                                          attempt is about to SERVE
+	 *                                          for that ref — never the
+	 *                                          raw held/claimed row when
+	 *                                          the served shape differs
+	 *                                          from it (see
+	 *                                          `served_claim_row()` and
+	 *                                          `Aura_Worker_Door_Holds::held_snapshot()`'s
+	 *                                          own `'listing'`).
+	 * @return string
+	 */
+	private static function served_fingerprint( array $rows_by_ref ) {
+		$tuples = array();
+		foreach ( $rows_by_ref as $ref => $row ) {
+			$tuples[] = $ref . '|' . sha1( (string) wp_json_encode( $row ) );
+		}
+		sort( $tuples, SORT_STRING );
+		return sha1( implode( "\n", $tuples ) );
 	}
 
 	/**
@@ -978,12 +1021,18 @@ class Aura_Worker_Elementor_Door {
 	 *                                      own return, the SAME shape as
 	 *                                      `$running_now` (Ruling S46,
 	 *                                      Codex round-19, S45 class).
-	 * @param string[]|null $held_identity `Aura_Worker_Door_Holds::held_identity()`'s
-	 *                                      own return — already sorted
-	 *                                      refs, read ONCE by the caller
-	 *                                      (Ruling S46) — or null when
-	 *                                      the held queue could not be
-	 *                                      read.
+	 * @param array $held_snapshot `Aura_Worker_Door_Holds::held_snapshot()`'s
+	 *                              own return — `{identity, listing}` —
+	 *                              read ONCE by the caller (Ruling S69)
+	 *                              and handed here whole: `identity`
+	 *                              (already-sorted refs, or null when the
+	 *                              held queue could not be read) for the
+	 *                              held_count-facing transition detection
+	 *                              Ruling S46 already established, and
+	 *                              `listing` for the SERVED-content
+	 *                              fingerprint Ruling S71 adds — see this
+	 *                              method's own `'held_served'` key
+	 *                              below.
 	 * @return bool True when the current computed tuple is either UNCHANGED
 	 *              from what is persisted (nothing to version), or this
 	 *              call's OWN write won its fence and was COMMITTED —
@@ -998,41 +1047,80 @@ class Aura_Worker_Elementor_Door {
 	 *              and the caller must serve `observation: null` alongside
 	 *              it.
 	 */
-	private static function sync_computed_state( $rewind = null, array $running_now = array(), array $interrupted_now = array(), $held_identity = null ) {
+	private static function sync_computed_state( $rewind = null, array $running_now = array(), array $interrupted_now = array(), array $held_snapshot = array( 'identity' => null, 'listing' => array() ) ) {
+		$held_identity = $held_snapshot['identity'] ?? null;
+		// Ruling S71 (Codex round-28 P2 on #88): WHAT IS SERVED IS WHAT IS
+		// IDENTIFIED — generalising Ruling S64's per-row log fingerprint
+		// from log rows to every OTHER collection this tuple folds an
+		// identity for. `running`/`interrupted`'s own ref-only identity
+		// (Rulings S45/S46) caught a claim entering or leaving the set,
+		// but not its OWN served field (`claimed_at`) changing while it
+		// stays put; a held row's ref-only identity caught it entering or
+		// leaving the queue, but not `refresh_touches()`/`refresh_rule()`
+		// rewriting its OWN content (a wp_options RESTORE landing on the
+		// SAME set of refs, with OLDER row content, passed the
+		// steady-state comparison and served the restored details under
+		// an observation that had already moved past them — the SAME
+		// hole Ruling S61 closed for log rows). `served_fingerprint()`
+		// below replaces the ref-only identity for `running`/`interrupted`
+		// outright (their served shape already includes the ref, so the
+		// fingerprint strictly subsumes it) and joins the EXISTING
+		// held_count-facing `held` identity as a NEW `held_served` field
+		// for `held`, whose served (narrower, claimed-twins-excluded)
+		// listing is a genuinely different set from held_count's own
+		// (broader) one. Every input is the SAME per-attempt snapshot the
+		// caller already took ($running_now/$interrupted_now from
+		// partition_stale_claims(), $held_snapshot from held_snapshot() —
+		// Rulings S52/S69) — no extra read.
+		$running_served     = array();
+		foreach ( $running_now as $ref => $claim ) {
+			$running_served[ (string) $ref ] = self::served_claim_row( $ref, $claim );
+		}
+		$interrupted_served = array();
+		foreach ( $interrupted_now as $ref => $claim ) {
+			$interrupted_served[ (string) $ref ] = self::served_claim_row( $ref, $claim );
+		}
+		$held_listing = is_array( $held_snapshot['listing'] ?? null ) ? $held_snapshot['listing'] : array();
+		$held_served  = array();
+		foreach ( $held_listing as $row ) {
+			$held_served[ (string) ( $row['ref'] ?? '' ) ] = $row;
+		}
 		$current = array(
-			'active'      => self::active(),
-			'seam'        => self::$seam,
-			'door'        => self::door_state(),
+			'active'       => self::active(),
+			'seam'         => self::$seam,
+			'door'         => self::door_state(),
 			// Ruling S29: null when no rewind is currently detected — the
 			// overwhelming majority of polls — so those compare exactly as
 			// before this ruling.
-			'rewind_top'  => ( is_array( $rewind ) && isset( $rewind['top'] ) ) ? (int) $rewind['top'] : null,
-			// Ruling S45 (Codex round-18 P2 on #88): a claim enters (or
-			// leaves) `running` SOLELY by its own `claimed_at` crossing
-			// (or having crossed) CLAIM_STALE_MS — no mutation of its own,
-			// no version bump — so a poll that serves it under the SAME
-			// observation it served when the claim was still young let
-			// Aura's strictly-greater comparison hide the transition
-			// entirely. The FULL sorted identity of the running set, not
-			// a count or "count + oldest claimed_at" proxy: a claim
-			// entering or leaving is provably a different array here even
-			// when the total COUNT does not change (one finishes just as
-			// another crosses the bound), which a count-shaped signal
-			// would silently absorb.
-			'running'     => self::claim_ref_identity( $running_now ),
-			// Ruling S46 (Codex round-19, S45 class): the SAME reasoning,
-			// for `interrupted` — a claim crosses INTO "stale, unleased"
-			// (or a running one crosses OUT of the running set at
-			// LEASE_HARD_CAP_S, landing here instead) with no mutation of
-			// its own either.
-			'interrupted' => self::claim_ref_identity( $interrupted_now ),
+			'rewind_top'   => ( is_array( $rewind ) && isset( $rewind['top'] ) ) ? (int) $rewind['top'] : null,
+			// Ruling S45 (Codex round-18 P2 on #88), fingerprinted as of
+			// Ruling S71: a claim entering or leaving `running` (no
+			// mutation, no version bump of its own) OR its OWN served
+			// `claimed_at` changing while it stays in the set — either
+			// way a provably different fingerprint, never a count or
+			// "count + oldest claimed_at" proxy that could silently
+			// absorb one crossing cancelling another.
+			'running'      => self::served_fingerprint( $running_served ),
+			// Ruling S46 (Codex round-19, S45 class), fingerprinted as of
+			// Ruling S71: the SAME reasoning, for `interrupted`.
+			'interrupted'  => self::served_fingerprint( $interrupted_served ),
 			// Ruling S46: a held row leaves the served `held`/`held_count`
 			// SOLELY by its own `expires_at` passing — nothing writes when
 			// a hold simply ages out; only `hold()`'s own NEXT purge_expired()
 			// sweep eventually deletes the row, long after the transition
 			// this fold exists to witness. Null (unreadable) is guarded
-			// below, before this tuple is ever compared or persisted.
-			'held'        => is_array( $held_identity ) ? $held_identity : array(),
+			// below, before this tuple is ever compared or persisted. This
+			// is the BROADER set (claimed twins included) held_count's own
+			// transition detection needs — see held_identity()'s own
+			// docblock for why it differs from the served listing below.
+			'held'         => is_array( $held_identity ) ? $held_identity : array(),
+			// Ruling S71: the SERVED `held` listing's own content —
+			// narrower than 'held' above (a claimed twin is excluded), and
+			// fingerprinted rather than ref-only, so refresh_touches()/
+			// refresh_rule() rewriting a row Aura is already showing is a
+			// detected transition even though nothing about WHICH refs
+			// are held changed.
+			'held_served'  => self::served_fingerprint( $held_served ),
 			// Ruling S61 (Codex round-23 P1 on #88): a wp_options RESTORE
 			// that happens to preserve every OTHER field above (the
 			// epoch, the door version, active/seam/door,
@@ -1041,7 +1129,7 @@ class Aura_Worker_Elementor_Door {
 			// already sits at N — is invisible to all of them. This
 			// identity is what makes it a detected transition instead:
 			// see Aura_Worker_Door_Log::log_shape_raw()'s own docblock.
-			'log_shape'   => Aura_Worker_Door_Log::log_shape_raw(),
+			'log_shape'    => Aura_Worker_Door_Log::log_shape_raw(),
 		);
 		if ( Aura_Worker_Door_Log::closure_read_was_unreadable()
 			|| Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt()
@@ -1445,26 +1533,25 @@ class Aura_Worker_Elementor_Door {
 		// The SAME read the caller already took (Ruling S46) — never a
 		// second one, which could disagree with the identity
 		// sync_computed_state() just persisted a transition for.
+		// Ruling S71: served_claim_row() is the SAME transformation
+		// sync_computed_state()'s own fingerprint was just computed
+		// over — never a second, independently-shaped construction that
+		// could drift from what was fingerprinted.
 		foreach ( $interrupted_now as $ref => $claim ) {
 			// Whatever reconcile() could not settle a moment ago — a claim
 			// whose `interrupted` entry could not be written is reported here
 			// every poll until it can be.
-			$interrupted[] = array(
-				'ref'        => (string) $ref,
-				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
-			);
+			$interrupted[] = self::served_claim_row( $ref, $claim );
 		}
 		// Past the bound and STILL RUNNING: the operator sees it, labelled for
 		// what it is rather than as a failure. The SAME read the caller
 		// already took (Ruling S45) — never a second one, which could
 		// disagree with the identity sync_computed_state() just persisted
-		// a transition for.
+		// a transition for. Ruling S71: served_claim_row(), the SAME
+		// shape already fingerprinted above.
 		$running = array();
 		foreach ( $running_now as $ref => $claim ) {
-			$running[] = array(
-				'ref'        => (string) $ref,
-				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
-			);
+			$running[] = self::served_claim_row( $ref, $claim );
 		}
 		if ( Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt() ) {
 			// Ruling S44 (Codex round-18 P2 on #88): a transient failure on

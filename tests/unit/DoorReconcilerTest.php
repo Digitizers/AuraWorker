@@ -581,6 +581,54 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S71 (Codex round-28 P2 on #88): the held identity recorded
+	 * only refs. A wp_options RESTORE (or any raw write) that lands on
+	 * the SAME set of held refs, with OLDER row content — `touches`
+	 * changed by `refresh_touches()`, `verdict`/`rule` by
+	 * `refresh_rule()` — bumps no version of its own (it did not go
+	 * through `Aura_Worker_Door_Log::versioned()`) and passed the
+	 * ref-only steady-state comparison unnoticed, serving the restored
+	 * details under an observation that had already moved past them.
+	 * `sync_computed_state()` now folds a fingerprint of the SERVED
+	 * `held` listing's own content (`held_served`, Ruling S71) into the
+	 * SAME comparison, so a content-only change with no bump of its own
+	 * is a detected transition just like Ruling S46 already made
+	 * ref-entering/leaving one.
+	 */
+	public function test_a_held_rows_touches_changing_raw_with_no_bump_still_advances_the_observation(): void {
+		$ref = $this->hold();
+		$baseline = $this->fragment();
+		$this->assertSame(
+			array( array( 'type' => 'page', 'id' => '7' ) ),
+			$baseline['held'][0]['touches'] ?? null,
+			'the fixture assumption this test is built on'
+		);
+		$v1 = Aura_Worker_Elementor_Door::governor_block()['observation'];
+		$this->assertIsInt( $v1 );
+
+		// The row's OWN content changes with NO version bump of its own —
+		// a raw write, never Aura_Worker_Door_Log::versioned() — modelling
+		// both refresh_touches()'s real (already-bumped, so irrelevant
+		// here) write and a wp_options RESTORE landing on this exact ref
+		// with content from before the change.
+		$this->patchOption( Aura_Worker_Door_Holds::HELD . $ref, array( 'touches' => array( array( 'type' => 'page', 'id' => '999' ) ) ) );
+
+		$crossed = $this->fragment();
+		$this->assertSame(
+			array( array( 'type' => 'page', 'id' => '999' ) ),
+			$crossed['held'][0]['touches'] ?? null,
+			'the new content is served'
+		);
+		$this->assertNotNull( $crossed['observation'], 'a single retry resolves this — never "torn twice"' );
+		$this->assertGreaterThan( $v1, $crossed['observation'], 'served under a witness STRICTLY greater than the pre-change poll' );
+
+		// A second serve of the SAME (already-persisted) content is a
+		// steady state.
+		$again = $this->fragment();
+		$this->assertSame( $crossed['observation'], $again['observation'], 'the content change is already recorded — a repeat serve does not bump again' );
+	}
+
+	/**
 	 * Ruling S67 (Codex round-25 P2 on #88): `count_unacked()` used to
 	 * filter its own COUNT against `self::floor()` — `get_option()`'s
 	 * cached read — rather than the proven `floor_raw()` a version bracket
