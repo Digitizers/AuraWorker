@@ -549,6 +549,44 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S77 (Codex round-31 P2 on #88): the SAME ambiguous commit as
+	 * the test just above, but this time the verifying `epoch_raw()`
+	 * re-read ALSO fails — genuinely unknown a SECOND way, never resolved
+	 * to a proven "did not land" by that failure. Before this ruling,
+	 * `$now === $new_epoch` was false whenever `$now` was the unreadable
+	 * sentinel `''`, falling straight through to a definitive `rotated:
+	 * false` — indistinguishable from a proven miss, so a caller's own
+	 * retry with the SAME `$expected` then lost the fence against
+	 * whatever this call's own mint actually landed as and ALSO answered
+	 * `false`, forever: `restamp_binding_epoch()` never ran.
+	 */
+	public function test_an_ambiguously_committed_rotation_whose_verify_also_fails_is_unknown_not_false(): void {
+		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s77';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s77';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+		// AND the verifying epoch_raw() re-read also fails — genuinely
+		// unknown a second way.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $out['rotated'], 'two unproven facts in a row are still just unknown — never a guessed false' );
+		$this->assertNull( $out['epoch'] );
+
+		// The rotation actually DID land — this call's own mint really
+		// is what the epoch now holds, confirmed with a healthy read now
+		// that the seam is cleared.
+		$this->assertSame( 'nonce-s77', get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
 	 * Ruling S62: a retry of the SAME logical rotation, once it has
 	 * genuinely landed (this models the caller re-deriving $expected
 	 * fresh and finding the epoch already rotated -- the ordinary,

@@ -1634,6 +1634,29 @@ class Aura_Worker_API {
 		// cannot both mint one (Ruling P23).
 		$out = Aura_Worker_Door_Log::rotate_epoch( $epoch );
 
+		// Ruling S77 (Codex round-31 P2 on #88): `rotated: null` — an
+		// AMBIGUOUS commit whose own verifying re-read ALSO could not be
+		// proven — is genuinely UNKNOWN, never the same fact as `false`
+		// (rotate_epoch()'s own docblock). Answering `rotated: false`
+		// here would tell Aura the rotation did not happen; a retry with
+		// the SAME `$epoch` would then lose the fence against whatever IS
+		// actually current (this call's own mint, if it landed) and
+		// report `false` again, forever — `restamp_binding_epoch()` never
+		// runs, and the binding record is left naming an epoch this site
+		// may already have left. The retryable 503 this answers instead
+		// is the SAME shape `Aura_Worker_Door_Holds`' own
+		// `retry_may_have_run()` uses: the caller retries, and the NEXT
+		// attempt's own verify — reading a by-then-healthy epoch_raw()
+		// that may already equal what THIS attempt minted — completes
+		// idempotently.
+		if ( null === $out['rotated'] ) {
+			return new WP_Error(
+				'aura_log_failed',
+				'This site could not prove whether the rotation landed; retry.',
+				array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+			);
+		}
+
 		// A LEGITIMATE ROTATION SAYS SO ON THE BINDING RECORD (Ruling P91).
 		// The record names the epoch it was written with, and P81's repair
 		// reads a disagreement as a half-done rebind — so without this the next

@@ -371,6 +371,59 @@ final class DoorRestTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S77 (Codex round-31 P2 on #88): an AMBIGUOUSLY committed
+	 * rotation whose OWN verifying re-read (`epoch_raw()`) ALSO could not
+	 * be proven used to fall straight through to `rotated: false` —
+	 * indistinguishable from a proven miss. This route's own
+	 * `! empty( $out['rotated'] )` check then never ran
+	 * `restamp_binding_epoch()`, and a caller retrying with the SAME
+	 * (now-stale) `$epoch` would lose the fence against whatever this
+	 * call's own mint actually landed as and ALSO answer `false` —
+	 * forever, since nothing here ever revisits it. `rotate_epoch()` now
+	 * answers `rotated: null` for this specific double-unproven case, and
+	 * this route turns that into a retryable 503 (`may_have_run`) rather
+	 * than a false `200 rotated: false`. See
+	 * `test_an_ambiguous_rotation_that_landed_still_restamps_the_binding_witness()`
+	 * just above for the OTHER half of the SAME mechanism — the identical
+	 * ambiguous commit, but with a HEALTHY verify that finds `current ==`
+	 * this call's own pre-minted target — which Ruling S77 leaves
+	 * completely unchanged: it still completes and restamps.
+	 */
+	public function test_an_ambiguous_rotation_whose_verify_also_fails_answers_a_retryable_503(): void {
+		$this->enforce_grants();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$gen    = Aura_Worker_Door_Log::binding_raw();
+		$before = Aura_Worker_Door_Log::epoch();
+		$req    = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s77-rest';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s77-rest';
+		$GLOBALS['_sa_option_read_fail'][ $witness ]                = true;
+		// AND the verifying epoch_raw() re-read also fails.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( WP_Error::class, $res, 'genuinely unknown — never a false "rotated: false" 200' );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertTrue( $res->get_error_data()['may_have_run'], 'a caller must retry, not assume nothing happened' );
+
+		// The rotation actually DID land — confirmed with a healthy read
+		// now that the seams are cleared, the SAME way the docblock's own
+		// sibling test proves it for the healthy-verify case.
+		$this->assertSame( 'nonce-s77-rest', get_option( Aura_Worker_Door_Log::EPOCH ) );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation itself never moved' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
 	 * Ruling P92 (F1): a rotation superseded mid-flight never stamps its stale
 	 * epoch over the winner's witness.
 	 *

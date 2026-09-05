@@ -3715,7 +3715,14 @@ class Aura_Worker_Door_Log {
 	 * already accounted for.
 	 *
 	 * @param string $expected The epoch the caller means to replace.
-	 * @return array{ rotated: bool, epoch: string } `epoch` is the one now in force either way.
+	 * @return array{ rotated: bool|null, epoch: string|null } `epoch` is
+	 *         the one now in force either way — except the Ruling S77
+	 *         (Codex round-31 P2 on #88) case: `rotated: null` when even
+	 *         the verifying re-read could not be proven, genuinely
+	 *         UNKNOWN rather than a guessed `false`, paired with
+	 *         `epoch: null` rather than the raw reader's own `''`
+	 *         unreadable sentinel. The caller answers its own retryable
+	 *         503 (`may_have_run`) for that case, never `rotated: false`.
 	 */
 	public static function rotate_epoch( $expected, $claim = '', $fence = '' ) {
 		// PRIMED BEFORE THE TRANSACTION OPENS (Ruling S8): the epoch must
@@ -3768,11 +3775,40 @@ class Aura_Worker_Door_Log {
 		// "half-done rebind"); anything else (still `$expected`, or a
 		// DIFFERENT value some other rotation produced) ⇒ `rotated:
 		// false`, this call's own mint demonstrably did not land.
+		//
+		// Ruling S77 (Codex round-31 P2 on #88): that "anything else"
+		// used to include a THIRD case this comparison cannot tell apart
+		// from a proven miss — the verifying epoch_raw() read ITSELF
+		// failing (`$now === ''`, the same sentinel an unreadable row and
+		// a genuinely absent one both answer). An ambiguous COMMIT
+		// (`committed: null`) paired with an UNPROVEN verify is not
+		// evidence this call's mint did not land — it is simply two
+		// unproven facts in a row — and answering a definitive `rotated:
+		// false` on top of them told a caller "nothing happened" when the
+		// honest answer is "unknown, and unknown a second time": a retry
+		// with the SAME `$expected` then loses the fence against
+		// whichever epoch is ACTUALLY current (this call's own, if it
+		// really did land) and ALSO reports `false` — `restamp_binding_epoch()`
+		// never runs, and the binding record is left naming an epoch this
+		// site may already have left (Ruling P91's own "half-done
+		// rebind", the exact case this whole idempotent-completion path
+		// exists to close). Preserved as `rotated: null` instead: the
+		// caller answers its own retryable 503 (`may_have_run`), never a
+		// guessed `false`, and the NEXT retry — reading a NOW-healthy
+		// epoch_raw() that happens to equal this call's own `$new_epoch`
+		// — completes the idempotent match and restamps, exactly as a
+		// healthy verify would have on the first try.
 		$now = self::epoch_raw();
 		if ( null === $outcome['committed'] && $now === $new_epoch ) {
 			return array(
 				'rotated' => true,
 				'epoch'   => $now,
+			);
+		}
+		if ( null === $outcome['committed'] && self::raw_option_was_unreadable() ) {
+			return array(
+				'rotated' => null,
+				'epoch'   => null,
 			);
 		}
 		return array(
