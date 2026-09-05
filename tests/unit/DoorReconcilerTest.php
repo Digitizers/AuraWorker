@@ -295,6 +295,81 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertGreaterThan( $v1, $left['observation'], 'leaving running is ALSO a transition — served under a strictly greater witness' );
 	}
 
+	/**
+	 * Ruling S46 (Codex round-19, S45 class): the SAME transition-fold as
+	 * `running`, for `held`/`held_count`/`queue_full` — a held row ages
+	 * out SOLELY by its own `expires_at` passing, no mutation of its own
+	 * (nothing deletes the row until hold()'s own NEXT purge_expired()
+	 * sweep). status_fragment() persists the crossing (its own `held`
+	 * field, live, and the identity that protects the witness);
+	 * governor_block()'s `held_count`/`queue_full` — which cannot write
+	 * anything themselves (Ruling S27) — benefit from that SAME persisted
+	 * witness once it has landed.
+	 */
+	public function test_a_held_row_aging_out_with_no_mutation_still_bumps_the_observation(): void {
+		$ref = $this->hold();
+		$this->assertSame( array( $ref ), array_column( $this->fragment()['held'], 'ref' ), 'the fixture assumption this test is built on' );
+		$v1 = Aura_Worker_Elementor_Door::governor_block()['observation'];
+		$this->assertIsInt( $v1 );
+		$this->assertSame( 1, Aura_Worker_Elementor_Door::governor_block()['held_count'] );
+
+		// The clock advances past the hold's own 7-day TTL — nothing else
+		// mutates; the row is not deleted (only hold()'s own sweep does
+		// that, and nothing calls hold() here).
+		$this->patchOption( Aura_Worker_Door_Holds::HELD . $ref, array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+		// held_rows() memoises its read for the WHOLE process (Ruling
+		// P71) — correct across two DIFFERENT reading requests, but this
+		// direct option-table patch (unlike a real write through
+		// Aura_Worker_Door_Holds' own methods) never calls forget_held()
+		// itself, so the FIRST status_fragment() call above's own memo
+		// would otherwise still answer the pre-patch snapshot here.
+		Aura_Worker_Door_Holds::forget_held();
+
+		$crossed = $this->fragment();
+		$this->assertSame( array(), $crossed['held'], 'the aged-out row no longer appears in the listing' );
+		$this->assertNotNull( $crossed['observation'], 'a single retry resolves this — never "torn twice"' );
+		$this->assertGreaterThan( $v1, $crossed['observation'], 'served under a witness STRICTLY greater than the pre-expiry poll' );
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 0, $block['held_count'], 'derived from the SAME persisted crossing — never a separate re-count' );
+		$this->assertFalse( $block['queue_full'] );
+		$this->assertGreaterThan( $v1, $block['observation'], 'the audit benefits from the poll\'s own persisted witness — it cannot write one itself (Ruling S27)' );
+
+		// A second serve of the SAME crossing is a steady state.
+		$again = $this->fragment();
+		$this->assertSame( $crossed['observation'], $again['observation'], 'the crossing is already recorded — a repeat serve does not bump again' );
+		$this->assertSame( array(), $again['held'] );
+	}
+
+	/**
+	 * Ruling S46 (Codex round-19, S45 class): the SAME transition-fold as
+	 * `running`, for `interrupted` — a claim crosses into "stale,
+	 * unleased" SOLELY by its own `claimed_at` ageing past CLAIM_STALE_MS,
+	 * no mutation of its own.
+	 */
+	public function test_an_unleased_claim_crossing_the_stale_bound_with_no_mutation_still_bumps_the_observation(): void {
+		$ref = $this->hold();
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) ); // fresh — NOT backdated
+
+		$young = $this->fragment();
+		$this->assertSame( array(), $young['interrupted'], 'the fixture assumption this test is built on — too young to be interrupted yet' );
+		$v1 = $young['observation'];
+		$this->assertIsInt( $v1 );
+
+		// The clock advances past CLAIM_STALE_MS — nothing else mutates.
+		$this->patchOption( Aura_Worker_Door_Holds::CLAIMED . $ref, array( 'claimed_at' => $this->longAgo() ) );
+
+		$crossed = $this->fragment();
+		$this->assertSame( array( $ref ), array_column( $crossed['interrupted'], 'ref' ), 'the crossing is now observed' );
+		$this->assertNotNull( $crossed['observation'], 'a single retry (this attempt\'s own persist) resolves this — never "torn twice"' );
+		$this->assertGreaterThan( $v1, $crossed['observation'], 'served under a witness STRICTLY greater than the young claim\'s own poll' );
+
+		// A second serve of the SAME crossing is a steady state.
+		$again = $this->fragment();
+		$this->assertSame( $crossed['observation'], $again['observation'], 'the crossing is already recorded — a repeat serve does not bump again' );
+		$this->assertSame( array( $ref ), array_column( $again['interrupted'], 'ref' ) );
+	}
+
 	/** An UNLEASED claim past the bound is interrupted, exactly as before. */
 	public function test_an_unleased_claim_past_the_bound_is_still_interrupted(): void {
 		$ref = $this->hold();

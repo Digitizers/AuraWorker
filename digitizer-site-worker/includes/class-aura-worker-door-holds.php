@@ -1242,10 +1242,13 @@ class Aura_Worker_Door_Holds {
 	 * @return int|null
 	 */
 	public static function count() {
-		$now     = time();
-		$claimed = self::rows( self::CLAIMED );
-		$held    = self::held_rows();
-		if ( null === $claimed || null === $held ) {
+		$claimed       = self::rows( self::CLAIMED );
+		// Ruling S46 (Codex round-19, S45 class): the SAME non-expired
+		// held identity status_fragment()'s own transition fold uses
+		// (held_identity()'s own docblock) — never a second, independent
+		// expiry scan that could in principle disagree with it.
+		$held_identity = self::held_identity();
+		if ( null === $claimed || null === $held_identity ) {
 			return null;
 		}
 		$refs = array();
@@ -1254,13 +1257,11 @@ class Aura_Worker_Door_Holds {
 				$refs[] = $ref;
 			}
 		}
-		foreach ( $held as $ref => $row ) {
-			// Only THIS binding's rows charge a slot (Ruling P58): a departed
-			// client's queue must not keep the current one out of its own.
-			if ( ! self::row_is_current( $row ) ) {
-				continue;
-			}
-			if ( ! self::is_expired( $row, $now ) || in_array( $ref, $refs, true ) ) {
+		// Only THIS binding's rows charge a slot (Ruling P58) — already
+		// true of $held_identity, which only ever names rows
+		// row_is_current() itself accepted.
+		foreach ( $held_identity as $ref ) {
+			if ( ! in_array( $ref, $refs, true ) ) {
 				$refs[] = $ref;
 			}
 		}
@@ -1362,6 +1363,45 @@ class Aura_Worker_Door_Holds {
 	 */
 	public static function queue_unreadable() {
 		return null === self::held_rows();
+	}
+
+	/**
+	 * The CURRENT-binding, NOT-EXPIRED held set's own IDENTITY — sorted
+	 * refs, from the SAME memoised held_rows() listing()/count() already
+	 * share (Ruling P71) — for status_fragment()'s own transition fold
+	 * (Ruling S46, Codex round-19, S45 class): a hold ageing past its own
+	 * `expires_at` mutates nothing and bumps no version on its own, so a
+	 * poll served right after the crossing used to carry the SAME
+	 * observation it served right before — Aura's strictly-greater
+	 * comparison then hid the row leaving `held`/`held_count` entirely.
+	 *
+	 * Deliberately the BROADER set `count()`'s own HELD half filters to —
+	 * never `listing()`'s narrower one, which additionally excludes a
+	 * claimed twin — because a ref's CLAIMED status changes only through a
+	 * real, already-versioned mutation (claim()'s own versioned() bump);
+	 * expiry is the one fact here that changes silently, and it is the
+	 * SAME fact whether or not the row happens to be claimed too.
+	 *
+	 * @return string[]|null Null when the held queue could not be read.
+	 */
+	public static function held_identity() {
+		$held = self::held_rows();
+		if ( null === $held ) {
+			return null;
+		}
+		$now  = time();
+		$refs = array();
+		foreach ( $held as $ref => $row ) {
+			if ( ! self::row_is_current( $row ) ) {
+				continue;
+			}
+			if ( self::is_expired( $row, $now ) ) {
+				continue;
+			}
+			$refs[] = (string) $ref;
+		}
+		sort( $refs, SORT_STRING );
+		return $refs;
 	}
 
 	/**

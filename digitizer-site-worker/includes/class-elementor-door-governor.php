@@ -475,21 +475,28 @@ class Aura_Worker_Elementor_Door {
 				// with the other about which claims are running right now,
 				// and this attempt never reads the claimed queue twice.
 				$running_now = Aura_Worker_Door_Holds::running_claims( self::CLAIM_STALE_MS );
+				// Ruling S46 (Codex round-19, S45 class): the SAME
+				// shape, for `interrupted` and `held` — read ONCE, here,
+				// before sync_computed_state() needs their identities and
+				// before build_status_fragment_state() reports them.
+				$interrupted_now = Aura_Worker_Door_Holds::stale_unleased_claims( self::CLAIM_STALE_MS );
+				$held_identity   = Aura_Worker_Door_Holds::held_identity();
 				// Ruling S22 (Codex round-9 P2 on #88): a COMPUTED
 				// transition — Elementor deactivating, the coverage seam
 				// changing, a newly DETECTED rewind (Ruling S29), and now
-				// (Ruling S45) the running set's own identity crossing a
-				// time threshold — is state, and must land BEFORE the
-				// bracketed reads below can prove anything about it. See
-				// sync_computed_state()'s own docblock. Persisting THIS
-				// request's own freshly detected transition (the ordinary
-				// case, not a concurrent write) bumps the version between
-				// the bracket's before and after reads too — correctly
+				// (Rulings S45/S46) the running/interrupted/held sets' own
+				// identities crossing a time threshold — is state, and
+				// must land BEFORE the bracketed reads below can prove
+				// anything about it. See sync_computed_state()'s own
+				// docblock. Persisting THIS request's own freshly
+				// detected transition (the ordinary case, not a
+				// concurrent write) bumps the version between the
+				// bracket's before and after reads too — correctly
 				// forcing one retry: sync_computed_state() is a fenced CAS
 				// (Rulings S24/S26), so the SECOND attempt finds its own
 				// write already there, persists nothing further, and the
 				// bracket closes clean.
-				$synced   = self::sync_computed_state( $rewind_info['rewind'], $running_now );
+				$synced   = self::sync_computed_state( $rewind_info['rewind'], $running_now, $interrupted_now, $held_identity );
 				// Ruling S28 (Codex round-12 P1 on #88): INSIDE the
 				// bracket, after sync_computed_state() — read back
 				// whatever is actually PERSISTED now, not this request's
@@ -500,7 +507,7 @@ class Aura_Worker_Elementor_Door {
 				// nothing this call may credit itself with, and the
 				// fragment falls back to live computation below.
 				$computed = $synced ? self::persisted_computed_state() : null;
-				return self::build_status_fragment_state( $rewind_info, $computed, $running_now );
+				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now );
 			},
 			function () use ( &$synced, &$rewind_info ) {
 				// Ruling S24 (Codex round-10 P2 on #88): the
@@ -673,18 +680,20 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * The running set's IDENTITY, for `sync_computed_state()`'s own
-	 * comparison (Ruling S45, Codex round-18 P2 on #88): every ref
-	 * currently in `running_claims()`'s answer, sorted so the SAME set
-	 * always serialises the same way regardless of which order the
-	 * underlying scan happened to return them in.
+	 * A claim SET's own IDENTITY, for `sync_computed_state()`'s own
+	 * comparison (Ruling S45, Codex round-18 P2 on #88; generalised to
+	 * `interrupted` too by Ruling S46, Codex round-19): every ref in
+	 * `running_claims()`'s or `stale_unleased_claims()`'s own answer,
+	 * sorted so the SAME set always serialises the same way regardless of
+	 * which order the underlying scan happened to return them in.
 	 *
-	 * @param array $running_now `Aura_Worker_Door_Holds::running_claims()`'s
-	 *                            own return, keyed by ref.
+	 * @param array $claims_now `Aura_Worker_Door_Holds::running_claims()`'s
+	 *                           or `stale_unleased_claims()`'s own return,
+	 *                           keyed by ref.
 	 * @return string[]
 	 */
-	private static function running_identity( array $running_now ) {
-		$refs = array_map( 'strval', array_keys( $running_now ) );
+	private static function claim_ref_identity( array $claims_now ) {
+		$refs = array_map( 'strval', array_keys( $claims_now ) );
 		sort( $refs, SORT_STRING );
 		return $refs;
 	}
@@ -784,17 +793,30 @@ class Aura_Worker_Elementor_Door {
 	 * majority) still bumps nothing (Ruling S6 stands): `rewind_top` is
 	 * `null` on both sides and the comparison is unaffected.
 	 *
-	 * @param array|null $rewind      `detect_rewind()`'s own `rewind`
-	 *                                  field: `{ detected: true, top: int
-	 *                                  }` when a rewind is CURRENTLY
-	 *                                  detected, null otherwise.
-	 * @param array      $running_now `Aura_Worker_Door_Holds::running_claims()`'s
-	 *                                  own return, read ONCE by the caller
-	 *                                  and handed to both this method and
-	 *                                  `build_status_fragment_state()`
-	 *                                  (Ruling S45, Codex round-18 P2 on
-	 *                                  #88) — see this method's own
-	 *                                  `'running'` key below for why.
+	 * @param array|null $rewind          `detect_rewind()`'s own `rewind`
+	 *                                      field: `{ detected: true, top:
+	 *                                      int }` when a rewind is
+	 *                                      CURRENTLY detected, null
+	 *                                      otherwise.
+	 * @param array      $running_now     `Aura_Worker_Door_Holds::running_claims()`'s
+	 *                                      own return, read ONCE by the
+	 *                                      caller and handed to both this
+	 *                                      method and
+	 *                                      `build_status_fragment_state()`
+	 *                                      (Ruling S45, Codex round-18 P2
+	 *                                      on #88) — see this method's
+	 *                                      own `'running'` key below for
+	 *                                      why.
+	 * @param array      $interrupted_now `Aura_Worker_Door_Holds::stale_unleased_claims()`'s
+	 *                                      own return, the SAME shape as
+	 *                                      `$running_now` (Ruling S46,
+	 *                                      Codex round-19, S45 class).
+	 * @param string[]|null $held_identity `Aura_Worker_Door_Holds::held_identity()`'s
+	 *                                      own return — already sorted
+	 *                                      refs, read ONCE by the caller
+	 *                                      (Ruling S46) — or null when
+	 *                                      the held queue could not be
+	 *                                      read.
 	 * @return bool True when the current computed tuple is either UNCHANGED
 	 *              from what is persisted (nothing to version), or this
 	 *              call's OWN write won its fence and was COMMITTED —
@@ -809,15 +831,15 @@ class Aura_Worker_Elementor_Door {
 	 *              and the caller must serve `observation: null` alongside
 	 *              it.
 	 */
-	private static function sync_computed_state( $rewind = null, array $running_now = array() ) {
+	private static function sync_computed_state( $rewind = null, array $running_now = array(), array $interrupted_now = array(), $held_identity = null ) {
 		$current = array(
-			'active'     => self::active(),
-			'seam'       => self::$seam,
-			'door'       => self::door_state(),
+			'active'      => self::active(),
+			'seam'        => self::$seam,
+			'door'        => self::door_state(),
 			// Ruling S29: null when no rewind is currently detected — the
 			// overwhelming majority of polls — so those compare exactly as
 			// before this ruling.
-			'rewind_top' => ( is_array( $rewind ) && isset( $rewind['top'] ) ) ? (int) $rewind['top'] : null,
+			'rewind_top'  => ( is_array( $rewind ) && isset( $rewind['top'] ) ) ? (int) $rewind['top'] : null,
 			// Ruling S45 (Codex round-18 P2 on #88): a claim enters (or
 			// leaves) `running` SOLELY by its own `claimed_at` crossing
 			// (or having crossed) CLAIM_STALE_MS — no mutation of its own,
@@ -830,21 +852,40 @@ class Aura_Worker_Elementor_Door {
 			// when the total COUNT does not change (one finishes just as
 			// another crosses the bound), which a count-shaped signal
 			// would silently absorb.
-			'running'    => self::running_identity( $running_now ),
+			'running'     => self::claim_ref_identity( $running_now ),
+			// Ruling S46 (Codex round-19, S45 class): the SAME reasoning,
+			// for `interrupted` — a claim crosses INTO "stale, unleased"
+			// (or a running one crosses OUT of the running set at
+			// LEASE_HARD_CAP_S, landing here instead) with no mutation of
+			// its own either.
+			'interrupted' => self::claim_ref_identity( $interrupted_now ),
+			// Ruling S46: a held row leaves the served `held`/`held_count`
+			// SOLELY by its own `expires_at` passing — nothing writes when
+			// a hold simply ages out; only `hold()`'s own NEXT purge_expired()
+			// sweep eventually deletes the row, long after the transition
+			// this fold exists to witness. Null (unreadable) is guarded
+			// below, before this tuple is ever compared or persisted.
+			'held'        => is_array( $held_identity ) ? $held_identity : array(),
 		);
-		if ( Aura_Worker_Door_Log::closure_read_was_unreadable() || Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt() ) {
+		if ( Aura_Worker_Door_Log::closure_read_was_unreadable()
+			|| Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt()
+			|| null === $held_identity
+		) {
 			// Ruling S39 (Codex round-16 P2 on #88): the door_state() call
 			// just above could not prove the closure marker either way —
 			// an unreadable marker used to read as "not closed", so
 			// $current['door'] here may be a fabricated "open" on a log
 			// that is actually full.
 			//
-			// Ruling S45 (Codex round-18 P2 on #88), same reasoning: an
-			// unreadable claimed queue (Ruling S44) means `$current['running']`
-			// above is built from an empty set this call could not prove
-			// is genuinely empty — comparing THAT against a persisted
-			// tuple naming a real running claim would look like the claim
-			// LEFT running, and persist that fabrication.
+			// Ruling S45/S46 (Codex rounds 18-19), same reasoning: an
+			// unreadable claimed queue (Ruling S44) means
+			// `$current['running']`/`$current['interrupted']` above are
+			// built from an empty set this call could not prove is
+			// genuinely empty; an unreadable held queue means
+			// `$current['held']` is the SAME kind of fabrication. Any one
+			// of them compared against a persisted tuple naming a real
+			// claim or hold would look like it LEFT, and persist that
+			// fabrication.
 			//
 			// Either way: neither persist nor bump — exactly like Rulings
 			// S24/S26, return false and let the caller withhold
@@ -1113,16 +1154,22 @@ class Aura_Worker_Elementor_Door {
 	 *                                 (the only case: the caller's sync
 	 *                                 could not be trusted at all, Rulings
 	 *                                 S24/S26).
-	 * @param array      $running_now `Aura_Worker_Door_Holds::running_claims()`'s
-	 *                                 own return, computed ONCE by the
-	 *                                 caller (Ruling S45, Codex round-18
-	 *                                 P2 on #88) — before this method AND
-	 *                                 before `sync_computed_state()` — and
-	 *                                 handed to both, so neither disagrees
-	 *                                 about which claims are running.
+	 * @param array      $running_now     `Aura_Worker_Door_Holds::running_claims()`'s
+	 *                                     own return, computed ONCE by
+	 *                                     the caller (Ruling S45, Codex
+	 *                                     round-18 P2 on #88) — before
+	 *                                     this method AND before
+	 *                                     `sync_computed_state()` — and
+	 *                                     handed to both, so neither
+	 *                                     disagrees about which claims
+	 *                                     are running.
+	 * @param array      $interrupted_now `Aura_Worker_Door_Holds::stale_unleased_claims()`'s
+	 *                                     own return, the SAME shape and
+	 *                                     the SAME treatment (Ruling S46,
+	 *                                     Codex round-19, S45 class).
 	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
 	 */
-	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array() ) {
+	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array(), array $interrupted_now = array() ) {
 		$after          = (int) $rewind_info['after'];
 		$site           = (string) $rewind_info['site'];
 		$rewind         = $rewind_info['rewind'];
@@ -1152,7 +1199,10 @@ class Aura_Worker_Elementor_Door {
 		// `interrupted` on every poll while the reconciler was correctly
 		// leaving it alone. One rule, two views of it.
 		$interrupted = array();
-		foreach ( Aura_Worker_Door_Holds::stale_unleased_claims( self::CLAIM_STALE_MS ) as $ref => $claim ) {
+		// The SAME read the caller already took (Ruling S46) — never a
+		// second one, which could disagree with the identity
+		// sync_computed_state() just persisted a transition for.
+		foreach ( $interrupted_now as $ref => $claim ) {
 			// Whatever reconcile() could not settle a moment ago — a claim
 			// whose `interrupted` entry could not be written is reported here
 			// every poll until it can be.

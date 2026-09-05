@@ -1393,13 +1393,37 @@ final class ElementorDoorGovernorTest extends TestCase {
 	 * held_rows()` memoises its read "for the request" — correct across
 	 * two DIFFERENT reading requests, wrong for a SINGLE request that
 	 * retries its own build after a torn read. A hold landing the instant
-	 * the FIRST attempt's own `listing()` call finishes capturing its
+	 * the FIRST attempt's own held-queue read finishes capturing its
 	 * snapshot (still pre-hold) bumps the version, which triggers the
-	 * retry — but without resetting the memo first, the retry's own
-	 * `listing()` call reused that SAME pre-hold snapshot: its bracketing
-	 * reads both land on the NEW (post-hold) version, so the loop returns
-	 * successfully with a fragment reporting the new version and a `held`
-	 * list still missing the hold that caused it.
+	 * retry — but without resetting the memo first, the retry's own read
+	 * would have reused that SAME pre-hold snapshot: its bracketing reads
+	 * would both land on the NEW (post-hold) version, so the loop would
+	 * return successfully with a fragment reporting the new version and a
+	 * `held` list still missing the hold that caused it. The reset still
+	 * closes exactly that gap.
+	 *
+	 * Ruling S46 (Codex round-19, S45 class) changed what the RETRY itself
+	 * now does with the fresh read it gets. `held`'s own identity now
+	 * feeds `sync_computed_state()` too (a hold ageing out is a versioned
+	 * transition, same as `running`) — and this racer, landing INSIDE
+	 * `held_identity()`'s own nested read via `hold()`'s own `count()`
+	 * check, is captured by attempt 0's `held_identity()` call BEFORE the
+	 * racer's insert becomes visible to it (the memo race Ruling S20 names
+	 * runs the OTHER way here: the racer's own recursive `held_rows()`
+	 * call, from inside `count()`, completes and populates the memo with
+	 * the PRE-hold snapshot, moments before the insert that would have
+	 * made it stale). Attempt 0 therefore persists a computed tuple whose
+	 * `held` is still `[]` — its OWN first write, needed for OTHER reasons
+	 * having nothing to do with this race — and attempt 1, now correctly
+	 * reading the hold, finds that persisted `[]` disagrees with what it
+	 * just read and issues a SECOND, corrective write of its own, which
+	 * tears attempt 1's own bracket too. TWO genuine transitions inside
+	 * one poll exhausts the two-attempt budget: `observation: null` is the
+	 * honest answer, not a bug — see status_fragment()'s own docblock for
+	 * why a door mutating this fast within one poll gets exactly that
+	 * answer. The `held` field itself is still correctly rebuilt (Ruling
+	 * S20 stands); only the WITNESS this specific double-transition costs
+	 * is what changed.
 	 */
 	public function test_a_hold_landing_right_after_the_first_listing_read_is_in_the_rebuilt_fragment(): void {
 		$this->registerAll();
@@ -1428,8 +1452,8 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$GLOBALS['_sa_after_rows_read'] = array();
 		$after                          = Aura_Worker_Door_Log::door_version_raw();
 		$this->assertNotSame( $before, $after, 'the hold really did bump the version — otherwise this test proves nothing' );
-		$this->assertSame( $after, $frag['observation'], 'the rebuild found an agreeing pair of reads under the NEW version' );
-		$this->assertCount( 1, $frag['held'], 'the hold that caused the retry is IN the rebuilt fragment, not missing from a stale memo' );
+		$this->assertNull( $frag['observation'], 'two real transitions inside one poll (the tuple\'s own first write, then Ruling S46\'s corrective one) exhaust the retry budget — the honest answer, never a guess' );
+		$this->assertCount( 1, $frag['held'], 'the hold that caused the retry is IN the rebuilt fragment (Ruling S20 stands), even though the WITNESS for it could not be' );
 	}
 
 	/**
