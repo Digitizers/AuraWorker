@@ -3276,42 +3276,78 @@ class Aura_Worker_Door_Log {
 		self::reconnect_retries_set( $wpdb, 0 );
 		try {
 			if ( $transactional ) {
-				$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				// Ruling S17 (Codex round-7 P1 on #88): a REAL transactional
-				// savepoint, before anything else — see this method's own
-				// docblock for why the nonce below is not enough on its own.
-				$wpdb->query( 'SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				// Ruling S16 (Codex round-6 P1 on #88): the proof the final
-				// COMMIT below checks before this method ever reports
-				// `committed: true`. See that COMMIT's own comment for what it
-				// proves and why.
-				$tx_nonce = wp_generate_uuid4();
-				$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				// Ruling S25 (Codex round-11 P1 on #88): VERIFY the savepoint
-				// AFTER this SET, not before it (Ruling S21's own original
-				// position) — the SET is ITSELF the last reconnect-prone
-				// statement before `$writes()` runs. A reconnect landing WHILE
-				// this exact SET is being issued lets `wpdb` transparently
-				// retry it on a fresh AUTOCOMMIT session — one that never held
-				// the savepoint above — and the retried SET still assigns the
-				// nonce there, so a check placed only BEFORE the SET (as Ruling
-				// S21 had it) never sees this window at all: the callback
-				// writes and the bump would then run un-transacted, each
-				// autocommitting individually on a real server, before the
-				// LATER `RELEASE SAVEPOINT` (Ruling S17) finally caught the
-				// problem — too late to stop any of it from having already
-				// landed. `ROLLBACK TO SAVEPOINT`, run immediately after the
-				// SET and before `$writes()`, closes this the same way Ruling
-				// S21 closed the window before it: a genuine no-op on the real
-				// session (nothing written yet, and the savepoint survives for
-				// Ruling S17's own RELEASE later), but MySQL error 1305 on a
-				// session where the savepoint never really took — whether the
-				// reconnect landed before SAVEPOINT, during it, or during this
-				// SET makes no difference to this ONE check, which is why a
-				// single verification positioned AFTER the last such statement
-				// replaces Ruling S21's earlier, narrower one.
-				$wpdb->query( 'ROLLBACK TO SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				if ( '' !== (string) $wpdb->last_error ) {
+				try {
+					// Ruling S91 (Codex round-39 P2 on #88): EVERY
+					// transaction-control statement here — never only the
+					// state-carrying writes `$writes()` itself issues — now
+					// goes through `must_succeed()` (Ruling S84's own
+					// checkpoint, generalised one more step): a `query`
+					// filter suppressing ONE of these (returning `false`,
+					// core's own documented way to blank a statement, WITHOUT
+					// necessarily touching `$wpdb->last_error` at all) used to
+					// pass silently — `START TRANSACTION`'s and `SAVEPOINT`'s
+					// own return values were never checked AT ALL, and the
+					// verifying `ROLLBACK TO SAVEPOINT` below checked only
+					// `last_error`, never its OWN return value either — so a
+					// suppressed control statement could let `$writes()` run
+					// on a session this method never actually protected,
+					// believing it had. Caught HERE, before `$writes()` is
+					// ever invoked: nothing has run yet, so aborting costs
+					// nothing.
+					self::must_succeed( $wpdb->query( 'START TRANSACTION' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					// Ruling S17 (Codex round-7 P1 on #88): a REAL transactional
+					// savepoint, before anything else — see this method's own
+					// docblock for why the nonce below is not enough on its own.
+					self::must_succeed( $wpdb->query( 'SAVEPOINT aura_door_tx' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					// Ruling S16 (Codex round-6 P1 on #88): the proof the final
+					// COMMIT below checks before this method ever reports
+					// `committed: true`. See that COMMIT's own comment for what it
+					// proves and why. NOT itself routed through must_succeed()
+					// (Ruling S91): its own failure is already caught by the
+					// verifying ROLLBACK TO SAVEPOINT immediately below — see
+					// that statement's own comment for why.
+					$tx_nonce = wp_generate_uuid4();
+					$wpdb->query( $wpdb->prepare( 'SET @aura_door_tx = %s', $tx_nonce ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					// Ruling S25 (Codex round-11 P1 on #88): VERIFY the savepoint
+					// AFTER this SET, not before it (Ruling S21's own original
+					// position) — the SET is ITSELF the last reconnect-prone
+					// statement before `$writes()` runs. A reconnect landing WHILE
+					// this exact SET is being issued lets `wpdb` transparently
+					// retry it on a fresh AUTOCOMMIT session — one that never held
+					// the savepoint above — and the retried SET still assigns the
+					// nonce there, so a check placed only BEFORE the SET (as Ruling
+					// S21 had it) never sees this window at all: the callback
+					// writes and the bump would then run un-transacted, each
+					// autocommitting individually on a real server, before the
+					// LATER `RELEASE SAVEPOINT` (Ruling S17) finally caught the
+					// problem — too late to stop any of it from having already
+					// landed. `ROLLBACK TO SAVEPOINT`, run immediately after the
+					// SET and before `$writes()`, closes this the same way Ruling
+					// S21 closed the window before it: a genuine no-op on the real
+					// session (nothing written yet, and the savepoint survives for
+					// Ruling S17's own RELEASE later), but MySQL error 1305 on a
+					// session where the savepoint never really took — whether the
+					// reconnect landed before SAVEPOINT, during it, or during this
+					// SET makes no difference to this ONE check, which is why a
+					// single verification positioned AFTER the last such statement
+					// replaces Ruling S21's earlier, narrower one.
+					//
+					// Ruling S91: must_succeed() here checks BOTH this
+					// statement's own return value AND last_error — the
+					// pre-ruling code checked only last_error, so a `query`
+					// filter suppressing THIS exact statement (a `false`
+					// return with last_error left clean by whatever the
+					// PREVIOUS statement was) fell through as if the
+					// savepoint had verified cleanly.
+					self::must_succeed( $wpdb->query( 'ROLLBACK TO SAVEPOINT aura_door_tx' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				} catch ( Aura_Worker_Door_Write_Failed $e ) {
+					// Ruling S91: any of the three control statements
+					// above failed — $writes() was NEVER invoked, so
+					// there is nothing of its own to undo; only the
+					// transaction this attempt may have already opened
+					// (START TRANSACTION itself could have succeeded
+					// before a LATER control statement failed) needs
+					// closing.
 					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 					return array(
 						'committed' => false,
@@ -3512,8 +3548,18 @@ class Aura_Worker_Door_Log {
 				// instant that single statement completes, so MySQL answers
 				// error 1305 ("SAVEPOINT … does not exist") here instead. That
 				// failure is treated exactly like the bump's own write failing.
-				$wpdb->query( 'RELEASE SAVEPOINT aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-				if ( '' !== (string) $wpdb->last_error ) {
+				//
+				// Ruling S91 (Codex round-39 P2 on #88): routed through
+				// must_succeed() — checking ONLY `last_error`, as this
+				// branch did before, misses a `query` filter that
+				// suppresses this exact statement (a `false` return
+				// with `last_error` left clean by whatever ran just
+				// before it), which then fell through as a false
+				// RELEASE and went on to a real COMMIT the savepoint
+				// was never actually there to protect.
+				try {
+					self::must_succeed( $wpdb->query( 'RELEASE SAVEPOINT aura_door_tx' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				} catch ( Aura_Worker_Door_Write_Failed $e ) {
 					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 					self::evict_after_rollback( $evict ); // Ruling S18
 					return array(

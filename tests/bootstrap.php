@@ -2965,6 +2965,24 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return false;
 			}
 
+			// Ruling S91 (Codex round-39 P2 on #88): a `query` filter that
+			// blanks ONE targeted statement — `false` returned, `last_error`
+			// left exactly as flush() just set it (empty) — distinct from
+			// `_sa_wpdb_query_filtered_out` above (which blanks whatever the
+			// NEXT statement happens to be) and from
+			// `_sa_reconnect_before_savepoint` below (which models the
+			// statement's own effect vanishing on a fresh session, not the
+			// statement itself being suppressed). `$GLOBALS['_sa_wpdb_query_blank_matching']`
+			// is matched EXACTLY (trimmed) against $query, never a substring —
+			// `SAVEPOINT aura_door_tx` must not also match `ROLLBACK TO
+			// SAVEPOINT aura_door_tx` or `RELEASE SAVEPOINT aura_door_tx`.
+			// Fires once.
+			$blank_matching = $GLOBALS['_sa_wpdb_query_blank_matching'] ?? '';
+			if ( '' !== $blank_matching && trim( $query ) === $blank_matching ) {
+				$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // fires once
+				return false;
+			}
+
 			// Aura_Worker_Door_Log::versioned() (Ruling S8, 2.16.2): a state
 			// write and its door-version bump run inside ONE transaction, so
 			// the stub models START TRANSACTION/COMMIT/ROLLBACK by
@@ -3868,6 +3886,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false; // Ruling S11's opt-in — see wp_cache_delete()'s own comment.
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
+	$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // Ruling S91: a `query` filter blanking ONE targeted statement by substring match.
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
 	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
@@ -5149,6 +5168,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false; // Ruling S11's opt-in — see wp_cache_delete()'s own comment.
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
+	$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // Ruling S91: a `query` filter blanking ONE targeted statement by substring match.
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
 	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.

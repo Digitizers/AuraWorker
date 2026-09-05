@@ -2709,4 +2709,46 @@ final class DoorLogTest extends TestCase {
 
 		$this->assertSame( $reserved_seq, $second, 'Ruling S86: echoing reserved_seq back recognises it, even with zero derivable idempotency material' );
 	}
+
+	/* ------------------------------------------------------------------ */
+	/* Ruling S91 (Codex round-39 P2 on #88): every transaction-control    */
+	/* statement, not only $writes()'s own, goes through must_succeed().  */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * A `query` filter suppressing the SAVEPOINT verification -- `false`
+	 * returned, `last_error` left clean, exactly what wpdb::query() does
+	 * when the filter blanks the SQL before flush() runs (it never reaches
+	 * MySQL at all) -- used to pass silently, because the pre-Ruling-S91
+	 * check here read ONLY `$wpdb->last_error`, never `ROLLBACK TO
+	 * SAVEPOINT`'s own return value. This is deliberately NOT a test of
+	 * the plain `SAVEPOINT` statement itself: blanking THAT one is already
+	 * caught even by the pre-S91 code, transitively -- a savepoint that was
+	 * never really opened makes this SAME verification fail for real on a
+	 * live server (MySQL error 1305), which the last_error check already
+	 * catches. The one statement whose OWN suppression the old, last_error
+	 * -only check could never see is this verification itself: nothing
+	 * downstream depends on ITS side effect, so nothing else ever surfaces
+	 * the gap. `must_succeed()` (Ruling S91) closes exactly that hole by
+	 * checking the return value too, inside its own try/catch, BEFORE
+	 * `$writes()` is ever invoked -- proven here by a callback that would
+	 * insert a row nobody may ever see if it ran.
+	 */
+	public function test_a_suppressed_savepoint_verification_aborts_the_unit_before_writes_runs(): void {
+		$name = 'aura_worker_door_log_test_s91_never_written';
+
+		$GLOBALS['_db_queries']                   = array();
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = 'ROLLBACK TO SAVEPOINT aura_door_tx';
+
+		$result = Aura_Worker_Door_Log::insert_unique( $name, array( 'seq' => 1 ) );
+
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = '';
+
+		$this->assertFalse( $result, 'a suppressed SAVEPOINT verification is a proven abort, not UNKNOWN -- must_succeed() throws before $writes() ever runs' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the callback that would have written this row never ran' );
+		foreach ( $GLOBALS['_db_queries'] as $q ) {
+			$this->assertStringNotContainsStringIgnoringCase( 'INSERT INTO', $q, 'no INSERT was ever issued -- the unit aborted before $writes()' );
+		}
+		$this->assertContains( 'ROLLBACK', $GLOBALS['_db_queries'], 'the transaction START TRANSACTION opened is closed, not left dangling' );
+	}
 }
