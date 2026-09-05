@@ -1787,4 +1787,42 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertNull( $block['observation'], 'this audit never writes -- it can only fail to prove the read it just took' );
 		$this->assertTrue( $block['active'], 'still served via live computation' );
 	}
+
+	/**
+	 * Ruling S55 (Codex round-21 P2 on #88): count_unacked() failing at
+	 * the driver (Ruling P53) used to report `log_unacked: null` sitting
+	 * right beside a perfectly ordinary, non-null `observation` -- a
+	 * fragment certifying a field it could not actually read. A count
+	 * read failure is unreadable, the same S44/S48-class pattern every
+	 * other unreadable-capable field on this fragment already follows:
+	 * `observation` is withheld for the whole poll.
+	 */
+	public function test_status_fragment_withholds_observation_when_the_unacked_count_fails(): void {
+		$this->registerAll();
+
+		$GLOBALS['_sa_door_unacked_error'] = true;
+		$frag                              = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_door_unacked_error'] = false;
+
+		$this->assertNull( $frag['log_unacked'], 'never a false zero for a backlog this poll could not count' );
+		$this->assertNull( $frag['observation'], 'a fragment that cannot vouch for one of its own fields is not witnessed at all' );
+
+		// The miss must not stick: the very next poll, once the driver
+		// recovers, is witnessed again.
+		$again = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $again['observation'] );
+	}
+
+	/** Ruling S55, the SAME fix read from governor_block(). */
+	public function test_governor_block_withholds_observation_when_the_unacked_count_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$GLOBALS['_sa_door_unacked_error'] = true;
+		$block                             = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_door_unacked_error'] = false;
+
+		$this->assertNull( $block['log_unacked'] );
+		$this->assertNull( $block['observation'], 'this audit reports the same log_unacked field under the same rule' );
+	}
 }

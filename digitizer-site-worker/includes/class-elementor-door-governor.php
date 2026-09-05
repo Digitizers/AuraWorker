@@ -418,9 +418,10 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return null;
 		}
-		$synced              = false;
-		$rewind_info         = array( 'top_unreadable' => false );
-		$computed_unreadable = false;
+		$synced                = false;
+		$rewind_info           = array( 'top_unreadable' => false );
+		$computed_unreadable   = false;
+		$log_unacked_unreadable = false;
 		return self::version_bracketed(
 			static function () {
 				// Ruling S20 (Codex round-8 P1 on #88): a retry MUST
@@ -430,7 +431,7 @@ class Aura_Worker_Elementor_Door {
 				// closes.
 				self::reset_request_caches();
 			},
-			function () use ( $after, $epoch, &$synced, &$rewind_info, &$computed_unreadable ) {
+			function () use ( $after, $epoch, &$synced, &$rewind_info, &$computed_unreadable, &$log_unacked_unreadable ) {
 				// Ruling S38 (Codex round-16 P1 on #88): reset
 				// UNCONDITIONALLY, on attempt 0 too — a floor-read failure
 				// belongs to the attempt that hit it, never carried in
@@ -538,9 +539,20 @@ class Aura_Worker_Elementor_Door {
 				// outright is already `!$synced` below and never reaches
 				// this line.
 				$computed_unreadable = $synced && Aura_Worker_Door_Log::raw_option_was_unreadable();
-				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now );
+				// Ruling S55 (Codex round-21 P2 on #88): read ONCE, here,
+				// before build_status_fragment_state() reports it — the
+				// SAME "read once, share with is_unreadable" shape every
+				// other unreadable-capable field on this fragment already
+				// has. count_unacked() never returns null for a genuine
+				// zero backlog (only for a failed read, per its own
+				// docblock), so `null === $log_unacked` is the complete
+				// signal — no separate flag/getter needed the way a
+				// get_option()-routed field would.
+				$log_unacked            = Aura_Worker_Door_Log::count_unacked();
+				$log_unacked_unreadable = ( null === $log_unacked );
+				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now, $log_unacked );
 			},
-			function () use ( &$synced, &$rewind_info, &$computed_unreadable ) {
+			function () use ( &$synced, &$rewind_info, &$computed_unreadable, &$log_unacked_unreadable ) {
 				// Ruling S24 (Codex round-10 P2 on #88): the
 				// computed-state transition ITSELF could not be committed
 				// — see sync_computed_state()'s own docblock for why a
@@ -591,7 +603,15 @@ class Aura_Worker_Elementor_Door {
 					// to live active/seam/door values for BOTH; this is
 					// what stops the unreadable half of that pair from
 					// also being served under a witness it never earned.
-					|| $computed_unreadable;
+					|| $computed_unreadable
+					// Ruling S55 (Codex round-21 P2 on #88): `log_unacked`
+					// could fail to be read (Ruling P53) same as any other
+					// field here, but nothing withheld `observation` for
+					// it — a fragment could report `log_unacked: null`
+					// (unknown) sitting right beside a perfectly ordinary,
+					// non-null witness, certifying a fragment this call
+					// could not actually vouch for in full.
+					|| $log_unacked_unreadable;
 			}
 		);
 	}
@@ -1223,9 +1243,18 @@ class Aura_Worker_Elementor_Door {
 	 *                                     own return, the SAME shape and
 	 *                                     the SAME treatment (Ruling S46,
 	 *                                     Codex round-19, S45 class).
+	 * @param int|null   $log_unacked     `Aura_Worker_Door_Log::count_unacked()`'s
+	 *                                     own return, read ONCE by the
+	 *                                     caller (Ruling S55, Codex
+	 *                                     round-21 P2 on #88) — before this
+	 *                                     method — so the caller's
+	 *                                     `is_unreadable` check sees the
+	 *                                     SAME null-or-int this method
+	 *                                     reports, never a second,
+	 *                                     possibly different read.
 	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
 	 */
-	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array(), array $interrupted_now = array() ) {
+	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array(), array $interrupted_now = array(), $log_unacked = null ) {
 		$after          = (int) $rewind_info['after'];
 		$site           = (string) $rewind_info['site'];
 		$rewind         = $rewind_info['rewind'];
@@ -1338,7 +1367,10 @@ class Aura_Worker_Elementor_Door {
 			'log_floor'   => Aura_Worker_Door_Log::floor_raw(),
 			// NULL when the backlog could not be counted (Ruling P53): Aura is
 			// told "unknown", never a false zero it would read as an empty log.
-			'log_unacked' => Aura_Worker_Door_Log::count_unacked(),
+			// The CALLER's own read (Ruling S55, Codex round-21 P2 on
+			// #88), never a second one here — see this method's own
+			// `$log_unacked` parameter docblock.
+			'log_unacked' => $log_unacked,
 			'log_full'    => Aura_Worker_Door_Log::full_report_raw(),
 		);
 	}
@@ -4193,7 +4225,8 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
-		$computed_unreadable = false;
+		$computed_unreadable    = false;
+		$log_unacked_unreadable = false;
 		// Ruling S43 (Codex round-18 P1 on #88): the SAME version-bracket
 		// discipline status_fragment() already has, through the SAME
 		// shared helper (version_bracketed()'s own docblock) — every
@@ -4216,7 +4249,7 @@ class Aura_Worker_Elementor_Door {
 				// goes through the identical held_rows() memo).
 				self::reset_request_caches();
 			},
-			static function () use ( &$computed_unreadable ) {
+			static function () use ( &$computed_unreadable, &$log_unacked_unreadable ) {
 				// Ruling S28 (Codex round-12 P1 on #88): the PERSISTED
 				// tuple, never this request's own live computation — see
 				// persisted_computed_state()'s own docblock for the race
@@ -4264,6 +4297,14 @@ class Aura_Worker_Elementor_Door {
 				// say "unknown" together rather than one of them
 				// inventing a zero.
 				$held = Aura_Worker_Door_Holds::count(); // read once
+				// Ruling S55 (Codex round-21 P2 on #88): read ONCE, here
+				// — the SAME "read once, share with is_unreadable" shape
+				// held_count/queue_full above already use. count_unacked()
+				// never returns null for a genuine zero backlog (only for
+				// a failed read), so `null === $log_unacked` is the
+				// complete signal.
+				$log_unacked            = Aura_Worker_Door_Log::count_unacked();
+				$log_unacked_unreadable = ( null === $log_unacked );
 				// Ruling S49 (Codex round-19 P2 on #88): ONE `$now` for
 				// every `_30d` counter AND the cutoff reported beside
 				// them — four separate `time()` calls could straddle an
@@ -4287,7 +4328,7 @@ class Aura_Worker_Elementor_Door {
 					'seam'                => $seam,
 					'door'                => $door,
 					'held_count'          => $held,
-					'log_unacked'         => Aura_Worker_Door_Log::count_unacked(), // null when unreadable (Ruling P53)
+					'log_unacked'         => $log_unacked, // null when unreadable (Ruling P53) — read once, above (Ruling S55)
 					// Ruling S37 (Codex round-15 class sweep on #88): null
 					// when THIS count could not be read — joining
 					// log_unacked/held_count above rather than reporting
@@ -4316,7 +4357,7 @@ class Aura_Worker_Elementor_Door {
 					'log_full'            => Aura_Worker_Door_Log::full_report_raw(),
 				);
 			},
-			static function () use ( &$computed_unreadable ) {
+			static function () use ( &$computed_unreadable, &$log_unacked_unreadable ) {
 				// Ruling S43: the closure marker (feeds `door` above,
 				// through door_state()) and the closed-log report (Ruling
 				// S42) are the two raw reads this audit's OWN fields
@@ -4334,7 +4375,11 @@ class Aura_Worker_Elementor_Door {
 				// pair from also being served under a witness.
 				return Aura_Worker_Door_Log::closure_read_was_unreadable()
 					|| Aura_Worker_Door_Log::full_report_raw_was_unreadable()
-					|| $computed_unreadable;
+					|| $computed_unreadable
+					// Ruling S55 (Codex round-21 P2 on #88): a failed
+					// backlog count is unreadable, not a false zero —
+					// see status_fragment()'s own identical check.
+					|| $log_unacked_unreadable;
 			}
 		);
 	}
