@@ -1825,4 +1825,41 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertNull( $block['log_unacked'] );
 		$this->assertNull( $block['observation'], 'this audit reports the same log_unacked field under the same rule' );
 	}
+
+	/**
+	 * Ruling S57 (Codex round-22 P2 on #88): binding_raw()'s own
+	 * unreadable flag was neither captured immediately after its read
+	 * nor folded into the bracket's own unreadable predicate --
+	 * binding_raw() answers '' for BOTH genuinely-unbound and unreadable,
+	 * so a fragment could report `binding: null` sitting right beside a
+	 * perfectly ordinary, non-null observation it never actually earned.
+	 */
+	public function test_status_fragment_withholds_observation_when_the_binding_read_fails(): void {
+		$this->registerAll();
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = 0;
+
+		$this->assertNull( $frag['binding'], 'never a stale/guessed binding for a read this poll could not prove' );
+		$this->assertNull( $frag['observation'], 'a fragment that cannot vouch for its own binding field is not witnessed at all' );
+
+		// The miss must not stick: the very next poll, once the driver
+		// recovers, is witnessed again.
+		$again = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $again['observation'] );
+	}
+
+	/** Ruling S57, the SAME fix read from governor_block(). */
+	public function test_governor_block_withholds_observation_when_the_binding_read_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = 0;
+
+		$this->assertNull( $block['binding'] );
+		$this->assertNull( $block['observation'], 'this audit reports the same binding field under the same rule' );
+	}
 }
