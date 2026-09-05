@@ -151,13 +151,24 @@ final class UninstallCoverageTest extends TestCase {
 	 *   increment (bump_door_version()'s INSERT … ON DUPLICATE KEY UPDATE on
 	 *   'aura_worker_door_observation'), the same upsert shape bump_refused()
 	 *   above already uses. Also under the swept 'aura_worker_' prefix. And —
-	 *   since Ruling S30, Codex round-13 P1 on #88 — versioned()'s DURABLE
-	 *   commit-witness write, an INSERT … ON DUPLICATE KEY UPDATE on
-	 *   'aura_worker_door_last_tx' inside every mutating transaction, before
-	 *   the version bump: a plain option row survives a reconnect that a
-	 *   MySQL session variable does not, so it stands in for the session
-	 *   nonce (Ruling S16) when that nonce cannot be read back after COMMIT.
-	 *   Also under the swept 'aura_worker_' prefix.
+	 *   since Ruling S30, Codex round-13 P1 on #88, superseded by Ruling S32,
+	 *   Codex round-14 P1 on #88 — versioned()'s DURABLE commit-witness
+	 *   write, a PLAIN INSERT (no ON DUPLICATE KEY UPDATE — a real second
+	 *   INSERT of the same name would collide) on
+	 *   'aura_worker_door_tx_<nonce>' inside every mutating transaction,
+	 *   before the version bump: a plain option row survives a reconnect
+	 *   that a MySQL session variable does not, so it stands in for the
+	 *   session nonce (Ruling S16) when that nonce cannot be read back
+	 *   after COMMIT. Named BY the transaction's own nonce (S30's row was
+	 *   ONE shared key every unit overwrote, so a second unit's commit
+	 *   could land on it between this unit's write and its own read-back)
+	 *   so two concurrent units' witness rows can never collide. The unit
+	 *   deletes its own row once the check is settled, and a bounded
+	 *   janitor DELETE (LIKE 'aura_worker_door_tx_%' AND older than
+	 *   LAST_TX_MAX_AGE_S, at most LAST_TX_JANITOR_LIMIT rows) sweeps up
+	 *   whatever a died process left behind — the DELETEs are not counted
+	 *   here (the ledger only tracks INSERT/UPDATE call sites), but both
+	 *   fall under the swept 'aura_worker_' prefix same as the INSERT.
 	 * - includes/class-elementor-door-governor.php (3, 2.16.0) — the door's
 	 *   rolling 30-day counters, in the rule counters' shape:
 	 *   'aura_worker_door_c_<name>_h<hour>', an atomic

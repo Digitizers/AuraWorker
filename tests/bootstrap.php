@@ -3363,6 +3363,44 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return 1;
 			}
 
+			// Aura_Worker_Door_Log::versioned()'s bounded janitor (Ruling
+			// S32, 2.16.2): sweeps up commit-witness rows a DIED process
+			// left behind — its own COMMIT landed, but the process never
+			// reached its own self-cleanup delete above. Bounded on age
+			// (CAST(option_value AS UNSIGNED), the row's stored unix
+			// timestamp) and on row count, so this never becomes a
+			// full-table scan on every single door mutation.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']+)' AND CAST\(option_value AS UNSIGNED\) < (\d+) LIMIT (\d+)$/", $query, $m ) ) {
+				// $m[1] is esc_like()'s escaping THEN prepare()'s addslashes,
+				// stacked — the exact same double-escaping the expired-notice
+				// claim sweep's LIKE handler above already has to undo.
+				// stripslashes() undoes prepare()'s layer; sa_like_to_regex()
+				// then reads esc_like()'s own backslash-escapes so a LITERAL
+				// underscore in the prefix (this option name is full of them)
+				// is never mistaken for LIKE's "any single character"
+				// wildcard.
+				$re     = sa_like_to_regex( stripslashes( $m[1] ) );
+				$before = (int) $m[2];
+				$limit  = (int) $m[3];
+				$n      = 0;
+				foreach ( array_keys( $GLOBALS['_options'] ) as $name ) {
+					if ( $n >= $limit ) {
+						break;
+					}
+					if ( ! preg_match( $re, $name ) ) {
+						continue;
+					}
+					if ( (int) $GLOBALS['_rows'][ $name ] >= $before ) {
+						continue;
+					}
+					unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+					$GLOBALS['_notoptions'][ $name ] = true;
+					$GLOBALS['_option_writes'][]     = array( 'delete', $name );
+					++$n;
+				}
+				return $n;
+			}
+
 			// Emulate the counters' atomic create-or-increment: one statement,
 			// no read, so a first bump inserts '1' and every later bump in the
 			// same hour adds one to whatever is there — never the two-step
@@ -3380,13 +3418,21 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return 1;
 			}
 			// Aura_Worker_Door_Log::versioned()'s DURABLE commit witness
-			// (Ruling S30, 2.16.2): an unconditional upsert — every unit
-			// simply OVERWRITES this row with its own nonce, unlike the
-			// atomic counters above — into 'aura_worker_door_last_tx',
-			// written INSIDE the transaction, BEFORE the version bump.
-			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', '([^']*)', 'no'\) ON DUPLICATE KEY UPDATE option_value = VALUES\(option_value\)$/", $query, $m ) ) {
+			// (Ruling S32, 2.16.2 — supersedes S30's shared-row upsert): a
+			// PLAIN insert, no ON DUPLICATE KEY UPDATE, into a row named BY
+			// this unit's own nonce ('aura_worker_door_tx_<nonce>') so two
+			// concurrent units can never collide on the same key — written
+			// INSIDE the transaction, BEFORE the version bump. A real MySQL
+			// UNIQUE index on option_name would refuse a genuine second
+			// INSERT of the same name; modelled the same way the ruleset's
+			// own plain insert does elsewhere in this stub.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', '([^']*)', 'no'\)$/", $query, $m ) ) {
 				$name  = stripslashes( $m[1] );
 				$value = stripslashes( $m[2] );
+				if ( null !== sa_read_option_uncached( $name ) ) {
+					$this->last_error = "Duplicate entry '{$name}' for key 'option_name'";
+					return false;
+				}
 				$GLOBALS['_rows'][ $name ]    = $value;
 				$GLOBALS['_options'][ $name ] = $value;
 				return 1;

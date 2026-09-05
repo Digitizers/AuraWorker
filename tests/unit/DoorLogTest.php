@@ -1160,14 +1160,27 @@ final class DoorLogTest extends TestCase {
 	 * variable is gone, indistinguishable from a COMMIT that ran on a
 	 * fresh session that never opened this transaction at all. A plain
 	 * option row survives that same reconnect, because it lives in the
-	 * table the landed COMMIT just made durable — so the SAME nonce,
-	 * written to `aura_worker_door_last_tx` BEFORE the bump, lets this
-	 * call prove the commit really happened even though its own session
-	 * check cannot.
+	 * table the landed COMMIT just made durable.
+	 *
+	 * Ruling S32 (Codex round-14 P1 on #88): S30's row was a SINGLE
+	 * shared key every unit overwrote — a second unit's own commit could
+	 * land on that key between this unit's write and this unit's
+	 * read-back, so the fallback could pass while proving nothing but
+	 * B's commit. The witness is now named BY this unit's own nonce
+	 * (`aura_worker_door_tx_<nonce>`), so it can never collide with a
+	 * DIFFERENT unit's own witness row — proven here by seeding one
+	 * before this call even starts and asserting it survives untouched.
 	 */
-	public function test_a_reconnect_after_a_real_commit_falls_back_to_the_durable_witness(): void {
-		$name = 'aura_worker_door_s30_test';
+	public function test_a_reconnect_after_a_real_commit_falls_back_to_its_own_durable_witness(): void {
+		$name = 'aura_worker_door_s32_test';
 
+		// A concurrent unit's own witness row — a different nonce, freshly
+		// written, still sitting there when this call's own fallback runs.
+		$foreign_name                         = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-b';
+		$GLOBALS['_rows'][ $foreign_name ]    = (string) time();
+		$GLOBALS['_options'][ $foreign_name ] = (string) time();
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-a';
 		$GLOBALS['_sa_reconnect_after_commit'] = true;
 		$outcome                               = Aura_Worker_Door_Log::versioned(
 			function () use ( $name ) {
@@ -1181,28 +1194,30 @@ final class DoorLogTest extends TestCase {
 			}
 		);
 		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
 
-		$this->assertTrue( $outcome['committed'], 'the durable witness proves the COMMIT really landed even though the session variable was lost afterwards' );
+		$this->assertTrue( $outcome['committed'], 'this unit\'s OWN durable witness proves the COMMIT really landed even though the session variable was lost afterwards' );
 		$this->assertTrue( $outcome['result'] );
 		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
+		$this->assertArrayHasKey( $foreign_name, $GLOBALS['_options'], 'a concurrent unit\'s own witness row is never touched by this unit\'s check or its own self-cleanup' );
+		$this->assertArrayNotHasKey(
+			Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-a',
+			$GLOBALS['_options'],
+			'this unit deletes its OWN witness row once the check is settled (Ruling S32)'
+		);
 	}
 
 	/**
-	 * The other half of Ruling S30: when the connection drops BEFORE
-	 * COMMIT (Ruling S16's own original window — nothing landed at all,
-	 * this call's own durable-witness write included), the fallback must
-	 * NOT be fooled by whatever an OLDER, already-committed transaction
-	 * left in that same row. Only THIS call's own nonce may prove THIS
-	 * call's own commit.
+	 * The other half of Ruling S32 (formerly S30): when the connection
+	 * drops BEFORE COMMIT (Ruling S16's own original window — the whole
+	 * transaction unwinds, this call's own durable-witness INSERT
+	 * included), there is nothing durable left to prove this call's own
+	 * commit, and the fallback must say so.
 	 */
-	public function test_a_reconnect_before_commit_is_not_fooled_by_an_older_durable_witness(): void {
-		$name = 'aura_worker_door_s30_test2';
+	public function test_a_reconnect_before_commit_leaves_no_witness_row_to_fall_back_to(): void {
+		$name = 'aura_worker_door_s32_test2';
 
-		// A previous, unrelated transaction's own nonce — still sitting in
-		// the durable witness row from before this call ever started.
-		$GLOBALS['_rows'][ Aura_Worker_Door_Log::LAST_TX ]    = 'an-older-nonce';
-		$GLOBALS['_options'][ Aura_Worker_Door_Log::LAST_TX ] = 'an-older-nonce';
-
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-c';
 		$GLOBALS['_sa_reconnect_before_commit'] = true;
 		$outcome                                = Aura_Worker_Door_Log::versioned(
 			function () use ( $name ) {
@@ -1216,15 +1231,69 @@ final class DoorLogTest extends TestCase {
 			}
 		);
 		$GLOBALS['_sa_reconnect_before_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
 
 		$this->assertFalse( $outcome['committed'] );
 		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
-		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the reconnect unwound this call\'s own durable-witness write too' );
-		$this->assertSame(
-			'an-older-nonce',
-			$GLOBALS['_options'][ Aura_Worker_Door_Log::LAST_TX ],
-			'the durable witness reverted to what a PREVIOUS transaction left — never mistaken for THIS call\'s own nonce'
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the reconnect unwound this call\'s own writes too' );
+		$this->assertArrayNotHasKey(
+			Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-c',
+			$GLOBALS['_options'],
+			'this call\'s own witness row was rolled back along with everything else — there is nothing to fall back to'
 		);
+	}
+
+	/**
+	 * Ruling S32's bounded janitor: a witness row outlives the unit that
+	 * wrote it only when that unit's process died between its own COMMIT
+	 * and its own self-cleanup delete — rare, but `versioned()` sweeps for
+	 * it on every mutating unit. The sweep must stay BOUNDED: only rows
+	 * older than `LAST_TX_MAX_AGE_S`, and never more than
+	 * `LAST_TX_JANITOR_LIMIT` of them in one pass, so this never turns
+	 * into a full-table scan on the hot path.
+	 */
+	public function test_the_janitor_sweeps_only_stale_witness_rows_and_never_more_than_the_bound(): void {
+		$stale_cutoff = time() - Aura_Worker_Door_Log::LAST_TX_MAX_AGE_S - 100;
+		$stale_count  = Aura_Worker_Door_Log::LAST_TX_JANITOR_LIMIT + 5;
+
+		for ( $i = 0; $i < $stale_count; $i++ ) {
+			$stale_name                      = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'stale-' . $i;
+			$GLOBALS['_rows'][ $stale_name ] = (string) $stale_cutoff;
+			$GLOBALS['_options'][ $stale_name ] = (string) $stale_cutoff;
+		}
+
+		$fresh_name                          = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'fresh';
+		$GLOBALS['_rows'][ $fresh_name ]     = (string) time();
+		$GLOBALS['_options'][ $fresh_name ]  = (string) time();
+
+		$name    = 'aura_worker_door_s32_janitor_test';
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$this->assertTrue( $outcome['committed'] );
+
+		$remaining_stale = 0;
+		for ( $i = 0; $i < $stale_count; $i++ ) {
+			if ( isset( $GLOBALS['_options'][ Aura_Worker_Door_Log::LAST_TX_PREFIX . 'stale-' . $i ] ) ) {
+				++$remaining_stale;
+			}
+		}
+
+		$this->assertSame(
+			$stale_count - Aura_Worker_Door_Log::LAST_TX_JANITOR_LIMIT,
+			$remaining_stale,
+			'exactly LAST_TX_JANITOR_LIMIT stale rows were swept in this one pass — bounded, not all-at-once'
+		);
+		$this->assertArrayHasKey( $fresh_name, $GLOBALS['_options'], 'a row younger than LAST_TX_MAX_AGE_S is never swept' );
 	}
 
 	/**

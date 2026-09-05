@@ -65,11 +65,25 @@ class Aura_Worker_Door_Log {
 	const OBSERVATION  = 'aura_worker_door_observation';
 	/**
 	 * The DURABLE commit witness `versioned()` writes inside its own
-	 * transaction, before the version bump (Ruling S30, Codex round-13 P1
-	 * on #88) — see that method's own docblock for the reconnect window
-	 * the session-variable nonce (Ruling S16) alone cannot close.
+	 * transaction, before the version bump (Ruling S30, Codex round-13 P1;
+	 * PER-TRANSACTION as of Ruling S32, Codex round-14 P1 — both on #88) —
+	 * see that method's own docblock for the reconnect window the
+	 * session-variable nonce (Ruling S16) alone cannot close, and for why
+	 * a single SHARED row (Ruling S30's own original shape) was itself
+	 * unsafe. The full option name is this PREFIX followed by the unit's
+	 * own nonce — `self::LAST_TX_PREFIX . $tx_nonce` — never written or
+	 * read by name alone.
 	 */
-	const LAST_TX      = 'aura_worker_door_last_tx';
+	const LAST_TX_PREFIX = 'aura_worker_door_tx_';
+	/**
+	 * How long a leaked per-transaction witness row (Ruling S32) may sit
+	 * before `versioned()`'s own bounded janitor sweeps it up — a process
+	 * that died between its own COMMIT and its own best-effort delete of
+	 * that SAME row is the only way one outlives the unit that wrote it.
+	 */
+	const LAST_TX_MAX_AGE_S = DAY_IN_SECONDS;
+	/** How many leaked witness rows the janitor removes per call — bounded, since this runs inside every mutating unit. */
+	const LAST_TX_JANITOR_LIMIT = 50;
 	const MAX_UNACKED  = 2000;
 	const PAGE         = 100;
 	/** How many INSERT collisions to ride through before giving up. */
@@ -1972,24 +1986,40 @@ class Aura_Worker_Door_Log {
 	 * the real transaction is gone, and this method answers `committed:
 	 * false` — accurately: nothing landed.
 	 *
-	 * THE COMMIT WITNESS MUST ALSO BE DURABLE (Ruling S30, Codex round-13
-	 * P1 on #88). Ruling S16's session-variable nonce has a gap of its own:
-	 * if `COMMIT` genuinely lands on THIS session but the connection then
-	 * drops before this method's own `SELECT @aura_door_tx` can run, the
-	 * session variable is gone — indistinguishable from the case Ruling
-	 * S16 exists to catch, where `COMMIT` ran on a fresh session that never
-	 * opened this transaction at all. Both answer NULL or a mismatch, so a
-	 * mutation that fully committed could be reported `committed: false`.
-	 * A plain option row does not have this problem: unlike a session
-	 * variable, it survives the reconnect that follows a landed `COMMIT`,
-	 * because it lives in the very table that `COMMIT` just made durable.
-	 * The SAME nonce is therefore also written to `self::LAST_TX` — inside
-	 * this transaction, BEFORE the version bump — and when the session
-	 * variable cannot confirm the commit, this method falls back to
-	 * reading that row RAW (no option cache, a fresh statement): equal to
-	 * this call's nonce means the COMMIT that wrote it landed for real and
-	 * the session was merely lost afterwards; anything else means it did
-	 * not.
+	 * THE COMMIT WITNESS MUST ALSO BE DURABLE — AND PER TRANSACTION
+	 * (Rulings S30/S32, Codex rounds 13/14 P1 on #88). Ruling S16's
+	 * session-variable nonce has a gap of its own: if `COMMIT` genuinely
+	 * lands on THIS session but the connection then drops before this
+	 * method's own `SELECT @aura_door_tx` can run, the session variable is
+	 * gone — indistinguishable from the case Ruling S16 exists to catch,
+	 * where `COMMIT` ran on a fresh session that never opened this
+	 * transaction at all. Both answer NULL or a mismatch, so a mutation
+	 * that fully committed could be reported `committed: false`. A plain
+	 * option row does not have this problem: unlike a session variable, it
+	 * survives the reconnect that follows a landed `COMMIT`, because it
+	 * lives in the very table that `COMMIT` just made durable.
+	 *
+	 * Ruling S30 wrote that row under ONE SHARED name for every unit —
+	 * which is itself unsafe: transaction A commits, reconnects before its
+	 * own session check, and transaction B (a different, unrelated unit)
+	 * commits afterwards and OVERWRITES that same shared row with B's OWN
+	 * nonce before A's fallback ever reads it — A's fallback then reads
+	 * B's nonce, a mismatch, and reports `committed: false` for a mutation
+	 * that was fully durable. Ruling S32 makes the witness PER
+	 * TRANSACTION instead: the option NAME itself carries the nonce
+	 * (`self::LAST_TX_PREFIX . $tx_nonce`), so no two units — however they
+	 * interleave — can ever collide on the same row. Existence of THAT
+	 * exact row (value: the write's own unix timestamp, never compared)
+	 * is the whole proof; nothing else could have written a row under a
+	 * name only this call's own nonce determines. Once the session check
+	 * or this fallback has answered — either way, best effort, OUTSIDE
+	 * the transaction, since it has already committed or rolled back by
+	 * then — the unit deletes its own row; a BOUNDED janitor inside this
+	 * same method sweeps up whatever a died process left behind (a
+	 * disconnect between COMMIT and that delete), never more than
+	 * `self::LAST_TX_JANITOR_LIMIT` rows older than
+	 * `self::LAST_TX_MAX_AGE_S`, so this table never accumulates rows
+	 * across restarts of the same fault.
 	 *
 	 * THE SESSION ITSELF IS ESTABLISHED WITH A SAVEPOINT, NOT JUST NAMED
 	 * (Ruling S17, Codex round-7 P1 on #88). Ruling S16's nonce closed the
@@ -2186,23 +2216,22 @@ class Aura_Worker_Door_Log {
 			);
 		}
 		if ( $transactional ) {
-			// Ruling S30 (Codex round-13 P1 on #88): a DURABLE commit
-			// witness, written INSIDE this transaction, BEFORE the version
-			// bump — see the post-COMMIT check below for the reconnect
-			// window this closes that the session-variable nonce (Ruling
-			// S16) cannot: if COMMIT itself lands but the connection then
-			// drops before this method's own SELECT of the session
-			// variable can run, the session variable is unreadable and
-			// looks IDENTICAL to a COMMIT that never happened on this
-			// session at all — a plain option row, unlike a session
-			// variable, survives the reconnect that follows a landed
-			// COMMIT, because it lives in the table the COMMIT itself just
-			// made durable.
+			// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): a DURABLE
+			// commit witness, PER TRANSACTION, written INSIDE this
+			// transaction, BEFORE the version bump — see the post-COMMIT
+			// check below for the reconnect window this closes that the
+			// session-variable nonce (Ruling S16) cannot, and this
+			// method's own docblock for why the row is named BY this
+			// unit's own nonce rather than shared with every other unit.
+			// `option_value` is never compared — the row's mere EXISTENCE
+			// under this exact name is the proof — so it carries the
+			// write's own unix timestamp, which is all the later janitor
+			// sweep needs to judge a leaked row's age.
 			$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->prepare(
-					"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no') ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)",
-					self::LAST_TX,
-					$tx_nonce
+					"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+					self::LAST_TX_PREFIX . $tx_nonce,
+					(string) time()
 				)
 			);
 		}
@@ -2266,7 +2295,8 @@ class Aura_Worker_Door_Log {
 			// statement itself simply fails). The RELEASE above already
 			// catches most of this window; this check remains for the
 			// narrower one still open between it and the COMMIT itself.
-			$commit_ok = ( '' === (string) $wpdb->last_error );
+			$tx_witness = self::LAST_TX_PREFIX . $tx_nonce;
+			$commit_ok  = ( '' === (string) $wpdb->last_error );
 			if ( $commit_ok ) {
 				$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
@@ -2284,16 +2314,49 @@ class Aura_Worker_Door_Log {
 					// resolves it: a plain option row — unlike a session
 					// variable — survives a reconnect, because it lives in
 					// the table the COMMIT that wrote it just made durable.
-					// Read RAW: no option-cache layer, a fresh statement.
+					// Ruling S32 (Codex round-14 P1 on #88): that row is
+					// named BY this unit's own nonce, so its mere EXISTENCE
+					// — never a value comparison — is the whole proof; a
+					// row a DIFFERENT, unrelated unit wrote can never share
+					// this exact name. Read RAW: no option-cache layer, a
+					// fresh statement.
 					$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 						$wpdb->prepare(
 							"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-							self::LAST_TX
+							$tx_witness
 						)
 					);
-					$commit_ok = ( is_string( $durable ) && $durable === $tx_nonce );
+					$commit_ok = is_string( $durable );
 				}
 			}
+			// Ruling S32: both branches above are now settled — clean up
+			// THIS unit's own witness row, best effort, OUTSIDE the
+			// transaction (which has already committed or rolled back by
+			// now, so this DELETE is its own separate, auto-committed
+			// statement). Only reached once a real COMMIT has actually
+			// been issued: the SAVEPOINT-release and bump-write failure
+			// branches above return before ever getting here, and in both
+			// of those the witness row this unit wrote was rolled back
+			// along with everything else, so there is nothing of THIS
+			// unit's own to delete.
+			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $tx_witness ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			// A BOUNDED JANITOR for whatever a DIED process left behind — a
+			// disconnect landing between ITS OWN COMMIT and ITS OWN delete
+			// above is the only way a witness row outlives the unit that
+			// wrote it. Runs on every mutating unit, so the bound
+			// (`self::LAST_TX_JANITOR_LIMIT` rows, older than
+			// `self::LAST_TX_MAX_AGE_S`) matters: this table must never be
+			// left to accumulate across restarts of the same fault, but
+			// nor may this sweep itself become a full-table scan on every
+			// single door mutation.
+			$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND CAST(option_value AS UNSIGNED) < %d LIMIT %d",
+					$wpdb->esc_like( self::LAST_TX_PREFIX ) . '%',
+					time() - self::LAST_TX_MAX_AGE_S,
+					self::LAST_TX_JANITOR_LIMIT
+				)
+			);
 			if ( ! $commit_ok ) {
 				// Ruling S15: no callback result — see the bump-failure
 				// branch above for why. Neither the session variable nor
