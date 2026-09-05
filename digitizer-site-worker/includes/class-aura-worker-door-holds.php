@@ -868,6 +868,35 @@ class Aura_Worker_Door_Holds {
 				'listing'  => array(),
 			);
 		}
+		// Ruling S70 (Codex round-27 P2 on #88): claimed rows, read ONCE,
+		// RAW, right here — never get_claimed()'s own get_option() call
+		// per ref. get_option()'s per-request NEGATIVE cache (WordPress's
+		// `notoptions`) remembers an option name as ABSENT for the rest of
+		// THIS request the FIRST time anything asks for it and finds
+		// nothing — reconcile()'s own earlier "is this ref claimed" check
+		// (or an earlier poll's) caches "no" for a ref a CONCURRENT
+		// claim() then genuinely inserts before this bracket opens, and a
+		// later get_claimed() call in here never learns of it: the
+		// approval keeps being listed as held under a version that
+		// already reflects the claim. A fresh bulk SELECT bypasses
+		// get_option() (and therefore that cache) entirely — the SAME
+		// reasoning partition_stale_claims() already applies to this
+		// identical table — and reading it ONCE here, for every ref this
+		// snapshot considers, is also strictly cheaper than one
+		// get_option() call per held row.
+		//
+		// A failed read is registered on the SAME sticky per-attempt flag
+		// partition_stale_claims() already sets for this table (Ruling
+		// S44) — one signal for one fact, regardless of which method's
+		// own read of the claimed queue happened to fail — and, like
+		// get_claimed()'s own prior behaviour on a failure, is treated
+		// permissively here (a ref is not excluded from `listing` on an
+		// unproven claim): the caller sees the failure through that flag
+		// and decides for itself whether to trust this poll.
+		$claimed = self::rows( self::CLAIMED );
+		if ( null === $claimed ) {
+			self::$claimed_queue_unreadable_this_attempt = true;
+		}
 		$identity = array();
 		$listing  = array();
 		foreach ( $held as $ref => $row ) {
@@ -878,7 +907,7 @@ class Aura_Worker_Door_Holds {
 				continue;
 			}
 			$identity[] = (string) $ref;
-			if ( null !== self::get_claimed( $ref ) ) {
+			if ( null !== $claimed && array_key_exists( $ref, $claimed ) ) {
 				continue;
 			}
 			$listing[] = array(

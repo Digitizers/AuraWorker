@@ -510,6 +510,77 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S70 (Codex round-27 P2 on #88): the held listing's
+	 * claimed-twin check went through `get_claimed()` — `get_option()`'s
+	 * own PER-REQUEST NEGATIVE cache (WordPress's `notoptions`): the first
+	 * time anything asks for an option name and finds nothing, core
+	 * remembers "absent" for the rest of the request. `reconcile()`'s own
+	 * `sweep()` calls `get_claimed()` for every held ref BEFORE
+	 * `status_fragment()`'s own bracket ever opens — the SAME shape of gap
+	 * Ruling S66 closed for the held queue's own memo — so a ref reconcile()
+	 * finds un-claimed, and a DIFFERENT request then genuinely claims
+	 * before this bracket runs, is still reported as un-claimed: the
+	 * approval is listed as still held under a door version that already
+	 * reflects the claim.
+	 *
+	 * `held_snapshot()` now reads the claimed queue RAW, once, per
+	 * snapshot — never `get_claimed()` — so this stale negative cache
+	 * cannot reach it at all.
+	 */
+	public function test_a_claimed_twin_cached_as_absent_is_still_excluded_from_the_listing(): void {
+		$ref = $this->hold();
+
+		// Establish a persisted baseline first (Ruling S22's own first-ever
+		// bump — see the S66/S69 tests above for the identical reasoning):
+		// sync_computed_state()'s own first-ever write evicts `notoptions`
+		// GLOBALLY as part of its own commit (Ruling S11's own post-commit
+		// re-eviction), which would otherwise clear the poison below
+		// before held_snapshot() ever gets a chance to read it stale.
+		$this->assertSame( array( $ref ), array_column( $this->fragment()['held'], 'ref' ), 'the fixture assumption this test is built on' );
+
+		// Mirrors reconcile()'s own sweep(): a real get_claimed() call,
+		// finding nothing, which is exactly what poisons core's own
+		// `notoptions` cache for this ref's CLAIMED option name for the
+		// rest of the request.
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the fixture assumption this test is built on' );
+
+		// A genuinely concurrent claim() landing for real in the
+		// "database" — written straight into the fixture store, bypassing
+		// Aura_Worker_Door_Holds' own write path (which would evict its
+		// OWN process's caches, never this one's) — modelling a DIFFERENT
+		// request's claim() the way S66/S67/S69 already model a sibling
+		// request's own writes.
+		$claimed_option                       = Aura_Worker_Door_Holds::CLAIMED . $ref;
+		$GLOBALS['_rows'][ $claimed_option ]   = maybe_serialize(
+			array(
+				'ref'        => $ref,
+				'binding'    => Aura_Worker_Door_Log::binding(),
+				'ability'    => 'elementor/publish-document',
+				'input'      => array(),
+				'touches'    => array( array( 'type' => 'page', 'id' => '7' ) ),
+				'actor'      => array( 'user_id' => 3, 'login' => 'bot' ),
+				'verdict'    => 'none',
+				'rule'       => null,
+				'created_at' => gmdate( 'c' ),
+				'claimed_at' => gmdate( 'c' ),
+			)
+		);
+
+		// The fixture assumption this test is built on: this process's own
+		// get_claimed() is STILL fooled — the negative cache never learned
+		// about the raw write above.
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the fixture assumption this test is built on' );
+
+		$fragment = $this->fragment();
+		$this->assertNotNull( $fragment['observation'] );
+		$this->assertSame(
+			array(),
+			array_column( $fragment['held'], 'ref' ),
+			'the claimed twin excludes the ref from the served listing — never the stale "no twin" memo'
+		);
+	}
+
+	/**
 	 * Ruling S67 (Codex round-25 P2 on #88): `count_unacked()` used to
 	 * filter its own COUNT against `self::floor()` — `get_option()`'s
 	 * cached read — rather than the proven `floor_raw()` a version bracket

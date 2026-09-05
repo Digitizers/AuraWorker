@@ -826,11 +826,24 @@ class Aura_Worker_Elementor_Door {
 	 * calling it left a stale snapshot standing under a door version that
 	 * had already moved past it.
 	 *
+	 * BELT, AS OF RULING S70 (Codex round-27 P2 on #88): also evicts
+	 * WordPress's own `notoptions` negative cache — the one exception to
+	 * "in-object memos only" above, added after the SAME class of bug
+	 * (Ruling S31) turned up a THIRD time on the get_claimed() side:
+	 * reconcile()'s own sweep() calls get_claimed() per ref, caching
+	 * "absent" for a ref that a CONCURRENT claim() genuinely inserts
+	 * moments later; the primary fix is that no bracketed read calls
+	 * get_claimed() at all any more (`held_snapshot()` reads the claimed
+	 * queue raw, once, per attempt — Ruling S70) — this is the second
+	 * layer, so a future read this reset does not yet know about is not
+	 * on its own the next silent regression.
+	 *
 	 * @return void
 	 */
 	private static function reset_request_caches() {
 		Aura_Worker_Door_Holds::forget_held();
 		self::$active = null;
+		wp_cache_delete( 'notoptions', 'options' );
 	}
 
 	/**
