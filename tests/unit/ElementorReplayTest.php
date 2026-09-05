@@ -227,6 +227,39 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'and so is the claimed twin' );
 	}
 
+	/**
+	 * Ruling S87 (Codex round-38 P1 on #88): S86's reservation mechanism
+	 * was unreachable in production -- govern_and_run() built its own
+	 * $entry with neither `aura_ref` nor `ref` mapped to it. Fixed via
+	 * open_pending_entry(), the ONE entry builder every open_pending()
+	 * call in this class now routes through: a replay's own admission
+	 * derives its reservation from the hold's OWN ref (already a
+	 * globally unique v4 UUID, minted once at hold time), and the
+	 * EARLIER terminal `held` record derives a DIFFERENT one -- the two
+	 * are namespaced apart (by purpose AND by outcome) so they never
+	 * collide into the SAME reservation despite sharing the SAME
+	 * underlying ref.
+	 */
+	public function test_the_held_record_and_the_replays_own_admission_carry_distinct_reservations(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		$GLOBALS['_current_user_id'] = 9;
+		$out                         = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$this->assertTrue( $out['ok'], 'the fixture assumption this test is built on' );
+
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertCount( 2, $log );
+		$this->assertNotEmpty( $log[0]['reservation'], 'Ruling S87: the held terminal record carries a reservation identity' );
+		$this->assertNotEmpty( $log[1]['reservation'], 'Ruling S87: the replay admission carries one too' );
+		$this->assertNotSame(
+			$log[0]['reservation'],
+			$log[1]['reservation'],
+			'the SAME underlying hold ref must derive DIFFERENT reservations for these two distinct log rows -- conflating them handed a later replay the ALREADY-terminal held row instead of a fresh admission'
+		);
+	}
+
 	// -----------------------------------------------------------------------
 	// (b) an unknown ref
 	// -----------------------------------------------------------------------
@@ -770,8 +803,13 @@ final class ElementorReplayTest extends TestCase {
 		$this->afterSwapOn(
 			Aura_Worker_Door_Holds::CLAIMED . $ref,
 			static function () {
-				// Aura rotating the log epoch on a rewind, mid-replay.
-				Aura_Worker_Door_Log::rotate_epoch( Aura_Worker_Door_Log::epoch() );
+				// Aura rotating the log epoch on a rewind, mid-replay — as if
+				// on its OWN connection (Ruling S8): rotate_epoch() opens its
+				// own versioned() unit, which would nest inside whatever CAS
+				// write just fired this seam otherwise.
+				sa_on_another_connection( static function () {
+					Aura_Worker_Door_Log::rotate_epoch( Aura_Worker_Door_Log::epoch() );
+				} );
 			}
 		);
 
@@ -848,7 +886,12 @@ final class ElementorReplayTest extends TestCase {
 		// and the operator's reject deletes the held row it was moving.
 		$GLOBALS['_sa_before_swap'] = static function () use ( $ref ) {
 			$GLOBALS['_sa_before_swap'] = null; // fires once
-			Aura_Worker_Door_Holds::reject( $ref );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// reject()'s own delete opens its own versioned() unit, which
+			// would nest inside claim()'s still-open one otherwise.
+			sa_on_another_connection( static function () use ( $ref ) {
+				Aura_Worker_Door_Holds::reject( $ref );
+			} );
 		};
 
 		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
@@ -857,6 +900,45 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( 'not_held', $out['reason'] );
 		$this->assertSame( array(), $this->ran );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim backed out' );
+	}
+
+	/**
+	 * Ruling S59 (Codex round-23 P1 on #88): claim() answering
+	 * retry_may_have_run() (Ruling S51 -- its own CLAIMED insert landed
+	 * ambiguously, so it may have already claimed the ref) used to be
+	 * collapsed into the SAME blanket `not_held` a genuine lost race
+	 * gets -- telling Aura the approval is gone for good, when the truth
+	 * is this replay attempt may have already run it. replay() now
+	 * propagates claim()'s own error whole: the retryable code, its
+	 * status and every field its data carries (`may_have_run`,
+	 * `retry_after`).
+	 */
+	public function test_claim_answering_retry_may_have_run_reaches_replays_own_wire_answer(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		// The SAME ambiguous-commit scenario DoorHoldsTest proves makes
+		// claim() answer retry_may_have_run(): the CLAIMED insert's own
+		// commit ack is lost, and the durable-witness fallback's own read
+		// then fails too.
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-s59';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s59';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'aura_hold_failed', $out['reason'], 'claim()\'s own code, never a blanket not_held' );
+		$this->assertTrue( $out['may_have_run'] ?? null, 'Aura must not treat this like a plain retry' );
+		$this->assertSame( 503, $out['status'] ?? null );
+		$this->assertSame( 5, $out['retry_after'] ?? null );
+		$this->assertSame( array(), $this->ran, 'nothing ran -- this is a retryable answer, not a claim' );
 	}
 
 	public function test_a_claim_racing_the_reject_answers_already_claimed(): void {
@@ -1065,7 +1147,12 @@ final class ElementorReplayTest extends TestCase {
 			$row['claimed_at'] = gmdate( 'c', time() - 3600 );
 			$GLOBALS['_options'][ Aura_Worker_Door_Holds::CLAIMED . $ref ] = $row;
 			$GLOBALS['_rows'][ Aura_Worker_Door_Holds::CLAIMED . $ref ]    = maybe_serialize( $row );
-			Aura_Worker_Door_Holds::sweep( time(), Aura_Worker_Elementor_Door::CLAIM_STALE_MS );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// sweep()'s own deletes each open their own versioned() unit,
+			// which would nest inside unclaim()'s still-open one otherwise.
+			sa_on_another_connection( static function () {
+				Aura_Worker_Door_Holds::sweep( time(), Aura_Worker_Elementor_Door::CLAIM_STALE_MS );
+			} );
 		};
 
 		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
@@ -1105,7 +1192,13 @@ final class ElementorReplayTest extends TestCase {
 		// Both rows are taken out from under the replay before it gives up.
 		$GLOBALS['_sa_before_swap'] = static function () use ( $ref ) {
 			if ( null !== Aura_Worker_Door_Holds::get_claimed( $ref ) ) {
-				Aura_Worker_Door_Holds::release( $ref );
+				// A racer, so it runs as if on its OWN connection (Ruling
+				// S8) — release()'s own deletes open their own versioned()
+				// unit, which would nest inside whatever CAS write just
+				// fired this seam otherwise.
+				sa_on_another_connection( static function () use ( $ref ) {
+					Aura_Worker_Door_Holds::release( $ref );
+				} );
 			}
 		};
 
@@ -1507,6 +1600,113 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertSame( $ref, $log[1]['ref'] );
 		$this->assertNull( Aura_Worker_Door_Holds::get_held( $ref ) );
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
+	}
+
+	/**
+	 * Ruling S35 (Codex round-15 P1 on #88): `Aura_Worker_Door_Holds::release()`
+	 * discarded `versioned()`'s own outcome, so a call that never actually
+	 * committed (a lost SAVEPOINT, an unreadable session nonce with no
+	 * durable witness, a failed version bump) was treated exactly like a
+	 * successful one — this REFUSAL path answered `refused_by_missing_ability`
+	 * (Aura marks the approval spent) even though the claimed row this
+	 * release was supposed to remove is still sitting there, claimed,
+	 * replayable behind an answer that said it never would be again.
+	 *
+	 * `release()` now RETURNS whether it committed, and every caller in
+	 * `class-elementor-door-governor.php` checks it through
+	 * `release_or_retry_later()` before building a definitive answer.
+	 */
+	public function test_an_uncommitted_release_on_the_missing_ability_path_is_retryable_and_leaves_the_claim_held(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		unset( $GLOBALS['_abilities']['elementor/publish-document'] ); // Elementor deactivated
+
+		// The terminal `refused` entry above is the 1st and only mutating
+		// commit in this flow before `release()`'s own — every commit
+		// this run issues before that one is let through untouched, and
+		// only the LAST (release()'s) one is made to never land.
+		$GLOBALS['_db_queries']                 = array();
+		// Ruling S86/S87 (Codex rounds 37-38 on #88), reverted by Ruling
+		// S89 (Codex round-39 P1 on #88): the reservation-index write
+		// that once added a SEPARATE commit per pending/terminal row is
+		// gone -- the count below (and the skip position, which must
+		// still land on release()'s own commit, the LAST one) is back
+		// to what it was before that index ever existed. Re-counted, not
+		// merely bumped by guesswork.
+		$GLOBALS['_sa_reconnect_before_commit']  = 3;
+		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$GLOBALS['_sa_reconnect_before_commit']  = false;
+
+		$commits = count(
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static function ( $q ) {
+					return 'COMMIT' === trim( (string) $q );
+				}
+			)
+		);
+		$this->assertSame( 3, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'retry_later', $out['reason'], 'never the definitive refusal — the release that was supposed to spend the approval did not commit' );
+		$this->assertArrayNotHasKey( 'reason', array_intersect_key( $out, array( 'refused_by_missing_ability' => null ) ) );
+		// The terminal `refused` entry itself already landed (a separate,
+		// earlier, successfully-committed transaction) — only the
+		// release is uncommitted. The ability-missing check runs BEFORE
+		// the claim (Ruling P42), so this ref was never claimed at all —
+		// its HELD row is what release() was about to remove, and that
+		// row is the one that must still be there.
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'never claimed on this path (Ruling P42) — nothing to strand here' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the held row is still there — the release never committed' );
+	}
+
+	/**
+	 * The other half of Ruling S35: an uncommitted release on the SUCCESS
+	 * path must not tell Aura the approval was spent either — a claimed
+	 * row stranded with no way back into the queue after Aura was told the
+	 * write was fully done and the approval fully spent would never be
+	 * revisited by anything.
+	 */
+	public function test_an_uncommitted_release_on_the_success_path_is_retryable_and_leaves_the_claim_claimed(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		$GLOBALS['_current_user_id']            = 9;
+		$GLOBALS['_db_queries']                 = array();
+		// Ruling S86/S87 (Codex rounds 37-38 on #88), reverted by Ruling
+		// S89 (Codex round-39 P1 on #88): the reservation-index write
+		// that once added a SEPARATE commit is gone -- the count below
+		// (and the skip position, which must still land on release()'s
+		// own commit, the LAST one) is back to what it was before that
+		// index ever existed. Re-counted, not merely bumped by guesswork.
+		$GLOBALS['_sa_reconnect_before_commit']  = 9;
+		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$GLOBALS['_sa_reconnect_before_commit']  = false;
+
+		$commits = count(
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static function ( $q ) {
+					return 'COMMIT' === trim( (string) $q );
+				}
+			)
+		);
+		$this->assertSame( 9, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+
+		// The ability genuinely ran, and its terminal 'ok' entry genuinely
+		// landed — proving the skip count let every EARLIER commit through
+		// untouched, and only release()'s own failed to commit.
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'ok', $log[1]['result'] );
+
+		$this->assertFalse( $out['ok'], 'never a success answer over an uncommitted release' );
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row is still claimed — the release never committed' );
 	}
 
 	// -----------------------------------------------------------------------

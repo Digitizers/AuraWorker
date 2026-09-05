@@ -23,6 +23,27 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Aura_Worker_Door_Holds {
 
+	/**
+	 * @var bool Set by from_db()/raw_bytes() (Ruling S37, Codex round-15
+	 * class sweep on #88): did the MOST RECENT read fail to prove itself
+	 * (a driver error), rather than the option genuinely being absent?
+	 * Reset at the start of every such read — a per-call outcome, checked
+	 * by the caller immediately afterwards, before anything else in this
+	 * same request can issue a second read and overwrite it.
+	 */
+	private static $option_read_unreadable = false;
+
+	/**
+	 * @var bool Set by partition_stale_claims() (Ruling S44, Codex
+	 * round-18 P2 on #88): did the MOST RECENT call fail to prove its
+	 * read of the claimed queue, rather than finding it genuinely empty?
+	 * Sticky across every partition_stale_claims() call THIS ATTEMPT
+	 * (stale_unleased_claims() and running_claims() each call it once) —
+	 * reset once, at the top of the attempt, by
+	 * reset_claimed_queue_unreadable_for_attempt().
+	 */
+	private static $claimed_queue_unreadable_this_attempt = false;
+
 	const HELD    = 'aura_worker_door_held_';
 	const CLAIMED = 'aura_worker_door_claimed_';
 	const TTL_S   = 604800;
@@ -58,7 +79,81 @@ class Aura_Worker_Door_Holds {
 	const LOCK_S  = 30;
 
 	/**
-	 * @param array $call { ability, input, touches, actor, verdict, rule }.
+	 * A FIXED namespace for a derived hold ref (Ruling S80, Codex round-33
+	 * P1 on #88) — an arbitrary but CONSTANT UUID, never regenerated, so
+	 * `derive_hold_ref()` is a pure, repeatable function of its own two
+	 * inputs across every call this plugin ever makes. Distinct from
+	 * `Aura_Worker_Door_Log::ROTATE_TARGET_NAMESPACE` (a different
+	 * derivation, a different purpose) — the two must never collide with
+	 * each other's inputs, which two different namespace constants
+	 * guarantee by construction (RFC 4122 §4.3: same namespace + name is
+	 * the only way to reproduce a v5 UUID).
+	 */
+	const HOLD_REF_NAMESPACE = 'b3f4c8a1-2e6d-4a9f-8c1b-7d5e9a3f0c62';
+
+	/**
+	 * Ruling S80 (Codex round-33 P1 on #88): `hold_locked()`'s ref used to
+	 * be `wp_generate_uuid4()` — a FRESH RANDOM value every call. An
+	 * insert whose own commit is unprovable (`insert_unique()` returning
+	 * `null`, Ruling S51) left a caller with nothing to recognise a retry
+	 * against: a retry (the SAME logical call, re-sent because the first
+	 * attempt's outcome was unknown) minted a DIFFERENT random ref, so if
+	 * the first attempt actually landed, the retry's own insert under its
+	 * own NEW ref succeeded too — queuing a SECOND, duplicate approval for
+	 * one mutation.
+	 *
+	 * DERIVED instead, from the caller's own idempotency material (Aura's
+	 * `aura_ref` correlation id, or any other identifier of the
+	 * INTERCEPTED REQUEST itself — never of its content alone) plus a
+	 * hash of `touches` (so two DIFFERENT calls sharing one `aura_ref` —
+	 * unlikely, but not this method's business to assume impossible —
+	 * still derive different refs): a retry supplying the SAME material
+	 * regenerates the IDENTICAL ref, and `hold_locked()`'s own
+	 * already-queued check (see its docblock) recognises it.
+	 *
+	 * Same RFC 4122 v5 algorithm as
+	 * `Aura_Worker_Door_Log::derive_rotation_target()` — duplicated
+	 * rather than shared across classes: this is a single, small, pure
+	 * primitive, and reaching across classes for it would trade a few
+	 * lines of duplication for a coupling neither class otherwise has.
+	 *
+	 * @param string $namespace HOLD_REF_NAMESPACE.
+	 * @param string $name      The idempotency material this ref is derived from.
+	 * @return string A 36-character RFC 4122 v5 UUID string.
+	 */
+	private static function derive_hold_ref( $namespace, $name ) {
+		$nhex   = str_replace( array( '-', '{', '}' ), '', $namespace );
+		$nbytes = '';
+		for ( $i = 0; $i < 32; $i += 2 ) {
+			$nbytes .= chr( hexdec( substr( $nhex, $i, 2 ) ) );
+		}
+		$hash = sha1( $nbytes . $name );
+		return sprintf(
+			'%08s-%04s-%04x-%02x%02s-%012s',
+			substr( $hash, 0, 8 ),
+			substr( $hash, 8, 4 ),
+			( hexdec( substr( $hash, 12, 4 ) ) & 0x0fff ) | 0x5000,
+			( hexdec( substr( $hash, 16, 2 ) ) & 0x3f ) | 0x80,
+			substr( $hash, 18, 2 ),
+			substr( $hash, 20, 12 )
+		);
+	}
+
+	/**
+	 * @param array $call { ability, input, touches, actor, verdict, rule,
+	 *   aura_ref? }. `aura_ref` (Ruling S80, Codex round-33 P1 on #88) is
+	 *   OPTIONAL — Aura's own correlation id for the intercepted request,
+	 *   or any other identifier of the request itself, when the caller has
+	 *   one to give. Present: the hold's ref is DERIVED from it (see
+	 *   `derive_hold_ref()`), so a caller retrying the SAME call after an
+	 *   ambiguous insert (`hold_locked()`'s own docblock) regenerates the
+	 *   IDENTICAL ref and is recognised rather than queuing a duplicate.
+	 *   Absent — today's only caller, `hold_call()` in
+	 *   class-elementor-door-governor.php, has no such identifier to give
+	 *   yet — falls back to a fresh random ref exactly as before this
+	 *   ruling; a retry in that case is NOT self-recognising, and the
+	 *   caller must act on the ambiguous error's own `ref` (see
+	 *   `retry_may_have_run()`) rather than blindly retrying.
 	 * @return string|WP_Error ref, or aura_hold_queue_full / aura_hold_failed.
 	 */
 	public static function hold( array $call ) {
@@ -129,6 +224,16 @@ class Aura_Worker_Door_Holds {
 			}
 			wp_cache_delete( self::LOCK, 'options' );
 			$raw = self::raw_bytes( self::LOCK );
+			if ( self::read_was_unreadable() ) {
+				// Ruling S37 (Codex round-15 class sweep on #88): ambiguous —
+				// this read cannot prove the lock vanished, only that it
+				// could not be read. Treated exactly like a lock that is
+				// there and not yet stale: back off and let the next
+				// iteration re-read, never race to take over a lock this
+				// call never actually proved gone.
+				usleep( 50000 );
+				continue;
+			}
 			if ( null === $raw ) {
 				continue; // the row vanished between the failed insert and this read
 			}
@@ -172,7 +277,15 @@ class Aura_Worker_Door_Holds {
 		if ( $queued >= self::CAP ) {
 			return new WP_Error( 'aura_hold_queue_full', 'Aura\'s approval queue for this site is full (50 held calls); ask the operator to act on it.', array( 'status' => 503 ) );
 		}
-		$ref = 'door_' . wp_generate_uuid4();
+		$touches  = is_array( $call['touches'] ?? null ) ? $call['touches'] : array();
+		$aura_ref = isset( $call['aura_ref'] ) ? (string) $call['aura_ref'] : '';
+		// Ruling S80 (Codex round-33 P1 on #88): DERIVED from the caller's
+		// own idempotency material when it has any to give — see
+		// `derive_hold_ref()`'s own docblock. Falls back to the pre-ruling
+		// random mint when it does not (this method's own docblock).
+		$ref = '' !== $aura_ref
+			? 'door_' . self::derive_hold_ref( self::HOLD_REF_NAMESPACE, $aura_ref . '|' . sha1( wp_json_encode( $touches ) ) )
+			: 'door_' . wp_generate_uuid4();
 		// WHOSE QUEUE THIS ROW JOINS, before anything is written (Ruling P72).
 		// An empty stamp used to read as "queued before the generation
 		// existed" — permanently current — so a hold taken during a
@@ -192,7 +305,7 @@ class Aura_Worker_Door_Holds {
 			'binding'    => $binding,
 			'ability'    => (string) $call['ability'],
 			'input'      => is_array( $call['input'] ?? null ) ? $call['input'] : array(),
-			'touches'    => is_array( $call['touches'] ?? null ) ? $call['touches'] : array(),
+			'touches'    => $touches,
 			'actor'      => is_array( $call['actor'] ?? null ) ? $call['actor'] : array(),
 			'verdict'    => in_array( $call['verdict'] ?? '', array( 'none', 'warn', 'rules_unavailable' ), true ) ? $call['verdict'] : 'none',
 			'rule'       => is_array( $call['rule'] ?? null ) ? self::rule_fields( $call['rule'] ) : null,
@@ -216,7 +329,42 @@ class Aura_Worker_Door_Holds {
 		}
 		$queued = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $row );
 		self::forget_held();
+		if ( null === $queued ) {
+			// Ruling S51 (Codex round-20 P1 on #88): with a RANDOM $ref
+			// (no `aura_ref` given), a caller retrying on an ordinary
+			// `false` from below inserts a brand-new row and is safe, but
+			// retrying blind on this UNPROVEN outcome is not: if this
+			// attempt's own insert actually landed, a retry mints a
+			// DIFFERENT random ref and queues a SECOND, duplicate
+			// approval for the same call.
+			//
+			// Ruling S80 (Codex round-33 P1 on #88): the error now carries
+			// this attempt's own `ref` regardless of how it was minted —
+			// with a DERIVED ref, a caller retrying with the SAME
+			// `aura_ref` regenerates this EXACT ref and is recognised by
+			// the `! $queued` branch below, rather than needing to poll
+			// this one first; with a random ref, the caller has nothing
+			// to derive, but at least knows which ref this UNPROVEN
+			// attempt would have landed under, and can query it directly.
+			// `may_have_run` is what tells the caller not to just retry
+			// blind either way.
+			return self::retry_may_have_run( array( 'ref' => $ref ) );
+		}
 		if ( ! $queued ) {
+			// Ruling S80: with a DERIVED ref, a fenced INSERT finding the
+			// name already taken is not a random-UUID-space collision (as
+			// it would have been before this ruling) — it is a retry of
+			// the SAME logical call (the SAME `aura_ref` + `touches`)
+			// recognising a hold this site already queued, whether from
+			// an earlier clean success or an earlier attempt's own
+			// ambiguous-but-landed insert (Ruling S51 above). Idempotent:
+			// the existing hold is returned, never a duplicate.
+			if ( '' !== $aura_ref ) {
+				$existing = self::get_held( $ref );
+				if ( null !== $existing ) {
+					return $ref;
+				}
+			}
 			return new WP_Error( 'aura_hold_failed', 'This site could not store the call for approval; it was not run.', array( 'status' => 503 ) );
 		}
 		return $ref;
@@ -244,6 +392,18 @@ class Aura_Worker_Door_Holds {
 	 * @return bool
 	 */
 	private static function is_expired( array $row, $now ) {
+		// Test seam only: fires immediately before this evaluation runs —
+		// models a real delay landing between what USED to be two separate
+		// callers each taking their own time() (held_identity() then,
+		// later, listing()'s own inline check — Ruling S69, Codex round-26
+		// P2 on #88; see held_snapshot()'s own docblock for the race this
+		// proves closed). Never armed by production code, and never
+		// cleared here either — the callable clearing itself, like every
+		// other "fires once" seam's own callback does, is what keeps this
+		// READ-ONLY from this file's point of view.
+		if ( isset( $GLOBALS['_sa_after_is_expired_check'] ) && is_callable( $GLOBALS['_sa_after_is_expired_check'] ) ) {
+			( $GLOBALS['_sa_after_is_expired_check'] )();
+		}
 		return strtotime( (string) ( isset( $row['expires_at'] ) ? $row['expires_at'] : '' ) ) <= (int) $now;
 	}
 
@@ -280,8 +440,7 @@ class Aura_Worker_Door_Holds {
 		}
 		if ( self::is_expired( $row, time() ) ) {
 			if ( null === self::get_claimed( $ref ) ) {
-				delete_option( self::HELD . $ref );
-				self::forget_held();
+				self::delete_versioned( self::HELD . $ref ); // Ruling S8
 			}
 			return null;
 		}
@@ -319,18 +478,8 @@ class Aura_Worker_Door_Holds {
 		if ( null === $bytes ) {
 			return null;
 		}
-		global $wpdb;
-		$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
-				self::HELD . $ref,
-				$bytes
-			)
-		);
-		wp_cache_delete( self::HELD . $ref, 'options' );
-		self::forget_held();
-		wp_cache_delete( 'notoptions', 'options' );
-		return 1 === (int) $gone ? $row : null;
+		// Ruling S8: versioned like every other fenced delete here.
+		return self::delete_versioned( self::HELD . $ref, $bytes ) ? $row : null;
 	}
 
 	/**
@@ -440,9 +589,17 @@ class Aura_Worker_Door_Holds {
 	 * @return array|WP_Error The claimed entry, or `not_held`.
 	 */
 	public static function claim( $ref ) {
-		global $wpdb;
 		$ref  = self::clean( $ref );
 		$held = self::from_db( self::HELD . $ref );
+		if ( self::read_was_unreadable() ) {
+			// Ruling S37 (Codex round-15 class sweep on #88): a driver
+			// failure here used to read exactly like the hold being gone —
+			// `not_held()`'s 404, which Aura reads as "this approval no
+			// longer exists" and never asks about again. The hold is
+			// untouched (nothing above this point has written anything),
+			// so the honest answer is retryable, not a refusal.
+			return new WP_Error( 'aura_hold_failed', 'This site could not read its approval queue; the claim was not attempted — retry.', array( 'status' => 503, 'retry_after' => 5 ) );
+		}
 		if ( null === $held ) {
 			return self::not_held();
 		}
@@ -479,17 +636,39 @@ class Aura_Worker_Door_Holds {
 			}
 			$claimed['binding'] = $fill;
 		}
-		if ( ! Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed ) ) {
+		// Ruling S51 (Codex round-20 P1 on #88): UNKNOWN (this insert's own
+		// commit could not be proven) is never the same fact as a PROVEN
+		// miss — reading it as "already claimed by someone else"
+		// (not_held(), a permanent 404) told Aura a still-open approval was
+		// gone for good, when this site genuinely does not know whether it
+		// just claimed the row or not. Retryable, and it says so.
+		$claimed_won = Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed );
+		if ( null === $claimed_won ) {
+			return self::retry_may_have_run();
+		}
+		if ( ! $claimed_won ) {
 			return self::not_held(); // already claimed
 		}
-		$wpdb->last_error = '';
-		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::HELD . $ref ) );
-		wp_cache_delete( self::HELD . $ref, 'options' );
-		self::forget_held();
-		if ( 1 !== (int) $gone ) {
+		// Ruling S8: versioned like every other fenced delete here — see
+		// delete_versioned(). No BYTE fence: ownership is already
+		// established by the CLAIMED insert's own uniqueness above, so a
+		// plain by-name delete (delete_option()'s own shape) is exactly
+		// what a real fence would additionally buy nothing over.
+		$held_gone = self::delete_versioned( self::HELD . $ref );
+		if ( null === $held_gone ) {
+			// Ruling S51: the CLAIMED insert just above is CONFIRMED
+			// durable — backing it out on an UNPROVEN delete here would
+			// compound one uncertainty with a second one, on top of a row
+			// this call already knows it owns. Leave the claim in place
+			// (harmless: an admitted claim nothing then runs is exactly
+			// what the reconciler's stale-claim sweep already exists to
+			// settle) and tell the truth instead of guessing either way.
+			return self::retry_may_have_run();
+		}
+		if ( ! $held_gone ) {
 			// A reject or the sweep won the race: the entry we claimed from
 			// no longer exists. Back out; nothing runs.
-			delete_option( self::CLAIMED . $ref );
+			self::delete_versioned( self::CLAIMED . $ref );
 			return self::not_held();
 		}
 		return $claimed;
@@ -539,7 +718,6 @@ class Aura_Worker_Door_Holds {
 	 * @return bool The row is held again, by this call.
 	 */
 	public static function unclaim( $ref ) {
-		global $wpdb;
 		$ref     = self::clean( $ref );
 		$claimed = self::from_db( self::CLAIMED . $ref );
 		if ( null === $claimed ) {
@@ -553,15 +731,29 @@ class Aura_Worker_Door_Holds {
 		// (Ruling P41). Stamped BEFORE the insert, so a row that exists always
 		// carries it.
 		$held['restored_at'] = gmdate( 'c' );
+		// Ruling S63 (Codex round-24 P1 on #88), audited: insert_unique()
+		// can answer null — committed, but the witness could not be
+		// proven (Ruling S51) — never a proven collision. `!$back` folds
+		// that into the SAME `false` a genuine "a held row is already
+		// there" collision gets, which could leave BOTH a (now real)
+		// held row and this ref's own claimed row standing together —
+		// but this is safe rather than a fix target: give_back(), the
+		// one caller that reads this return value, never trusts it at
+		// face value either way (its own docblock: "it reports what it
+		// could SEE"), and re-derives `claim_retained` from a FRESH
+		// get_held()/get_claimed() read regardless of what `$back` said
+		// — a coexisting held+claimed pair is already the exact shape
+		// listing()/sweep() hide and leave for the reconciler. The other
+		// caller (the lease-race backup) discards this return value
+		// entirely.
 		$back = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $held );
 		self::forget_held();
 		if ( ! $back ) {
 			return false; // a held row is already there — the claimed row stands
 		}
-		$wpdb->last_error = '';
-		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::CLAIMED . $ref ) );
-		wp_cache_delete( self::CLAIMED . $ref, 'options' );
-		return 1 === (int) $gone;
+		// Ruling S8: versioned like claim()'s own delete — no byte fence,
+		// ownership already established by the HELD insert's own uniqueness.
+		return self::delete_versioned( self::CLAIMED . $ref );
 	}
 
 	/** @param string $ref Ref. @param int $seq Seq. @return bool */
@@ -604,12 +796,143 @@ class Aura_Worker_Door_Holds {
 		return $written;
 	}
 
-	/** Delete the claimed row and any held twin. @param string $ref Ref. */
+	/**
+	 * Delete the claimed row and any held twin — versioned as ONE unit
+	 * (Ruling S8, Codex round-4 P1 on #88): both deletes are a SINGLE
+	 * logical release, and either one alone is enough to bump — a ref with
+	 * only a claimed row, only a held row, or both, all release cleanly.
+	 *
+	 * RETURNS whether it actually committed (Ruling S35, Codex round-15 P1
+	 * on #88). Every caller MUST check it: an approval is spent, or a claim
+	 * counted settled, only once THIS call is known to have landed — never
+	 * on the strength of having merely invoked it. A caller that ignored
+	 * this treated `committed:false` (a lost SAVEPOINT, an unreadable
+	 * session nonce with no durable witness, a failed version bump) exactly
+	 * like success: a "definitive" refusal or success was reported to Aura
+	 * while the row it claimed to have released sat there, still claimed,
+	 * replayable behind an answer that said it never would be again — or,
+	 * on the success path, a claimed row stranded with no way back into the
+	 * queue after Aura was told the approval was fully spent.
+	 *
+	 * @param string $ref Ref.
+	 * @return bool True once the release is durably committed.
+	 */
 	public static function release( $ref ) {
-		$ref = self::clean( $ref );
-		delete_option( self::CLAIMED . $ref );
-		delete_option( self::HELD . $ref );
+		$ref     = self::clean( $ref );
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $ref ) {
+				$claimed_name = self::CLAIMED . $ref;
+				$held_name    = self::HELD . $ref;
+				// Ruling S60 (Codex round-23 P1 on #88): delete_option()
+				// answers `false` for BOTH "there was genuinely nothing
+				// to delete" and "the delete itself failed" — casting
+				// that straight to a boolean and OR-ing the two rows
+				// together let `$mutated` land on `false` for a row that
+				// actually still existed, which versioned() then reads
+				// as "nothing to do" and COMMITS trivially: release()
+				// reported `true` (or, worse, a caller-visible steady
+				// no-op) while the claimed or held row this call was
+				// supposed to remove sat there untouched.
+				// delete_row_provably() tells the two apart; `null`
+				// (unknown either way) demands the unit rolls back
+				// rather than certify a release that may not have
+				// happened.
+				$claimed_gone = self::delete_row_provably( $claimed_name );
+				if ( null === $claimed_gone ) {
+					return array( 'rollback' => true );
+				}
+				$held_gone = self::delete_row_provably( $held_name );
+				if ( null === $held_gone ) {
+					return array( 'rollback' => true );
+				}
+				return array(
+					// Ruling S72 (Codex round-28 P2 on #88): `mutated`
+					// only when a delete ACTUALLY removed a row —
+					// `delete_row_provably()` returning `true` — never
+					// merely PROVING both rows already absent (`false`),
+					// which is what an idempotent release() of an
+					// already-released ref, or the loser of a race
+					// against another release()/reject()/sweep() that
+					// already removed both rows, looks like. Nothing
+					// changed, so nothing here may bump the version or
+					// write a witness for it — `committed: true` as a
+					// pure no-op, versioned()'s own existing `!$mutated`
+					// path, is exactly the "release confirmed" answer
+					// release()'s own caller already expects.
+					'mutated' => ( true === $claimed_gone || true === $held_gone ),
+					'result'  => null,
+					// Ruling S11 (Codex round-5 P1 on #88): repeated by
+					// versioned() after commit.
+					'evict'   => array( $claimed_name, $held_name, 'notoptions' ),
+				);
+			}
+		);
 		self::forget_held();
+		return ! empty( $outcome['committed'] );
+	}
+
+	/**
+	 * Delete one option row, PROVABLY (Ruling S60, Codex round-23 P1 on
+	 * #88) — delete_option() itself answers `false` for BOTH "there was
+	 * genuinely nothing to delete" and "the delete failed", with no
+	 * reliable way to tell them apart from its own return value alone.
+	 *
+	 * TWO checks, either one enough to prove a genuine failure: `false`
+	 * WITH `$wpdb->last_error` set (the ordinary "the statement itself
+	 * errored" signal every other raw write in this codebase checks), OR
+	 * — even when `last_error` looks clean — a RAW re-read (the same
+	 * proven `raw_option_read()` idiom `Aura_Worker_Door_Log` uses
+	 * everywhere else, never this request's own object cache, which
+	 * `delete_option()` may already have evicted regardless of whether
+	 * the underlying row is actually gone) that still finds the row
+	 * sitting there. Either one is definitive; neither being true is
+	 * what makes "gone" provable rather than merely claimed.
+	 *
+	 * TRUE vs FALSE, AS OF RULING S72 (Codex round-28 P2 on #88): `true`
+	 * and "provably gone" used to be the SAME answer regardless of which
+	 * of the two ways a row can be gone this call actually proved —
+	 * delete_option() genuinely removing one (a REAL mutation), or the
+	 * raw re-read proving one was never there to begin with (NO
+	 * mutation at all). `release()` folded both into a single `mutated`
+	 * signal, so an idempotent or racing-loser release() — every row it
+	 * touches already gone — still reported a mutation, bumped the
+	 * version, and wrote a witness for a call that changed nothing.
+	 * `false` was never actually reachable before this ruling (every
+	 * "gone" path returned `true`); it is repurposed here as its own
+	 * distinct, provable answer rather than added as a fourth state.
+	 *
+	 * @param string $name Option name.
+	 * @return bool|null True when THIS CALL deleted a row that was really
+	 *                    there — a real mutation; false when the row is
+	 *                    PROVABLY gone but this call did not remove it
+	 *                    (already absent) — provable, but no mutation;
+	 *                    null — UNKNOWN, never a proven miss — when a
+	 *                    failure could be neither ruled out nor confirmed.
+	 */
+	private static function delete_row_provably( $name ) {
+		global $wpdb;
+		$wpdb->last_error = '';
+		$deleted           = (bool) delete_option( $name );
+		if ( $deleted ) {
+			return true; // delete_option()'s own affirmative: a row really was removed
+		}
+		if ( '' !== (string) $wpdb->last_error ) {
+			return null; // the delete itself reported an error — unknown, never a proven miss
+		}
+		// delete_option() claims there was nothing to delete. Prove it,
+		// raw, rather than trust a `false` this codebase already knows
+		// is ambiguous.
+		$raw = Aura_Worker_Door_Log::raw_option_for( $name );
+		if ( Aura_Worker_Door_Log::raw_option_was_unreadable() ) {
+			return null; // cannot prove either way
+		}
+		if ( null !== $raw ) {
+			// The row is PROVABLY still there — delete_option()'s own
+			// `false` claimed otherwise, and this is exactly the case
+			// that claim cannot be trusted for.
+			return null;
+		}
+		return false; // provably absent, but not by THIS call (Ruling S72) — no mutation
 	}
 
 	/**
@@ -617,7 +940,6 @@ class Aura_Worker_Door_Holds {
 	 * @return string rejected|already_claimed|not_held
 	 */
 	public static function reject( $ref ) {
-		global $wpdb;
 		$ref = self::clean( $ref );
 		if ( null !== self::get_claimed( $ref ) ) {
 			return 'already_claimed';
@@ -629,40 +951,99 @@ class Aura_Worker_Door_Holds {
 		// own delete (Codex round-8 P1): a replay that claimed between the
 		// read above and this statement already moved the row, and a reject
 		// reported on top of it would let Aura mark rejected an action whose
-		// mutation is running.
-		$wpdb->last_error = '';
-		$gone             = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", self::HELD . $ref ) );
-		wp_cache_delete( self::HELD . $ref, 'options' );
-		self::forget_held();
-		return 1 === (int) $gone ? 'rejected' : 'already_claimed';
+		// mutation is running. Ruling S8: versioned like every other fenced
+		// delete here.
+		return self::delete_versioned( self::HELD . $ref ) ? 'rejected' : 'already_claimed';
 	}
 
 	/**
-	 * What `/status` reports: no inputs, no claimed twins, nothing expired.
+	 * ONE read of the held queue, at ONE `$now` — feeding every caller that
+	 * used to take its own separate snapshot (Ruling S69, Codex round-26 P2
+	 * on #88, the S52 pattern `partition_stale_claims()` already
+	 * established for `running`/`interrupted`): `held_identity()`'s
+	 * broader, non-expired set (`identity` below) and `listing()`'s
+	 * narrower one, which additionally excludes a claimed twin (`listing`
+	 * below) — see `held_identity()`'s own docblock for why the two sets
+	 * differ.
 	 *
-	 * @return array[]
+	 * THE BUG THIS CLOSES: `held_identity()` and `listing()` used to be two
+	 * INDEPENDENT calls, each with its own `time()`. A hold crossing its own
+	 * `expires_at` in the (however short) window between the two calls
+	 * changed the served `listing()` — or the identity `sync_computed_state()`
+	 * folds into its persisted comparison — while the OTHER of the pair
+	 * still answered from before the crossing: the SAME row, in the SAME
+	 * poll, reported as both still-held and already-gone depending on which
+	 * of the two a caller happened to read. Expiry mutates nothing and bumps
+	 * no version, so `version_bracketed()`'s own before/after read agreed
+	 * regardless — nothing about a torn `held`/identity pair looks torn to
+	 * it. One snapshot, one `$now`, closes the window: whichever side of the
+	 * crossing this call lands on, `identity` and `listing` agree about it.
+	 *
+	 * `$now` defaults to `time()` for a STANDALONE caller (`listing()`,
+	 * `held_identity()`, `count()` below all still call this fresh, once,
+	 * on their own) — a BRACKETED caller (`status_fragment()`,
+	 * `governor_block()`) takes this ONCE per attempt and threads the SAME
+	 * snapshot to everywhere in that attempt that needs either half.
+	 *
+	 * @param int|null $now Unix time; null defaults to time().
+	 * @return array{ identity: string[]|null, listing: array[] } `identity`
+	 *         is null only when the held queue itself could not be read
+	 *         (Ruling P57); `listing` is `array()` either way — a caller
+	 *         needing to tell "empty" from "unreadable" reads `identity`
+	 *         (or `queue_unreadable()`, which now checks the same fact).
 	 */
-	public static function listing() {
-		$out  = array();
-		$now  = time();
+	public static function held_snapshot( $now = null ) {
+		$now  = null === $now ? time() : (int) $now;
 		$held = self::held_rows();
 		if ( null === $held ) {
-			// Nothing to LIST is not the same as nothing HELD (Ruling P57), and
-			// the caller must not read an empty list as an empty queue —
-			// status_fragment() carries `held_unreadable: true` beside it.
-			return array();
+			return array(
+				'identity' => null,
+				'listing'  => array(),
+			);
 		}
+		// Ruling S70 (Codex round-27 P2 on #88): claimed rows, read ONCE,
+		// RAW, right here — never get_claimed()'s own get_option() call
+		// per ref. get_option()'s per-request NEGATIVE cache (WordPress's
+		// `notoptions`) remembers an option name as ABSENT for the rest of
+		// THIS request the FIRST time anything asks for it and finds
+		// nothing — reconcile()'s own earlier "is this ref claimed" check
+		// (or an earlier poll's) caches "no" for a ref a CONCURRENT
+		// claim() then genuinely inserts before this bracket opens, and a
+		// later get_claimed() call in here never learns of it: the
+		// approval keeps being listed as held under a version that
+		// already reflects the claim. A fresh bulk SELECT bypasses
+		// get_option() (and therefore that cache) entirely — the SAME
+		// reasoning partition_stale_claims() already applies to this
+		// identical table — and reading it ONCE here, for every ref this
+		// snapshot considers, is also strictly cheaper than one
+		// get_option() call per held row.
+		//
+		// A failed read is registered on the SAME sticky per-attempt flag
+		// partition_stale_claims() already sets for this table (Ruling
+		// S44) — one signal for one fact, regardless of which method's
+		// own read of the claimed queue happened to fail — and, like
+		// get_claimed()'s own prior behaviour on a failure, is treated
+		// permissively here (a ref is not excluded from `listing` on an
+		// unproven claim): the caller sees the failure through that flag
+		// and decides for itself whether to trust this poll.
+		$claimed = self::rows( self::CLAIMED );
+		if ( null === $claimed ) {
+			self::$claimed_queue_unreadable_this_attempt = true;
+		}
+		$identity = array();
+		$listing  = array();
 		foreach ( $held as $ref => $row ) {
 			if ( ! self::row_is_current( $row ) ) {
 				continue; // another binding's queue (Ruling P58)
 			}
-			if ( null !== self::get_claimed( $ref ) ) {
+			if ( self::is_expired( $row, $now ) ) {
 				continue;
 			}
-			if ( strtotime( (string) ( $row['expires_at'] ?? '' ) ) <= $now ) {
+			$identity[] = (string) $ref;
+			if ( null !== $claimed && array_key_exists( $ref, $claimed ) ) {
 				continue;
 			}
-			$out[] = array(
+			$listing[] = array(
 				'ref'        => $ref,
 				'ability'    => $row['ability'] ?? '',
 				'actor'      => $row['actor'] ?? array(),
@@ -672,7 +1053,26 @@ class Aura_Worker_Door_Holds {
 				'created_at' => $row['created_at'] ?? '',
 			);
 		}
-		return $out;
+		sort( $identity, SORT_STRING );
+		return array(
+			'identity' => $identity,
+			'listing'  => $listing,
+		);
+	}
+
+	/**
+	 * What `/status` reports: no inputs, no claimed twins, nothing expired.
+	 *
+	 * A standalone `held_snapshot()` call, at this call's own `time()`
+	 * (Ruling S69) — a caller that also needs the identity fold in the SAME
+	 * instant (`status_fragment()`'s own builder) takes ONE `held_snapshot()`
+	 * itself instead of calling this method, so the two never disagree
+	 * about a hold crossing `expires_at` between them.
+	 *
+	 * @return array[]
+	 */
+	public static function listing() {
+		return self::held_snapshot()['listing'];
 	}
 
 	/**
@@ -752,14 +1152,12 @@ class Aura_Worker_Door_Holds {
 				if ( self::finish_unclaim_in_flight( $ref, $row, $at ) ) {
 					continue;
 				}
-				delete_option( self::HELD . $ref );
-				self::forget_held(); // the replay's own delete, retried
+				self::delete_versioned( self::HELD . $ref ); // the replay's own delete, retried — Ruling S8
 				$gone++;
 				continue;
 			}
 			if ( strtotime( (string) ( $row['expires_at'] ?? '' ) ) <= (int) $now ) {
-				delete_option( self::HELD . $ref );
-				self::forget_held();
+				self::delete_versioned( self::HELD . $ref ); // Ruling S8
 				$gone++;
 			}
 		}
@@ -801,16 +1199,10 @@ class Aura_Worker_Door_Holds {
 		if ( null === $bytes ) {
 			return true; // the unclaim's own delete already landed
 		}
-		global $wpdb;
-		$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
-				self::CLAIMED . $ref,
-				$bytes
-			)
-		);
-		wp_cache_delete( self::CLAIMED . $ref, 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
+		// Ruling S8: versioned like every other fenced delete here — whether
+		// or not it actually removes a row (a racer may already have), so
+		// this always reports true regardless, exactly as before.
+		self::delete_versioned( self::CLAIMED . $ref, $bytes );
 		return true;
 	}
 
@@ -1072,14 +1464,42 @@ class Aura_Worker_Door_Holds {
 	 * alone. A claim younger than the bound is in neither — it is simply not
 	 * old enough to be anybody's business yet.
 	 *
+	 * PUBLIC as of Ruling S52 (Codex round-20 P2 on #88): ONE snapshot, ONE
+	 * scan, ONE lease check per row, for a caller that needs BOTH sides
+	 * together — see `stale_unleased_claims()`/`running_claims()`'s own
+	 * docblocks for the race two SEPARATE calls (each its own fresh scan)
+	 * used to open, and `status_fragment()`'s own call site for why it now
+	 * calls this method directly instead of them.
+	 *
 	 * @param int $ms Age bound in milliseconds.
-	 * @return array{ stale: array[], running: array[] } Both keyed by ref.
+	 * @return array{ stale: array[], running: array[], all: array[] } `stale`
+	 *         and `running` keyed by ref, from the exact SAME read and the
+	 *         exact SAME lease check per row — a ref can never appear in
+	 *         both, or in neither, because its lease moved between two
+	 *         answers this method never took twice. `all` (Ruling S73,
+	 *         Codex round-29 P2 on #88) is the SAME read's own raw claimed
+	 *         map, EVERY ref regardless of age — a claim too young for
+	 *         either bucket above (still "just in progress") still counts
+	 *         toward `Aura_Worker_Elementor_Door::governor_block()`'s own
+	 *         `held_count`, so a caller building that fingerprint needs
+	 *         this too, from the SAME scan, never a second one.
 	 */
-	private static function partition_stale_claims( $ms ) {
+	public static function partition_stale_claims( $ms ) {
 		$cut  = time() - (int) floor( (int) $ms / 1000 );
 		$cap  = time() - self::LEASE_HARD_CAP_S;
-		$out  = array( 'stale' => array(), 'running' => array() );
-		foreach ( (array) self::rows( self::CLAIMED ) as $ref => $row ) { // null ⇒ nothing stale (Ruling P57)
+		$out  = array( 'stale' => array(), 'running' => array(), 'all' => array() );
+		$rows = self::rows( self::CLAIMED );
+		if ( null === $rows ) {
+			// Ruling S44 (Codex round-18 P2 on #88): a transient failure
+			// here used to cast to `(array) null` — the SAME empty set a
+			// genuinely quiet claimed queue answers — and neither
+			// stale_unleased_claims() nor running_claims() (both callers
+			// of this method) ever saw the difference. Sticky for the
+			// rest of this attempt: see the property's own docblock.
+			self::$claimed_queue_unreadable_this_attempt = true;
+		}
+		$out['all'] = (array) $rows;
+		foreach ( (array) $rows as $ref => $row ) { // null ⇒ nothing stale (Ruling P57) — see also claimed_queue_was_unreadable_this_attempt()
 			if ( ! ( strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) ) <= $cut ) ) {
 				continue; // young: not stale, and not "running" either — just in progress
 			}
@@ -1087,6 +1507,29 @@ class Aura_Worker_Door_Holds {
 			$out[ $side ][ $ref ] = $row;
 		}
 		return $out;
+	}
+
+	/**
+	 * Whether ANY `partition_stale_claims()` call this attempt (via
+	 * `stale_unleased_claims()`/`running_claims()`) failed to prove its
+	 * read of the claimed queue (Ruling S44, Codex round-18 P2 on #88).
+	 * Checked by the caller once, immediately after both have run.
+	 *
+	 * @return bool
+	 */
+	public static function claimed_queue_was_unreadable_this_attempt() {
+		return self::$claimed_queue_unreadable_this_attempt;
+	}
+
+	/**
+	 * Reset at the top of EVERY `status_fragment()` attempt — both the
+	 * first and any retry — mirroring
+	 * `Aura_Worker_Door_Log::reset_floor_unreadable_for_attempt()` (Ruling
+	 * S38): a failure from a PREVIOUS attempt or a previous request must
+	 * never leak into this one.
+	 */
+	public static function reset_claimed_queue_unreadable_for_attempt() {
+		self::$claimed_queue_unreadable_this_attempt = false;
 	}
 
 	/**
@@ -1139,8 +1582,7 @@ class Aura_Worker_Door_Holds {
 		}
 		foreach ( $held as $ref => $row ) {
 			if ( self::is_expired( $row, $now ) && null === self::get_claimed( $ref ) ) {
-				delete_option( self::HELD . $ref );
-				self::forget_held();
+				self::delete_versioned( self::HELD . $ref ); // Ruling S8
 				$gone++;
 			}
 		}
@@ -1163,10 +1605,53 @@ class Aura_Worker_Door_Holds {
 	 * @return int|null
 	 */
 	public static function count() {
-		$now     = time();
-		$claimed = self::rows( self::CLAIMED );
-		$held    = self::held_rows();
-		if ( null === $claimed || null === $held ) {
+		// Ruling S46 (Codex round-19, S45 class): the SAME non-expired
+		// held identity status_fragment()'s own transition fold uses
+		// (held_identity()'s own docblock) — never a second, independent
+		// expiry scan that could in principle disagree with it. Ruling
+		// S69: routed through count_from_identity() below so a caller
+		// that already took its OWN held_snapshot() this attempt
+		// (governor_block()) can feed count_from_identity() that SAME
+		// identity instead of this method taking a second, independent
+		// one.
+		return self::count_from_identity( self::held_snapshot()['identity'] );
+	}
+
+	/**
+	 * `count()`'s own merge, from an ALREADY-TAKEN `held_snapshot()`
+	 * identity (Ruling S69, Codex round-26 P2 on #88, the S52 pattern) —
+	 * `$held_identity` is never re-derived here, so a caller that took ONE
+	 * `held_snapshot()` this attempt for the served `held` listing and the
+	 * identity fold (`status_fragment()`'s own builder) or simply for this
+	 * count (`governor_block()`'s own builder) feeds the SAME snapshot here
+	 * rather than risk a hold's `expires_at` crossing between an
+	 * independent read here and the one it already made.
+	 *
+	 * CLAIMED rows are read fresh every call by default — a claim is a
+	 * real, already-versioned mutation (Ruling P58's own reasoning), never
+	 * a silent time-based crossing, so there was no snapshot for it to
+	 * share prior to Ruling S74. `$claimed` (Codex round-30 P1 on #88) is
+	 * that ruling's own exception: `status_fragment()`'s builder already
+	 * reads the FULL claimed set via `partition_stale_claims()`'s own
+	 * `'all'` key (Ruling S73) to feed its held_count-facing identity
+	 * hash — passing that SAME read here, rather than defaulting to null
+	 * and taking a second one, is what lets that hash and this count
+	 * agree about which claimed rows exist without a duplicate query.
+	 *
+	 * @param string[]|null $held_identity A `held_snapshot()`'s own
+	 *                                     `'identity'`.
+	 * @param array|null    $claimed       `self::rows(self::CLAIMED)`'s own
+	 *                                     shape, already read by the
+	 *                                     caller; null (default) reads it
+	 *                                     fresh here, exactly as before
+	 *                                     Ruling S74.
+	 * @return int|null
+	 */
+	public static function count_from_identity( $held_identity, $claimed = null ) {
+		if ( null === $claimed ) {
+			$claimed = self::rows( self::CLAIMED );
+		}
+		if ( null === $claimed || null === $held_identity ) {
 			return null;
 		}
 		$refs = array();
@@ -1175,13 +1660,11 @@ class Aura_Worker_Door_Holds {
 				$refs[] = $ref;
 			}
 		}
-		foreach ( $held as $ref => $row ) {
-			// Only THIS binding's rows charge a slot (Ruling P58): a departed
-			// client's queue must not keep the current one out of its own.
-			if ( ! self::row_is_current( $row ) ) {
-				continue;
-			}
-			if ( ! self::is_expired( $row, $now ) || in_array( $ref, $refs, true ) ) {
+		// Only THIS binding's rows charge a slot (Ruling P58) — already
+		// true of $held_identity, which only ever names rows
+		// row_is_current() itself accepted.
+		foreach ( $held_identity as $ref ) {
+			if ( ! in_array( $ref, $refs, true ) ) {
 				$refs[] = $ref;
 			}
 		}
@@ -1196,19 +1679,9 @@ class Aura_Worker_Door_Holds {
 	 * @return bool One row removed.
 	 */
 	private static function delete_held_fenced( $ref, array $row ) {
-		global $wpdb;
 		$option = self::HELD . self::clean( $ref );
-		$gone   = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->prepare(
-				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
-				$option,
-				maybe_serialize( $row )
-			)
-		);
-		wp_cache_delete( $option, 'options' );
-		self::forget_held();
-		wp_cache_delete( 'notoptions', 'options' );
-		return 1 === (int) $gone;
+		// Ruling S8: versioned like every other fenced delete here.
+		return self::delete_versioned( $option, maybe_serialize( $row ) );
 	}
 
 	/**
@@ -1296,6 +1769,35 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
+	 * The CURRENT-binding, NOT-EXPIRED held set's own IDENTITY — sorted
+	 * refs, from the SAME memoised held_rows() listing()/count() already
+	 * share (Ruling P71) — for status_fragment()'s own transition fold
+	 * (Ruling S46, Codex round-19, S45 class): a hold ageing past its own
+	 * `expires_at` mutates nothing and bumps no version on its own, so a
+	 * poll served right after the crossing used to carry the SAME
+	 * observation it served right before — Aura's strictly-greater
+	 * comparison then hid the row leaving `held`/`held_count` entirely.
+	 *
+	 * Deliberately the BROADER set `count()`'s own HELD half filters to —
+	 * never `listing()`'s narrower one, which additionally excludes a
+	 * claimed twin — because a ref's CLAIMED status changes only through a
+	 * real, already-versioned mutation (claim()'s own versioned() bump);
+	 * expiry is the one fact here that changes silently, and it is the
+	 * SAME fact whether or not the row happens to be claimed too.
+	 *
+	 * A standalone `held_snapshot()` call, at this call's own `time()`
+	 * (Ruling S69) — `status_fragment()`'s own builder takes ONE
+	 * `held_snapshot()` itself instead of calling this method, so this
+	 * identity and the served `held` listing can never disagree about a
+	 * hold crossing `expires_at` between two separate calls.
+	 *
+	 * @return string[]|null Null when the held queue could not be read.
+	 */
+	public static function held_identity() {
+		return self::held_snapshot()['identity'];
+	}
+
+	/**
 	 * Every row under a prefix, from the database, keyed by ref — or NULL when
 	 * that could not be read (Ruling P57).
 	 *
@@ -1330,11 +1832,106 @@ class Aura_Worker_Door_Holds {
 	 * Drop the memo — called by every held write in this process, so a reader
 	 * after a write never sees the queue as it was before it.
 	 *
+	 * PURE CACHE INVALIDATION AS OF RULING S8 (Codex round-4 P1 on #88). It
+	 * used to ALSO bump the door version here (Ruling S6) — a single choke
+	 * point catching every held/claimed write, deletes included, since every
+	 * one of them already called this uniformly. That bump was a SEPARATE
+	 * statement from whatever write preceded it, which is exactly the gap
+	 * S8 closes: a poll landing between the write and this call could see
+	 * the new state under the OLD version. The fenced deletes this class
+	 * issues now bump from INSIDE the same transaction as their own DELETE,
+	 * through `delete_versioned()` below; the insert/update mutations bump
+	 * from inside `Aura_Worker_Door_Log::insert_unique()`/
+	 * `write_option_where()` the same way. This method is called from
+	 * BOTH kinds of site and must stay safe to call from inside an open
+	 * transaction OR outside one — which pure cache invalidation trivially
+	 * is, and a bump here no longer would be.
+	 *
 	 * @return void
 	 */
 	public static function forget_held() {
 		self::$held_rows = null;
 		self::$held_read = false;
+	}
+
+	/**
+	 * A single fenced DELETE (or an unconditional `delete_option()`),
+	 * versioned in one transaction with the door-version bump (Ruling S8,
+	 * Codex round-4 P1 on #88) — the "fenced deletes" choke point Ruling S6
+	 * named but could not close on its own, since a raw DELETE bypasses
+	 * both `Aura_Worker_Door_Log::insert_unique()` and `write_option_where()`.
+	 *
+	 * @param string      $name  Option name.
+	 * @param string|null $fence The exact serialised bytes the row must
+	 *                           still hold — a real fenced delete, the shape
+	 *                           every other mutex/row delete in the door
+	 *                           uses. Null for an unconditional
+	 *                           `delete_option()`, used only where no race
+	 *                           is possible (see call sites).
+	 * @return bool|null One row removed; null — UNKNOWN, never the same as
+	 *         false (Ruling S51, Codex round-20 P1 on #88) — when
+	 *         versioned() could not prove whether this delete's own commit
+	 *         landed. Most callers here already only ever ACT on a strict
+	 *         `true`, so a caller that does not explicitly check for null
+	 *         still fails exactly as safely as it did for a proven `false`
+	 *         (a falsy value either way) — it simply does not get told the
+	 *         difference. `claim()` is the one caller for whom that
+	 *         difference matters and checks for it explicitly.
+	 */
+	private static function delete_versioned( $name, $fence = null ) {
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name, $fence ) {
+				global $wpdb;
+				$wpdb->last_error = '';
+				// NEVER delete_option() for the no-fence form (Ruling S8):
+				// its return does not reliably say whether a row existed to
+				// remove — this class's own stub models it as always true,
+				// and even real WordPress core's version is not something
+				// this method's callers (claim()/reject()/etc.) may depend
+				// on for "did this actually remove one row", which several
+				// of them fence their own next step on. A raw
+				// DELETE ... WHERE option_name = %s is the exact shape
+				// those callers always issued, fence or not.
+				// Ruling S84 (Codex round-35 P1 on #88): must_succeed()
+				// before the (int) cast in both branches — a real driver
+				// failure must abort the unit; a genuine "0 rows, nothing
+				// there" (an int 0, never `false`) still passes through
+				// untouched, exactly as claim()'s own null-check for this
+				// method already depends on.
+				if ( null === $fence ) {
+					$gone = (int) Aura_Worker_Door_Log::must_succeed(
+						$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+							$wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $name )
+						)
+					);
+				} else {
+					$gone = (int) Aura_Worker_Door_Log::must_succeed(
+						$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+							$wpdb->prepare(
+								"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+								$name,
+								$fence
+							)
+						)
+					);
+				}
+				wp_cache_delete( $name, 'options' );
+				wp_cache_delete( 'notoptions', 'options' );
+				$won = 1 === $gone;
+				return array(
+					'mutated' => $won,
+					'result'  => $won,
+					// Ruling S11 (Codex round-5 P1 on #88): repeated by
+					// versioned() after commit.
+					'evict'   => array( $name, 'notoptions' ),
+				);
+			}
+		);
+		self::forget_held(); // cache-only now (see its own docblock) — safe whether or not the delete above landed
+		if ( null === $outcome['committed'] ) {
+			return null; // Ruling S51: UNKNOWN, not a proven miss.
+		}
+		return $outcome['committed'] && $outcome['result'];
 	}
 
 	private static function rows( $prefix ) {
@@ -1364,15 +1961,45 @@ class Aura_Worker_Door_Holds {
 		return $out;
 	}
 
-	/** @param string $option Option. @return array|null the DATABASE's row. */
+	/**
+	 * UNREADABLE IS NOT ABSENT (Ruling S37, Codex round-15 class sweep on
+	 * #88): a driver failure and a genuinely missing row both used to
+	 * answer `null` here — indistinguishable to a caller like `claim()`,
+	 * which decided "not held" (a WP_Error the operator's approval never
+	 * comes back from) on either. The array|null contract stays exactly
+	 * as it was for every existing caller; `self::$option_read_unreadable`
+	 * carries the distinction ALONGSIDE it for the callers that must act
+	 * on ambiguity differently from absence — see `read_was_unreadable()`.
+	 *
+	 * @param string $option Option. @return array|null the DATABASE's row.
+	 */
 	private static function from_db( $option ) {
 		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		self::$option_read_unreadable = false;
+		$wpdb->last_error              = '';
+		$raw                            = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			self::$option_read_unreadable = true;
+			return null;
+		}
 		if ( null === $raw ) {
 			return null;
 		}
 		$val = maybe_unserialize( $raw );
 		return is_array( $val ) ? $val : null;
+	}
+
+	/**
+	 * Whether the MOST RECENT `from_db()`/`raw_bytes()` call could not
+	 * prove its read, rather than finding the row genuinely absent (Ruling
+	 * S37, Codex round-15 class sweep on #88). The caller must read this
+	 * immediately after — before anything else in this same request can
+	 * issue a second read and overwrite it.
+	 *
+	 * @return bool
+	 */
+	public static function read_was_unreadable() {
+		return self::$option_read_unreadable;
 	}
 
 	/**
@@ -1383,12 +2010,24 @@ class Aura_Worker_Door_Holds {
 	 * fence can only match the row this call actually read, never a fresher
 	 * one a racer already installed.
 	 *
+	 * UNREADABLE IS NOT ABSENT (Ruling S37, Codex round-15 class sweep on
+	 * #88): shares `self::$option_read_unreadable`/`read_was_unreadable()`
+	 * with `from_db()` — see that method's own docblock. `take_lock()`
+	 * consults it before ever treating a null answer here as "the row
+	 * vanished".
+	 *
 	 * @param string $option Option.
 	 * @return string|null
 	 */
 	private static function raw_bytes( $option ) {
 		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		self::$option_read_unreadable = false;
+		$wpdb->last_error              = '';
+		$raw                            = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option ) );
+		if ( '' !== (string) $wpdb->last_error ) {
+			self::$option_read_unreadable = true;
+			return null;
+		}
 		return null === $raw ? null : (string) $raw;
 	}
 
@@ -1400,5 +2039,33 @@ class Aura_Worker_Door_Holds {
 	/** @return WP_Error */
 	private static function not_held() {
 		return new WP_Error( 'not_held', 'No held call with that reference.', array( 'status' => 404 ) );
+	}
+
+	/**
+	 * Ruling S51 (Codex round-20 P1 on #88): the answer for an insert whose
+	 * OWN commit could not be proven one way or the other — never `not_held()`
+	 * (a proven, permanent 404 an unproven maybe is not) and never a bare
+	 * retry (which drops the one fact Aura needs: this site's own PREVIOUS
+	 * attempt may already have landed, so retrying blind risks a caller
+	 * acting twice on what it believes is a fresh admission). `may_have_run`
+	 * in the error data is the flag every such caller carries this signal
+	 * through with.
+	 *
+	 * @param array $extra Ruling S80 (Codex round-33 P1 on #88): additional
+	 *   error-data fields merged in on top of the defaults below — used
+	 *   by `hold_locked()`'s own ambiguous-insert branch to carry the
+	 *   attempted `ref` back to the caller. Defaults to none, unchanged
+	 *   for this method's other callers.
+	 * @return WP_Error
+	 */
+	private static function retry_may_have_run( array $extra = array() ) {
+		return new WP_Error(
+			'aura_hold_failed',
+			'This site could not prove whether the previous attempt landed; retry.',
+			array_merge(
+				array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true ),
+				$extra
+			)
+		);
 	}
 }

@@ -146,19 +146,56 @@ final class UninstallCoverageTest extends TestCase {
 	 *   'aura_worker_door_log_acked' and the row purge on
 	 *   'aura_worker_door_log_<seq>' — to 'aura_worker_door_epoch', so neither
 	 *   can cross a rotation.)
-	 *   All names fall under the swept 'aura_worker_' prefix.
-	 * - includes/class-elementor-door-governor.php (1, 2.16.0) — the door's
+	 *   All names fall under the swept 'aura_worker_' prefix. And — since
+	 *   2.16.2, Ruling A65 — the site-issued observation witness's own atomic
+	 *   increment (bump_door_version()'s INSERT … ON DUPLICATE KEY UPDATE on
+	 *   'aura_worker_door_observation'), the same upsert shape bump_refused()
+	 *   above already uses. Also under the swept 'aura_worker_' prefix. And —
+	 *   since Ruling S82, Codex round-33 P2 on #88 — restamp_observation_forward()'s
+	 *   OWN INSERT … ON DUPLICATE KEY UPDATE on that SAME
+	 *   'aura_worker_door_observation' key: a clock-and-witness-floored
+	 *   restamp Aura's own `door_observation_seen` (see
+	 *   Aura_Worker_Elementor_Door::maybe_restamp_observation_forward()'s
+	 *   own docblock) forces past a value this site's copy has fallen
+	 *   behind after a whole-DB restore. Same key as bump_door_version()'s
+	 *   own write above, already under the swept 'aura_worker_' prefix. And —
+	 *   since Ruling S30, Codex round-13 P1 on #88, superseded by Ruling S32,
+	 *   Codex round-14 P1 on #88 — versioned()'s DURABLE commit-witness
+	 *   write, a PLAIN INSERT (no ON DUPLICATE KEY UPDATE — a real second
+	 *   INSERT of the same name would collide) on
+	 *   'aura_worker_door_tx_<nonce>' inside every mutating transaction,
+	 *   before the version bump: a plain option row survives a reconnect
+	 *   that a MySQL session variable does not, so it stands in for the
+	 *   session nonce (Ruling S16) when that nonce cannot be read back
+	 *   after COMMIT. Named BY the transaction's own nonce (S30's row was
+	 *   ONE shared key every unit overwrote, so a second unit's commit
+	 *   could land on it between this unit's write and its own read-back)
+	 *   so two concurrent units' witness rows can never collide. The unit
+	 *   deletes its own row once the check is settled, and a bounded
+	 *   janitor DELETE (LIKE 'aura_worker_door_tx_%' AND older than
+	 *   LAST_TX_MAX_AGE_S, at most LAST_TX_JANITOR_LIMIT rows) sweeps up
+	 *   whatever a died process left behind — the DELETEs are not counted
+	 *   here (the ledger only tracks INSERT/UPDATE call sites), but both
+	 *   fall under the swept 'aura_worker_' prefix same as the INSERT.
+	 * - includes/class-elementor-door-governor.php (3, 2.16.0) — the door's
 	 *   rolling 30-day counters, in the rule counters' shape:
 	 *   'aura_worker_door_c_<name>_h<hour>', an atomic
 	 *   INSERT … ON DUPLICATE KEY UPDATE no scan of function calls could see.
-	 *   Under the swept 'aura_worker_' prefix.
+	 *   Under the swept 'aura_worker_' prefix. And — since Ruling S26,
+	 *   Codex round-11 P1 on #88 — sync_computed_state()'s persist of the
+	 *   computed `{ active, seam, door }` tuple on 'aura_worker_door_computed':
+	 *   a real conditional INSERT (`WHERE NOT EXISTS`, insert_unique_write()'s
+	 *   own shape) for the first-ever mint, and a fenced compare-and-swap
+	 *   UPDATE on the exact bytes last read, so a request racing a newer
+	 *   transition can never overwrite it blind. Also under the swept
+	 *   'aura_worker_' prefix.
 	 */
 	private const ACKNOWLEDGED_RAW_OPTION_WRITES = array(
-		'includes/class-aura-worker-door-log.php'    => 9,
+		'includes/class-aura-worker-door-log.php'    => 12,
 		'includes/class-aura-worker-magic-link.php'  => 3,
 		'includes/class-aura-worker-rules.php'       => 5,
 		'includes/class-aura-worker.php'             => 2,
-		'includes/class-elementor-door-governor.php' => 1,
+		'includes/class-elementor-door-governor.php' => 3,
 	);
 
 	protected function setUp(): void {

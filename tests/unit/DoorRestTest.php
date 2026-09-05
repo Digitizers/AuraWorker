@@ -58,6 +58,24 @@ final class DoorRestTest extends TestCase {
 	/** @var string|null the gateway secret key, once enforce_grants() has run */
 	private $grant_secret = null;
 
+	/**
+	 * rotate_epoch()'s own derived target (Ruling S78, Codex round-32 P1
+	 * on #88) — computed the SAME way `rotate_epoch()` itself does, from
+	 * `$expected` and the CURRENT binding generation, via Reflection on
+	 * the private `derive_rotation_target()` primitive.
+	 */
+	private function rotationTarget( string $expected ): string {
+		$m = new ReflectionMethod( Aura_Worker_Door_Log::class, 'derive_rotation_target' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		return $m->invoke(
+			null,
+			Aura_Worker_Door_Log::ROTATE_TARGET_NAMESPACE,
+			$expected . '|' . Aura_Worker_Door_Log::binding_raw()
+		);
+	}
+
 	/** Provisions a real gateway pubkey, turning on grant enforcement. */
 	private function enforce_grants(): void {
 		if ( ! function_exists( 'sodium_crypto_sign_keypair' ) ) {
@@ -234,6 +252,65 @@ final class DoorRestTest extends TestCase {
 		$this->assertIsArray( get_option( 'aura_worker_door_log_2' ), 'the still-unacked row survives' );
 	}
 
+	/**
+	 * Ruling S15 (Codex round-6 P2 on #88): `Aura_Worker_Door_Log::ack()`
+	 * answers `committed: false` when a real floor raise's own version bump
+	 * fails and the whole unit rolls back — nothing acked, nothing purged.
+	 * The route treats that exactly like `restore_unsettled()` treats an
+	 * unsettled restore: RETRYABLE (503 aura_log_failed), never a 200 that
+	 * claims the ack happened.
+	 */
+	public function test_a_failed_bump_inside_ack_answers_503_aura_log_failed(): void {
+		Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$res                                                                  = $this->api->ack_door_log( $this->request( array( 'epoch' => $epoch, 'seq' => 1 ) ) );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertInstanceOf( WP_Error::class, $res );
+		$this->assertSame( 'aura_log_failed', $res->get_error_code() );
+		$data = $res->get_error_data();
+		$this->assertSame( 503, $data['status'] );
+		$this->assertIsArray( get_option( 'aura_worker_door_log_1' ), 'the row this ack would have purged is still there' );
+	}
+
+	/**
+	 * Ruling S85 (Codex round-36 P2 on #88): on a NON-transactional
+	 * engine (MyISAM ...), a guarded write's own must_succeed() failure
+	 * inside ack_write() -- its purge DELETE, here -- used to make
+	 * versioned() answer `committed: true` with NO `result` key at all
+	 * (Ruling S13's own reasoning: "nothing CAN be rolled back here, so
+	 * the most honest answer is committed"). ack()'s own `true ===
+	 * $outcome['committed']` check (Ruling S15) then trusted that and
+	 * returned `$outcome['result']` -- `null` -- as if it were the
+	 * ordinary success shape. This route's `array_key_exists( 'committed',
+	 * $result )` check then ran on a NULL `$result`: a TypeError, not a
+	 * warning, since array_key_exists() requires an array. Fixed at the
+	 * source -- versioned() now answers `committed: null` (unknown, never
+	 * a false "committed") for exactly this case, and this route's own
+	 * EXISTING handling -- already required to treat `committed: null`
+	 * as retryable for the durable-witness-unreadable case -- catches it
+	 * for free, with no route-level change at all.
+	 */
+	public function test_ack_answers_503_not_a_fatal_when_a_guarded_write_fails_on_a_non_transactional_engine(): void {
+		Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+		// ack_write()'s purge DELETE opens with "DELETE f FROM" -- see
+		// DoorLogTest's own sibling seam for the same statement.
+		$GLOBALS['_sa_reconnect_mid_query'] = 'DELETE f FROM';
+		$res                                = $this->api->ack_door_log( $this->request( array( 'epoch' => $epoch, 'seq' => 1 ) ) );
+		$GLOBALS['_sa_reconnect_mid_query']  = false;
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+
+		$this->assertInstanceOf( WP_Error::class, $res, 'Ruling S85: retryable, never a fatal and never a false 200' );
+		$this->assertSame( 'aura_log_failed', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertIsArray( get_option( 'aura_worker_door_log_1' ), 'the row this ack would have purged is still there' );
+	}
+
 	public function test_a_stale_ack_at_or_below_the_current_floor_is_a_no_op(): void {
 		Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
 		$epoch = Aura_Worker_Door_Log::epoch();
@@ -305,6 +382,104 @@ final class DoorRestTest extends TestCase {
 
 		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation never moved' );
 		$this->assertSame( Aura_Worker_Door_Log::epoch_raw(), $res->data['epoch'], 'nor did the cursor' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * Ruling S62 (Codex round-23 P2 on #88): an AMBIGUOUSLY committed
+	 * rotation that actually landed used to answer `rotated: false`, so
+	 * this route never called restamp_binding_epoch() at all -- the
+	 * binding record kept naming the OLD epoch, and the next
+	 * same-identity connect (Ruling P91) read that disagreement as a
+	 * half-done rebind. rotate_epoch() now completes the rotation
+	 * idempotently on an unknown commit, so this route's own
+	 * `! empty( $out['rotated'] )` check still fires and the restamp
+	 * still runs.
+	 */
+	public function test_an_ambiguous_rotation_that_landed_still_restamps_the_binding_witness(): void {
+		$this->enforce_grants();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$gen    = Aura_Worker_Door_Log::binding_raw();
+		$before = Aura_Worker_Door_Log::epoch();
+		// Ruling S78: the derived target, computed before the seam below
+		// fixes uuid4() (which now names only the witness row).
+		$target = $this->rotationTarget( $before );
+		$req    = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-s62-rest';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s62-rest';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertTrue( $res->data['rotated'], 'the ambiguous commit actually landed' );
+		$this->assertSame( $target, $res->data['epoch'] );
+		$this->assertArrayNotHasKey( 'witness_stale', $res->data, 'restamp_binding_epoch() ran and landed' );
+		$this->assertSame( $target, Aura_Worker_Door_Log::binding_record()['epoch'], 'the binding record names the new cursor, not the old one' );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation itself never moved -- only the epoch witness' );
+		Aura_Worker_Magic_Link::release_site( $fence );
+	}
+
+	/**
+	 * Ruling S77 (Codex round-31 P2 on #88): an AMBIGUOUSLY committed
+	 * rotation whose OWN verifying re-read (`epoch_raw()`) ALSO could not
+	 * be proven used to fall straight through to `rotated: false` —
+	 * indistinguishable from a proven miss. This route's own
+	 * `! empty( $out['rotated'] )` check then never ran
+	 * `restamp_binding_epoch()`, and a caller retrying with the SAME
+	 * (now-stale) `$epoch` would lose the fence against whatever this
+	 * call's own mint actually landed as and ALSO answer `false` —
+	 * forever, since nothing here ever revisits it. `rotate_epoch()` now
+	 * answers `rotated: null` for this specific double-unproven case, and
+	 * this route turns that into a retryable 503 (`may_have_run`) rather
+	 * than a false `200 rotated: false`. See
+	 * `test_an_ambiguous_rotation_that_landed_still_restamps_the_binding_witness()`
+	 * just above for the OTHER half of the SAME mechanism — the identical
+	 * ambiguous commit, but with a HEALTHY verify that finds `current ==`
+	 * this call's own pre-minted target — which Ruling S77 leaves
+	 * completely unchanged: it still completes and restamps.
+	 */
+	public function test_an_ambiguous_rotation_whose_verify_also_fails_answers_a_retryable_503(): void {
+		$this->enforce_grants();
+		$fence = Aura_Worker_Magic_Link::claim_site();
+		$this->assertTrue( Aura_Worker_Door_Log::rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://dash.example' ), Aura_Worker_Magic_Link::SITE_CLAIM, $fence ) );
+		$gen    = Aura_Worker_Door_Log::binding_raw();
+		$before = Aura_Worker_Door_Log::epoch();
+		// Ruling S78: the derived target, computed before the seam below
+		// fixes uuid4() (which now names only the witness row).
+		$target = $this->rotationTarget( $before );
+		$req    = $this->request( array( 'epoch' => $before ) );
+		$req->set_header( 'X-Aura-Approval-Grant', $this->mint( 'door.rotate', array( 'epoch' => $before ) ) );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s77-rest';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s77-rest';
+		$GLOBALS['_sa_option_read_fail'][ $witness ]                = true;
+		// AND the verifying epoch_raw() re-read also fails.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$res = $this->api->rotate_door_epoch( $req );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( WP_Error::class, $res, 'genuinely unknown — never a false "rotated: false" 200' );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertTrue( $res->get_error_data()['may_have_run'], 'a caller must retry, not assume nothing happened' );
+
+		// The rotation actually DID land — confirmed with a healthy read
+		// now that the seams are cleared, the SAME way the docblock's own
+		// sibling test proves it for the healthy-verify case.
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+		$this->assertSame( $gen, Aura_Worker_Door_Log::binding_raw(), 'the generation itself never moved' );
 		Aura_Worker_Magic_Link::release_site( $fence );
 	}
 

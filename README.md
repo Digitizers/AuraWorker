@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.16.1-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.16.2-green" alt="Stable" />
 </p>
 
 ---
@@ -237,6 +237,10 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.16.2
+
+- `/status`'s door fragment carries `observation`, a per-site door-version witness bumped atomically by every door-state mutation (never by a mere poll) and clock-floored so a restored backup can never reissue a value it already served, so Aura can order overlapping polls by the site's own witness instead of request timestamps; `elementor.governor` reports the current value. The observation witness requires InnoDB for wp_options and 64-bit PHP; without them ordering falls back to Aura's own request order for that site (`elementor.governor` reports why via `observation_unsupported`: `engine` or `php32`).
 
 ### 2.16.1
 

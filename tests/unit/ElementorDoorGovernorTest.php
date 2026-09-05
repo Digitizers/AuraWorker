@@ -159,6 +159,31 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertTrue( $log[0]['admitted'] );
 	}
 
+	/**
+	 * Ruling S87 (Codex round-38 P1 on #88): a DIRECT (non-replay) write
+	 * carries no `aura_ref` -- no per-request nonce exists anywhere in
+	 * this codebase for that shape of call (this method's own docblock
+	 * on open_pending_entry() explains why one is not fabricated) --
+	 * except when it presented an approval grant, itself a unique,
+	 * call-bound token. open_pending_entry() falls back to it, so a
+	 * gated write's own admission is ALSO reachable by S86's reservation
+	 * mechanism, not only a replay's.
+	 */
+	public function test_a_direct_write_with_a_presented_grant_carries_it_as_the_reservation_identity(): void {
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-call-context.php';
+		$this->registerAll();
+		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
+
+		$_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] = 'grant-token-s87';
+		$out                                    = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
+		unset( $_SERVER['HTTP_X_AURA_APPROVAL_GRANT'] );
+
+		$this->assertSame( array( 'ok' => true, 'input' => array( 'post_id' => 7 ) ), $out );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertCount( 1, $log );
+		$this->assertNotEmpty( $log[0]['reservation'], 'Ruling S87: the presented grant is reachable as the reservation identity for a direct, non-replay write' );
+	}
+
 	public function test_a_snapshot_failure_refuses_before_the_inner_callback(): void {
 		$this->registerAll();
 		$this->installRuleset( array( array( 'key' => 'rule/a', 'effect' => 'allow', 'target' => array( 'type' => 'page', 'id' => '7' ), 'reason' => 'ok' ) ) );
@@ -363,7 +388,14 @@ final class ElementorDoorGovernorTest extends TestCase {
 				return;
 			}
 			$racing = true;
-			Aura_Worker_Door_Log::ack( $epoch, $seq );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// ack() opens its own versioned() unit, which would nest inside
+			// whatever CAS write just fired this seam otherwise.
+			sa_on_another_connection(
+				static function () use ( $epoch, $seq ) {
+					Aura_Worker_Door_Log::ack( $epoch, $seq );
+				}
+			);
 		};
 
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
@@ -528,7 +560,14 @@ final class ElementorDoorGovernorTest extends TestCase {
 		// fence a few statements later. That is the window: admitted under one
 		// binding, about to run under another.
 		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () {
-			sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://new.example' ) );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// rotate_binding() opens its own versioned() unit, which would
+			// nest inside open_pending()'s still-open one otherwise.
+			sa_on_another_connection(
+				static function () {
+					sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://new.example' ) );
+				}
+			);
 		};
 
 		$out = wp_get_ability( 'elementor/publish-document' )->execute( array( 'post_id' => 7 ) );
@@ -1171,5 +1210,773 @@ final class ElementorDoorGovernorTest extends TestCase {
 
 		$this->assertNull( $frag['binding'], 'never the stale A, and never the unproven B' );
 		$this->assertNull( $block['binding'], 'never the stale A, and never the unproven B' );
+	}
+
+	/**
+	 * `observation` (Ruling A65, 2.16.2) is a per-site DOOR VERSION (Ruling
+	 * S6, Codex round-3 P1 on #88), never a serve counter: two polls with NO
+	 * mutation between them describe the SAME state, and correctly report
+	 * the SAME observation — Aura's strictly-greater comparison treats equal
+	 * as "not newer", which is exactly right here.
+	 */
+	public function test_two_serves_with_no_mutation_between_them_answer_the_same_observation(): void {
+		$this->registerAll();
+		$first  = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$second = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$this->assertIsInt( $first );
+		$this->assertSame( $first, $second, 'nothing mutated between the two polls, so nothing ordered them apart' );
+	}
+
+	/** A door-state mutation between two polls is what raises the version — never merely being served (Ruling S6). */
+	public function test_a_mutation_between_serves_raises_the_observation(): void {
+		$this->registerAll();
+		$before = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+
+		// Any door-state mutation will do; a hold is the simplest one this
+		// suite already exercises elsewhere (DoorHoldsTest's own $call()).
+		Aura_Worker_Door_Holds::hold( array(
+			'ability' => 'elementor/publish-document',
+			'input'   => array( 'post_id' => 9 ),
+			'touches' => array( array( 'type' => 'page', 'id' => '9' ) ),
+			'actor'   => array( 'user_id' => 3, 'login' => 'bot', 'app_password_name' => 'Elementor MCP (Claude)', 'app_password_uuid' => 'u', 'via' => 'mcp' ),
+			'verdict' => 'none',
+			'rule'    => null,
+		) );
+
+		$after = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$this->assertGreaterThan( $before, $after, 'a real mutation lands between the two polls, so the second must be reported strictly newer' );
+	}
+
+	/**
+	 * `governor_block()` is an on-demand AUDIT, never a poll — reading it
+	 * must not itself advance the version, and neither does an ordinary
+	 * `status_fragment()` poll with nothing mutating in between (Ruling S6).
+	 */
+	/**
+	 * Ruling S43 (Codex round-18 P1 on #88): governor_block() used to read
+	 * the computed tuple, epoch, binding and held count BEFORE a single,
+	 * unbracketed `observation` read, then the backlog and 30-day counters
+	 * AFTER it — a torn audit under one witness, since nothing caught a
+	 * mutation landing anywhere in that window. It now shares
+	 * status_fragment()'s own version_bracketed() helper.
+	 *
+	 * Ruling S79 (Codex round-32 P2 on #88) SUPERSEDES this test's
+	 * original "clean retry serves the new state" premise for the exact
+	 * race modelled here. `version_bracketed()`'s loop checks `$unreadable`
+	 * BEFORE it ever compares before/after door versions — and attempt
+	 * 0's `audit_identity` comparison (Ruling S75) runs at the very END
+	 * of the SAME attempt that captured active/seam/door EARLY (Ruling
+	 * S43's own read order). A competing write landing in between (as
+	 * this racer models) is therefore caught by THAT comparison first:
+	 * attempt 0's own live identity — built from the door state it read
+	 * before the race — can never match what the race just persisted,
+	 * whether the persisted state carries a matching `audit_identity` (a
+	 * mismatch) or none at all (Ruling S79's own "absent baseline" case
+	 * — this racer, like a partial/legacy write, never calls the real
+	 * `sync_served_identities()`). Either way `mark_unreadable()` fires
+	 * and the loop returns immediately with THIS attempt's own
+	 * (necessarily pre-race) content — never reaching the version-tear
+	 * retry this test used to exercise in isolation.
+	 *
+	 * This is not a new hole: a REAL competing `status_fragment()` write
+	 * (which always persists a matching `audit_identity`) already took
+	 * this exact path under Ruling S75 alone — this synthetic racer
+	 * merely dodged it by omitting the key, a loophole Ruling S79
+	 * closes for every shape of missing baseline, not only this one.
+	 * The honest outcome is `door: 'open'` (this attempt's own capture)
+	 * with `observation: null` — never a false witness over content
+	 * half of which predates the race.
+	 */
+	public function test_a_mutation_mid_build_of_the_audit_withholds_observation_rather_than_serve_a_torn_mix(): void {
+		$this->registerAll();
+		// A real poll first (Ruling S28) — this is what actually PERSISTS
+		// the computed tuple via a real conditional INSERT, so the racer's
+		// own direct write below lands on a row that already properly
+		// exists, not the "notoptions" miss-cache a never-persisted
+		// governor_block()-only fixture would leave stuck.
+		Aura_Worker_Elementor_Door::status_fragment();
+		$first = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 'open', $first['door'], 'the fixture assumption this test is built on' );
+		$this->assertIsInt( $first['observation'], 'the fixture assumption this test is built on -- a real baseline is certified' );
+
+		// epoch_raw()'s own read is as EARLY as this racer can land —
+		// right after $active/$seam/$door are captured from the persisted
+		// tuple, and well before held_count/the backlog counters.
+		$GLOBALS['_sa_after_option_read'] = static function ( string $name ) {
+			if ( Aura_Worker_Door_Log::EPOCH !== $name ) {
+				return;
+			}
+			$GLOBALS['_sa_after_option_read'] = null; // fires once
+			$winner = array(
+				'active'     => true,
+				'seam'       => 'ok',
+				'door'       => 'closed',
+				'rewind_top' => null,
+			);
+			$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::COMPUTED ]    = maybe_serialize( $winner );
+			$GLOBALS['_options'][ Aura_Worker_Elementor_Door::COMPUTED ] = $winner;
+			Aura_Worker_Door_Log::bump_door_version(); // the racer's own transition, already committed
+		};
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_after_option_read'] = null;
+
+		$this->assertNull( $block['observation'], 'Ruling S79: this attempt cannot prove its own (necessarily pre-race) content pairs with what the race just persisted' );
+		$this->assertSame( 'open', $block['door'], 'the honest content: THIS attempt\'s own capture, taken before the race landed -- never the race\'s "closed", which this attempt never actually re-read' );
+	}
+
+	/**
+	 * The other half of Ruling S43: a mutation on EVERY attempt (the door
+	 * mutating faster than one audit can read it consistently) answers
+	 * `observation: null` — the SAME honest answer status_fragment()
+	 * already gives, never a guess built on either attempt's own
+	 * (possibly torn) reads.
+	 */
+	public function test_a_persistently_torn_audit_answers_observation_null(): void {
+		$this->registerAll();
+		// Ruling S79 (Codex round-32 P2 on #88): a real baseline first —
+		// without one, a fresh site's very first audit withholds
+		// `observation` on attempt 0 already (no `audit_identity` to
+		// pair with), which would report `$fires === 1` here for the
+		// WRONG reason and never actually exercise this test's own
+		// "torn on both attempts" premise. The racer below only ever
+		// touches `BINDING`/the door version — never `COMPUTED` — so
+		// this baseline's `audit_identity` stays valid and matching
+		// throughout, and pure version-tear detection is what both
+		// attempts exhaust.
+		Aura_Worker_Elementor_Door::status_fragment();
+		$fires = 0;
+
+		$GLOBALS['_sa_after_option_read'] = function ( string $name ) use ( &$fires ) {
+			if ( Aura_Worker_Door_Log::BINDING !== $name ) {
+				return;
+			}
+			++$fires;
+			Aura_Worker_Door_Log::bump_door_version();
+		};
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_after_option_read'] = null;
+
+		$this->assertGreaterThanOrEqual( 2, $fires, 'the fixture assumption this test is built on — both attempts tore' );
+		$this->assertNull( $block['observation'], 'torn on both attempts — the honest answer is unordered, never a guess' );
+	}
+
+	public function test_governor_block_reports_the_current_observation_without_bumping_it(): void {
+		$this->registerAll();
+		$served = Aura_Worker_Elementor_Door::status_fragment()['observation'];
+		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'] );
+		$this->assertSame( $served, Aura_Worker_Elementor_Door::governor_block()['observation'], 'a second audit read changes nothing' );
+		$this->assertSame( $served, Aura_Worker_Elementor_Door::status_fragment()['observation'], 'nor does a second POLL, with nothing having mutated' );
+	}
+
+	/**
+	 * A bump whose read-back cannot be proven answers `observation: null` —
+	 * "no witness this serve" — never a stale or guessed number, in both
+	 * shapes.
+	 */
+	public function test_observation_is_null_in_both_shapes_when_it_cannot_be_proven(): void {
+		$this->registerAll();
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+
+		$frag  = Aura_Worker_Elementor_Door::status_fragment();
+		$block = Aura_Worker_Elementor_Door::governor_block();
+
+		$GLOBALS['_sa_wpdb_error'] = '';
+
+		$this->assertNull( $frag['observation'] );
+		$this->assertNull( $block['observation'] );
+	}
+
+	/**
+	 * Ruling S6 (Codex round-3 P1 on #88): the version is READ before and
+	 * after building the fragment, never allocated by `status_fragment()`
+	 * itself. A mutation landing between the two reads (a torn read) is
+	 * caught by comparing them, and the fragment is rebuilt ONCE from a
+	 * fresh pair. Modelled via the generic per-read seam
+	 * (`$GLOBALS['_sa_after_option_read']`, which every uncached option read
+	 * in this stub already runs through) filtered to the ONE option this
+	 * class's own version lives under, firing exactly once so only the
+	 * FIRST ("before") read of the first attempt triggers the mutation.
+	 */
+	public function test_a_mutation_during_construction_yields_a_rebuilt_fragment_with_the_new_version(): void {
+		$this->registerAll();
+		$fired = false;
+		$GLOBALS['_sa_after_option_read'] = static function ( $name ) use ( &$fired ) {
+			if ( $fired || Aura_Worker_Door_Log::OBSERVATION !== $name ) {
+				return;
+			}
+			$fired = true;
+			unset( $GLOBALS['_sa_after_option_read'] ); // fires once
+			Aura_Worker_Door_Log::bump_door_version(); // a real mutation, landing exactly between the "before" and "after" reads
+		};
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_after_option_read'] = null;
+		$this->assertTrue( $fired, 'the seam must actually have fired for this test to prove anything' );
+		$this->assertIsInt( $frag['observation'], 'the rebuild found an agreeing pair of reads' );
+		$this->assertSame(
+			Aura_Worker_Door_Log::door_version_raw(),
+			$frag['observation'],
+			'the rebuilt fragment carries the version AFTER the mutation, never the torn one from the first attempt'
+		);
+	}
+
+	/**
+	 * Still torn after the one rebuild (Ruling S6): this site's door is
+	 * mutating faster than one request can read it consistently, and the
+	 * honest answer is `null` — unordered this poll — never a guess from
+	 * either attempt.
+	 */
+	public function test_a_mutation_on_every_read_yields_observation_null(): void {
+		$this->registerAll();
+		$GLOBALS['_sa_after_option_read'] = static function ( $name ) {
+			if ( Aura_Worker_Door_Log::OBSERVATION !== $name ) {
+				return;
+			}
+			Aura_Worker_Door_Log::bump_door_version(); // never stops: every read of the version sees a fresh mutation
+		};
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_after_option_read'] = null;
+		$this->assertNull( $frag['observation'], 'torn on the retry too: unordered this poll, never a guess' );
+	}
+
+	/**
+	 * Ruling S20 (Codex round-8 P1 on #88): `Aura_Worker_Door_Holds::
+	 * held_rows()` memoises its read "for the request" — correct across
+	 * two DIFFERENT reading requests, wrong for a SINGLE request that
+	 * retries its own build after a torn read. A hold landing the instant
+	 * the FIRST attempt's own held-queue read finishes capturing its
+	 * snapshot (still pre-hold) bumps the version, which triggers the
+	 * retry — but without resetting the memo first, the retry's own read
+	 * would have reused that SAME pre-hold snapshot: its bracketing reads
+	 * would both land on the NEW (post-hold) version, so the loop would
+	 * return successfully with a fragment reporting the new version and a
+	 * `held` list still missing the hold that caused it. The reset still
+	 * closes exactly that gap.
+	 *
+	 * Ruling S46 (Codex round-19, S45 class) changed what the RETRY itself
+	 * now does with the fresh read it gets. `held`'s own identity now
+	 * feeds `sync_computed_state()` too (a hold ageing out is a versioned
+	 * transition, same as `running`) — and this racer, landing INSIDE
+	 * `held_identity()`'s own nested read via `hold()`'s own `count()`
+	 * check, is captured by attempt 0's `held_identity()` call BEFORE the
+	 * racer's insert becomes visible to it (the memo race Ruling S20 names
+	 * runs the OTHER way here: the racer's own recursive `held_rows()`
+	 * call, from inside `count()`, completes and populates the memo with
+	 * the PRE-hold snapshot, moments before the insert that would have
+	 * made it stale). Attempt 0 therefore persists a computed tuple whose
+	 * `held` is still `[]` — its OWN first write, needed for OTHER reasons
+	 * having nothing to do with this race — and attempt 1, now correctly
+	 * reading the hold, finds that persisted `[]` disagrees with what it
+	 * just read and issues a SECOND, corrective write of its own, which
+	 * tears attempt 1's own bracket too. TWO genuine transitions inside
+	 * one poll exhausts the two-attempt budget: `observation: null` is the
+	 * honest answer, not a bug — see status_fragment()'s own docblock for
+	 * why a door mutating this fast within one poll gets exactly that
+	 * answer. The `held` field itself is still correctly rebuilt (Ruling
+	 * S20 stands); only the WITNESS this specific double-transition costs
+	 * is what changed.
+	 */
+	public function test_a_hold_landing_right_after_the_first_listing_read_is_in_the_rebuilt_fragment(): void {
+		$this->registerAll();
+		$before = Aura_Worker_Door_Log::door_version_raw();
+
+		$GLOBALS['_sa_after_rows_read'][ Aura_Worker_Door_Holds::HELD ] = static function () {
+			// Fires the instant held_rows()'s own read completes, inside
+			// the FIRST attempt's build — exactly the window Ruling S20
+			// closes: the memo this call is about to populate is already
+			// the LAST pre-hold snapshot this process will ever take
+			// without an explicit reset.
+			Aura_Worker_Door_Holds::hold(
+				array(
+					'ability' => 'elementor/publish-document',
+					'input'   => array( 'post_id' => 7 ),
+					'touches' => array( array( 'type' => 'page', 'id' => '7' ) ),
+					'actor'   => array( 'user_id' => 3, 'login' => 'bot' ),
+					'verdict' => 'none',
+					'rule'    => null,
+				)
+			);
+		};
+
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_after_rows_read'] = array();
+		$after                          = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertNotSame( $before, $after, 'the hold really did bump the version — otherwise this test proves nothing' );
+		$this->assertNull( $frag['observation'], 'two real transitions inside one poll (the tuple\'s own first write, then Ruling S46\'s corrective one) exhaust the retry budget — the honest answer, never a guess' );
+		$this->assertCount( 1, $frag['held'], 'the hold that caused the retry is IN the rebuilt fragment (Ruling S20 stands), even though the WITNESS for it could not be' );
+	}
+
+	/**
+	 * Ruling S22 (Codex round-9 P2 on #88): Elementor deactivating (or the
+	 * coverage seam changing) touches no `wp_options` row at all — nothing
+	 * here mutates the door log or the hold queue — so the two bracketing
+	 * version reads both answer the SAME observation even though `active`
+	 * and `door` in the fragment just flipped. Aura's strictly-greater
+	 * comparison would then reject the corrected fragment forever, since
+	 * its observation is never greater than the one already served.
+	 * `sync_computed_state()` closes this by treating the computed tuple
+	 * itself as door state: a transition is written through
+	 * `Aura_Worker_Door_Log::versioned()`, which is what actually advances
+	 * the version here — not any hold or log mutation.
+	 *
+	 * `self::$active` is a request-local memo that is STICKY once true
+	 * (Elementor cannot vanish mid-request in real WordPress, so `active()`
+	 * never re-checks once it has answered true) — a real deactivation is
+	 * only ever observed by the NEXT request's own fresh check. Modelled
+	 * here by clearing the ability registry AND resetting the memo by
+	 * Reflection, the same technique this file already uses to read
+	 * WP_Ability's own stored (unexposed) properties.
+	 */
+	public function test_elementor_deactivating_between_two_serves_raises_the_observation(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+		$this->assertSame( 'open', $first['door'] );
+
+		// The next request: no elementor/* ability is registered at all,
+		// and active()'s own memo is reset to model a fresh process.
+		$GLOBALS['_abilities'] = array();
+		$prop                  = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'active' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, null );
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertFalse( $second['active'] );
+		$this->assertSame( 'closed', $second['door'] );
+		$this->assertNotSame(
+			$first['observation'],
+			$second['observation'],
+			'the computed transition itself must advance the version — otherwise Aura keeps the stale active/open state forever'
+		);
+	}
+
+	/** The other half of Ruling S22: a steady state must not bump the version on every poll. */
+	public function test_two_steady_serves_do_not_raise_the_observation(): void {
+		$this->registerAll();
+
+		$first  = Aura_Worker_Elementor_Door::status_fragment();
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertSame(
+			$first['observation'],
+			$second['observation'],
+			'nothing changed between two polls — sync_computed_state() must write nothing on a steady state'
+		);
+	}
+
+	/**
+	 * Ruling S24 (Codex round-10 P2 on #88): sync_computed_state()'s own
+	 * versioned() call can fail to commit exactly like any other door
+	 * mutation — a bump-write failure, a failed savepoint, an unproven
+	 * COMMIT. active()/door_state() answer the FRESH values regardless
+	 * (read live, never from the persisted option), so the fragment built
+	 * right after still carries the CORRECT active/door — but pairing it
+	 * with door_version_raw() would report an observation that never
+	 * actually witnessed this transition (the version is whatever it was
+	 * BEFORE the failed bump). status_fragment() must instead serve
+	 * `observation: null` — honest: the site could not witness this state.
+	 */
+	public function test_a_failed_computed_state_commit_serves_the_new_values_with_a_null_observation(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+		$this->assertSame( 'open', $first['door'] );
+
+		// The next request: Elementor is gone, AND the version bump this
+		// transition needs cannot be committed.
+		$GLOBALS['_abilities'] = array();
+		$prop                  = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'active' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, null );
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_option_write_fail'] = array();
+
+		$this->assertFalse( $second['active'], 'the fresh computed value is still correct even though it could not be committed' );
+		$this->assertSame( 'closed', $second['door'] );
+		$this->assertNull( $second['observation'], 'nothing proves this transition landed paired with any version' );
+	}
+
+	/** The other half of Ruling S24: a STEADY poll is unaffected by an armed but unneeded bump failure. */
+	public function test_a_steady_poll_is_unaffected_by_an_unneeded_bump_failure(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$second                                                                = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_option_write_fail']                                      = array();
+
+		$this->assertSame(
+			$first['observation'],
+			$second['observation'],
+			'nothing changed, so sync_computed_state() never attempted a write the armed failure could catch'
+		);
+	}
+
+	/**
+	 * Ruling S26 (Codex round-11 P1 on #88): the computed-state persist is
+	 * a FENCED compare-and-swap on the exact bytes read, never a plain
+	 * `update_option()`. A request that computed its own tuple and paused
+	 * before writing it can otherwise overwrite a NEWER transition another
+	 * (faster) request already persisted — while its own bump still
+	 * advances the version, so the STALE tuple this call writes would be
+	 * reported under a HIGHER, more-recent-looking observation than the
+	 * honest transition it just clobbered. The racer here lands the
+	 * instant this call's own CAS UPDATE checks the row — exactly the
+	 * window between this call's read of the persisted tuple and its
+	 * write — and must win: this call's fence then matches zero rows, and
+	 * `sync_computed_state()` must report the loss rather than silently
+	 * treating it as a normal commit.
+	 */
+	public function test_a_racing_transition_that_wins_the_fence_first_is_never_overwritten(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+
+		// The next request: Elementor is gone for THIS process too — so it
+		// attempts its own persist — but a DIFFERENT, faster request wins
+		// the very fence this call is about to use.
+		$GLOBALS['_abilities'] = array();
+		$prop                  = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'active' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, null );
+
+		$GLOBALS['_sa_before_swap'] = static function () {
+			// The racer: a tuple this call never computed, persisted under
+			// a version this call's own fence never accounted for.
+			$winner = array(
+				'active' => false,
+				'seam'   => 'racer-seam',
+				'door'   => 'closed',
+			);
+			$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::COMPUTED ]    = maybe_serialize( $winner );
+			$GLOBALS['_options'][ Aura_Worker_Elementor_Door::COMPUTED ] = $winner;
+			Aura_Worker_Door_Log::bump_door_version(); // the racer's own transition, already committed
+		};
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertFalse( $second['active'], 'the fresh computed value from THIS process is still what is reported' );
+		$this->assertSame( 'closed', $second['door'] );
+		$this->assertNotSame( 'racer-seam', $second['seam'], 'the reported seam is THIS process own, never the racer persisted value' );
+		$this->assertNull( $second['observation'], 'the fence lost — a newer transition already won, and this call may not claim credit for any version' );
+	}
+
+	/**
+	 * Ruling S27 (Codex round-11 P2 on #88): governor_block() is an
+	 * on-demand AUDIT, never a poll — and it never runs
+	 * verify_coverage() of its own, so `self::$seam` here is typically the
+	 * documented request-local `unchecked`. Calling sync_computed_state()
+	 * the way status_fragment() does would compare a PRIOR `/status`
+	 * request's persisted `seam: 'ok'` against THIS request's own
+	 * `unchecked`, look like a real transition, and version it, advancing
+	 * the observation on nothing but a READ. governor_block() must never
+	 * write at all: it reports the current door version exactly as
+	 * Aura_Worker_Door_Log::door_version_raw() already documents it.
+	 *
+	 * Ruling S28 (Codex round-12 P1 on #88) additionally has
+	 * governor_block() report the PERSISTED `seam` (this request's OWN
+	 * possibly-stale `unchecked` is never served) — the same
+	 * persisted-over-live rule status_fragment() now follows for its
+	 * bracketed fragment, for the identical reason: a live value this
+	 * request happens to hold is not provably paired with the version
+	 * being reported alongside it, while the persisted one, by
+	 * construction, is.
+	 */
+	public function test_an_audit_read_does_not_change_the_observation(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertSame( 'ok', $first['seam'] );
+
+		// The next request: an AUDIT call in which verify_coverage() has
+		// never run — the documented request-local default.
+		$prop = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'seam' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, 'unchecked' );
+
+		$block = Aura_Worker_Elementor_Door::governor_block();
+
+		$this->assertSame( 'ok', $block['seam'], 'the PERSISTED value (Ruling S28) — this request\'s own live, unforced "unchecked" is never served' );
+		$this->assertSame(
+			$first['observation'],
+			$block['observation'],
+			'an audit read must not advance the observation merely by reading a seam that differs from what was last persisted'
+		);
+	}
+
+	/**
+	 * Ruling S28 (Codex round-12 P1 on #88): poll A starts before Elementor
+	 * deactivates, so its request-local `active()` stays memoised `true`
+	 * for the rest of A's process. A racer (a DIFFERENT, faster process
+	 * observing the real deactivation) persists `inactive/closed` and
+	 * bumps the version in the window between A's OWN steady-state check
+	 * and A's bracketed reads.
+	 *
+	 * Ruling S33 (Codex round-15 P1 on #88) moved where that bracket
+	 * OPENS -- before detect_rewind()/sync_computed_state() run at all,
+	 * not after -- so this exact racer now lands INSIDE attempt 0's
+	 * bracket from the start, forcing a retry (attempt 0's own before/after
+	 * disagree). On attempt 1, A's live view is STILL stale (active:
+	 * true -- nothing in this test ever makes A observe the real
+	 * deactivation), so sync_computed_state() no longer takes the steady
+	 * fast path: it now MISMATCHES the racer's persisted tuple, reaches
+	 * its own fenced CAS, and -- since nothing else has touched the row
+	 * since the racer's write -- that CAS succeeds, overwriting the
+	 * racer's tuple with A's own stale one and bumping the version a
+	 * SECOND time. Attempt 1 is therefore torn too, and status_fragment()
+	 * reports the only honest answer left: observation: null -- TWO real
+	 * mutations landed while this one poll tried to read a consistent
+	 * snapshot, exactly the "mutating faster than one request can read
+	 * it" case that method's own docblock already names.
+	 *
+	 * This is not a regression from the OLD (narrower) bracket: that CAS
+	 * has no way to know its OWN view is stale, only whether the bytes it
+	 * read still match what's there now, so A would have overwritten the
+	 * racer's tuple with its own stale one on its VERY NEXT poll anyway.
+	 * S33 only means THIS poll now witnesses the collision instead of
+	 * reporting an observation it was not entitled to -- a single-pass
+	 * "success" that was really a coincidence of how narrow the old
+	 * bracket was, not evidence the read was actually consistent.
+	 */
+	public function test_a_racer_landing_between_the_steady_check_and_the_bracket_forces_a_second_collision(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+
+		// THIS request's own live computation never changes -- it never
+		// observes any deactivation -- so sync_computed_state()'s own
+		// steady-state check (comparing its live active:true against
+		// whatever is persisted AT THAT MOMENT, also active:true) matches
+		// and returns via the fast path, never reaching the CAS at all --
+		// on attempt 0. Fires once, so attempt 1's own steady check runs
+		// unarmed and genuinely mismatches instead.
+		$GLOBALS['_sa_after_computed_state_steady'] = static function () {
+			$GLOBALS['_sa_after_computed_state_steady'] = null; // fires once
+			// The racer: lands in the window between that steady-state
+			// verdict and this call's own bracketed reads.
+			$winner = array(
+				'active' => false,
+				'seam'   => 'ok',
+				'door'   => 'closed',
+			);
+			$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::COMPUTED ]    = maybe_serialize( $winner );
+			$GLOBALS['_options'][ Aura_Worker_Elementor_Door::COMPUTED ] = $winner;
+			Aura_Worker_Door_Log::bump_door_version(); // the racer's own transition, already committed
+		};
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertNotSame( $first['observation'], $second['observation'], 'the racer really did bump the version -- otherwise this test proves nothing' );
+		$this->assertNull( $second['observation'], "a SECOND real mutation (this request's own stale CAS, on the retry) landed during this poll too -- never a confident observation over two collisions" );
+		$this->assertTrue( $second['active'], "A's own stale CAS won the race on retry and overwrote the racer's tuple -- the served fields reflect that write, not the racer's, which is exactly why observation is null rather than trusted" );
+		$this->assertSame( 'open', $second['door'] );
+	}
+
+	/** A steady poll with no racer at all must still report the same, unchanged state. */
+	public function test_a_steady_poll_with_no_racer_is_unaffected(): void {
+		$this->registerAll();
+		$first  = Aura_Worker_Elementor_Door::status_fragment();
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertSame( $first['active'], $second['active'] );
+		$this->assertSame( $first['door'], $second['door'] );
+		$this->assertSame( $first['observation'], $second['observation'] );
+	}
+
+	/**
+	 * Ruling S48 (Codex round-19 P2 on #88): `persisted_computed_state()`
+	 * used to read the COMPUTED tuple back through plain `get_option()`,
+	 * which answers the same default for a genuinely absent row and one
+	 * it failed to read -- indistinguishable. A steady poll's
+	 * `sync_computed_state()` never even reaches a write (its own
+	 * `get_option()` read is a DIFFERENT, request-cache-backed call this
+	 * failure never touches), so `$synced` is true and the fragment tried
+	 * to read back a tuple that demonstrably EXISTS -- but this read
+	 * failed. The old code read that failure as "nothing persisted yet",
+	 * fell back to this request's own live active/seam/door (fine, they
+	 * happen to agree with what is actually persisted), and served them
+	 * paired with an `observation` this read never proved anything about
+	 * -- exactly the S28 race, one layer down. The fragment must still be
+	 * served; only `observation` is withheld.
+	 */
+	public function test_a_failed_computed_tuple_read_back_withholds_observation_but_still_serves_a_fragment(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $first['observation'], 'the fixture assumption this test is built on' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = true;
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = 0;
+
+		$this->assertNull( $second['observation'], 'the read that would have proven this version could not itself be proven' );
+		$this->assertTrue( $second['active'], 'still served -- the same live-computation fallback a genuinely fresh site already gets' );
+		$this->assertSame( 'open', $second['door'] );
+
+		// The miss must not stick: the VERY NEXT poll, once the driver
+		// recovers, is witnessed again.
+		$third = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $third['observation'], 'a transient read failure is not cached against the next attempt' );
+	}
+
+	/**
+	 * Ruling S48, the SAME fix read from `governor_block()` -- which never
+	 * writes (Ruling S27) and so has no `$synced` guard of its own; the
+	 * read-back failure alone must withhold `observation` here too.
+	 */
+	public function test_governor_block_withholds_observation_on_a_failed_computed_tuple_read_back(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = true;
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = 0;
+
+		$this->assertNull( $block['observation'], 'this audit never writes -- it can only fail to prove the read it just took' );
+		$this->assertTrue( $block['active'], 'still served via live computation' );
+	}
+
+	/**
+	 * Ruling S55 (Codex round-21 P2 on #88): count_unacked() failing at
+	 * the driver (Ruling P53) used to report `log_unacked: null` sitting
+	 * right beside a perfectly ordinary, non-null `observation` -- a
+	 * fragment certifying a field it could not actually read. A count
+	 * read failure is unreadable, the same S44/S48-class pattern every
+	 * other unreadable-capable field on this fragment already follows:
+	 * `observation` is withheld for the whole poll.
+	 */
+	public function test_status_fragment_withholds_observation_when_the_unacked_count_fails(): void {
+		$this->registerAll();
+
+		$GLOBALS['_sa_door_unacked_error'] = true;
+		$frag                              = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_door_unacked_error'] = false;
+
+		$this->assertNull( $frag['log_unacked'], 'never a false zero for a backlog this poll could not count' );
+		$this->assertNull( $frag['observation'], 'a fragment that cannot vouch for one of its own fields is not witnessed at all' );
+
+		// The miss must not stick: the very next poll, once the driver
+		// recovers, is witnessed again.
+		$again = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $again['observation'] );
+	}
+
+	/** Ruling S55, the SAME fix read from governor_block(). */
+	public function test_governor_block_withholds_observation_when_the_unacked_count_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$GLOBALS['_sa_door_unacked_error'] = true;
+		$block                             = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_door_unacked_error'] = false;
+
+		$this->assertNull( $block['log_unacked'] );
+		$this->assertNull( $block['observation'], 'this audit reports the same log_unacked field under the same rule' );
+	}
+
+	/**
+	 * Ruling S57 (Codex round-22 P2 on #88): binding_raw()'s own
+	 * unreadable flag was neither captured immediately after its read
+	 * nor folded into the bracket's own unreadable predicate --
+	 * binding_raw() answers '' for BOTH genuinely-unbound and unreadable,
+	 * so a fragment could report `binding: null` sitting right beside a
+	 * perfectly ordinary, non-null observation it never actually earned.
+	 */
+	public function test_status_fragment_withholds_observation_when_the_binding_read_fails(): void {
+		$this->registerAll();
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$frag = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = 0;
+
+		$this->assertNull( $frag['binding'], 'never a stale/guessed binding for a read this poll could not prove' );
+		$this->assertNull( $frag['observation'], 'a fragment that cannot vouch for its own binding field is not witnessed at all' );
+
+		// The miss must not stick: the very next poll, once the driver
+		// recovers, is witnessed again.
+		$again = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $again['observation'] );
+	}
+
+	/** Ruling S57, the SAME fix read from governor_block(). */
+	public function test_governor_block_withholds_observation_when_the_binding_read_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = 0;
+
+		$this->assertNull( $block['binding'] );
+		$this->assertNull( $block['observation'], 'this audit reports the same binding field under the same rule' );
+	}
+
+	/**
+	 * Ruling S58 (Codex round-22 P2 on #88): governor_block()'s OWN
+	 * epoch_raw() read -- entirely separate from status_fragment()'s
+	 * (via detect_rewind()) -- never fed the verdict at all before this
+	 * ruling. `epoch: null` could be certified under a perfectly
+	 * ordinary, non-null observation.
+	 */
+	public function test_governor_block_withholds_observation_when_the_epoch_read_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::governor_block(); // mints the epoch for real, primes the object cache
+		// Ruling S79 (Codex round-32 P2 on #88): a real `audit_identity`
+		// baseline too — governor_block() alone never writes one
+		// (Ruling S27), so without this poll BOTH calls below would
+		// withhold `observation` for the "no baseline yet" reason, and
+		// the final `$again` assertion (a transient failure is not
+		// cached against the NEXT attempt) would never actually get to
+		// prove that once a baseline exists.
+		Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = 0;
+
+		$this->assertNull( $block['epoch'], 'never a stale epoch for a read this poll could not prove' );
+		$this->assertNull( $block['observation'] );
+
+		$again = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertIsInt( $again['observation'], 'a transient read failure is not cached against the next attempt' );
+	}
+
+	/**
+	 * Ruling S58 (Codex round-22 P2 on #88): Aura_Worker_Door_Holds::count()
+	 * already answers null when either of its own two internal reads (the
+	 * claimed queue, the held queue) fails -- but nothing downstream of
+	 * it withheld `observation` for that before this ruling: `held_count`/
+	 * `queue_full` could be certified as null right beside a perfectly
+	 * ordinary witness.
+	 */
+	public function test_governor_block_withholds_observation_when_holds_count_fails(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$held_key = $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::HELD );
+		$GLOBALS['_sa_rows_read_error'][ $held_key ] = true;
+		Aura_Worker_Door_Holds::forget_held(); // the FIRST call above already memoised a successful read
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_rows_read_error'] = array();
+
+		$this->assertNull( $block['held_count'], 'never a false zero for a queue this poll could not read' );
+		$this->assertNull( $block['queue_full'] );
+		$this->assertNull( $block['observation'] );
+
+		// held_rows() memoises for the WHOLE request (Ruling P71), failure
+		// included -- forget_held() is what a real WRITE (or a retry's own
+		// reset_request_caches()) would call; here it models a genuinely
+		// fresh read, not this same poison surviving by design.
+		Aura_Worker_Door_Holds::forget_held();
+		$again = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertIsInt( $again['observation'], 'a transient read failure is not cached against the next attempt' );
 	}
 }

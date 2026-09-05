@@ -46,8 +46,13 @@ final class DoorLogTest extends TestCase {
 		// is deleted — leaving the reservation this writer thinks it holds
 		// pointing at a number below the floor.
 		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( $epoch ) {
-			Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
-			Aura_Worker_Door_Log::ack( $epoch, 1 );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// settle()/ack() each open their own versioned() transaction,
+			// which would nest inside this writer's still-open one otherwise.
+			sa_on_another_connection( function () use ( $epoch ) {
+				Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
+				Aura_Worker_Door_Log::ack( $epoch, 1 );
+			} );
 		};
 
 		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
@@ -69,8 +74,12 @@ final class DoorLogTest extends TestCase {
 	public function test_the_handed_back_number_is_deleted_only_while_it_carries_this_writers_bytes(): void {
 		$epoch = Aura_Worker_Door_Log::epoch();
 		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( $epoch ) {
-			Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
-			Aura_Worker_Door_Log::ack( $epoch, 1 );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// see the test above.
+			sa_on_another_connection( function () use ( $epoch ) {
+				Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
+				Aura_Worker_Door_Log::ack( $epoch, 1 );
+			} );
 			// …and a third request reserves the (now free) name 1 before this
 			// writer gets to its fenced delete. A bare delete_option() here
 			// would destroy that reservation.
@@ -90,6 +99,28 @@ final class DoorLogTest extends TestCase {
 	 * An unreadable one cast to 0 and deleted FULL_MARKER over a backlog that
 	 * was still full — the door open again with nothing having been acked.
 	 */
+	/**
+	 * Ruling S37 sweep, part 2 (Codex round-17 on #88): close() answers
+	 * `false` to two different events — a genuine write failure, and
+	 * losing the race to a concurrent closer whose own marker is already
+	 * there — and the confirming raw read is what would normally tell
+	 * them apart. When THAT read cannot be proven either, close() still
+	 * answers `false`: the SAME safe, retryable answer a genuinely absent
+	 * marker gets, never a wrongly-confirmed `true` manufactured from an
+	 * unprovable read, and never (the other direction) a claim that the
+	 * log is still open when it is, in fact, already closed.
+	 */
+	public function test_close_answers_false_when_it_cannot_confirm_a_lost_races_own_marker(): void {
+		$this->assertTrue( Aura_Worker_Door_Log::close(), 'this call wins the race for real' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::FULL_MARKER ] = true;
+		$out = Aura_Worker_Door_Log::close(); // loses the race — the marker is already there
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertFalse( $out, 'the confirming read could not prove the lost race — never wrongly confirmed true' );
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed(), 'the log really is closed regardless — this call just could not prove it itself' );
+	}
+
 	public function test_an_ack_with_an_unreadable_count_keeps_the_closure_marker(): void {
 		$epoch = Aura_Worker_Door_Log::epoch();
 		$seq   = Aura_Worker_Door_Log::open_pending( $this->entry() );
@@ -126,6 +157,30 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_sa_door_unacked_error'] = true;
 		$this->assertNull( Aura_Worker_Door_Log::count_unacked() );
 		$GLOBALS['_sa_door_unacked_error'] = false;
+	}
+
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): row_from_db() answering
+	 * `null` for both "the row is genuinely absent" and "the read could not
+	 * be proven" both make patch()/admit() answer `false` — the SAME safe
+	 * refusal either way, and admit()'s own caller already turns a false
+	 * into the retryable `aura_log_failed` 503 rather than a silent no-op.
+	 * row_from_db_was_unreadable() is what makes the two provably distinct
+	 * for the first time, even though neither's EXTERNAL answer changes.
+	 */
+	public function test_an_unreadable_row_and_a_genuinely_absent_one_both_refuse_admit_but_are_provably_distinct(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::PREFIX . $seq ] = true;
+
+		$this->assertFalse( Aura_Worker_Door_Log::admit( $seq ), 'refuses exactly like a genuinely absent row would' );
+		$this->assertTrue( Aura_Worker_Door_Log::row_from_db_was_unreadable(), 'but the read is now provably AMBIGUOUS, not absent' );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		// A genuinely absent row (never allocated) refuses the SAME way…
+		$this->assertFalse( Aura_Worker_Door_Log::admit( 999999 ) );
+		// …but is now provably NOT ambiguous — the read succeeded and found nothing.
+		$this->assertFalse( Aura_Worker_Door_Log::row_from_db_was_unreadable() );
 	}
 
 	public function test_seq_is_allocated_by_the_insert_and_is_contiguous(): void {
@@ -244,6 +299,76 @@ final class DoorLogTest extends TestCase {
 		Aura_Worker_Door_Log::settle( 1, array( 'result' => 'ok' ) );
 		Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), 1 );
 		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
+	}
+
+	/**
+	 * Ruling S84 (Codex round-35 P1 on #88): ack_write()'s own purge
+	 * DELETE used to be cast to `(int)` with NEITHER its own `false` NOR
+	 * $wpdb->last_error checked -- a deadlock aborting the whole InnoDB
+	 * transaction there cast to `0`, indistinguishable from an ordinary
+	 * "nothing above the floor yet" outcome, and count_unacked($floor)
+	 * right after went on to decide the log was under capacity using the
+	 * ALREADY-raised (and, on a deadlock, already ROLLED BACK by MySQL
+	 * itself) floor -- reopening the door via delete_option(FULL_MARKER)
+	 * on what is by then an autocommit session versioned()'s own later
+	 * commit-witness check cannot undo. must_succeed() now catches the
+	 * purge DELETE's own failure immediately and aborts the WHOLE unit
+	 * (Ruling S12's `rollback: true`) before count_unacked() -- let alone
+	 * the reopen -- ever runs.
+	 */
+	public function test_ack_aborts_when_its_own_purge_delete_fails(): void {
+		Aura_Worker_Door_Log::close();
+		$epoch        = Aura_Worker_Door_Log::epoch();
+		$seq          = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$floor_before = Aura_Worker_Door_Log::floor();
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed(), 'the fixture assumption this test is built on' );
+
+		// ack_write()'s purge DELETE opens with "DELETE f FROM" -- distinct
+		// from the floor-raise UPDATE just before it (which opens
+		// "UPDATE ... f JOIN") -- so this seam lands on the purge alone,
+		// modelling a deadlock that aborts the whole transaction the
+		// instant this ONE statement runs.
+		$GLOBALS['_sa_reconnect_mid_query'] = 'DELETE f FROM';
+		$out                                = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_reconnect_mid_query'] = false;
+
+		$this->assertFalse( $out['committed'], 'Ruling S84: the purge DELETE\'s own failure aborts the whole unit -- never a false "committed" on the strength of a statement that never landed' );
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed(), 'FULL_MARKER intact -- the door was never reopened on an aborted/autocommit session' );
+		$this->assertSame( $floor_before, Aura_Worker_Door_Log::floor(), 'the floor raise earlier in the SAME unit was rolled back too, not left standing while only the purge failed' );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'], 'the row itself is untouched -- the purge never actually landed' );
+	}
+
+	/**
+	 * Ruling S85 (Codex round-36 P1 on #88), the SAME scenario as the
+	 * sibling test just above, but on a NON-transactional engine: there
+	 * is no ROLLBACK to issue at all (Ruling S13), and the pre-S85 answer
+	 * here was `committed: true` with NO `result` key -- ack()'s own
+	 * `true === $outcome['committed']` check (Ruling S15) then trusted
+	 * it and returned `null` as its own "success". `committed: null` --
+	 * unknown, never a false "committed" -- is the honest answer: an
+	 * EARLIER statement in this SAME callback (the floor-raise UPDATE)
+	 * may already have autocommitted before the purge DELETE's own
+	 * failure was ever seen, and nothing on this engine can prove either
+	 * way.
+	 */
+	public function test_ack_on_a_non_transactional_engine_answers_committed_null_when_its_purge_delete_fails(): void {
+		Aura_Worker_Door_Log::close();
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$seq   = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+		$GLOBALS['_sa_reconnect_mid_query'] = 'DELETE f FROM';
+		$out                                = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_reconnect_mid_query']  = false;
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+
+		$this->assertArrayHasKey( 'committed', $out, 'Ruling S85: the caller-safe tri-state, never a bare success shape with no committed key at all' );
+		$this->assertNull( $out['committed'], 'Ruling S85: unknown, never `true` -- an earlier statement in the SAME callback may already have autocommitted' );
+		$this->assertArrayNotHasKey( 'result', $out, 'the SAME shape Ruling S51 already established for committed:null elsewhere in this method -- nothing here may be indexed as a success payload' );
 	}
 
 	public function test_rotate_epoch_mints_a_new_epoch_clears_closure_and_keeps_the_floor_and_every_row(): void {
@@ -374,6 +499,24 @@ final class DoorLogTest extends TestCase {
 		$GLOBALS['_rows'][ $name ]     = maybe_serialize( $row );
 	}
 
+	/**
+	 * rotate_epoch()'s own derived target (Ruling S78, Codex round-32 P1
+	 * on #88) — computed the SAME way `rotate_epoch()` itself does, from
+	 * `$expected` and the CURRENT binding generation, via Reflection on
+	 * the private `derive_rotation_target()` primitive.
+	 */
+	private function rotationTarget( string $expected ): string {
+		$m = new ReflectionMethod( Aura_Worker_Door_Log::class, 'derive_rotation_target' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		return $m->invoke(
+			null,
+			Aura_Worker_Door_Log::ROTATE_TARGET_NAMESPACE,
+			$expected . '|' . Aura_Worker_Door_Log::binding_raw()
+		);
+	}
+
 	/* ---- settle() is pending-only: the first terminal writer wins ---- */
 
 	/**
@@ -450,6 +593,249 @@ final class DoorLogTest extends TestCase {
 		$this->assertFalse( $out['rotated'] );
 		$this->assertSame( $before, $out['epoch'] );
 		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S62 (Codex round-23 P2 on #88): an AMBIGUOUSLY committed
+	 * rotation -- the durable-witness fallback itself could not prove the
+	 * commit either way (Ruling S51) -- used to answer `rotated: false`,
+	 * so `rotate_door_epoch()`'s own caller never ran
+	 * restamp_binding_epoch() and the next same-identity connect treated
+	 * a rotation that had, in fact, already landed as a half-done rebind.
+	 * `rotate_epoch()` now mints its OWN replacement epoch BEFORE
+	 * versioned() ever runs and, on an unknown commit, re-reads the epoch
+	 * raw and compares it to that EXACT target -- never merely "did the
+	 * epoch change", which the two tests just above (a racer's own
+	 * winning rotation, or a caller naming an epoch that was never real)
+	 * would also satisfy without THIS call's own write having landed at
+	 * all.
+	 */
+	public function test_an_ambiguously_committed_rotation_that_actually_landed_completes_idempotently(): void {
+		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+		// Ruling S78: the ROTATION target is now DERIVED from $before, not
+		// wp_generate_uuid4() -- computed here, before the seam below fixes
+		// every uuid4() call, which now only names the WITNESS row (the
+		// commit-tx nonce), never the epoch itself.
+		$target = $this->rotationTarget( $before );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s62';
+		// Reaches the durable-witness fallback: the COMMIT statement
+		// itself looks clean, but the post-commit session-nonce
+		// read-back finds no session variables (Ruling S16's own
+		// reconnect-after-commit model).
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s62';
+		// And the fallback's OWN witness read then fails too -- genuinely
+		// unknown, never resolved either way by the existing S51 fallback
+		// alone.
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertTrue( $out['rotated'], 'this call\'s own pre-minted target is exactly what the epoch now holds -- the ambiguous commit actually landed' );
+		$this->assertSame( $target, $out['epoch'] );
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S77 (Codex round-31 P2 on #88): the SAME ambiguous commit as
+	 * the test just above, but this time the verifying `epoch_raw()`
+	 * re-read ALSO fails — genuinely unknown a SECOND way, never resolved
+	 * to a proven "did not land" by that failure. Before this ruling,
+	 * `$now === $new_epoch` was false whenever `$now` was the unreadable
+	 * sentinel `''`, falling straight through to a definitive `rotated:
+	 * false` — indistinguishable from a proven miss, so a caller's own
+	 * retry with the SAME `$expected` then lost the fence against
+	 * whatever this call's own mint actually landed as and ALSO answered
+	 * `false`, forever: `restamp_binding_epoch()` never ran.
+	 */
+	public function test_an_ambiguously_committed_rotation_whose_verify_also_fails_is_unknown_not_false(): void {
+		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+		// Ruling S78: the derived target, computed BEFORE the seam below
+		// fixes uuid4() (which now names only the witness row).
+		$target = $this->rotationTarget( $before );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s77';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s77';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+		// AND the verifying epoch_raw() re-read also fails — genuinely
+		// unknown a second way.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $out['rotated'], 'two unproven facts in a row are still just unknown — never a guessed false' );
+		$this->assertNull( $out['epoch'] );
+
+		// The rotation actually DID land — this call's own mint really
+		// is what the epoch now holds, confirmed with a healthy read now
+		// that the seam is cleared.
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S78 (Codex round-32 P1 on #88) supersedes this test's old
+	 * premise. Before S78 the target was `wp_generate_uuid4()` -- a fresh
+	 * RANDOM value every call -- so a retry naming the SAME (now stale)
+	 * `$expected` could never recognise its own first attempt: the fence
+	 * is lost (0 rows), `committed:true` runs directly, and the answer
+	 * was a definitive `rotated:false` forever, even though nothing was
+	 * actually wrong.
+	 *
+	 * With the target DERIVED from `$expected` (Ruling S78), a same-
+	 * `$expected` retry re-derives the IDENTICAL target the first call
+	 * already landed, so the "fence lost" branch now recognises
+	 * `current === $new_epoch` and correctly reports `rotated:true` --
+	 * this retry did not rotate anything itself, but it truthfully
+	 * recognises that the rotation it asked for already happened, rather
+	 * than reporting a lie.
+	 */
+	public function test_a_retry_of_an_already_landed_rotation_recognises_its_own_prior_work(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$first  = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $first['rotated'] );
+
+		// A retry naming the OLD (now stale) epoch -- exactly what a
+		// caller unaware the first attempt landed would send again.
+		$second = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$this->assertTrue( $second['rotated'], 'Ruling S78: the retry derives the SAME target the first call already landed -- it recognises its own prior work, not a lost race to someone else' );
+		$this->assertSame( $first['epoch'], $second['epoch'], 'the epoch already in force, unchanged by the retry' );
+		$this->assertSame( $first['epoch'], get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S78: two DIFFERENT logical rotations (two different
+	 * `$expected` values) must derive two DIFFERENT targets -- the
+	 * derivation is keyed on `$expected`, so it never collides across
+	 * genuinely distinct rotations, only self-recognises a repeat of the
+	 * SAME one.
+	 */
+	public function test_two_successive_rotations_derive_distinct_targets(): void {
+		$first_expected = Aura_Worker_Door_Log::epoch();
+		$first          = Aura_Worker_Door_Log::rotate_epoch( $first_expected );
+		$this->assertTrue( $first['rotated'] );
+
+		$second_expected = $first['epoch']; // the epoch now in force
+		$second          = Aura_Worker_Door_Log::rotate_epoch( $second_expected );
+		$this->assertTrue( $second['rotated'] );
+
+		$this->assertNotSame( $first['epoch'], $second['epoch'], 'a later legitimate rotation starts from a new expected epoch and therefore derives a new target' );
+		$this->assertSame( $second['epoch'], get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S78's explicit "retry after ambiguous+unverifiable"
+	 * scenario: the FIRST attempt's commit is ambiguous AND its own
+	 * verify also fails (Ruling S77 -- `rotated:null`, genuinely
+	 * unknown). A caller retrying with the SAME `$expected` (e.g. after
+	 * the REST route's retryable 503) must recognise the first attempt's
+	 * own landed rotation and restamp, rather than losing the fence to
+	 * "someone else" forever.
+	 */
+	public function test_a_retry_after_an_ambiguous_and_unverifiable_rotation_recognises_and_restamps(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$target = $this->rotationTarget( $before );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s78-retry';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s78-retry';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+		// AND the FIRST attempt's own verifying epoch_raw() re-read also
+		// fails -- Ruling S77's genuinely-unknown case.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$first = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $first['rotated'], 'sanity: the first attempt is genuinely unknown, per Ruling S77' );
+		// The rotation actually DID land underneath the unreadable verify.
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+
+		// The retry names the SAME (still stale, from the retrying
+		// caller's point of view) $expected -- no ambiguity seam active
+		// on the retry itself, so it takes the "fence lost" branch
+		// directly. Ruling S78: it must recognise current === its own
+		// derived target and report true, restamping rather than lying.
+		$retry = Aura_Worker_Door_Log::rotate_epoch( $before );
+
+		$this->assertTrue( $retry['rotated'], 'Ruling S78: the retry derives the SAME target the ambiguous-but-landed first attempt already wrote, and recognises it' );
+		$this->assertSame( $target, $retry['epoch'] );
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S81 (Codex round-33 P1 on #88): `binding_raw()` answers ''
+	 * for BOTH a genuinely unbound site and an UNREADABLE read -- the
+	 * same sentinel every other raw_option()-backed read shares. Feeding
+	 * that sentinel into `derive_rotation_target()` unseen mints a target
+	 * from the WRONG (empty) generation whenever this read fails --
+	 * reopening the exact S78 bug an unreadable INPUT, not a random
+	 * mint, this time. Checked immediately after the read: an unreadable
+	 * binding is retryable ambiguity, never a target this call derives
+	 * at all.
+	 */
+	public function test_rotate_epoch_answers_retryable_ambiguity_when_the_binding_read_fails(): void {
+		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $out['rotated'], 'an unreadable binding is unknown, never a target derived from the sentinel' );
+		$this->assertNull( $out['epoch'] );
+		// Nothing was even attempted -- versioned() never ran, so the
+		// epoch this site actually holds is completely untouched.
+		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S81's own "unreadable on the retry" scenario: a first
+	 * attempt lands cleanly, a RETRY (the caller re-deriving the same
+	 * now-stale $expected) hits an unreadable binding and must answer
+	 * retryable ambiguity rather than a wrongly-derived target's false
+	 * "rotated: false" -- and once the read recovers, the NEXT retry
+	 * recognises its own already-landed target and restamps (Ruling
+	 * S78), exactly as if the binding read had never failed at all.
+	 */
+	public function test_a_retry_with_an_unreadable_binding_stays_ambiguous_then_recognises_once_readable(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$target = $this->rotationTarget( $before );
+
+		$first = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $first['rotated'], 'the fixture assumption this test is built on -- a clean first landing' );
+		$this->assertSame( $target, $first['epoch'] );
+
+		// The retry: same (now stale) $expected, but this time the
+		// binding read itself fails.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$retry = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $retry['rotated'], 'Ruling S81: unreadable, never a false built on the wrong (sentinel) generation' );
+		$this->assertNull( $retry['epoch'] );
+		// The FIRST attempt's own landed rotation is untouched by the
+		// retry's own refusal to guess.
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+
+		// The binding read recovers -- the NEXT retry derives the SAME
+		// target the first attempt already reached (the real binding
+		// generation never actually changed) and recognises it.
+		$again = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $again['rotated'], 'Ruling S78: once readable, the retry derives the correct target and recognises its own prior landing' );
+		$this->assertSame( $target, $again['epoch'] );
 	}
 
 	public function test_stale_pending_finds_only_pending_rows_older_than_the_cutoff(): void {
@@ -552,5 +938,1909 @@ final class DoorLogTest extends TestCase {
 
 		$GLOBALS['_sa_wpdb_query_filtered_out'] = false;
 		$this->assertSame( '', $stale, 'unreadable, never A (stale) and never B (unproven)' );
+	}
+
+	/**
+	 * The site-issued observation witness (Ruling A65, 2.16.2), CLOCK-FLOORED
+	 * (Ruling S4, Codex round-2 P1 on #88): each bump is
+	 * GREATEST( current + 1, wall-clock-microseconds ), so it is guaranteed
+	 * only to STRICTLY INCREASE — never a fixed "+1" delta, since a slower
+	 * clock can carry it further ahead than a bare increment would. Asserting
+	 * an exact `+1` here would be asserting a coincidence of timing, not the
+	 * guarantee the counter actually makes.
+	 */
+	public function test_bump_door_version_strictly_increases_and_is_an_int(): void {
+		$a = Aura_Worker_Door_Log::bump_door_version();
+		$b = Aura_Worker_Door_Log::bump_door_version();
+		$c = Aura_Worker_Door_Log::bump_door_version();
+		$this->assertIsInt( $a );
+		$this->assertGreaterThanOrEqual( $a + 1, $b );
+		$this->assertGreaterThanOrEqual( $b + 1, $c );
+	}
+
+	/** Two serves within one request strictly increase — never the same number twice. */
+	public function test_two_bumps_in_one_request_never_answer_the_same_value(): void {
+		$first  = Aura_Worker_Door_Log::bump_door_version();
+		$second = Aura_Worker_Door_Log::bump_door_version();
+		$this->assertGreaterThan( $first, $second );
+	}
+
+	/**
+	 * Ruling S4 (Codex round-2 P1 on #88): a plain per-row counter is not
+	 * enough — `wp_options` can be restored from a backup taken before this
+	 * row's later bumps, and a counter restored to a lower stored value
+	 * would otherwise resume REISSUING numbers it already served, which
+	 * breaks Aura's ordering. Clock-flooring means a restore can roll the
+	 * STORED value back but not the CLOCK, so the very next bump after a
+	 * restore still resumes strictly above every value issued before it.
+	 */
+	public function test_a_restore_never_reissues_a_value_already_served_before_it(): void {
+		$before_restore = 0;
+		for ( $i = 0; $i < 3; $i++ ) {
+			$before_restore = Aura_Worker_Door_Log::bump_door_version();
+		}
+
+		// The database is restored from a backup taken before any of the
+		// bumps above — the row rolls back to a value far below every one
+		// of them, exactly as a snapshot restore would.
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::OBSERVATION ]    = '100';
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::OBSERVATION ] = '100';
+
+		$after_restore = Aura_Worker_Door_Log::bump_door_version();
+
+		$this->assertGreaterThan(
+			$before_restore,
+			$after_restore,
+			'the clock floor means a restored counter resumes strictly ABOVE every value it issued before the backup, never reissuing one'
+		);
+	}
+
+	/**
+	 * Ruling S83 (Codex round-34 P1 on #88): a `door_observation_seen` at
+	 * or above `MAX_OBSERVATION_SEEN` made `$seen + 1` overflow a 64-bit
+	 * int into a FLOAT, which then floated straight through this query's
+	 * `%d` placeholders uncontrolled -- this PUBLIC method refuses it,
+	 * belt-and-braces, for any caller that reaches it directly.
+	 *
+	 * Ruling S90 (Codex round-39 P2 on #88) TIGHTENS the threshold this
+	 * method itself honours at, from "anything below `MAX_OBSERVATION_SEEN`
+	 * itself" to "anything at or below `MAX_OBSERVATION_SEEN - 2`" --
+	 * see `MAX_OBSERVATION_SEEN`'s own docblock for the two-threshold
+	 * design (ACCEPT at the REST layer vs HONOUR here) this method is
+	 * the HONOUR half of. `MAX_OBSERVATION_SEEN - 1` -- ACCEPTED by the
+	 * REST arg validator, since it is `<= MAX_OBSERVATION_SEEN` -- is
+	 * now ALSO refused here, silently, the SAME `{ committed: false }`
+	 * shape as the cap itself.
+	 */
+	public function test_restamp_observation_forward_honours_only_up_to_the_cap_minus_two(): void {
+		$before = Aura_Worker_Door_Log::bump_door_version();
+
+		$at_cap    = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN );
+		$php_max   = Aura_Worker_Door_Log::restamp_observation_forward( PHP_INT_MAX );
+		$one_below = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 1 );
+
+		$this->assertFalse( $at_cap['committed'], 'refused plainly at the cap itself -- never merely "large"' );
+		$this->assertFalse( $php_max['committed'], 'PHP_INT_MAX refused outright -- never an overflowing $seen + 1' );
+		$this->assertFalse( $one_below['committed'], 'Ruling S90: MAX - 1 is ACCEPTED by the REST validator but NOT honoured here -- the tighter threshold this method itself enforces' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'no write attempted for any of the three -- the version this site holds is completely untouched' );
+
+		// Two below the cap IS honoured -- the largest value this method
+		// ever acts on.
+		$two_below = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2 );
+		$this->assertTrue( $two_below['committed'] );
+		$this->assertGreaterThan( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2, Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertLessThanOrEqual( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN, Aura_Worker_Door_Log::door_version_raw(), 'Ruling S90: the served value never exceeds the class ceiling itself' );
+	}
+
+	/**
+	 * The clock floor applies even to a row that has NEVER existed (Ruling
+	 * S4): the first-ever bump on a fresh site still answers the clock
+	 * value, not a bare `1` — a value any restored backup could trivially
+	 * reissue is never handed out even once.
+	 */
+	public function test_the_first_ever_bump_on_a_fresh_site_answers_the_clock_derived_value_not_one(): void {
+		$first = Aura_Worker_Door_Log::bump_door_version();
+		$this->assertGreaterThanOrEqual( 1000000000000000, $first, 'microsecond wall-clock time today is well past 10^15' );
+	}
+
+	/**
+	 * Ruling S2 (Codex round-1 P1 on #88): the increment-plus-read must be
+	 * ONE atomic operation, not an atomic increment followed by a SEPARATE
+	 * re-read of the shared row. The old shape let an interleaved second
+	 * bump land between the first request's own upsert and its own read,
+	 * so BOTH requests could answer the row's latest value instead of each
+	 * answering what it itself assigned.
+	 *
+	 * Modelled here as two independent CONNECTIONS (two SA_Test_Wpdb
+	 * instances, exactly as two separate PHP requests would each hold their
+	 * own mysqli connection) interleaved via a seam that fires from INSIDE
+	 * the stub's own upsert handler — between THIS request's own INSERT and
+	 * its own `SELECT LAST_INSERT_ID()` — never a callback inside production
+	 * code, which has no such hook. Pre-fix (a plain re-read of the shared
+	 * row) this test is RED: both connections would answer the same value.
+	 */
+	public function test_two_interleaved_bumps_on_different_connections_never_answer_the_same_value(): void {
+		$other = null;
+		$GLOBALS['_sa_after_door_version_bump'] = static function () use ( &$other ) {
+			$mine            = $GLOBALS['wpdb'];
+			$GLOBALS['wpdb'] = new SA_Test_Wpdb(); // a second, independent connection
+			$other           = Aura_Worker_Door_Log::bump_door_version();
+			$GLOBALS['wpdb'] = $mine; // restored before THIS request's own next statement
+		};
+
+		$mine = Aura_Worker_Door_Log::bump_door_version();
+
+		$this->assertIsInt( $mine );
+		$this->assertIsInt( $other );
+		$this->assertNotSame( $mine, $other, 'never the same number twice' );
+		$this->assertGreaterThan( $mine, $other, "the second, interleaved connection's own upsert ran AFTER the first's, so it lands strictly ahead — the first connection's own read answers what IT assigned, never a re-read of the row" );
+	}
+
+	/**
+	 * A read-back that cannot be PROVEN (Ruling S1's same discipline) answers
+	 * null — "no witness this serve" — never a stale or guessed number, even
+	 * though the underlying upsert may well have landed.
+	 */
+	public function test_bump_door_version_answers_null_when_the_read_back_cannot_be_proven(): void {
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+		$out                       = Aura_Worker_Door_Log::bump_door_version();
+		$GLOBALS['_sa_wpdb_error'] = '';
+		$this->assertNull( $out );
+	}
+
+	/**
+	 * Ruling S5 (Codex round-2 P2 on #88): the upsert can commit and the
+	 * connection can then drop before this SAME request's own
+	 * `SELECT LAST_INSERT_ID()` runs — WordPress can transparently reconnect
+	 * and run it on a FRESH session, where `LAST_INSERT_ID()` genuinely
+	 * answers `0`. `0` is numeric and would otherwise pass as a witness this
+	 * connection never actually produced; it must answer null instead.
+	 */
+	public function test_bump_door_version_answers_null_when_the_read_back_is_a_reconnected_zero(): void {
+		$GLOBALS['_sa_last_insert_id_reconnect'] = true;
+		$out                                     = Aura_Worker_Door_Log::bump_door_version();
+		$GLOBALS['_sa_last_insert_id_reconnect'] = false;
+		$this->assertNull( $out, 'a fresh-session LAST_INSERT_ID() of 0 is not this connection\'s own witness' );
+	}
+
+	/** `door_version_raw()` is READ-ONLY: it reports the current value and never advances it. */
+	public function test_door_version_raw_reports_without_bumping(): void {
+		$this->assertNull( Aura_Worker_Door_Log::door_version_raw(), 'no witness has ever served this site' );
+		$bumped = Aura_Worker_Door_Log::bump_door_version();
+		$this->assertSame( $bumped, Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertSame( $bumped, Aura_Worker_Door_Log::door_version_raw(), 'a second read changes nothing' );
+	}
+
+	/**
+	 * The counter is NEVER reset by rotation, rebind or unbind (Ruling A65)
+	 * — it orders mutations across all of them. Since Ruling S6 (Codex
+	 * round-3 P1 on #88), `rotate_epoch()` is ITSELF a choke point and bumps
+	 * on its own successful rotation — a rewind recovery is real door state
+	 * changing, so the version after it is strictly GREATER than whatever it
+	 * was before, never merely equal and never reset to null or zero.
+	 */
+	public function test_observation_survives_an_epoch_rotation(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$seq    = Aura_Worker_Door_Log::bump_door_version();
+		Aura_Worker_Door_Log::rotate_epoch( $before );
+		$after_rotation = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertGreaterThan( $seq, $after_rotation, 'the rotation is itself a mutation, and it bumps for itself' );
+		$this->assertGreaterThan( $after_rotation, Aura_Worker_Door_Log::bump_door_version(), 'and the next bump continues past it' );
+	}
+
+	/**
+	 * Ruling S7 (Codex round-3 P2 on #88): on a 32-bit PHP build the
+	 * clock-derived value (~1.7e15 today) cannot be represented as an int
+	 * without corrupting it, so the READ-BACK always answers null there —
+	 * even though the counter itself still advances correctly, since the
+	 * WRITE side is built as a decimal STRING (never assembled as one PHP
+	 * int) and MySQL evaluates it in its own 64-bit domain regardless of the
+	 * PHP client's word size. Modelled via a test-only seam standing in for
+	 * `PHP_INT_SIZE`, since the real constant cannot be redefined.
+	 */
+	public function test_bump_door_version_answers_null_on_a_32_bit_build_but_still_advances_the_counter(): void {
+		Aura_Worker_Door_Log::set_int_size_for_tests( 4 );
+		$first  = Aura_Worker_Door_Log::bump_door_version();
+		$second = Aura_Worker_Door_Log::bump_door_version();
+		Aura_Worker_Door_Log::set_int_size_for_tests( null );
+
+		$this->assertNull( $first, 'a 32-bit build must never hand back a witness it cannot represent' );
+		$this->assertNull( $second );
+
+		// The counter still advanced on every bump above — proven by
+		// switching back to a 64-bit read and finding a real, positive
+		// value already stored, not the null a corrupted write would leave.
+		$this->assertGreaterThan( 0, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/** The same 32-bit guard applies to the READ-ONLY audit path (Ruling S7). */
+	public function test_door_version_raw_also_answers_null_on_a_32_bit_build(): void {
+		Aura_Worker_Door_Log::bump_door_version(); // a real value now exists in the row
+
+		Aura_Worker_Door_Log::set_int_size_for_tests( 4 );
+		$out = Aura_Worker_Door_Log::door_version_raw();
+		Aura_Worker_Door_Log::set_int_size_for_tests( null );
+
+		$this->assertNull( $out, 'a 32-bit build cannot prove what the row holds without risking corruption' );
+		$this->assertGreaterThan( 0, Aura_Worker_Door_Log::door_version_raw(), 'and the value is still there once read on a build that can represent it' );
+	}
+
+	/**
+	 * Ruling S8 (Codex round-4 P1 on #88): the state write and its version
+	 * bump run in ONE transaction — proven from the request's own statement
+	 * log rather than from behaviour, since the STATEMENT ORDER is exactly
+	 * what a separate-statement bug (the finding this ruling answers) gets
+	 * wrong. Finds the bump's own upsert (the statement naming
+	 * Aura_Worker_Door_Log::OBSERVATION) and asserts a START TRANSACTION
+	 * precedes it and a COMMIT follows it, with nothing else in between that
+	 * would mean a SECOND unit. hold() is proven the same way in
+	 * DoorHoldsTest.php.
+	 */
+	private function assertBumpIsBracketedByOneTransaction( array $log ): void {
+		$bump = null;
+		foreach ( $log as $i => $sql ) {
+			if ( false !== strpos( (string) $sql, Aura_Worker_Door_Log::OBSERVATION ) ) {
+				$bump = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $bump, 'the version bump must have landed at all' );
+		$start = null;
+		for ( $i = $bump; $i >= 0; $i-- ) {
+			if ( 'START TRANSACTION' === trim( (string) $log[ $i ] ) ) {
+				$start = $i;
+				break;
+			}
+		}
+		$commit = null;
+		for ( $i = $bump, $n = count( $log ); $i < $n; $i++ ) {
+			if ( 'COMMIT' === trim( (string) $log[ $i ] ) ) {
+				$commit = $i;
+				break;
+			}
+			// A ROLLBACK before any COMMIT means the bump's OWN unit was
+			// undone — never what a successful mutation's log should show.
+			$this->assertNotSame( 'ROLLBACK', trim( (string) $log[ $i ] ), 'the bump landed in a unit that then rolled back' );
+		}
+		$this->assertNotNull( $start, 'a transaction opened before the bump' );
+		$this->assertNotNull( $commit, 'and closed with a COMMIT after it' );
+	}
+
+	public function test_open_pending_bumps_the_version_inside_its_own_transaction(): void {
+		$GLOBALS['_db_queries'] = array();
+		$seq                    = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->assertIsInt( $seq );
+		$this->assertBumpIsBracketedByOneTransaction( $GLOBALS['_db_queries'] );
+	}
+
+	public function test_ack_bumps_the_version_inside_its_own_transaction(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_db_queries'] = array();
+		$out                    = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$this->assertSame( 1, $out['acked'] );
+		$this->assertBumpIsBracketedByOneTransaction( $GLOBALS['_db_queries'] );
+	}
+
+	public function test_a_rotate_epoch_bumps_the_version_inside_its_own_transaction(): void {
+		$before                 = Aura_Worker_Door_Log::epoch();
+		$GLOBALS['_db_queries'] = array();
+		$out                    = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $out['rotated'] );
+		$this->assertBumpIsBracketedByOneTransaction( $GLOBALS['_db_queries'] );
+	}
+
+	/**
+	 * A bump whose own WRITE fails must roll the state write back too
+	 * (Ruling S8) — never a mutation that landed with no witness at all,
+	 * silently invisible until some unrelated later mutation finally
+	 * advanced the version past it.
+	 */
+	public function test_a_bump_write_failure_rolls_back_the_state_write_with_it(): void {
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out                                                                  = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertInstanceOf( WP_Error::class, $out, 'every retry hit the same failing bump and gave up' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_log_1', $GLOBALS['_options'], 'the row was rolled back with the failed bump' );
+		$this->assertArrayNotHasKey( 'aura_worker_door_log_1', $GLOBALS['_rows'] );
+	}
+
+	/**
+	 * The race Ruling S8 exists to close, reproduced at the ONE place the
+	 * stub can show it precisely: the racer seam fires from INSIDE
+	 * insert_unique()'s statement — the exact gap between the state write
+	 * landing and the version bump that used to be a separate, later
+	 * statement (Ruling S6 alone). Because state and bump are now the SAME
+	 * transaction, nothing between them can be a poll's opportunity to
+	 * observe one without the other: the racer callback itself runs
+	 * synchronously inside that gap, and even it — reading through this
+	 * same shared "database" — can only ever find a version that is either
+	 * not yet bumped (the OLD one, matching state that has not committed
+	 * either, from THIS reader's perspective once it opens its own
+	 * transaction) or, once versioned() reaches its own bump and commits,
+	 * both together. What the OLD two-statement design could produce and
+	 * this cannot: a poll's OWN before/after version read (status_fragment()'s
+	 * Ruling S6 check) disagreeing with itself while state visibly changed
+	 * in between — proven here by running that exact check from the racer.
+	 */
+	public function test_a_racer_between_the_state_write_and_the_bump_sees_a_consistent_version_pair(): void {
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-door-holds.php';
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-elementor-door-governor.php';
+		$GLOBALS['_sa_force_door'] = true;
+		Aura_Worker_Elementor_Door::reset_for_tests();
+		do_action( 'wp_abilities_api_init' );
+
+		$before = null;
+		$after  = null;
+		$GLOBALS['_sa_after_insert_unique']['aura_worker_door_log_1'] = static function () use ( &$before, &$after ) {
+			sa_on_another_connection(
+				static function () use ( &$before, &$after ) {
+					// status_fragment()'s OWN Ruling S6 before/after check,
+					// run from a separate connection at the exact moment
+					// Ruling S8 used to leave open: after the state write,
+					// before the bump.
+					$before = Aura_Worker_Door_Log::door_version_raw();
+					$after  = Aura_Worker_Door_Log::door_version_raw();
+				}
+			);
+		};
+
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq );
+		// The racer's own before/after pair AGREES with itself — it is not
+		// possible for it to have observed the row (new state) alongside a
+		// version its OWN two reads disagree about, because nothing writes
+		// the version between those two reads either. status_fragment()'s
+		// retry logic therefore never has anything to repair for THIS
+		// mutation: state and version move together or not at all.
+		$this->assertSame( $before, $after, "the racer's own two version reads never disagree with each other across this gap" );
+	}
+
+	/**
+	 * Ruling S9 (Codex round-4 P2 on #88): every counter the fragment or
+	 * governor_block() reports advances the version through the SAME
+	 * versioned() unit as its own upsert — bump_refused() (log_full.refused)
+	 * included, which changing bumps.php did not used to touch at all: a
+	 * later poll could see a changed refusal count under an unchanged
+	 * observation.
+	 */
+	public function test_a_refusal_on_a_closed_log_raises_the_observation(): void {
+		Aura_Worker_Door_Log::close();
+		$before = Aura_Worker_Door_Log::door_version_raw();
+
+		Aura_Worker_Door_Log::bump_refused();
+
+		$this->assertGreaterThan( $before, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/**
+	 * Ruling S10 (Codex round-5 P1 on #88): the read-back runs AFTER COMMIT,
+	 * never before. If the connection dropped between the version upsert
+	 * and SELECT LAST_INSERT_ID(), WordPress could reconnect for the SELECT
+	 * — and a FRESH connection rolls back whatever the OLD one had left
+	 * uncommitted, so committing only AFTER would have lost the mutation
+	 * while still reporting `committed: true`. Committing first closes that:
+	 * a reconnect landing AFTER the COMMIT lands on a session that never
+	 * assigned anything (`SELECT LAST_INSERT_ID()` answers `0`, Ruling S5 ⇒
+	 * null), but the mutation is ALREADY durable.
+	 */
+	public function test_a_reconnect_between_the_bump_and_the_read_back_leaves_the_mutation_committed(): void {
+		$GLOBALS['_db_queries']                  = array();
+		$GLOBALS['_sa_last_insert_id_reconnect'] = true; // the read-back answers 0, as a reconnect would
+		$outcome                                 = Aura_Worker_Door_Log::versioned(
+			function () {
+				$GLOBALS['_options']['aura_worker_door_s10_test'] = array( 'x' => 1 );
+				$GLOBALS['_rows']['aura_worker_door_s10_test']    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( 'aura_worker_door_s10_test' ),
+				);
+			}
+		);
+		$GLOBALS['_sa_last_insert_id_reconnect'] = false;
+
+		$this->assertTrue( $outcome['committed'], 'the mutation is committed regardless of whether its own witness could be read back' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertNull( $outcome['observation'], 'the reconnected read-back answers 0, which Ruling S5 turns into null' );
+		$this->assertArrayHasKey( 'aura_worker_door_s10_test', $GLOBALS['_options'], 'the state is present' );
+
+		// The ORDER, from the request's own statement log: COMMIT before the
+		// read-back it protects — never the reverse, which would commit a
+		// transaction the reconnect had already rolled back on the OLD
+		// connection.
+		$log    = $GLOBALS['_db_queries'];
+		$commit = array_search( 'COMMIT', $log, true );
+		$select = null;
+		foreach ( $log as $i => $sql ) {
+			if ( 'SELECT LAST_INSERT_ID()' === trim( (string) $sql ) ) {
+				$select = $i;
+			}
+		}
+		$this->assertNotFalse( $commit, 'the transaction committed' );
+		$this->assertNotNull( $select, 'the read-back was still attempted' );
+		$this->assertLessThan( $select, $commit, 'COMMIT runs before the read-back' );
+	}
+
+	/**
+	 * Ruling S11 (Codex round-5 P1 on #88): every wrapped write's own
+	 * pre-commit eviction leaves a window — a CONCURRENT request can
+	 * repopulate the option cache from the pre-commit snapshot before this
+	 * transaction commits, and nothing evicted it again afterwards. Modelled
+	 * with a racer that repopulates $GLOBALS['_sa_option_cache'] (the stub's
+	 * request-level option cache — see get_option()) at exactly that point,
+	 * via the SAME seam used elsewhere in this suite
+	 * ($GLOBALS['_sa_after_insert_unique']). versioned()'s post-commit
+	 * repeat must evict it a second time, so the next get_option() sees the
+	 * NEW value, not the racer's stale one.
+	 */
+	public function test_a_racer_repopulating_the_cache_before_commit_is_defeated_by_the_post_commit_repeat(): void {
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = true;
+		$name = 'aura_worker_door_s11_test';
+
+		$GLOBALS['_sa_after_insert_unique'][ $name ] = static function () use ( $name ) {
+			// The exact gap Ruling S11 closes: this fires right after the
+			// write's OWN pre-commit eviction, before the transaction
+			// commits. A concurrent request re-reads the row from the
+			// pre-commit database snapshot and caches THAT.
+			$GLOBALS['_sa_option_cache'][ $name ] = array( 'stale' => true );
+		};
+
+		$won = Aura_Worker_Door_Log::insert_unique( $name, array( 'stale' => false ) );
+
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false;
+
+		$this->assertTrue( $won );
+		$fresh = get_option( $name );
+		$this->assertIsArray( $fresh );
+		$this->assertFalse( $fresh['stale'], 'the post-commit repeat evicted the racer\'s repopulated entry, so this read reaches the database again' );
+	}
+
+	/**
+	 * Ruling S12 (Codex round-5 P2 on #88): when the epoch DELETE succeeds
+	 * but the replacement insert_unique_write() then fails, the old code
+	 * ignored that false result — the transaction still bumped the version
+	 * and committed with NO epoch row at all, reporting `rotated: true` with
+	 * an empty one. Both branches of rotate_epoch_write() now check it and
+	 * roll the WHOLE unit back — the DELETE included — so the epoch this
+	 * call reports, and the one the row actually still holds, are the
+	 * ORIGINAL, never-replaced one.
+	 */
+	public function test_rotate_epoch_rolls_back_when_the_claim_conditioned_replacement_insert_fails(): void {
+		require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-magic-link.php';
+		$before = Aura_Worker_Door_Log::epoch();
+		$fence  = Aura_Worker_Magic_Link::claim_site();
+
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::EPOCH;
+		$out                               = Aura_Worker_Door_Log::rotate_epoch( $before, Aura_Worker_Magic_Link::SITE_CLAIM, $fence );
+		$GLOBALS['_sa_insert_unique_fail']  = false;
+
+		$this->assertFalse( $out['rotated'] );
+		$this->assertSame( $before, $out['epoch'], 'the epoch this call reports is the one that was never actually replaced' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::epoch_raw(), 'and the row itself still holds it — the DELETE rolled back too' );
+	}
+
+	/** The same failure, on the unclaimed (grant-gated /door/rotate) branch. */
+	public function test_rotate_epoch_rolls_back_when_the_unclaimed_replacement_insert_fails(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_insert_unique_fail'] = Aura_Worker_Door_Log::EPOCH;
+		$out                               = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_insert_unique_fail']  = false;
+
+		$this->assertFalse( $out['rotated'] );
+		$this->assertSame( $before, $out['epoch'] );
+		$this->assertSame( $before, Aura_Worker_Door_Log::epoch_raw() );
+	}
+
+	/**
+	 * Ruling S14 (Codex round-6 P1 on #88): `rotate_binding()`'s epoch
+	 * rotation runs INSIDE the same closure as its own record write, both
+	 * inside the ONE transaction `versioned()` opens. When the epoch rotates
+	 * but the following record write then fails, the closure used to answer
+	 * `mutated => false` — telling `versioned()` nothing happened and to
+	 * COMMIT, which durably published the NEW epoch while the binding record
+	 * still named the OLD one. The closure now answers `rollback => true`
+	 * instead, so the whole unit — the epoch rotation included — rolls back:
+	 * a transient binding-write failure leaves the epoch AND the binding
+	 * exactly as they were, `rotated: false` in effect (the site's own
+	 * generation never moved), safe for the caller's retry to redo whole.
+	 */
+	public function test_a_transient_binding_write_failure_after_the_epoch_rotates_leaves_neither_moved(): void {
+		// An existing binding record first — a first-ever rotate_binding()
+		// call takes the "no record" claim-conditional INSERT path, which
+		// this test does not mean to exercise.
+		$this->assertTrue( sa_rotate_binding( array( 'client' => 'c1', 'dashboard' => 'https://one.example' ) ) );
+		$epoch_before   = Aura_Worker_Door_Log::epoch();
+		$binding_before = Aura_Worker_Door_Log::binding_raw();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$out = sa_rotate_binding( array( 'client' => 'c2', 'dashboard' => 'https://two.example' ) );
+		$GLOBALS['_sa_option_write_fail']                                 = array();
+
+		$this->assertFalse( $out, 'the record write failed, so the whole rotation reports false' );
+		$this->assertSame( $epoch_before, Aura_Worker_Door_Log::epoch_raw(), 'the epoch rotation rolled back with the failed record write' );
+		$this->assertSame( $binding_before, Aura_Worker_Door_Log::binding_raw(), 'and the OLD binding generation is untouched' );
+	}
+
+	/**
+	 * Ruling S15 (Codex round-6 P2 on #88): `versioned()` used to hand a
+	 * rolled-back caller its own SUCCESS-shaped `result` — `ack()` returned
+	 * `$outcome['result']` unconditionally, so a bump-write failure after a
+	 * real floor raise reported the ack as having happened, when the
+	 * ROLLBACK just undid it. `ack()` now checks `committed` itself and
+	 * answers a FAILURE shape instead: nothing acked, nothing purged, the
+	 * floor read fresh from the row the rollback actually left behind.
+	 */
+	public function test_a_bump_write_failure_inside_ack_purges_nothing_and_reports_committed_false(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertArrayHasKey( 'committed', $out );
+		$this->assertFalse( $out['committed'], 'a rolled-back ack reports committed: false' );
+		$this->assertSame( 0, $out['acked'] );
+		$this->assertSame( 0, $out['floor'], 'the floor raise was rolled back with the failed bump' );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'], 'the row this ack would have purged is still there' );
+	}
+
+	/**
+	 * The same Ruling S15 fix, on `rotate_epoch()`: a bump-write failure
+	 * after a real epoch rotation used to report `rotated: true` — the
+	 * closure's own success-shaped result, handed back unconditionally by a
+	 * caller that never checked `committed`. `rotate_epoch()` now answers
+	 * `rotated: false` with the epoch read fresh from the rolled-back row.
+	 */
+	public function test_a_bump_write_failure_inside_rotate_epoch_reports_rotated_false(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+
+		$this->assertFalse( $out['rotated'] );
+		$this->assertSame( $before, $out['epoch'], 'the never-replaced epoch, read fresh after the rollback' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::epoch_raw() );
+	}
+
+	/**
+	 * Ruling S16 (Codex round-6 P1 on #88): a per-unit session nonce, set as
+	 * the FIRST statement after START TRANSACTION, proves the final COMMIT
+	 * ran on the SAME session that opened the transaction — not a fresh one
+	 * WordPress transparently reconnected onto after a drop between the
+	 * version bump and the COMMIT. A reconnect there lands on a session
+	 * with no transaction open, so the COMMIT that runs is a harmless no-op
+	 * that still returns success; the nonce read-back (which does not
+	 * survive a reconnect) is what catches it.
+	 */
+	public function test_a_reconnect_between_the_bump_and_commit_reports_committed_false(): void {
+		$name = 'aura_worker_door_s16_test';
+
+		$GLOBALS['_sa_reconnect_before_commit'] = true;
+		$outcome                                = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_commit'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'the COMMIT that ran could not be proven to be on the transaction\'s own session' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'MySQL itself rolled the old session\'s transaction back the moment it was lost' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_rows'] );
+	}
+
+	/** The normal path: no reconnect, the nonce matches, committed stays true. */
+	public function test_the_normal_commit_path_still_proves_the_session_and_reports_committed_true(): void {
+		$name    = 'aura_worker_door_s16_normal_test';
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$this->assertTrue( $outcome['committed'] );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * Ruling S40 (Codex round-17 P1 on #88): a COMMIT that fails OUTRIGHT
+	 * — a lock-wait timeout, a deferred constraint violation — on a
+	 * connection that never dropped used to be reported committed:true
+	 * anyway, because the session-variable nonce (Ruling S16) still
+	 * matched: nothing had reconnected, so nothing had cleared it.
+	 * COMMIT's own return and last_error are now checked FIRST and
+	 * decide on their own when they look bad; the nonce is never asked.
+	 * The explicit ROLLBACK this failure now triggers closes the
+	 * still-open transaction, taking this unit's own witness INSERT
+	 * down with it.
+	 */
+	public function test_a_commit_that_fails_outright_on_a_live_connection_reports_committed_false(): void {
+		$name = 'aura_worker_door_s40_test';
+
+		$GLOBALS['_sa_commit_fails_connection_alive'] = true;
+		$outcome                                       = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_fails_connection_alive'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'COMMIT reported failure on a connection that never dropped — the nonce matching does not override that' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the explicit ROLLBACK undid it, along with the witness INSERT in the same transaction' );
+	}
+
+	/**
+	 * The other half of Ruling S40: an ack lost on a COMMIT that genuinely
+	 * landed must still answer committed:true — the new gate (COMMIT's own
+	 * return/last_error, checked first) does not regress Rulings
+	 * S30/S32/S34's own durable-witness fallback for exactly this case,
+	 * and the explicit ROLLBACK this branch now issues first is a no-op on
+	 * a session whose COMMIT already popped its own transaction, so the
+	 * witness — genuinely durable — is still exactly where it landed.
+	 */
+	public function test_an_ack_lost_commit_that_genuinely_landed_still_reports_committed_true(): void {
+		$name = 'aura_worker_door_s40_landed_test';
+
+		$GLOBALS['_sa_commit_ambiguous_ack'] = true;
+		$outcome                             = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_ambiguous_ack'] = false;
+
+		$this->assertTrue( $outcome['committed'], 'the durable witness — read after a no-op ROLLBACK on an already-committed session — proves it landed' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * Ruling S30 (Codex round-13 P1 on #88): the session-variable nonce
+	 * (Ruling S16) has a gap of its own — if COMMIT genuinely lands on
+	 * THIS session but the connection then drops and reconnects before
+	 * this method's own `SELECT @aura_door_tx` can run, the session
+	 * variable is gone, indistinguishable from a COMMIT that ran on a
+	 * fresh session that never opened this transaction at all. A plain
+	 * option row survives that same reconnect, because it lives in the
+	 * table the landed COMMIT just made durable.
+	 *
+	 * Ruling S32 (Codex round-14 P1 on #88): S30's row was a SINGLE
+	 * shared key every unit overwrote — a second unit's own commit could
+	 * land on that key between this unit's write and this unit's
+	 * read-back, so the fallback could pass while proving nothing but
+	 * B's commit. The witness is now named BY this unit's own nonce
+	 * (`aura_worker_door_tx_<nonce>`), so it can never collide with a
+	 * DIFFERENT unit's own witness row — proven here by seeding one
+	 * before this call even starts and asserting it survives untouched.
+	 */
+	public function test_a_reconnect_after_a_real_commit_falls_back_to_its_own_durable_witness(): void {
+		$name = 'aura_worker_door_s32_test';
+
+		// A concurrent unit's own witness row — a different nonce, freshly
+		// written, still sitting there when this call's own fallback runs.
+		$foreign_name                         = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-b';
+		$GLOBALS['_rows'][ $foreign_name ]    = (string) time();
+		$GLOBALS['_options'][ $foreign_name ] = (string) time();
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-a';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$outcome                               = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+
+		$this->assertTrue( $outcome['committed'], 'this unit\'s OWN durable witness proves the COMMIT really landed even though the session variable was lost afterwards' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
+		$this->assertArrayHasKey( $foreign_name, $GLOBALS['_options'], 'a concurrent unit\'s own witness row is never touched by this unit\'s check or its own self-cleanup' );
+		$this->assertArrayNotHasKey(
+			Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-a',
+			$GLOBALS['_options'],
+			'this unit deletes its OWN witness row once the check is settled (Ruling S32)'
+		);
+	}
+
+	/**
+	 * The other half of Ruling S32 (formerly S30): when the connection
+	 * drops BEFORE COMMIT (Ruling S16's own original window — the whole
+	 * transaction unwinds, this call's own durable-witness INSERT
+	 * included), there is nothing durable left to prove this call's own
+	 * commit, and the fallback must say so.
+	 */
+	public function test_a_reconnect_before_commit_leaves_no_witness_row_to_fall_back_to(): void {
+		$name = 'aura_worker_door_s32_test2';
+
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-c';
+		$GLOBALS['_sa_reconnect_before_commit'] = true;
+		$outcome                                = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the reconnect unwound this call\'s own writes too' );
+		$this->assertArrayNotHasKey(
+			Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-c',
+			$GLOBALS['_options'],
+			'this call\'s own witness row was rolled back along with everything else — there is nothing to fall back to'
+		);
+	}
+
+	/**
+	 * Ruling S32's bounded janitor: a witness row outlives the unit that
+	 * wrote it only when that unit's process died between its own COMMIT
+	 * and its own self-cleanup delete — rare, but `versioned()` sweeps for
+	 * it on every mutating unit. The sweep must stay BOUNDED: only rows
+	 * older than `LAST_TX_MAX_AGE_S`, and never more than
+	 * `LAST_TX_JANITOR_LIMIT` of them in one pass, so this never turns
+	 * into a full-table scan on the hot path.
+	 */
+	public function test_the_janitor_sweeps_only_stale_witness_rows_and_never_more_than_the_bound(): void {
+		$stale_cutoff = time() - Aura_Worker_Door_Log::LAST_TX_MAX_AGE_S - 100;
+		$stale_count  = Aura_Worker_Door_Log::LAST_TX_JANITOR_LIMIT + 5;
+
+		for ( $i = 0; $i < $stale_count; $i++ ) {
+			$stale_name                      = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'stale-' . $i;
+			$GLOBALS['_rows'][ $stale_name ] = (string) $stale_cutoff;
+			$GLOBALS['_options'][ $stale_name ] = (string) $stale_cutoff;
+		}
+
+		$fresh_name                          = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'fresh';
+		$GLOBALS['_rows'][ $fresh_name ]     = (string) time();
+		$GLOBALS['_options'][ $fresh_name ]  = (string) time();
+
+		$name    = 'aura_worker_door_s32_janitor_test';
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$this->assertTrue( $outcome['committed'] );
+
+		$remaining_stale = 0;
+		for ( $i = 0; $i < $stale_count; $i++ ) {
+			if ( isset( $GLOBALS['_options'][ Aura_Worker_Door_Log::LAST_TX_PREFIX . 'stale-' . $i ] ) ) {
+				++$remaining_stale;
+			}
+		}
+
+		$this->assertSame(
+			$stale_count - Aura_Worker_Door_Log::LAST_TX_JANITOR_LIMIT,
+			$remaining_stale,
+			'exactly LAST_TX_JANITOR_LIMIT stale rows were swept in this one pass — bounded, not all-at-once'
+		);
+		$this->assertArrayHasKey( $fresh_name, $GLOBALS['_options'], 'a row younger than LAST_TX_MAX_AGE_S is never swept' );
+	}
+
+	/**
+	 * Ruling S34 (Codex round-15 P1 on #88): when COMMIT genuinely lands
+	 * but its OWN acknowledgement is lost — `$wpdb->last_error` set, or a
+	 * false return — the guard used to short-circuit on that alone,
+	 * skipping BOTH the session check and the durable fallback, deleting
+	 * this unit's own witness row, and reporting committed:false over
+	 * writes that were, in fact, durable. An ambiguous COMMIT must consult
+	 * the durable witness exactly like an unreadable session variable
+	 * does: the row is there because this same transaction wrote it
+	 * before the bump, and nothing about the ack being lost afterwards
+	 * unwinds that.
+	 */
+	public function test_an_ambiguous_commit_that_really_landed_falls_back_to_the_durable_witness(): void {
+		$name = 'aura_worker_door_s34_test';
+
+		$GLOBALS['_sa_commit_ambiguous_ack'] = true;
+		$outcome                             = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_ambiguous_ack'] = false;
+
+		$this->assertTrue( $outcome['committed'], 'the durable witness proves the COMMIT really landed even though the statement itself reported failure' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
+	}
+
+	/**
+	 * The other half of Ruling S34: an ambiguous COMMIT that did NOT land
+	 * must still answer false — checking the durable witness is not a bias
+	 * toward committed:true, it is the same proof read honestly either way.
+	 */
+	public function test_an_ambiguous_commit_that_did_not_land_still_answers_false(): void {
+		$name = 'aura_worker_door_s34_test2';
+
+		$GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] = true;
+		$outcome                                         = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] = false;
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the ambiguous COMMIT really did not commit' );
+	}
+
+	/**
+	 * Ruling S17 (Codex round-7 P1 on #88): the nonce alone is not proof — a
+	 * reconnect landing WHILE the nonce's own `SET` is issued can be
+	 * transparently retried by `wpdb` on a fresh autocommit session, and
+	 * the retried statement assigns the SAME nonce this method later checks,
+	 * so the post-COMMIT read-back would pass even though no transaction was
+	 * ever open while the callback and the bump ran. `SAVEPOINT aura_door_tx`
+	 * — set immediately after START TRANSACTION, before the nonce — cannot
+	 * be silently re-created this way: an autocommit session that runs
+	 * SAVEPOINT outside any explicit transaction discards it the instant
+	 * that statement completes, so a later check against it fails loudly
+	 * (modelled as MySQL error 1305) instead of quietly succeeding on a
+	 * session that was never really in a transaction. As of Ruling S21
+	 * (Codex round-8 P1) that check is `ROLLBACK TO SAVEPOINT`, run
+	 * immediately after `SAVEPOINT` — BEFORE the callback below ever runs —
+	 * rather than `RELEASE SAVEPOINT` at the very end; see that ruling's own
+	 * test for the guarantee this reordering adds.
+	 */
+	public function test_a_reconnect_between_start_transaction_and_the_savepoint_reports_committed_false(): void {
+		$name = 'aura_worker_door_s17_test';
+
+		$GLOBALS['_sa_reconnect_before_savepoint'] = true;
+		$outcome                                   = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_savepoint'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'the savepoint this session never actually held could not be released' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the transaction the savepoint would have proven was never really open' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_rows'] );
+	}
+
+	/** The normal path: the savepoint releases cleanly, and committed stays true. */
+	public function test_the_normal_path_still_releases_the_savepoint_and_reports_committed_true(): void {
+		$name    = 'aura_worker_door_s17_normal_test';
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$this->assertTrue( $outcome['committed'] );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * Ruling S21 (Codex round-8 P1 on #88): Ruling S17's `RELEASE SAVEPOINT`
+	 * catches a reconnect only at the CLOSE of the unit — after `$writes()`
+	 * and the version bump have both already run. On a real server that
+	 * already dropped the transaction, every statement they issued would
+	 * have autocommitted individually, un-transacted, immune to the
+	 * `ROLLBACK` this method issues once it finally notices — reporting
+	 * `committed: false` at that point is honest about the VERSION not
+	 * having advanced, but not about whether the state write itself landed
+	 * anyway. `ROLLBACK TO SAVEPOINT aura_door_tx`, issued immediately
+	 * after `SAVEPOINT` and BEFORE the nonce or `$writes()`, catches the
+	 * SAME reconnect before any of that can happen: this test proves
+	 * `$writes()` is never even invoked.
+	 */
+	public function test_a_reconnect_before_the_savepoint_never_runs_the_callback(): void {
+		$ran = false;
+
+		$GLOBALS['_sa_reconnect_before_savepoint'] = true;
+		$outcome                                   = Aura_Worker_Door_Log::versioned(
+			function () use ( &$ran ) {
+				$ran = true;
+				return array(
+					'mutated' => true,
+					'result'  => true,
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_savepoint'] = false;
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertFalse( $ran, 'the savepoint is verified before $writes() ever runs — a failure here means the callback was never invoked at all' );
+	}
+
+	/**
+	 * Ruling S25 (Codex round-11 P1 on #88): Ruling S21's own verification
+	 * ran BEFORE the nonce `SET` — which left that `SET` itself as a
+	 * reconnect-prone statement the check never covered. A reconnect
+	 * landing WHILE the SET is being issued lets `wpdb` retry it on a fresh
+	 * autocommit session that never held the savepoint, and the retried SET
+	 * still assigns the SAME nonce this method later compares — so
+	 * `$writes()` and the bump would run un-transacted, each autocommitting
+	 * individually, before Ruling S17's own `RELEASE SAVEPOINT` finally
+	 * caught it at the close. `ROLLBACK TO SAVEPOINT`, moved to run
+	 * immediately AFTER the SET instead, catches the SAME reconnect before
+	 * `$writes()` ever runs: this test proves the callback is never invoked
+	 * and nothing landed.
+	 */
+	public function test_a_reconnect_during_the_nonce_set_never_runs_the_callback(): void {
+		$ran = false;
+
+		$GLOBALS['_sa_reconnect_during_set'] = true;
+		$outcome                             = Aura_Worker_Door_Log::versioned(
+			function () use ( &$ran ) {
+				$ran = true;
+				return array(
+					'mutated' => true,
+					'result'  => true,
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_during_set'] = false;
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertFalse( $ran, 'the savepoint is re-verified after the SET, before $writes() ever runs' );
+	}
+
+	/**
+	 * Ruling S18 (Codex round-7 P1 on #88): `ack_write()` evicts the floor's
+	 * cache entry and then re-reads it via `self::floor()` (to compute the
+	 * response it hands back) BEFORE this method decides whether to commit —
+	 * which re-caches the UNCOMMITTED, just-raised value. If the bump then
+	 * fails and the whole unit rolls back, the database reverts to the OLD
+	 * floor, but nothing evicted the cache again — so a caller re-reading
+	 * `floor()` right after `committed: false` got the never-landed value
+	 * back from cache. `versioned()` now repeats every listed eviction
+	 * before returning from ANY rollback it can reach once `$writes()` has
+	 * run, exactly like the post-COMMIT repeat (Ruling S11).
+	 */
+	public function test_a_bump_write_failure_inside_ack_evicts_the_cache_it_poisoned(): void {
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		// The object cache is a layer the stub keeps SEPARATE from "the
+		// database" ($GLOBALS['_rows']/['_options']) precisely so a
+		// transaction's ROLLBACK — which restores those two wholesale —
+		// cannot also silently prove this fix by accident: only an actual
+		// wp_cache_delete( FLOOR, 'options' ) call clears it.
+		//
+		// ack_write() evicts FLOOR TWICE before the bump ever runs: once
+		// from its own self::insert_unique( FLOOR, 0 ) (a no-op INSERT here,
+		// since the row already exists, but insert_unique_write() still
+		// evicts on every call), and again right after the raise — the
+		// eviction this test means to exercise. The hook below fires on
+		// the FIRST delete and re-arms itself for the SECOND, so the
+		// poisoned value lands at the correct moment regardless of that
+		// earlier, unrelated eviction.
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = true;
+		$GLOBALS['_sa_after_wp_cache_delete'][ Aura_Worker_Door_Log::FLOOR ] = static function () use ( $seq ) {
+			$GLOBALS['_sa_after_wp_cache_delete'][ Aura_Worker_Door_Log::FLOOR ] = static function () use ( $seq ) {
+				// Fires on the SECOND delete — ack_write()'s own eviction
+				// right after raising the floor — and models a read (this
+				// process's own subsequent `self::floor()` call, or a
+				// concurrent one) caching the UNCOMMITTED, just-raised
+				// value.
+				$GLOBALS['_sa_option_cache'][ Aura_Worker_Door_Log::FLOOR ] = $seq;
+			};
+		};
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$out = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_option_write_fail']                                     = array();
+		$GLOBALS['_sa_option_cache_honors_wp_cache_delete']                   = false;
+
+		$this->assertFalse( $out['committed'] );
+		// Without the fix this reads $seq back from the poisoned cache
+		// entry the hook above planted — a value the ROLLBACK's own
+		// database restore never touches, because it lives in a separate
+		// layer that only a repeated wp_cache_delete() call clears.
+		$this->assertSame( 0, Aura_Worker_Door_Log::floor(), 'the rollback repeats the eviction, so a fresh read answers the database, not the never-landed raise' );
+	}
+
+	/**
+	 * Ruling S13 (Codex round-5 P2 on #88): engine_is_transactional() reads
+	 * `SHOW TABLE STATUS WHERE Name = 'wp_options'` ONCE per request (an
+	 * EXACT match, never `LIKE` — Ruling S23, Codex round-9 P2 on #88, since
+	 * `_` in a LIKE pattern is a single-character wildcard that an ordinary
+	 * table name like `wp_options` already contains) and caches the answer
+	 * — a second call must not re-issue the probe.
+	 */
+	public function test_the_engine_detection_reads_show_table_status_once_and_caches_it(): void {
+		$GLOBALS['_sa_table_engines'][ $GLOBALS['wpdb']->options ] = 'MyISAM';
+		$GLOBALS['_db_queries']                                    = array();
+
+		$first = Aura_Worker_Door_Log::bump_door_version();
+		$this->assertNull( $first, 'MyISAM is not transactional, so the read-back refuses to report a witness' );
+		$this->assertContains( "SHOW TABLE STATUS WHERE Name = 'wp_options'", $GLOBALS['_db_queries'] );
+
+		$probes = static function ( array $log ): int {
+			return count(
+				array_filter(
+					$log,
+					static function ( $q ) {
+						return false !== strpos( (string) $q, 'SHOW TABLE STATUS' );
+					}
+				)
+			);
+		};
+		$before_second_call = $probes( $GLOBALS['_db_queries'] );
+
+		Aura_Worker_Door_Log::bump_door_version();
+
+		$this->assertSame( $before_second_call, $probes( $GLOBALS['_db_queries'] ), 'checked once per request, then cached' );
+	}
+
+	/**
+	 * Ruling S23 (Codex round-9 P2 on #88): `SHOW TABLE STATUS LIKE
+	 * '%s'` treated the table name as a real MySQL LIKE pattern, in which
+	 * `_` is a single-character WILDCARD — and `wp_options` carries one,
+	 * unescaped. A decoy table whose name is the same length with any
+	 * other character standing in for that underscore (`wpXoptions`) would
+	 * therefore ALSO match, and if such a table happened to exist with a
+	 * different engine, this method could report — and cache for the whole
+	 * request — the DECOY's engine instead of `wp_options`'s own. The fix
+	 * queries `WHERE Name = %s`, a plain equality with no metacharacters:
+	 * this test seeds exactly that decoy, on the OPPOSITE (non-
+	 * transactional) engine from the real `wp_options`, and proves it is
+	 * never matched.
+	 */
+	public function test_the_engine_detection_is_never_confused_by_a_like_wildcard_collision(): void {
+		$decoy = 'wpXoptions'; // same length as 'wp_options', 'X' standing in for the LIKE-wildcard '_'
+		$GLOBALS['_sa_table_engines'][ $GLOBALS['wpdb']->options ] = 'InnoDB';
+		$GLOBALS['_sa_table_engines'][ $decoy ]                    = 'MyISAM';
+		$GLOBALS['_db_queries']                                    = array();
+
+		$out = Aura_Worker_Door_Log::bump_door_version();
+
+		$this->assertIsInt( $out, 'wp_options is InnoDB - the decoy engine must not have been matched instead' );
+		$this->assertContains( "SHOW TABLE STATUS WHERE Name = 'wp_options'", $GLOBALS['_db_queries'] );
+		$this->assertNotContains( "SHOW TABLE STATUS WHERE Name = '$decoy'", $GLOBALS['_db_queries'], 'production code only ever asks about its own table, by exact name' );
+	}
+
+	/**
+	 * Ruling S13: on a non-transactional engine, versioned() skips
+	 * START TRANSACTION/COMMIT entirely and runs the writes exactly as it
+	 * always would have — the state still lands — but the version bump's
+	 * witness is never reported for this site, by ANY route.
+	 */
+	public function test_a_non_transactional_engine_still_writes_but_never_reports_a_witness(): void {
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+
+		$GLOBALS['_db_queries'] = array();
+		$seq                    = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq, 'the state write itself still lands' );
+		$this->assertArrayHasKey( 'aura_worker_door_log_' . $seq, $GLOBALS['_options'] );
+		$this->assertNotContains( 'START TRANSACTION', $GLOBALS['_db_queries'], 'no transaction opens on a non-transactional engine' );
+		$this->assertNotContains( 'COMMIT', $GLOBALS['_db_queries'] );
+		$this->assertNull( Aura_Worker_Door_Log::door_version_raw(), 'no witness is ever reported for this site' );
+		$this->assertSame( 'engine', Aura_Worker_Door_Log::observation_unsupported_reason() );
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+	}
+
+	/** A transactional engine (the default this whole suite otherwise runs under) is unaffected. */
+	public function test_a_transactional_engine_opens_and_commits_a_real_transaction(): void {
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( true );
+
+		$GLOBALS['_db_queries'] = array();
+		$seq                    = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq );
+		$this->assertContains( 'START TRANSACTION', $GLOBALS['_db_queries'] );
+		$this->assertContains( 'COMMIT', $GLOBALS['_db_queries'] );
+		$this->assertIsInt( Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertNull( Aura_Worker_Door_Log::observation_unsupported_reason() );
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+	}
+
+	/**
+	 * Ruling S47 (Codex round-19 P1 on #88): a TRANSIENT `SHOW TABLE
+	 * STATUS` failure must never be read as "this table is non-
+	 * transactional" — `versioned()` used to collapse the two, taking the
+	 * autocommit branch (no transaction, no rollback, `$writes()` landing
+	 * the instant it ran) on what may well be a real InnoDB table having a
+	 * bad moment, letting a concurrent `/status` poll certify state a
+	 * half-finished mutation had not actually made durable. An unreadable
+	 * probe now answers retryable, before `$writes()` ever runs — nothing
+	 * written, nothing to roll back — and, critically, is never cached, so
+	 * the very next attempt probes fresh rather than inheriting this one's
+	 * miss.
+	 */
+	public function test_an_unreadable_engine_probe_is_retryable_and_never_caches_the_miss(): void {
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+		$GLOBALS['_db_queries']    = array();
+
+		$out = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertInstanceOf( 'WP_Error', $out, 'an unreadable engine probe must never silently pick a branch to write under' );
+		$data = $out->get_error_data();
+		$this->assertSame( 503, $data['status'] );
+		$this->assertContains( "SHOW TABLE STATUS WHERE Name = 'wp_options'", $GLOBALS['_db_queries'], 'the probe was attempted' );
+		$this->assertNotContains( 'START TRANSACTION', $GLOBALS['_db_queries'], 'never guesses the transactional branch either' );
+		$this->assertNotContains( 'COMMIT', $GLOBALS['_db_queries'], 'never guesses the autocommit branch' );
+		$this->assertSame( array(), $GLOBALS['_options'], 'nothing landed while the engine could not be proven — not even the epoch mint' );
+
+		// The failed probe must not have been cached as "non-transactional":
+		// once the driver recovers, the VERY NEXT call takes the real
+		// transactional path rather than being stuck on the earlier miss.
+		$GLOBALS['_sa_wpdb_error'] = '';
+		$GLOBALS['_db_queries']    = array();
+		$seq                       = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq, 'the very next call succeeds once the probe can actually answer' );
+		$this->assertContains( 'START TRANSACTION', $GLOBALS['_db_queries'], 'the real transactional path — nothing was cached from the earlier failure' );
+		$this->assertContains( 'COMMIT', $GLOBALS['_db_queries'] );
+	}
+
+	/**
+	 * Ruling S47: `observation_unsupported_reason()` names 'engine' only for
+	 * a DEFINITIVE non-transactional answer — a transient probe failure is
+	 * not the permanent "upgrade the host" fact this field exists to
+	 * report, and must answer null (unknown this poll), never 'engine'.
+	 */
+	public function test_observation_unsupported_reason_does_not_confuse_unreadable_with_non_transactional(): void {
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+		$this->assertNull( Aura_Worker_Door_Log::observation_unsupported_reason(), 'unreadable is not the same fact as "this engine cannot roll back"' );
+		$GLOBALS['_sa_wpdb_error'] = '';
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+		$this->assertSame( 'engine', Aura_Worker_Door_Log::observation_unsupported_reason(), 'a DEFINITIVE non-transactional answer still reports the permanent reason' );
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+	}
+
+	/**
+	 * Ruling S50 (Codex round-20 P1 on #88): a connection dropping WHILE
+	 * $writes() runs one of its OWN statements used to let
+	 * wpdb::check_connection() transparently reconnect and REPLAY that
+	 * exact statement on a fresh, autocommit session -- landing it
+	 * independently and permanently, invisible to $writes() (which saw an
+	 * ordinary success), before versioned()'s own SAVEPOINT/COMMIT
+	 * machinery ever ran. `reconnect_retries = 0` for the unit's own
+	 * duration makes check_connection() give up instead: the dropped
+	 * statement's own query() call just fails, so nothing lands and
+	 * versioned() reports the ordinary retryable `committed: false`.
+	 *
+	 * `insert_unique_write()`'s own "INSERT ... SELECT ... FROM DUAL WHERE
+	 * NOT EXISTS" statement is the target -- picked out by its distinctive
+	 * "FROM DUAL" fragment so this lands on $writes()'s OWN query, never
+	 * one of the fixed control statements (START TRANSACTION, SAVEPOINT,
+	 * the nonce SET) versioned() always issues first and already protects
+	 * a different way (Rulings S17/S21/S25).
+	 */
+	public function test_a_dropped_connection_mid_writes_never_replays_the_statement(): void {
+		$name           = 'aura_worker_door_log_test_s50';
+		$before_retries = $GLOBALS['wpdb']->sa_reconnect_retries_for_tests();
+
+		$GLOBALS['_sa_reconnect_mid_query'] = 'FROM DUAL';
+		$GLOBALS['_db_queries']             = array();
+
+		$won = Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) );
+
+		$this->assertFalse( $won, 'a dropped connection mid-write is retryable, never a silent success' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the row never landed -- a replay on a fresh session would have inserted it anyway' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_rows'], 'not even in the raw "database" -- nothing ran a second time' );
+		$this->assertSame( $before_retries, $GLOBALS['wpdb']->sa_reconnect_retries_for_tests(), 'restored after the unit finished, whatever the outcome' );
+
+		// And the miss does not stick: a healthy retry afterwards succeeds
+		// normally, on the SAME connection, with reconnects unaffected.
+		$won_retry = Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) );
+		$this->assertTrue( $won_retry );
+		$this->assertSame( $before_retries, $GLOBALS['wpdb']->sa_reconnect_retries_for_tests() );
+	}
+
+	/**
+	 * Ruling S51 (Codex round-20 P1 on #88): the ambiguous-COMMIT fallback
+	 * used to read its own durable witness through a plain get_var(), with
+	 * no last_error check -- `is_string( $durable )` answered `false` for
+	 * BOTH a proven-absent row (this commit genuinely did not land) and a
+	 * driver failure that proved NOTHING (this method has no idea), then
+	 * deleted the witness row regardless. If the commit had actually
+	 * landed and this read merely failed, that delete erased the ONLY
+	 * surviving evidence of it, permanently, while the caller was told
+	 * `committed: false` -- a proven negative for a fact nobody could
+	 * still prove.
+	 *
+	 * `committed` is now `null` for exactly this case -- UNKNOWN, never
+	 * the same as `false` -- and the witness row is left untouched so a
+	 * later, healthier read (the janitor, or a fresh attempt) can still
+	 * find it.
+	 */
+	public function test_an_unreadable_durable_witness_read_answers_null_and_never_deletes_the_witness(): void {
+		$name = 'aura_worker_door_log_test_s51';
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s51';
+		// Reaches the durable-witness fallback: the COMMIT statement itself
+		// looks clean, but the post-commit session-nonce read-back finds no
+		// session variables (Ruling S16's own reconnect-after-commit model).
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s51';
+		// And THIS fallback's own read of that witness fails outright.
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $outcome['committed'], 'unreadable is not the same fact as a proven negative' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result unless committed is strictly true' );
+		$this->assertArrayHasKey( $witness, $GLOBALS['_options'], 'the witness row is left untouched -- deleting it on an unproven read would erase the only evidence this unit ever ran' );
+	}
+
+	/**
+	 * Ruling S53 (Codex round-21 P1 on #88): Ruling S50 zeroes
+	 * reconnect_retries for the WHOLE unit, so $writes() can never be
+	 * replayed on a reconnected session -- but the durable-witness
+	 * fallback runs strictly AFTER $writes() already committed or rolled
+	 * back, and exists PRECISELY to resolve a connection lost on the way
+	 * back from a real COMMIT. Leaving reconnect_retries at 0 through
+	 * that read meant the one case the witness exists for -- a genuinely
+	 * landed commit whose ack got lost -- could not reconnect either, and
+	 * answered committed: null for a commit that had, in fact, already
+	 * happened. reconnect_retries is restored right before this read
+	 * (not only in the method's own closing `finally`), so a reconnect
+	 * here succeeds and finds the witness a healthy connection would.
+	 */
+	public function test_a_connection_lost_after_a_durable_commit_reconnects_to_find_its_own_witness(): void {
+		$name = 'aura_worker_door_log_test_s53';
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s53';
+		// Reaches the durable-witness fallback: the COMMIT statement
+		// itself looks clean, but the post-commit session-nonce
+		// read-back finds no session variables (Ruling S16's own
+		// reconnect-after-commit model) -- the ack of a real commit,
+		// lost.
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		// The fallback's OWN witness read needs a reconnect to succeed:
+		// while reconnect_retries is still 0 (the bug this ruling
+		// closes), the read fails outright; once S53 restores it first,
+		// the read proceeds normally and finds the witness this unit's
+		// own COMMIT already made durable.
+		$GLOBALS['_sa_reconnect_mid_query']    = 'AS probe, (SELECT option_value FROM';
+
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_reconnect_mid_query']    = false;
+
+		$this->assertTrue( $outcome['committed'], 'the witness this unit\'s own real COMMIT wrote is found once the fallback read can reconnect' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
+	}
+
+	/**
+	 * Ruling S54 (Codex round-21 P2 on #88): the durable witness's own
+	 * INSERT had its return and last_error ignored, and
+	 * bump_door_version_write() -- the VERY NEXT statement -- clears
+	 * last_error at its own first line, erasing any trace of a failed
+	 * witness write. A unit could therefore COMMIT for real (state +
+	 * bump both landing) with no witness of its own ever having been
+	 * written -- and a later ambiguous ack on that SAME commit would then
+	 * read "no witness" as a PROVEN false for a mutation that had, in
+	 * fact, already landed. The witness INSERT now gates the unit exactly
+	 * like the savepoint check before it: a failure here rolls back
+	 * before the bump ever runs, reporting the ordinary retryable
+	 * committed:false, with nothing landed at all.
+	 */
+	public function test_a_failing_witness_insert_aborts_the_whole_unit_before_the_bump(): void {
+		$name = 'aura_worker_door_log_test_s54';
+
+		$before_version = Aura_Worker_Door_Log::door_version_raw();
+
+		$GLOBALS['_sa_uuid_fixed']          = 'nonce-s54';
+		$witness                            = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s54';
+		// Fails the witness INSERT itself -- reconnect_retries is 0 for
+		// this whole unit's duration (Ruling S50), and this seam fails a
+		// matched query outright while that holds.
+		$GLOBALS['_sa_reconnect_mid_query'] = $witness;
+
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_reconnect_mid_query'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'a witness this unit could not prove it wrote must not let the unit commit' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result when committed is not true' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the state write itself was rolled back -- never landed alone, without its witness' );
+		$this->assertArrayNotHasKey( $witness, $GLOBALS['_options'], 'the failed witness never landed either' );
+		$this->assertSame( $before_version, Aura_Worker_Door_Log::door_version_raw(), 'no bump ran -- the version is unchanged' );
+	}
+
+	/**
+	 * Ruling S56 (Codex round-22 P1 on #88): wpdb::$reconnect_retries is
+	 * PROTECTED in real WordPress core (verified against core
+	 * 7.0/7.0.4/7.1's own wp-includes/class-wpdb.php). A direct
+	 * `$wpdb->reconnect_retries = 0` from Aura_Worker_Door_Log's own
+	 * scope -- Ruling S50's original implementation -- is not something
+	 * every possible $wpdb can be trusted to tolerate: stock wpdb
+	 * happens to define matching __get()/__set() magic methods that do
+	 * not block this property, but a custom db.php drop-in that REPLACES
+	 * wpdb outright need not. reconnect_retries_get()/_set() read and
+	 * write through a scope-bound Closure::bind() instead, which reaches
+	 * a protected property regardless of the object's own magic methods
+	 * -- this test double's own property is now PROTECTED (mirroring
+	 * core exactly) specifically so a public stub can never mask this
+	 * class of bug again.
+	 */
+	public function test_reconnect_guard_is_available_against_a_protected_property_via_the_closure(): void {
+		$this->assertTrue( Aura_Worker_Door_Log::reconnect_guard_available(), 'the closure-bound reader/writer reaches the PROTECTED property exactly like it must against real core' );
+
+		// And versioned() itself still works end to end through the
+		// closure, not just the guard-availability check in isolation.
+		$name    = 'aura_worker_door_log_test_s56_guard';
+		$before  = $GLOBALS['wpdb']->sa_reconnect_retries_for_tests();
+		$outcome = Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) );
+
+		$this->assertTrue( $outcome );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+		$this->assertSame( $before, $GLOBALS['wpdb']->sa_reconnect_retries_for_tests(), 'restored to the value read through the SAME closure' );
+	}
+
+	/**
+	 * Ruling S65 (Codex round-25 P1 on #88), OVERTURNING Ruling S56's own
+	 * "proceed on detection alone" design: a $wpdb whose own class
+	 * declares no reconnect_retries property at all (a db.php drop-in
+	 * that REPLACES wpdb outright, modelled by
+	 * SA_Test_Wpdb_No_Reconnect_Guard, which proxies everything else to
+	 * a real SA_Test_Wpdb but declares no properties of its own) can
+	 * still transparently reconnect and autocommit a retried statement
+	 * BEFORE the post-$writes() nonce check ever gets a chance to notice
+	 * -- detecting a mutation that already landed twice is not the same
+	 * fact as preventing it. versioned() now FAILS CLOSED instead: it
+	 * refuses BEFORE `$writes()` is ever invoked -- no callback
+	 * invocation at all, proven here directly against versioned() itself,
+	 * not merely inferred from insert_unique()'s own outcome -- reports
+	 * the ordinary retryable committed:false, and names the reason on
+	 * the wire via door_write_unsupported_reason().
+	 */
+	public function test_reconnect_guard_unavailable_fails_closed_before_writes_ever_runs(): void {
+		$real            = $GLOBALS['wpdb'];
+		$GLOBALS['wpdb'] = new SA_Test_Wpdb_No_Reconnect_Guard( $real );
+		try {
+			$this->assertFalse( Aura_Worker_Door_Log::reconnect_guard_available() );
+			$this->assertSame( 'reconnect_guard_unavailable', Aura_Worker_Door_Log::door_write_unsupported_reason(), 'the reason is visible on the wire, never silent' );
+
+			$invocations = 0;
+			$outcome     = Aura_Worker_Door_Log::versioned(
+				function () use ( &$invocations ) {
+					++$invocations;
+					return array( 'mutated' => true, 'result' => true );
+				}
+			);
+
+			$this->assertSame( 0, $invocations, 'the callback never runs at all -- refused BEFORE $writes(), not detected after it' );
+			$this->assertFalse( $outcome['committed'], 'the ordinary retryable answer, the same shape every other early refusal here already uses' );
+			$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result when committed is not true' );
+
+			// And the end-to-end shape through a real caller: no row lands.
+			$name = 'aura_worker_door_log_test_s65_fail_closed';
+			$this->assertFalse( Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) ) );
+			$this->assertArrayNotHasKey( $name, $GLOBALS['_options'] );
+		} finally {
+			$GLOBALS['wpdb'] = $real;
+		}
+	}
+
+	/**
+	 * Ruling S65: the guard being unavailable is a property of the LIVE
+	 * $wpdb, not of any one call -- restoring a real $wpdb (with the
+	 * property back) makes the very next call work normally again, with
+	 * no reason reported.
+	 */
+	public function test_reconnect_guard_unavailable_does_not_stick_once_a_real_wpdb_is_back(): void {
+		$real            = $GLOBALS['wpdb'];
+		$GLOBALS['wpdb'] = new SA_Test_Wpdb_No_Reconnect_Guard( $real );
+		$this->assertFalse( Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_log_test_s65_stuck', array( 'x' => 1 ) ) );
+		$GLOBALS['wpdb'] = $real;
+
+		$this->assertNull( Aura_Worker_Door_Log::door_write_unsupported_reason() );
+		$this->assertTrue( Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_log_test_s65_recovered', array( 'x' => 1 ) ) );
+	}
+
+	/**
+	 * Ruling S63 (Codex round-24 P1 on #88): insert_unique() now answers
+	 * null for "committed, but the witness could not be proven" (Ruling
+	 * S51) -- open_pending()'s own allocation loop tested it as a plain
+	 * boolean, and `if ( null )` is falsy, so an ambiguous insert fell
+	 * straight into "collision, try the next number": a SECOND seq was
+	 * allocated and admitted while the FIRST row -- which may already
+	 * exist, pending, at the number this call actually wanted -- sat
+	 * there unadmitted, permanently splitting the log's own contiguous
+	 * numbering. null now STOPS the loop outright: no further
+	 * allocation, a retryable answer carrying may_have_run, and never a
+	 * second, sibling row.
+	 */
+	public function test_an_ambiguous_insert_stops_allocation_never_a_second_seq(): void {
+		// An unarmed call first, so epoch/binding are already minted and
+		// primed before the armed call's own seam takes effect.
+		$first_seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->assertIsInt( $first_seq );
+		$target_seq = $first_seq + 1;
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s63';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s63';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( 'WP_Error', $out, 'never a seq handed back for a write this call could not prove' );
+		$data = $out->get_error_data();
+		$this->assertSame( 503, $data['status'] );
+		$this->assertTrue( $data['may_have_run'] );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $target_seq, $GLOBALS['_options'], 'the row this attempt actually wrote is exactly where it landed -- the real commit the ambiguous witness could not prove' );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::PREFIX . ( $target_seq + 1 ), $GLOBALS['_options'], 'never a SECOND, sibling row allocated behind the ambiguous first one' );
+	}
+
+	/**
+	 * Ruling S86 (Codex round-37 P1 on #88), the S80 pattern applied to
+	 * open_pending()'s own seq allocation: the ambiguous case just above
+	 * left a retry with NOTHING to recognise its own prior attempt by,
+	 * so a caller retrying after `may_have_run` allocated a SECOND seq
+	 * behind the first, unadmitted one -- blocking log_after() (and
+	 * every later entry) until the reconciler's CLAIM_STALE_MS sweep.
+	 * With a derived reservation identity (`aura_ref` + a hash of
+	 * `touches`) STAMPED ON THE PENDING ROW ITSELF (Ruling S89, Codex
+	 * round-39 P1 on #88, replacing the SEPARATE index row Ruling S86
+	 * originally wrote alongside it), the retry regenerates the SAME
+	 * identity, SCANS the pending rows for one carrying it, and
+	 * recognises it -- no new allocation, and the row can be
+	 * admitted/executed normally from there.
+	 */
+	public function test_a_retry_of_an_ambiguous_open_pending_with_the_same_aura_ref_recognises_the_reservation(): void {
+		$entry = $this->entry( array( 'aura_ref' => 'aura-ref-s86' ) );
+		// An unarmed call first (different aura_ref, so it never touches
+		// the reservation this test cares about), so epoch/binding are
+		// already minted and primed before the armed call's own seam
+		// takes effect -- the SAME discipline the sibling S63 test above
+		// already uses.
+		Aura_Worker_Door_Log::open_pending( $this->entry( array( 'aura_ref' => 'aura-ref-s86-priming' ) ) );
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s86';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s86';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$first = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( 'WP_Error', $first, 'the fixture assumption this test is built on -- the first attempt is ambiguous' );
+		$data = $first->get_error_data();
+		$this->assertTrue( $data['may_have_run'] );
+		$reserved_seq = $data['reserved_seq'];
+		$this->assertIsInt( $reserved_seq );
+		$this->assertNotSame( '', $data['reservation'], 'Ruling S86: the ambiguous error carries the reservation identity too' );
+		// The ambiguous attempt actually DID land underneath the
+		// unreadable witness.
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $reserved_seq, $GLOBALS['_options'] );
+
+		// The retry: same aura_ref, same touches -- no ambiguity seam of
+		// its own, exactly what a caller re-sending the SAME intercepted
+		// request after the first attempt's own 503 would do. Recognised
+		// by the SCAN alone (Ruling S89): unlike the old index-based
+		// mechanism, there is no SEPARATE write here for anything to
+		// have corrupted -- the pending row's own stamped `reservation`
+		// field is the only thing this lookup ever reads.
+		$second = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$this->assertSame( $reserved_seq, $second, 'Ruling S86/S89: the SAME aura_ref recognises the existing reservation -- never a second, sibling seq' );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::PREFIX . ( $reserved_seq + 1 ), $GLOBALS['_options'], 'no N+1 allocated behind the recognised reservation' );
+
+		// The recognised row admits and executes normally from here --
+		// this is a REAL row, not a placeholder.
+		$this->assertTrue( Aura_Worker_Door_Log::admit( $reserved_seq ) );
+		$this->assertTrue( Aura_Worker_Door_Log::settle( $reserved_seq, array( 'result' => 'ok' ) ) );
+	}
+
+	/**
+	 * Ruling S86: the OTHER half -- two genuinely DIFFERENT intercepted
+	 * requests (different `aura_ref`) must derive two DIFFERENT
+	 * reservations, so two distinct calls are never merged into one row.
+	 */
+	public function test_distinct_aura_refs_on_open_pending_derive_distinct_rows(): void {
+		$first  = Aura_Worker_Door_Log::open_pending( $this->entry( array( 'aura_ref' => 'aura-ref-one' ) ) );
+		$second = Aura_Worker_Door_Log::open_pending( $this->entry( array( 'aura_ref' => 'aura-ref-two' ) ) );
+
+		$this->assertIsInt( $first );
+		$this->assertIsInt( $second );
+		$this->assertNotSame( $first, $second );
+	}
+
+	/**
+	 * Ruling S89 (Codex round-39 P1 on #88): the bug the OLD reservation
+	 * INDEX had -- "index points at a free/other request's seq" --
+	 * cannot exist once there is no index. A row this SAME seq once
+	 * held for aura_ref A can be acked and purged, and a genuinely
+	 * UNRELATED later call (a DIFFERENT aura_ref, or none) can recreate
+	 * a pending row at that SAME number (Ruling P37's own "recreate N at
+	 * or below the floor"). A retry for aura_ref A must never recognise
+	 * THAT row -- the scan matches on the row's own STAMPED identity,
+	 * never merely its position, so a row belonging to someone else at
+	 * the SAME seq is never mistaken for this request's own.
+	 */
+	public function test_a_different_requests_row_recreated_at_the_same_seq_is_never_recognised(): void {
+		$entry_a = $this->entry( array( 'aura_ref' => 'aura-ref-s89-a' ) );
+		$seq_a   = Aura_Worker_Door_Log::open_pending( $entry_a );
+		$this->assertIsInt( $seq_a, 'the fixture assumption this test is built on' );
+
+		// aura_ref A's own row is acked and purged -- the number is
+		// free again.
+		Aura_Worker_Door_Log::admit( $seq_a );
+		Aura_Worker_Door_Log::settle( $seq_a, array( 'result' => 'ok' ) );
+		Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), $seq_a );
+		$this->assertFalse( get_option( Aura_Worker_Door_Log::PREFIX . $seq_a ), 'the fixture assumption this test is built on -- the row is genuinely gone' );
+
+		// Ruling P37's own "recreate N at or below the floor" race is
+		// what actually lands a genuinely UNRELATED row back at this
+		// EXACT freed number in production (a floor raise landing
+		// between another writer's own top read and its insert) --
+		// forged directly here, rather than reconstructing that race's
+		// own precise timing, since what THIS test verifies is the
+		// LOOKUP's own behaviour once such a row exists, not how it got
+		// there.
+		$row_b = array(
+			'ability'     => 'elementor/publish-document',
+			'actor'       => array( 'user_id' => 3, 'login' => 'bot' ),
+			'touches'     => array( array( 'type' => 'page', 'id' => '9' ) ),
+			'verdict'     => 'allow',
+			'seq'         => $seq_a,
+			'at'          => gmdate( 'c' ),
+			'binding'     => Aura_Worker_Door_Log::binding(),
+			'result'      => 'pending',
+			'admitted'    => false,
+			'reservation' => 'a-completely-different-requests-identity',
+		);
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::PREFIX . $seq_a ] = $row_b;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::PREFIX . $seq_a ]    = maybe_serialize( $row_b );
+
+		// A retry for aura_ref A -- if the OLD index still pointed at
+		// this seq, this would wrongly recognise B's row as A's own.
+		$retry_a = Aura_Worker_Door_Log::open_pending( $entry_a );
+
+		$this->assertNotSame( $seq_a, $retry_a, 'Ruling S89: the OTHER request\'s row at the reused seq is never recognised as this one\'s' );
+		$this->assertIsInt( $retry_a );
+		$this->assertGreaterThan( $seq_a, $retry_a, 'a genuinely fresh allocation, above the row that already exists' );
+	}
+
+	/**
+	 * Ruling S89: the OTHER bug the OLD index had -- "stale index after
+	 * a terminal row" -- restated directly against the scan (Ruling S87
+	 * already established the RULE; this is the SAME scenario expressed
+	 * with no index in the picture at all). A row that has moved past
+	 * `pending` no longer carries the reservation this scan will ever
+	 * match -- a retry for the SAME aura_ref allocates fresh.
+	 */
+	public function test_a_terminal_row_with_the_same_identity_is_not_reused(): void {
+		$entry = $this->entry( array( 'aura_ref' => 'aura-ref-s89-terminal' ) );
+		$first = Aura_Worker_Door_Log::open_pending( $entry );
+		$this->assertIsInt( $first );
+
+		Aura_Worker_Door_Log::admit( $first );
+		Aura_Worker_Door_Log::settle( $first, array( 'result' => 'ok' ) );
+
+		$second = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$this->assertNotSame( $first, $second, 'Ruling S89: a terminal row is never reused, however identical the identity' );
+		$this->assertIsInt( $second );
+	}
+
+	/**
+	 * Ruling S86: a caller supplying `aura_ref` for the FIRST time (no
+	 * reservation on record yet) allocates exactly as it always has --
+	 * the mechanism only ever SHORT-CIRCUITS a genuine repeat, never
+	 * changes the ordinary, unambiguous path.
+	 */
+	public function test_open_pending_allocates_fresh_when_no_reservation_exists_yet(): void {
+		$entry = $this->entry( array( 'aura_ref' => 'aura-ref-brand-new' ) );
+		$seq   = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$this->assertIsInt( $seq );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'] );
+
+		// A CLEAN repeat (no ambiguity at all) with the SAME aura_ref
+		// recognises the reservation the first, successful call
+		// registered -- proving the pure derivation path on its own,
+		// independent of the reserved_seq echo-back the ambiguous-retry
+		// sibling test above also relies on.
+		$again = Aura_Worker_Door_Log::open_pending( $entry );
+		$this->assertSame( $seq, $again, 'the SAME aura_ref recognises the existing reservation on a clean repeat too, not only after an ambiguous one' );
+	}
+
+	/**
+	 * Ruling S86's own answer to "what does the reservation fall back to
+	 * with no idempotency material at all": NOT S80's own unrecoverable
+	 * random fallback -- `reserved_seq`, a plain integer this method
+	 * already hands back in EVERY ambiguous answer regardless of
+	 * `aura_ref`, is itself a usable retry key. A caller with nothing
+	 * else to derive from need only echo it back.
+	 */
+	public function test_a_retry_echoing_back_reserved_seq_recognises_it_with_no_aura_ref_at_all(): void {
+		Aura_Worker_Door_Log::open_pending( $this->entry() ); // primes epoch/binding, same discipline as above
+		$entry = $this->entry(); // no aura_ref at all
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s86-noref';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s86-noref';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$first = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( 'WP_Error', $first );
+		$data = $first->get_error_data();
+		$this->assertSame( '', $data['reservation'], 'no aura_ref was given -- no derived identity either' );
+		$reserved_seq = $data['reserved_seq'];
+
+		// The retry echoes reserved_seq back explicitly -- the ONLY
+		// correlation available to a caller with no idempotency material
+		// of its own.
+		$retry_entry                    = $this->entry();
+		$retry_entry['reserved_seq'] = $reserved_seq;
+		$second                          = Aura_Worker_Door_Log::open_pending( $retry_entry );
+
+		$this->assertSame( $reserved_seq, $second, 'Ruling S86: echoing reserved_seq back recognises it, even with zero derivable idempotency material' );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Ruling S91 (Codex round-39 P2 on #88): every transaction-control    */
+	/* statement, not only $writes()'s own, goes through must_succeed().  */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * A `query` filter suppressing the SAVEPOINT verification -- `false`
+	 * returned, `last_error` left clean, exactly what wpdb::query() does
+	 * when the filter blanks the SQL before flush() runs (it never reaches
+	 * MySQL at all) -- used to pass silently, because the pre-Ruling-S91
+	 * check here read ONLY `$wpdb->last_error`, never `ROLLBACK TO
+	 * SAVEPOINT`'s own return value. This is deliberately NOT a test of
+	 * the plain `SAVEPOINT` statement itself: blanking THAT one is already
+	 * caught even by the pre-S91 code, transitively -- a savepoint that was
+	 * never really opened makes this SAME verification fail for real on a
+	 * live server (MySQL error 1305), which the last_error check already
+	 * catches. The one statement whose OWN suppression the old, last_error
+	 * -only check could never see is this verification itself: nothing
+	 * downstream depends on ITS side effect, so nothing else ever surfaces
+	 * the gap. `must_succeed()` (Ruling S91) closes exactly that hole by
+	 * checking the return value too, inside its own try/catch, BEFORE
+	 * `$writes()` is ever invoked -- proven here by a callback that would
+	 * insert a row nobody may ever see if it ran.
+	 */
+	public function test_a_suppressed_savepoint_verification_aborts_the_unit_before_writes_runs(): void {
+		$name = 'aura_worker_door_log_test_s91_never_written';
+
+		$GLOBALS['_db_queries']                   = array();
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = 'ROLLBACK TO SAVEPOINT aura_door_tx';
+
+		$result = Aura_Worker_Door_Log::insert_unique( $name, array( 'seq' => 1 ) );
+
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = '';
+
+		$this->assertFalse( $result, 'a suppressed SAVEPOINT verification is a proven abort, not UNKNOWN -- must_succeed() throws before $writes() ever runs' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the callback that would have written this row never ran' );
+		foreach ( $GLOBALS['_db_queries'] as $q ) {
+			$this->assertStringNotContainsStringIgnoringCase( 'INSERT INTO', $q, 'no INSERT was ever issued -- the unit aborted before $writes()' );
+		}
+		$this->assertContains( 'ROLLBACK', $GLOBALS['_db_queries'], 'the transaction START TRANSACTION opened is closed, not left dangling' );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Ruling S93 (Codex round-41 P1 on #88): the FLOOR seed insert inside */
+	/* ack_write() is guarded like every other statement in the unit.     */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * `ack_write()`'s FLOOR seed insert is `insert_unique_write()`, the
+	 * SAME dual-context primitive `insert_unique()` uses for every
+	 * non-exempt name -- exempted from Ruling S84's must_succeed() sweep
+	 * because it ALSO runs OUTSIDE any transaction (the ordinary
+	 * `insert_unique( self::FLOOR, ... )` call from other sites). Called
+	 * from INSIDE `ack_write()`'s own already-open `versioned()` unit, its
+	 * raw `false` used to be silently swallowed -- indistinguishable from
+	 * the ORDINARY "floor already exists" miss -- so the floor raise and
+	 * the purge that follow it ran as the unit's own next statements
+	 * regardless. Ruling S93's `$in_unit` flag routes the raw query
+	 * result through `must_succeed()` before it collapses to that bool,
+	 * so a real failure THROWS immediately, caught by `versioned()`'s own
+	 * `$writes()` try/catch as `{ rollback: true }` -- before the floor
+	 * raise or the purge ever run.
+	 *
+	 * Proven by blanking the EXACT seed-insert statement (a `query`
+	 * filter returning `false` with `last_error` left clean, the same
+	 * mechanism Ruling S91 introduced) and confirming: `ack()` reports
+	 * `committed: false`, `acked: 0`; the floor option is never created
+	 * (no raise, since there was nothing to raise FROM); and the settled
+	 * row this ack would have purged survives untouched.
+	 */
+	public function test_a_suppressed_floor_seed_insert_aborts_ack_before_the_raise_or_purge(): void {
+		global $wpdb;
+
+		$seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::FLOOR, $GLOBALS['_options'], 'the fixture assumption this test is built on -- no floor row exists yet, so the seed insert is a genuine attempt, not a no-op' );
+
+		// The EXACT statement insert_unique_write() issues for the FLOOR
+		// seed -- built the same way the production code builds it, so
+		// this test breaks loudly (never silently stops matching) if that
+		// statement's shape ever changes.
+		$seed_sql = $wpdb->prepare(
+			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+			Aura_Worker_Door_Log::FLOOR,
+			maybe_serialize( 0 ),
+			'no',
+			Aura_Worker_Door_Log::FLOOR
+		);
+
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = trim( $seed_sql );
+		$out                                      = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // fires once, but tidy regardless
+
+		$this->assertSame( false, $out['committed'], 'Ruling S93: a suppressed seed insert is a proven abort, not the ordinary idempotent no-op' );
+		$this->assertSame( 0, $out['acked'] );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::FLOOR, $GLOBALS['_options'], 'no raise -- the unit aborted before the floor was ever seeded, let alone raised' );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'], 'no purge -- the settled row this ack would have deleted survives untouched' );
+	}
+
+	/**
+	 * The other half of Ruling S93's own test recipe: an OUT-OF-UNIT
+	 * VERSION_EXEMPT_INSERTS call -- `insert_unique()` with no `$in_unit`
+	 * argument at all, exactly as every caller besides `ack_write()`
+	 * already uses it -- is completely unaffected. A suppressed seed
+	 * insert here answers the SAME plain `false` it always has (routed
+	 * through no `must_succeed()` at all, since there is no enclosing
+	 * unit for a thrown exception to abort), never a thrown exception
+	 * that would surprise a caller with no `versioned()` unit around it.
+	 */
+	public function test_an_out_of_unit_version_exempt_insert_is_unaffected_by_the_in_unit_flag(): void {
+		global $wpdb;
+
+		$name = 'aura_worker_door_hold_lock';
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'] );
+
+		$seed_sql = $wpdb->prepare(
+			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+			$name,
+			maybe_serialize( 'a-token' ),
+			'no',
+			$name
+		);
+
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = trim( $seed_sql );
+		$result                                   = Aura_Worker_Door_Log::insert_unique( $name, 'a-token' ); // no $in_unit -- the default, unchanged behaviour
+		$GLOBALS['_sa_wpdb_query_blank_matching'] = '';
+
+		$this->assertFalse( $result, 'Ruling S93: unchanged -- a suppressed insert out-of-unit is still the ordinary plain false, never a thrown exception' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'] );
 	}
 }

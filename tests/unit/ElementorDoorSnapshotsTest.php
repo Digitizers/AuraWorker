@@ -293,6 +293,28 @@ final class ElementorDoorSnapshotsTest extends TestCase {
 		$this->assertSame( 'act_78', $pre['door']['ref'] );
 	}
 
+	/**
+	 * Ruling S87 (Codex round-38 P1 on #88): open_restore_entry() had
+	 * Aura's own correlation id in hand ALL ALONG -- the SAME `aura_ref`
+	 * this test's own sibling above already asserts lands on the row as
+	 * `ref` -- but never handed it to open_pending()'s own S86
+	 * reservation mechanism, which reads a DIFFERENT key (`aura_ref`).
+	 * The mechanism was unreachable on the restore path for exactly that
+	 * reason. Fixed: the SAME value is now ALSO threaded through as
+	 * `aura_ref`, and the row it lands on carries the derived
+	 * `reservation` identity.
+	 */
+	public function test_a_restore_entry_carries_its_aura_ref_as_the_reservation_identity(): void {
+		$env = $this->pageEnvelope();
+
+		$res = $this->api->restore_snapshot( $this->request( array( 'id' => $env['id'], 'aura_ref' => 'act_87s' ) ) );
+
+		$this->assertSame( 200, $res->get_status() );
+		$row = Aura_Worker_Door_Log::get( 1 );
+		$this->assertSame( 'act_87s', $row['ref'] );
+		$this->assertNotEmpty( $row['reservation'], 'Ruling S87: the reservation mechanism is reachable on the restore path' );
+	}
+
 	public function test_a_design_system_pre_restore_capture_enumerates_the_current_set(): void {
 		$this->seedDesignSystem();
 		$snaps = new Aura_Worker_Snapshots();

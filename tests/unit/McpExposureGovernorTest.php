@@ -100,11 +100,20 @@ final class McpExposureGovernorTest extends TestCase {
 	public function test_every_key_appears_with_active_true_when_the_door_initialised(): void {
 		$this->bringUpTheDoor();
 		$b = $this->block();
+		// Ruling S43 (Codex round-18 P1 on #88): `observation` moves to the
+		// END of the array — version_bracketed() appends it once the
+		// bracket settles, after every OTHER field the builder returned.
+		// Key order carries no meaning over the wire (a JSON object is
+		// unordered); this test pins PHP's own array order only so a
+		// future field addition/removal is caught here rather than by a
+		// consumer.
 		$this->assertSame(
 			array(
 				'active',
 				'epoch',
 				'binding',
+				'observation_unsupported',
+				'door_write_unsupported',
 				'seam',
 				'door',
 				'held_count',
@@ -113,8 +122,10 @@ final class McpExposureGovernorTest extends TestCase {
 				'unobserved_30d',
 				'hook_missed_30d',
 				'unknown_ability_30d',
+				'counters_as_of',
 				'queue_full',
 				'log_full',
+				'observation',
 			),
 			array_keys( $b )
 		);
@@ -122,6 +133,24 @@ final class McpExposureGovernorTest extends TestCase {
 		$this->assertIsString( $b['epoch'] );
 		$this->assertNotSame( '', $b['epoch'] );
 		$this->assertNull( $b['binding'], 'nothing has bound this site, and a read never mints one (Ruling A5b)' );
+		// THIS call is the one that mints the epoch (asserted non-empty just
+		// above), and minting a virgin site's epoch is ITSELF a door-state
+		// mutation (Ruling S6: insert_unique() bumps on any new door-prefixed
+		// row) — a version-tear consideration Ruling S79 does not touch.
+		//
+		// Ruling S79 (Codex round-32 P2 on #88) SUPERSEDES this test's own
+		// prior expectation here. `governor_block()` never writes an
+		// `audit_identity` baseline itself (Ruling S27 — only a `/status`
+		// poll's own `sync_served_identities()` does), and THIS is that
+		// audit's very first call on a virgin site: no baseline exists yet
+		// to pair with, in either direction. An absent baseline never
+		// authorises a witness — this call's content is live and correct
+		// (every field above is asserted against it), but the version it
+		// would otherwise be served under is withheld until a real
+		// `/status` poll persists one.
+		$this->assertNull( $b['observation'], 'Ruling S79: a fresh site has no audit_identity baseline yet, so this first-ever audit withholds a witness it cannot back' );
+		$this->assertNull( $b['observation_unsupported'], 'a normal test run is on a transactional engine and 64-bit PHP, so nothing is unsupported (Ruling S13)' );
+		$this->assertNull( $b['door_write_unsupported'], 'the test double declares reconnect_retries same as real core, so writes are supported (Ruling S65)' );
 		$this->assertSame( 'ok', $b['seam'], 'verify_coverage() ran and every registered elementor/* ability is wrapped' );
 		$this->assertSame( 'open', $b['door'] );
 		$this->assertSame( 0, $b['held_count'] );
@@ -130,6 +159,12 @@ final class McpExposureGovernorTest extends TestCase {
 		$this->assertSame( 0, $b['unobserved_30d'] );
 		$this->assertSame( 0, $b['hook_missed_30d'] );
 		$this->assertSame( 0, $b['unknown_ability_30d'] );
+		// Ruling S49 (Codex round-19 P2 on #88): the cutoff the four
+		// `_30d` fields above were computed against — not covered by
+		// `observation` (they shrink on their own as this cutoff
+		// advances, with no mutation for anything to version).
+		$this->assertIsString( $b['counters_as_of'] );
+		$this->assertMatchesRegularExpression( '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/', $b['counters_as_of'] );
 		$this->assertFalse( $b['queue_full'] );
 		$this->assertNull( $b['log_full'] );
 	}
@@ -194,6 +229,27 @@ final class McpExposureGovernorTest extends TestCase {
 	}
 
 	// --- the _30d counters read what Tasks 5/7 already bump -----------------
+
+	/**
+	 * Ruling S49 (Codex round-19 P2 on #88): `counters_as_of` is the SAME
+	 * hour-bucket cutoff `count_30d()` computed the four `_30d` fields
+	 * against, not a separately-derived approximation of it — asserted by
+	 * recomputing the cutoff from wall time bracketing the call, the same
+	 * before/after tolerance a real `time()`-based read needs (the window
+	 * is only actually different across these two computations if this
+	 * assertion runs in the exact same second an hour boundary ticks
+	 * over).
+	 */
+	public function test_governor_block_reports_the_same_cutoff_count_30d_used(): void {
+		$this->bringUpTheDoor();
+		$before = time();
+		$b      = $this->block();
+		$after  = time();
+
+		$expected_min = gmdate( 'c', (int) floor( ( $before - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS ) * HOUR_IN_SECONDS );
+		$expected_max = gmdate( 'c', (int) floor( ( $after - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS ) * HOUR_IN_SECONDS );
+		$this->assertContains( $b['counters_as_of'], array_unique( array( $expected_min, $expected_max ) ), "the exact cutoff count_30d()'s own arithmetic produces for a real call taken in this same window" );
+	}
 
 	public function test_count_30d_sums_the_window_in_one_query_and_excludes_older_buckets_and_other_names(): void {
 		$now      = strtotime( '2026-09-02T12:00:00Z' );

@@ -105,6 +105,91 @@ class Aura_Worker_API {
 			'methods'             => 'GET',
 			'callback'            => array( $this, 'get_status' ),
 			'permission_callback' => array( $this->security, 'check_read_permission' ),
+			'args'                => array(
+				// Ruling S82 (Codex round-33 P2 on #88): see
+				// Aura_Worker_Elementor_Door::maybe_restamp_observation_forward()'s
+				// own docblock for the whole-DB-restore hole this closes
+				// and why only Aura's own record can name it.
+				//
+				// Ruling S83 (Codex round-34 P1 on #88): CAPPED at
+				// Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN, never
+				// merely "a non-negative integer" — an UNCAPPED
+				// `PHP_INT_MAX - 1` (which the pre-ruling check above
+				// happily accepted) made `restamp_observation_forward()`'s
+				// own `$seen + 1` overflow a 64-bit int into a FLOAT,
+				// which then floated straight through a `%d` placeholder
+				// in `$wpdb->prepare()` uncontrolled — pinning every
+				// LATER version this site could ever report. A custom
+				// `aura_invalid_param` WP_Error (never a bare `false`,
+				// which core would answer with its own generic
+				// `rest_invalid_param`) names the actual reason plainly.
+				//
+				// Ruling S88 (Codex round-38 P2 on #88), SUPERSEDED by
+				// Ruling S90 (Codex round-39 P2 on #88), SUPERSEDED AGAIN
+				// by Ruling S92 (Codex round-40 P1 on #88) — the fourth
+				// time this one constant has ping-ponged between too
+				// tight and too loose. S88 shrank ACCEPT to
+				// `MAX_OBSERVATION_SEEN - 2`; S90 restored it to
+				// `<= MAX_OBSERVATION_SEEN`, reasoning "no legitimate
+				// value the site could ever serve is refused" — but that
+				// was still a ceiling, and `observation` is NOT bounded
+				// by the class constant in practice: honouring a rewind
+				// at `MAX - 2` restamps to `MAX - 1`, and the SAME commit's
+				// own generic version bump (every `versioned()` write
+				// advances the door version once more, on top of
+				// whatever `$writes()` itself did) carries that straight
+				// to `MAX` — a value this site can now legitimately
+				// report. Any LATER, perfectly ordinary mutation bumps it
+				// ONE more time, to `MAX + 1`, and S90's own ceiling then
+				// refused that value FOR EVER: `observation` only ever
+				// increases, so once the site's own witness has crossed
+				// the constant, EVERY later echo of it back — which is
+				// exactly what Aura does every poll — was a 400,
+				// permanently.
+				//
+				// Ruling S92's mechanism: ACCEPT and HONOUR are not just
+				// different THRESHOLDS (S90's own framing) — they are
+				// different QUESTIONS, and only one of them has anything
+				// to do with `MAX_OBSERVATION_SEEN`. ACCEPT must be a
+				// superset of every value the site's OWN witness can ever
+				// reach, and that witness is UNBOUNDED (it only counts
+				// up) — so this check has NO magnitude ceiling of its
+				// own at all; it verifies SHAPE only: a non-negative
+				// integer representable as a native PHP int. Overflow
+				// safety lives ENTIRELY on the HONOUR side —
+				// `Aura_Worker_Door_Log::restamp_observation_forward()`'s
+				// own `seen <= MAX_OBSERVATION_SEEN - 2` guard, unchanged
+				// by this ruling — because that is the ONLY place a
+				// value from here ever feeds an arithmetic `+ 1`; an
+				// accepted-but-not-honoured value is echoed and dropped,
+				// never computed with, so it cannot overflow anything
+				// however large it is.
+				'door_observation_seen' => array(
+					'required'          => false,
+					'type'              => 'integer',
+					'validate_callback' => function( $value ) {
+						if ( null === $value ) {
+							return true;
+						}
+						// Ruling S92: magnitude checked BEFORE any cast
+						// to (int) — casting a float outside the
+						// platform int range is undefined behaviour in
+						// PHP, so a value too large to BE a PHP int
+						// (arriving as a float, or as a numeric string
+						// PHP itself would only ever parse as a float)
+						// is refused by comparing it, as a float, to
+						// PHP_INT_MAX first.
+						if ( ! is_numeric( $value ) || (float) $value < 0 || (float) $value > PHP_INT_MAX ) {
+							return new WP_Error( 'aura_invalid_param', 'door_observation_seen must be a non-negative integer.', array( 'status' => 400 ) );
+						}
+						if ( (int) $value != $value ) { // phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
+							return new WP_Error( 'aura_invalid_param', 'door_observation_seen must be a non-negative integer.', array( 'status' => 400 ) );
+						}
+						return true;
+					},
+					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — accepted whenever it is a non-negative integer representable as a native PHP int, with NO magnitude ceiling of its own (Ruling S92): the site's own witness only ever counts up, so any value it could legitimately echo back must be acceptable, however large. When it EXCEEDS this site's current door version under that SAME epoch AND is at or below Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2 (the SEPARATE, tighter threshold restamp_observation_forward() actually HONOURS — the only place overflow safety is enforced), the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored — 200, never a bump, never an error — when it is not greater than the current version, when `door_epoch` does not name this site's CURRENT epoch, or when it is accepted but above the honour threshold. Refused outright with a 400 `aura_invalid_param` only for a negative value, a non-integer (a float, or a non-canonical numeric string), or a magnitude beyond PHP_INT_MAX.", 'digitizer-site-worker' ),
+				),
+			),
 		) );
 
 		// Available updates (read-only).
@@ -557,9 +642,16 @@ class Aura_Worker_API {
 		// Elementor is still there.
 		if ( class_exists( 'Aura_Worker_Elementor_Door' ) && Aura_Worker_Elementor_Door::present() ) {
 			Aura_Worker_Elementor_Door::reconcile();
-			$status['door'] = (object) Aura_Worker_Elementor_Door::status_fragment(
+			// Ruling S82 (Codex round-33 P2 on #88): the REST arg's own
+			// `validate_callback` already refused anything but a
+			// non-negative integer or absence; `get_param()` answers
+			// `null` when the caller sent nothing at all, which
+			// `status_fragment()`'s own default treats as a no-op.
+			$observation_seen = $request->get_param( 'door_observation_seen' );
+			$status['door']   = (object) Aura_Worker_Elementor_Door::status_fragment(
 				(int) $request->get_param( 'door_after' ),
-				(string) $request->get_param( 'door_epoch' ) // the epoch the cursor belongs to; '' ⇒ served from 0
+				(string) $request->get_param( 'door_epoch' ), // the epoch the cursor belongs to; '' ⇒ served from 0
+				null === $observation_seen ? null : (int) $observation_seen
 			);
 		}
 
@@ -1549,6 +1641,31 @@ class Aura_Worker_API {
 
 		$result = Aura_Worker_Door_Log::ack( $epoch, $seq );
 
+		// Ruling S15 (Codex round-6 P2 on #88): `committed: false` means the
+		// whole unit rolled back — nothing was acked, nothing was purged, and
+		// `Aura_Worker_Door_Log::ack()` did not even try to compute a
+		// success-shaped answer. RETRYABLE, not a designated refusal: the
+		// same `aura_log_failed` code `restore_unsettled()` already answers
+		// with for the identical shape of fact — this site could not record
+		// an outcome, so the caller repeats the call rather than assuming its
+		// ack landed.
+		//
+		// `committed` is now TRI-STATE (Ruling S51, Codex round-20 P1 on
+		// #88): `null` when even the durable witness itself could not be
+		// read. `! $result['committed']` is already `true` for BOTH `false`
+		// and `null` — retrying an ack is always safe regardless of which
+		// (ack_write() is itself idempotent on a repeat with the SAME
+		// epoch/seq, per its own docblock), so this check is unchanged and
+		// correct as written; it is not the `not_held()`-style permanent
+		// refusal `claim()` had to stop conflating the two for.
+		if ( array_key_exists( 'committed', $result ) && ! $result['committed'] ) {
+			return new WP_Error(
+				'aura_log_failed',
+				'This site could not record the outcome of this ack; nothing was acknowledged. Retry.',
+				array( 'status' => 503 )
+			);
+		}
+
 		$body = array(
 			'acked'   => (int) $result['acked'],
 			'floor'   => (int) $result['floor'],
@@ -1608,6 +1725,29 @@ class Aura_Worker_API {
 		// epoch named, so two granted rotations answering the same rewind
 		// cannot both mint one (Ruling P23).
 		$out = Aura_Worker_Door_Log::rotate_epoch( $epoch );
+
+		// Ruling S77 (Codex round-31 P2 on #88): `rotated: null` — an
+		// AMBIGUOUS commit whose own verifying re-read ALSO could not be
+		// proven — is genuinely UNKNOWN, never the same fact as `false`
+		// (rotate_epoch()'s own docblock). Answering `rotated: false`
+		// here would tell Aura the rotation did not happen; a retry with
+		// the SAME `$epoch` would then lose the fence against whatever IS
+		// actually current (this call's own mint, if it landed) and
+		// report `false` again, forever — `restamp_binding_epoch()` never
+		// runs, and the binding record is left naming an epoch this site
+		// may already have left. The retryable 503 this answers instead
+		// is the SAME shape `Aura_Worker_Door_Holds`' own
+		// `retry_may_have_run()` uses: the caller retries, and the NEXT
+		// attempt's own verify — reading a by-then-healthy epoch_raw()
+		// that may already equal what THIS attempt minted — completes
+		// idempotently.
+		if ( null === $out['rotated'] ) {
+			return new WP_Error(
+				'aura_log_failed',
+				'This site could not prove whether the rotation landed; retry.',
+				array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+			);
+		}
 
 		// A LEGITIMATE ROTATION SAYS SO ON THE BINDING RECORD (Ruling P91).
 		// The record names the epoch it was written with, and P81's repair

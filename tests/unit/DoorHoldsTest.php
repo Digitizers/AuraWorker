@@ -641,6 +641,28 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertFalse( get_option( Aura_Worker_Door_Holds::LOCK ) ); // …and the lock is still released
 	}
 
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): raw_bytes() answering
+	 * `null` for both "the lock row vanished" and "the read could not be
+	 * proven" used to mean take_lock() looped back and raced straight to
+	 * insert_unique() as if the lock had already gone — the opposite of
+	 * what an UNREADABLE lock proves. It now backs off exactly like a
+	 * lock it can see is fresh, and never seizes it.
+	 */
+	public function test_take_lock_does_not_seize_a_lock_it_cannot_prove_stale(): void {
+		$stale = time() - Aura_Worker_Door_Holds::LOCK_S - 1;
+		add_option( Aura_Worker_Door_Holds::LOCK, $stale, '', 'no' ); // genuinely stale, if only it could be read
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Holds::LOCK ] = true; // every read of it fails
+
+		$err = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $err );
+		$this->assertSame( 'aura_hold_busy', $err->get_error_code(), 'never seizes a lock it could not prove stale' );
+		$this->assertSame( 0, Aura_Worker_Door_Holds::count(), 'nothing was admitted while the lock could not be evaluated' );
+		$this->assertSame( (string) $stale, (string) $GLOBALS['_rows'][ Aura_Worker_Door_Holds::LOCK ], 'the original lock row is untouched' );
+	}
+
 	public function test_two_racers_on_a_stale_lock_only_one_of_them_takes_it(): void {
 		$stale = time() - Aura_Worker_Door_Holds::LOCK_S - 1;
 		add_option( Aura_Worker_Door_Holds::LOCK, $stale, '', 'no' );
@@ -736,6 +758,125 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertArrayHasKey( 'aura_worker_door_claimed_' . $ref, $GLOBALS['_options'] );
 		$again = Aura_Worker_Door_Holds::claim( $ref );
 		$this->assertSame( 'not_held', $again->get_error_code() );
+	}
+
+	/**
+	 * Ruling S37 (Codex round-15 class sweep on #88): from_db() answering
+	 * `null` for both "the row is genuinely absent" and "the read could
+	 * not be proven" used to mean claim() answered `not_held` — a 404
+	 * Aura reads as "this approval no longer exists" — for a hold that
+	 * was, in fact, sitting right there, unreadable rather than gone.
+	 * from_db()'s read_was_unreadable() signal now lets claim() answer the
+	 * RETRYABLE path instead, and touch nothing.
+	 */
+	public function test_a_claim_answers_retryably_when_the_held_read_is_unreadable_never_not_held(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Holds::HELD . $ref ] = true;
+
+		$out = Aura_Worker_Door_Holds::claim( $ref );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_failed', $out->get_error_code(), 'never `not_held` — that would tell Aura the approval is gone' );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		// The hold is untouched — a HEALTHY claim() right afterwards still
+		// finds and moves it, proving nothing was spent on the failed read.
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+	}
+
+	/**
+	 * Ruling S51 (Codex round-20 P1 on #88): claim()'s own CLAIMED insert
+	 * reaching versioned()'s durable-witness fallback, whose OWN read then
+	 * cannot be proven either way, used to answer `not_held()` -- a
+	 * permanent 404 Aura reads as "this approval is gone for good" -- for
+	 * an attempt that may, in fact, have just claimed the row. Retryable,
+	 * and it says so via `may_have_run`, so Aura re-polls instead of
+	 * giving up on a still-live approval.
+	 */
+	public function test_claim_answers_retry_later_with_may_have_run_when_its_own_insert_is_unproven(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-claim-s51';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-claim-s51';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Door_Holds::claim( $ref );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertTrue( $out->get_error_data()['may_have_run'], 'never a bare retry -- this attempt may already have claimed the ref' );
+		// The durable witness this insert wrote was left UNTOUCHED (Ruling
+		// S51) -- proving this really is the unreadable path, not some
+		// other retryable one that would have cleaned it up.
+		$this->assertArrayHasKey( $witness, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * Ruling S80 (Codex round-33 P1 on #88): `hold_locked()`'s pre-ruling
+	 * ref was `wp_generate_uuid4()` -- a FRESH RANDOM value every call --
+	 * so a retry of the SAME logical call (the SAME `aura_ref`) after an
+	 * ambiguous insert minted a DIFFERENT ref and, if the first attempt
+	 * actually landed, queued a SECOND, duplicate approval. With the ref
+	 * DERIVED from `aura_ref` + a hash of `touches`, the retry regenerates
+	 * the IDENTICAL ref: `insert_unique()` finds the name already taken
+	 * (a proven `false`, not the ambiguous `null` the first attempt saw),
+	 * and `hold_locked()`'s own already-queued check recognises it,
+	 * returning the EXISTING ref rather than erroring or duplicating.
+	 */
+	public function test_a_retry_of_an_ambiguous_hold_with_the_same_aura_ref_recognises_the_existing_hold(): void {
+		$call = $this->call( array( 'aura_ref' => 'aura-ref-s80' ) );
+		Aura_Worker_Door_Log::epoch();   // mints it for real, priming the cache before the seam below
+		Aura_Worker_Door_Log::binding(); // same -- binding_record() lazily mints too
+
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-hold-s80';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-hold-s80';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$first = Aura_Worker_Door_Holds::hold( $call );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( WP_Error::class, $first, 'the fixture assumption this test is built on -- the first attempt is ambiguous' );
+		$this->assertTrue( $first->get_error_data()['may_have_run'] );
+		$attempted_ref = $first->get_error_data()['ref'];
+		$this->assertMatchesRegularExpression( '/^door_[0-9a-f-]{36}$/', $attempted_ref, 'Ruling S80: the ambiguous error carries the ref this attempt tried' );
+		// The ambiguous attempt actually DID land underneath the unreadable
+		// witness -- confirmed with a healthy read now that the seam is
+		// cleared.
+		$this->assertArrayHasKey( 'aura_worker_door_held_' . $attempted_ref, $GLOBALS['_options'] );
+
+		// The retry: same aura_ref, same touches, no ambiguity seam of its
+		// own -- exactly what a caller re-sending the SAME intercepted
+		// request after the first attempt's own 503 would do.
+		$second = Aura_Worker_Door_Holds::hold( $call );
+
+		$this->assertIsString( $second, 'recognised, not a second error' );
+		$this->assertSame( $attempted_ref, $second, 'Ruling S80: the SAME aura_ref derives the SAME ref, recognising the existing hold' );
+		$this->assertSame( 1, Aura_Worker_Door_Holds::count(), 'exactly one row -- never a duplicate approval for the same call' );
+	}
+
+	/**
+	 * Ruling S80: the OTHER half -- two genuinely DIFFERENT intercepted
+	 * requests (different `aura_ref`) must derive two DIFFERENT refs, so
+	 * two distinct calls are never merged into one hold.
+	 */
+	public function test_distinct_aura_refs_derive_distinct_hold_refs(): void {
+		$first  = Aura_Worker_Door_Holds::hold( $this->call( array( 'aura_ref' => 'aura-ref-one' ) ) );
+		$second = Aura_Worker_Door_Holds::hold( $this->call( array( 'aura_ref' => 'aura-ref-two' ) ) );
+
+		$this->assertIsString( $first );
+		$this->assertIsString( $second );
+		$this->assertNotSame( $first, $second );
+		$this->assertSame( 2, Aura_Worker_Door_Holds::count() );
 	}
 
 	public function test_a_claim_that_finds_the_held_row_gone_backs_out(): void {
@@ -905,7 +1046,12 @@ final class DoorHoldsTest extends TestCase {
 		// The window: the sweep lands after unclaim()'s held INSERT and before
 		// its claimed DELETE.
 		$GLOBALS['_sa_after_insert_unique'][ Aura_Worker_Door_Holds::HELD . $ref ] = static function () use ( &$swept ) {
-			$swept = Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS );
+			// A racer, so it runs as if on its OWN connection (Ruling S8) —
+			// sweep()'s own deletes each open their own versioned() unit,
+			// which would nest inside unclaim()'s still-open one otherwise.
+			sa_on_another_connection( function () use ( &$swept ) {
+				$swept = Aura_Worker_Door_Holds::sweep( time(), self::CLAIM_STALE_MS );
+			} );
 		};
 
 		$restored = Aura_Worker_Door_Holds::unclaim( $ref );
@@ -1055,6 +1201,215 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertSame( 1, Aura_Worker_Door_Holds::count(), 'the claimed ref still counts' );
 		Aura_Worker_Door_Holds::hold( $this->call() );
 		$this->assertArrayHasKey( 'aura_worker_door_held_' . $ref, $GLOBALS['_rows'], 'and its held twin was not purged out from under the replay' );
+	}
+
+	/**
+	 * Ruling S6 (Codex round-3 P1 on #88): `forget_held()` is the choke point
+	 * that bumps the door version for every held/claimed write on this
+	 * class's side — `hold()`, `claim()`, `unclaim()`, `release()`,
+	 * `reject()`, `refresh_rule()`, `refresh_touches()`, `stamp_terminal_seq()`
+	 * and the sweep — because every one of them already calls it uniformly.
+	 * Proven here across the write shapes that reach it by the most
+	 * different routes: a fresh insert (`hold()`), a CAS row update
+	 * (`refresh_rule()`), and a raw, fenced delete (`release()`).
+	 */
+	public function test_hold_refresh_rule_and_release_each_bump_the_door_version(): void {
+		$before = Aura_Worker_Door_Log::door_version_raw();
+		$ref    = Aura_Worker_Door_Holds::hold( $this->call() );
+		$after_hold = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertIsInt( $after_hold );
+		$this->assertNotSame( $before, $after_hold, 'a fresh insert (hold()) bumps' );
+
+		Aura_Worker_Door_Holds::refresh_rule( $ref, array( 'key' => 'r', 'state' => 'blocked' ) );
+		$after_refresh = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertGreaterThan( $after_hold, $after_refresh, 'a CAS row update (refresh_rule()) bumps too' );
+
+		Aura_Worker_Door_Holds::release( $ref );
+		$after_release = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertGreaterThan( $after_refresh, $after_release, 'and a raw, fenced delete (release()) bumps as well — none of the three go through write_option_where()/insert_unique() alone' );
+	}
+
+	/**
+	 * Ruling S72 (Codex round-28 P2 on #88): `release()` reported a
+	 * mutation whenever `delete_row_provably()` PROVED a row gone —
+	 * whether this call actually deleted it, or the row was already
+	 * absent (an idempotent second release(), or the loser of a race
+	 * against another release()/reject()/sweep() that got there first).
+	 * Both rows already gone changes nothing, so a second release() must
+	 * not bump the door version or write a commit witness for it —
+	 * `committed: true` as a pure no-op, the same "release confirmed"
+	 * answer the caller already gets from the first, real release().
+	 */
+	public function test_a_second_release_of_an_already_released_ref_bumps_nothing(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+		$claimed_name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+		$held_name    = Aura_Worker_Door_Holds::HELD . $ref;
+		$this->assertTrue( Aura_Worker_Door_Holds::release( $ref ), 'the fixture assumption this test is built on' );
+		$this->assertArrayNotHasKey( $claimed_name, $GLOBALS['_options'], 'the fixture assumption this test is built on' );
+		$this->assertArrayNotHasKey( $held_name, $GLOBALS['_options'], 'the fixture assumption this test is built on' );
+
+		$count_witnesses = static function () {
+			return count(
+				array_filter(
+					array_keys( $GLOBALS['_rows'] ),
+					static function ( $name ) {
+						return 0 === strpos( $name, Aura_Worker_Door_Log::LAST_TX_PREFIX );
+					}
+				)
+			);
+		};
+		$witnesses_before = $count_witnesses();
+		$version_before    = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertIsInt( $version_before );
+
+		// The stub's own delete_option() always answers `true` (it does
+		// not model "nothing there to delete" the way real WordPress
+		// does), so a second, ordinary release() call could never reach
+		// delete_row_provably()'s own raw-read confirmation on its own.
+		// Arming the SAME seam Ruling S60's own tests use — for a row
+		// that is ALREADY gone this time, not one that still exists —
+		// puts delete_option() in exactly the shape real WordPress takes
+		// for an idempotent delete: `false`, no error, and the row
+		// genuinely absent underneath it.
+		$GLOBALS['_sa_delete_option_fail'][ $claimed_name ] = true;
+		$GLOBALS['_sa_delete_option_fail'][ $held_name ]    = true;
+
+		$second = Aura_Worker_Door_Holds::release( $ref );
+
+		$GLOBALS['_sa_delete_option_fail'] = array();
+
+		$this->assertTrue( $second, 'an idempotent release of an already-released ref still reports success' );
+		$this->assertSame( $version_before, Aura_Worker_Door_Log::door_version_raw(), 'no bump — nothing changed for a pure no-op release' );
+		$this->assertSame( $witnesses_before, $count_witnesses(), 'no commit witness written for a pure no-op release' );
+	}
+
+	/**
+	 * Ruling S60 (Codex round-23 P1 on #88): delete_option() answers
+	 * `false` for BOTH "there was genuinely nothing to delete" and "the
+	 * delete failed" -- casting that straight to a boolean and OR-ing the
+	 * claimed/held rows together used to let `$mutated` land on `false`
+	 * for a row that actually still existed, which versioned() then read
+	 * as "nothing to do" and committed trivially: release() reported
+	 * `true` while the claimed row it was supposed to remove sat there
+	 * untouched. delete_row_provably()'s raw re-read now catches this
+	 * even when delete_option() leaves no visible last_error behind.
+	 */
+	public function test_a_failing_claimed_row_delete_aborts_release_leaving_the_row_intact(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+		$claimed_name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+		$this->assertArrayHasKey( $claimed_name, $GLOBALS['_options'] );
+
+		$GLOBALS['_sa_delete_option_fail'][ $claimed_name ] = true;
+		$version_before = Aura_Worker_Door_Log::door_version_raw();
+
+		$committed = Aura_Worker_Door_Holds::release( $ref );
+
+		$GLOBALS['_sa_delete_option_fail'] = array();
+
+		$this->assertFalse( $committed, 'a delete that could not be proven must not report success' );
+		$this->assertArrayHasKey( $claimed_name, $GLOBALS['_options'], 'the claimed row is still there — delete_option() never actually removed it' );
+		$this->assertSame( $version_before, Aura_Worker_Door_Log::door_version_raw(), 'no bump — nothing committed' );
+
+		// The miss must not stick: a healthy retry afterwards succeeds
+		// normally and actually removes the row.
+		$this->assertTrue( Aura_Worker_Door_Holds::release( $ref ) );
+		$this->assertArrayNotHasKey( $claimed_name, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * Ruling S60, the OTHER signal: delete_option() failing WITH
+	 * last_error set — the ordinary "the statement itself errored" case
+	 * every other raw write here already checks, exercised here for
+	 * release()'s own new check specifically.
+	 */
+	public function test_a_claimed_row_delete_that_sets_last_error_also_aborts_release(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+		$claimed_name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+
+		$GLOBALS['_sa_delete_option_fail'][ $claimed_name ]            = true;
+		$GLOBALS['_sa_delete_option_fail_with_error'][ $claimed_name ] = true;
+
+		$committed = Aura_Worker_Door_Holds::release( $ref );
+
+		$GLOBALS['_sa_delete_option_fail']            = array();
+		$GLOBALS['_sa_delete_option_fail_with_error'] = array();
+
+		$this->assertFalse( $committed );
+		$this->assertArrayHasKey( $claimed_name, $GLOBALS['_options'] );
+	}
+
+	/**
+	 * The internal hold-queue LOCK mutex is not door state Aura ever sees —
+	 * `insert_unique()`'s exemption list (Ruling S6) must not bump for its
+	 * acquisition. Tested directly on the primitive rather than through
+	 * `hold()`, which itself performs SEVERAL real mutations for one call
+	 * (an epoch mint, a binding mint, the held row's own insert — each
+	 * legitimately bumps on its own, so counting hold()'s total bumps could
+	 * never isolate the lock's contribution from theirs).
+	 */
+	public function test_insert_unique_on_the_hold_lock_name_does_not_bump_the_door_version(): void {
+		$before = Aura_Worker_Door_Log::door_version_raw();
+		Aura_Worker_Door_Log::insert_unique( Aura_Worker_Door_Holds::LOCK, 'token' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'the internal mutex is not reported door state, so acquiring it must not bump' );
+
+		// The exemption is scoped to that one name — an ordinary insert right
+		// after it still bumps, proving the primitive itself is not disabled.
+		Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_held_test-ref', array( 'x' => 1 ) );
+		$this->assertNotSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'an ordinary door-prefixed insert still bumps' );
+	}
+
+	/**
+	 * Ruling S8 (Codex round-4 P1 on #88): hold()'s state write and its
+	 * version bump run in ONE transaction — proven from the request's own
+	 * statement log, the same way open_pending()/ack()/rotate_epoch() are in
+	 * DoorLogTest.php. hold() itself can open SEVERAL transactions in one
+	 * call (an epoch mint, a binding mint, the held row's own insert), so
+	 * this finds the bump nearest the HELD row's own insert rather than
+	 * assuming there is only one transaction in the log.
+	 */
+	public function test_hold_bumps_the_version_inside_its_own_transaction(): void {
+		$GLOBALS['_db_queries'] = array();
+		$ref                    = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsString( $ref );
+
+		$log = $GLOBALS['_db_queries'];
+		$held_insert = null;
+		foreach ( $log as $i => $sql ) {
+			if ( false !== strpos( (string) $sql, Aura_Worker_Door_Holds::HELD . $ref ) ) {
+				$held_insert = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $held_insert, 'the held row was written at all' );
+		// The bump nearest (at or after) the held row's own insert.
+		$bump = null;
+		for ( $i = $held_insert, $n = count( $log ); $i < $n; $i++ ) {
+			if ( false !== strpos( (string) $log[ $i ], Aura_Worker_Door_Log::OBSERVATION ) ) {
+				$bump = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $bump, 'the held insert bumped the version' );
+		$start = null;
+		for ( $i = $bump; $i >= 0; $i-- ) {
+			if ( 'START TRANSACTION' === trim( (string) $log[ $i ] ) ) {
+				$start = $i;
+				break;
+			}
+		}
+		$commit = null;
+		for ( $i = $bump, $n = count( $log ); $i < $n; $i++ ) {
+			if ( 'COMMIT' === trim( (string) $log[ $i ] ) ) {
+				$commit = $i;
+				break;
+			}
+		}
+		$this->assertNotNull( $start, 'a transaction opened before the bump' );
+		$this->assertNotNull( $commit, 'and closed with a COMMIT after it' );
+		$this->assertLessThanOrEqual( $held_insert, $start, "the SAME transaction covers the held row's own insert" );
 	}
 
 	/** The reconciler's stale-claim bound, as the governor declares it. */

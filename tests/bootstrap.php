@@ -344,10 +344,35 @@ if ( ! function_exists( 'wp_cache_delete' ) ) {
 			'key'   => $key,
 			'group' => $group,
 		);
-		// The one cache entry this stub models: core's `notoptions` negative
-		// cache (wp-includes/option.php). Evicting it forgets every miss.
+		// The one cache entry this stub models UNCONDITIONALLY: core's
+		// `notoptions` negative cache (wp-includes/option.php). Evicting it
+		// forgets every miss.
 		if ( 'notoptions' === $key && 'options' === $group ) {
 			$GLOBALS['_notoptions'] = array();
+		}
+		// Ruling S11 (Codex round-5 P1 on #88): a real wp_cache_delete(
+		// $option, 'options' ) also evicts THIS request's own cached copy of
+		// that option — $GLOBALS['_sa_option_cache'], the layer several
+		// OTHER tests seed to model "this process read a stale value and
+		// must not be fooled by a write that never evicted its own cache".
+		// Those tests seed that value specifically because THIS stub used to
+		// let it survive every wp_cache_delete() call, so making eviction
+		// real here — unconditionally — would silently rewrite what several
+		// unrelated, already-passing tests are proving. So this is opt-in,
+		// armed only by the one test that exists to prove versioned()'s
+		// post-commit re-eviction actually defeats a racer's repopulation.
+		if ( ! empty( $GLOBALS['_sa_option_cache_honors_wp_cache_delete'] ) && 'options' === $group && isset( $GLOBALS['_sa_option_cache'] ) && array_key_exists( $key, (array) $GLOBALS['_sa_option_cache'] ) ) {
+			unset( $GLOBALS['_sa_option_cache'][ $key ] );
+		}
+		// A hook keyed by option name, firing right after THIS eviction
+		// (Ruling S18, 2.16.2) — for a test modelling a re-read (this same
+		// process, or a concurrent one) re-caching a value at exactly this
+		// point, the same shape `_sa_after_insert_unique` already gives the
+		// insert path. Fires once per name.
+		if ( 'options' === $group && isset( $GLOBALS['_sa_after_wp_cache_delete'][ $key ] ) && is_callable( $GLOBALS['_sa_after_wp_cache_delete'][ $key ] ) ) {
+			$fn = $GLOBALS['_sa_after_wp_cache_delete'][ $key ];
+			unset( $GLOBALS['_sa_after_wp_cache_delete'][ $key ] );
+			$fn();
 		}
 		return true;
 	}
@@ -687,6 +712,31 @@ if ( ! function_exists( 'wp_schedule_single_event' ) ) {
 
 if ( ! function_exists( 'delete_option' ) ) {
 	function delete_option( string $option ): bool {
+		// Ruling S60 (Codex round-23 P1 on #88): models delete_option()
+		// itself failing to remove a row that DOES exist -- the one case
+		// its own `false` return cannot be told apart from "there was
+		// genuinely nothing to delete". A test arms this by NAME; `true`
+		// (or a positive int, "let N through then fail") leaves the row
+		// standing and answers `false`, with `last_error` left EMPTY by
+		// default -- the harder, silent-failure case
+		// Aura_Worker_Door_Holds::delete_row_provably()'s own raw-read
+		// fallback exists to catch, since the visible-last_error case is
+		// already the ordinary failure signal every other raw write here
+		// checks. `_sa_delete_option_fail_with_error[$option]` additionally
+		// sets last_error too, for the OTHER half of that same check.
+		if ( ! empty( $GLOBALS['_sa_delete_option_fail'][ $option ] ) ) {
+			$fail = $GLOBALS['_sa_delete_option_fail'][ $option ];
+			if ( is_int( $fail ) && $fail > 1 ) {
+				$GLOBALS['_sa_delete_option_fail'][ $option ] = $fail - 1;
+			} else {
+				$GLOBALS['_sa_delete_option_fail'][ $option ] = false; // fires once (or N times, then clears)
+			}
+			if ( ! empty( $GLOBALS['_sa_delete_option_fail_with_error'][ $option ] ) ) {
+				global $wpdb;
+				$wpdb->last_error = 'delete failed';
+			}
+			return false; // the row is left standing
+		}
 		unset( $GLOBALS['_options'][ $option ] );
 		unset( $GLOBALS['_rows'][ $option ] );
 		unset( $GLOBALS['_rows_autoload'][ $option ] );
@@ -1020,6 +1070,31 @@ function sa_after_option_read( string $name ): void {
 function sa_before_swap(): void {
 	if ( isset( $GLOBALS['_sa_before_swap'] ) && is_callable( $GLOBALS['_sa_before_swap'] ) ) {
 		call_user_func( $GLOBALS['_sa_before_swap'] );
+	}
+}
+
+/**
+ * Run $fn as if it were issued on a SEPARATE database connection (Ruling S8,
+ * 2.16.2) — swaps $GLOBALS['wpdb'] to a fresh SA_Test_Wpdb for the duration,
+ * exactly as the interleaved-bump tests already do by hand. A racer
+ * representing another concurrent request's mutation must run this way
+ * whenever it can land while THIS connection has a
+ * Aura_Worker_Door_Log::versioned() transaction open — otherwise its own
+ * START TRANSACTION would appear to NEST inside this one's, which the stub
+ * refuses (MySQL has no nested transactions). Restores the original
+ * connection afterwards, even if $fn throws — a racer that leaves the swap
+ * in place would strand every statement AFTER it on the wrong "connection".
+ *
+ * @param callable $fn
+ * @return mixed $fn's own return value.
+ */
+function sa_on_another_connection( callable $fn ) {
+	$mine            = $GLOBALS['wpdb'];
+	$GLOBALS['wpdb'] = new SA_Test_Wpdb();
+	try {
+		return $fn();
+	} finally {
+		$GLOBALS['wpdb'] = $mine;
 	}
 }
 
@@ -1889,11 +1964,79 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		public bool $ready = true;
 		/**
+		 * wpdb::$reconnect_retries (Ruling S50, 2.16.2) — PROTECTED, to
+		 * mirror WordPress core exactly (verified against core
+		 * 7.0/7.0.4/7.1's own wp-includes/class-wpdb.php: `protected
+		 * $reconnect_retries = 5;`). A PUBLIC declaration here is what let
+		 * Ruling S50's own `$wpdb->reconnect_retries = 0` direct property
+		 * write pass every test while still being a real fatal
+		 * (`Error: Cannot access protected property`) on a genuine
+		 * `db.php` drop-in without matching magic methods — Ruling S56,
+		 * Codex round-22 P1 on #88. Production code now reads/writes this
+		 * ONLY through `Aura_Worker_Door_Log::reconnect_retries_get()`/
+		 * `_set()`'s scope-bound closures, exactly as it must for a real
+		 * protected property; `sa_reconnect_retries_for_tests()` below is
+		 * this test double's OWN accessor, for tests that need to observe
+		 * the value without reproducing the closure-bind dance themselves.
+		 */
+		protected int $reconnect_retries = 5;
+		/** Ruling S56: a test's own window onto the protected property above — never used by production code. */
+		public function sa_reconnect_retries_for_tests() {
+			return $this->reconnect_retries;
+		}
+		/**
 		 * What the LAST statement that actually ran left behind — wpdb keeps
 		 * it in $last_result, and get_var() extracts from there whether or not
 		 * the statement it was handed ever reached the database.
 		 */
 		private $sa_last_var = null;
+		/**
+		 * MySQL's LAST_INSERT_ID() session variable (Ruling S2, 2.16.2): set
+		 * ONLY by a statement that runs THROUGH THIS INSTANCE — a racer that
+		 * writes the row directly (bypassing $wpdb->query()) must never touch
+		 * it, exactly as a second real MySQL connection's own session cannot
+		 * see into this one's. This is what lets `bump_door_version()`'s
+		 * upsert-then-`SELECT LAST_INSERT_ID()` answer THIS call's own
+		 * assigned value even when another connection increments the same row
+		 * in between.
+		 */
+		private $sa_last_insert_id = null;
+		/**
+		 * Aura_Worker_Door_Log::versioned()'s open transaction snapshots
+		 * (Ruling S8, 2.16.2) — PER INSTANCE, exactly as a real transaction
+		 * is scoped to the CONNECTION that opened it: a racer standing in for
+		 * a second concurrent request swaps `$GLOBALS['wpdb']` to a fresh
+		 * `SA_Test_Wpdb` (never reusing this one), so that instance's own
+		 * transaction stack starts empty and its START TRANSACTION is never
+		 * mistaken for nesting inside THIS instance's still-open one.
+		 *
+		 * @var array<int, array{ rows: array, options: array, notoptions: array }>
+		 */
+		private $sa_txn_stack = array();
+		/**
+		 * MySQL session (user) variables (Ruling S16, 2.16.2) — PER INSTANCE,
+		 * exactly like `sa_last_insert_id` above: a real reconnect lands on a
+		 * fresh session where none of these exist, which is the whole point of
+		 * `versioned()`'s post-COMMIT nonce check. Cleared whenever a COMMIT
+		 * is modelled as landing on a reconnected session (see `query()`'s
+		 * `_sa_reconnect_before_commit` seam) and by `sa_forget_last_result()`
+		 * between tests.
+		 *
+		 * @var array<string, string>
+		 */
+		private $sa_session_vars = array();
+		/**
+		 * Has a COMMIT actually landed (the plain, no-seam-armed success
+		 * path) since the CURRENT transaction opened (Ruling S50, 2.16.2)?
+		 * Reset by START TRANSACTION, set by a genuinely landed COMMIT.
+		 * `_sa_reconnect_after_commit` gates on this so it fires on the
+		 * FIRST `SELECT @...` read that actually comes AFTER a commit —
+		 * versioned() now issues a SECOND such read (Ruling S50's own
+		 * belt-and-braces check) BEFORE the commit, which must never be
+		 * mistaken for the later, post-commit one this seam exists to
+		 * model.
+		 */
+		private $sa_commit_landed_this_txn = false;
 		/**
 		 * The same thing for get_row(). wpdb keeps ONE $last_result; modelling
 		 * the two separately is the harsher choice, because it means the stale
@@ -1960,6 +2103,27 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 						);
 					}
 				}
+				// A hook keyed by PREFIX, firing right after this exact read
+				// completes (Ruling S20, 2.16.2) — for a test modelling a
+				// mutation landing the instant a memoising reader
+				// (Aura_Worker_Door_Holds::held_rows()) finishes capturing
+				// its snapshot, before that memo is used or dropped. Fires
+				// once per prefix.
+				//
+				// `stripslashes()` TWICE: prepare()'s addslashes() escaped
+				// esc_like()'s own backslash before substitution — the same
+				// double escaping a real wpdb::prepare()/esc_like() pair
+				// produces — so the captured group still carries ONE level
+				// of LIKE-escaping after a single stripslashes() (which is
+				// exactly what `sa_like_to_regex()` above wants). A plain
+				// prefix constant has neither, so comparing against one
+				// needs both levels removed.
+				$prefix = stripslashes( stripslashes( $m[1] ) );
+				if ( isset( $GLOBALS['_sa_after_rows_read'][ $prefix ] ) && is_callable( $GLOBALS['_sa_after_rows_read'][ $prefix ] ) ) {
+					$fn = $GLOBALS['_sa_after_rows_read'][ $prefix ];
+					unset( $GLOBALS['_sa_after_rows_read'][ $prefix ] );
+					$fn();
+				}
 				return $out;
 			}
 			// Aura_Worker_Door_Log::stale_pending() (2.16.0): the numeric log
@@ -1972,6 +2136,16 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// the same one every other door-log branch reads.
 			if ( preg_match( "/^SELECT option_name, option_value FROM \\S+ WHERE option_name LIKE '([^']*)' AND option_name REGEXP '([^']*)' AND CAST\\(SUBSTRING\\(option_name, \\d+\\) AS UNSIGNED\\) > (\\d+)$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				// Ruling S37/S38 (Codex round-15 class sweep on #88):
+				// Aura_Worker_Door_Log::stale_pending()'s own scan failing
+				// at the driver — real wpdb answers its cleared
+				// $last_result (an empty array) with last_error the only
+				// tell, exactly like every other get_results() failure
+				// modelled in this stub.
+				if ( ! empty( $GLOBALS['_sa_stale_pending_read_error'] ) ) {
+					$this->last_error = 'stale pending scan failed';
+					return array();
+				}
 				$floor = (int) $m[3];
 				$out   = array();
 				foreach ( sa_door_log_rows_matching( $m[1], $m[2] ) as $name ) {
@@ -2140,6 +2314,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
 			}
+			// Ruling S53 (Codex round-21 P1 on #88): see
+			// sa_reconnect_mid_query_check()'s own docblock — the post-COMMIT
+			// nonce read-back (Ruling S16) is one of the two get_var()/
+			// get_row() reads that seam must be able to land on.
+			if ( $this->sa_reconnect_mid_query_check( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return null;
+			}
 			// Aura_Worker_Elementor_Door::has_state() (Ruling P46): how many
 			// door rows are left, excluding the 30-day counter buckets and the
 			// hold-queue lock. Counted over the merged "database" view, the
@@ -2202,10 +2384,30 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					$this->last_error = 'no such function';
 					return null;
 				}
+				$held = ! empty( $GLOBALS['_sa_named_locks'][ $name ] );
+				// Ruling S52 (Codex round-20 P2 on #88): models a lease
+				// that FLIPS on every read this name is armed for — a
+				// test's only lever to prove two SEPARATE reads of the
+				// SAME ref's lease can disagree with EACH OTHER (the race
+				// two separate running_claims()/stale_unleased_claims()
+				// calls used to open), while a SINGLE read inside
+				// partition_stale_claims() never can. Alternates FOREVER
+				// once armed, not just once — a version_bracketed() retry
+				// re-reads from scratch, and the bug this models must
+				// still be there to find on attempt 2 exactly as it was on
+				// attempt 1, or a retry born of the SAME lease churn could
+				// coincidentally "fix" the very race being tested.
+				if ( ! empty( $GLOBALS['_sa_lease_release_after_check'][ $name ] ) ) {
+					if ( $held ) {
+						unset( $GLOBALS['_sa_named_locks'][ $name ] );
+					} else {
+						$GLOBALS['_sa_named_locks'][ $name ] = true;
+					}
+				}
 				// A connection id when held; NULL when free — the same shape,
 				// which is why production consults last_error to tell a free
 				// lock from a broken statement.
-				return empty( $GLOBALS['_sa_named_locks'][ $name ] ) ? null : '77';
+				return $held ? '77' : null;
 			}
 			// The liveness probe Aura_Worker_Health::check_db_connection() issues.
 			// A reachable database answers '1' — a string, which is what the
@@ -2215,6 +2417,59 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			if ( 'SELECT 1' === trim( (string) $query ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return '1';
+			}
+			// Aura_Worker_Door_Log::bump_door_version()'s connection-scoped
+			// read-back (Ruling S2, 2.16.2): the value the LAST statement
+			// issued THROUGH THIS INSTANCE assigned via LAST_INSERT_ID(expr)
+			// — never a re-read of the shared row, which is exactly the race
+			// this replaced. `_sa_wpdb_error` above already covers "the
+			// read-back itself fails"; null here additionally covers the
+			// honest case where nothing has been assigned on this connection
+			// yet.
+			if ( 'SELECT LAST_INSERT_ID()' === trim( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				// Ruling S5 (Codex round-2 P2 on #88): the upsert can commit
+				// and the connection can then drop before THIS statement
+				// runs, and WordPress can transparently reconnect and run it
+				// on a FRESH session — one that never assigned anything, so
+				// `LAST_INSERT_ID()` genuinely answers `0` there. Modelled as
+				// a one-shot global so a test can arm exactly this reconnect
+				// without touching `sa_last_insert_id` itself, which would
+				// instead be modelling "nothing was ever assigned".
+				if ( ! empty( $GLOBALS['_sa_last_insert_id_reconnect'] ) ) {
+					$GLOBALS['_sa_last_insert_id_reconnect'] = false; // fires once
+					return '0';
+				}
+				return null === $this->sa_last_insert_id ? null : (string) $this->sa_last_insert_id;
+			}
+			// Aura_Worker_Door_Log::versioned()'s post-COMMIT session-nonce
+			// read-back (Ruling S16, 2.16.2): a MySQL session (user) variable,
+			// scoped to THIS connection exactly like LAST_INSERT_ID() above —
+			// absent (null) on a fresh session, which is what a reconnect
+			// between the SET and this SELECT models.
+			//
+			// `_sa_reconnect_after_commit` (Ruling S30, 2.16.2) models the
+			// NARROWER, later window: COMMIT itself already landed for
+			// real (the transaction snapshot is NOT unwound, unlike
+			// `_sa_reconnect_before_commit` above, which fires earlier and
+			// discards everything), but the connection then drops and
+			// reconnects before this exact SELECT can run — clearing
+			// session variables same as any reconnect, but leaving every
+			// row COMMIT just made durable (including the S30 witness)
+			// untouched. Fires once.
+			if ( preg_match( '/^SELECT @(\w+)$/', (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				// Gated on sa_commit_landed_this_txn (Ruling S50): this
+				// seam models a reconnect landing AFTER the real COMMIT,
+				// never versioned()'s own EARLIER, pre-commit nonce
+				// re-check (Ruling S50's own belt-and-braces read) — the
+				// two would otherwise be indistinguishable by query text
+				// alone, since both read the exact same session variable.
+				if ( ! empty( $GLOBALS['_sa_reconnect_after_commit'] ) && $this->sa_commit_landed_this_txn ) {
+					$GLOBALS['_sa_reconnect_after_commit'] = false; // fires once
+					$this->sa_session_vars = array();
+				}
+				return $this->sa_session_vars[ $m[1] ] ?? null;
 			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
@@ -2368,6 +2623,38 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
 			}
+			// Ruling S53 (Codex round-21 P1 on #88): see
+			// sa_reconnect_mid_query_check()'s own docblock —
+			// raw_option_read()'s nonce-probed witness read (Ruling S51) is
+			// one of the two get_var()/get_row() reads that seam must be
+			// able to land on.
+			if ( $this->sa_reconnect_mid_query_check( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return null;
+			}
+			// Aura_Worker_Door_Log::engine_is_transactional()'s own probe
+			// (Ruling S13, 2.16.2; queried by EXACT name, never LIKE, as of
+			// Ruling S23, Codex round-9 P2 on #88 — see that method's own
+			// docblock for why LIKE was wrong). A real multi-table model:
+			// $GLOBALS['_sa_table_engines'] maps table name => engine, so a
+			// test can seed a DECOY table (e.g. 'wpXoptions', a single-char
+			// LIKE-wildcard collision with 'wp_options') on a DIFFERENT
+			// engine and prove the exact-match query is never confused by
+			// it — a table not in the map does not exist, matching what a
+			// real WHERE Name = … would answer for one (no row, not an
+			// error).
+			if ( preg_match( "/^SHOW TABLE STATUS WHERE Name = '([^']*)'$/", (string) $query, $m ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				$name                     = stripslashes( $m[1] );
+				$engines                  = (array) ( $GLOBALS['_sa_table_engines'] ?? array() );
+				if ( ! array_key_exists( $name, $engines ) ) {
+					return null; // no such table
+				}
+				return (object) array(
+					'Name'   => $name,
+					'Engine' => (string) $engines[ $name ],
+				);
+			}
 			// The one shape app_password_row_state() issues (#434 N1): the
 			// call's own nonce as a `probe` column, beside that user's
 			// Application Passwords meta row read straight from the
@@ -2461,9 +2748,20 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * can never be the stale answer another test's probe meets.
 		 */
 		public function sa_forget_last_result(): void {
-			$this->sa_last_var     = null;
-			$this->sa_last_row     = null;
-			$this->sa_last_results = array();
+			$this->sa_last_var        = null;
+			$this->sa_last_row        = null;
+			$this->sa_last_results    = array();
+			// LAST_INSERT_ID() is a per-CONNECTION session variable (Ruling
+			// S2): a fresh test is a fresh connection, and one test's bump
+			// must never be readable as another's witness.
+			$this->sa_last_insert_id  = null;
+			// A test that left a transaction open (a bug in the code under
+			// test, or a test that forgot to let versioned() finish) must not
+			// strand the NEXT test believing one is already open (Ruling S8).
+			$this->sa_txn_stack       = array();
+			// Session variables are per-connection too (Ruling S16) — a fresh
+			// test must not inherit another test's nonce.
+			$this->sa_session_vars    = array();
 		}
 
 		/**
@@ -2475,6 +2773,19 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		public function get_col( $query = null, $x = 0 ) {
 			$this->last_query         = (string) $query;
 			$GLOBALS['_db_queries'][] = (string) $query;
+			// Ruling S37 (Codex round-15 class sweep on #88): real
+			// wpdb::get_col() answers its own cleared $last_result — an
+			// empty array, never null or false — for a statement that
+			// failed at the driver, with last_error the only tell. Not
+			// modelled before this ruling because nothing needed to break
+			// a get_col() call on its own; scoped to $_sa_wpdb_error so it
+			// shares the SAME global every other read-failure seam already
+			// uses, rather than adding a get_col()-specific one.
+			if ( ! empty( $GLOBALS['_sa_wpdb_error'] ) ) {
+				$this->last_error = (string) $GLOBALS['_sa_wpdb_error'];
+				return array();
+			}
+			$this->last_error = '';
 			// The unbounded prefix listing uninstall.php issues (#434 Task 10).
 			// Read against $_rows — the "database" — so a row written by raw SQL
 			// (the rule counters) is as visible to the sweep here as it is on a
@@ -2601,11 +2912,298 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * respectively (on both statements — a real driver doesn't care which
 		 * statement it was asked to run when the connection is the problem).
 		 */
+		/**
+		 * Ruling S50 (Codex round-20 P1 on #88), shared by query()/
+		 * get_row()/get_var() (Ruling S53, Codex round-21 P1 on #88 —
+		 * raw_option_read()'s witness fallback reads via get_row(), and
+		 * the post-commit nonce read-back via get_var(), so a test
+		 * simulating a dropped connection mid-statement must be able to
+		 * land on ANY of the three, exactly like real wpdb's
+		 * check_connection() gate, which applies to every statement a
+		 * connection issues regardless of which method sent it): armed
+		 * by a test to land on whichever query it names (or the very
+		 * next one, for `true`). A real dropped connection sends
+		 * wpdb::check_connection() into up to `reconnect_retries`
+		 * reconnect attempts: with retries left it reconnects and
+		 * TRANSPARENTLY REPLAYS this exact statement on the fresh session
+		 * — modelled by clearing session state exactly like every other
+		 * reconnect seam here, then letting the statement run normally
+		 * (a replay on a fresh session still lands the same row). With
+		 * `reconnect_retries` already at 0 — what Ruling S50 itself sets
+		 * for versioned()'s whole unit — check_connection() gives up
+		 * before ever retrying, and the caller must report the honest
+		 * "server has gone away" failure instead. Fires once.
+		 *
+		 * @param string $query The query about to run.
+		 * @return bool True when THIS exact call must fail outright —
+		 *              `last_error` is already set by the time this
+		 *              returns.
+		 */
+		private function sa_reconnect_mid_query_check( $query ) {
+			$armed = $GLOBALS['_sa_reconnect_mid_query'] ?? false;
+			$hit   = true === $armed
+				|| ( is_string( $armed ) && '' !== $armed && false !== strpos( (string) $query, $armed ) );
+			if ( ! $hit ) {
+				return false;
+			}
+			$GLOBALS['_sa_reconnect_mid_query'] = false; // fires once
+			if ( 0 === (int) $this->reconnect_retries ) {
+				$this->last_error = 'MySQL server has gone away';
+				return true;
+			}
+			$this->sa_session_vars = array(); // the fresh, reconnected session
+			return false;
+		}
+
 		public function query( $query ) {
 			$query                    = (string) $query;
 			$this->last_query         = $query;
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
+
+			if ( $this->sa_reconnect_mid_query_check( $query ) ) {
+				return false;
+			}
+
+			// Ruling S91 (Codex round-39 P2 on #88): a `query` filter that
+			// blanks ONE targeted statement — `false` returned, `last_error`
+			// left exactly as flush() just set it (empty) — distinct from
+			// `_sa_wpdb_query_filtered_out` above (which blanks whatever the
+			// NEXT statement happens to be) and from
+			// `_sa_reconnect_before_savepoint` below (which models the
+			// statement's own effect vanishing on a fresh session, not the
+			// statement itself being suppressed). `$GLOBALS['_sa_wpdb_query_blank_matching']`
+			// is matched EXACTLY (trimmed) against $query, never a substring —
+			// `SAVEPOINT aura_door_tx` must not also match `ROLLBACK TO
+			// SAVEPOINT aura_door_tx` or `RELEASE SAVEPOINT aura_door_tx`.
+			// Fires once.
+			$blank_matching = $GLOBALS['_sa_wpdb_query_blank_matching'] ?? '';
+			if ( '' !== $blank_matching && trim( $query ) === $blank_matching ) {
+				$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // fires once
+				return false;
+			}
+
+			// Aura_Worker_Door_Log::versioned() (Ruling S8, 2.16.2): a state
+			// write and its door-version bump run inside ONE transaction, so
+			// the stub models START TRANSACTION/COMMIT/ROLLBACK by
+			// snapshotting the "database" ($_rows/$_options/$_notoptions) on
+			// entry and restoring it on ROLLBACK, discarding the snapshot on
+			// COMMIT. MySQL has no nested transactions — a second
+			// START TRANSACTION while one is already open would silently
+			// COMMIT the first on a real server — so a test (or a production
+			// bug) that nests one here fails LOUD instead of modelling that
+			// silent surprise.
+			if ( 'START TRANSACTION' === trim( $query ) || 'BEGIN' === trim( $query ) ) {
+				if ( ! empty( $this->sa_txn_stack ) ) {
+					throw new RuntimeException( 'wpdb stub: nested START TRANSACTION on the SAME connection — MySQL has none; this is a bug in the code under test, not something to model. A racer standing in for a second connection must swap $GLOBALS[\'wpdb\'] to a fresh SA_Test_Wpdb instead of reusing this one.' );
+				}
+				$this->sa_txn_stack[]            = array(
+					'rows'       => $GLOBALS['_rows'],
+					'options'    => $GLOBALS['_options'],
+					'notoptions' => $GLOBALS['_notoptions'],
+					'savepoint'  => null,
+				);
+				$this->sa_commit_landed_this_txn = false;
+				return true;
+			}
+			// A real transactional SAVEPOINT (Ruling S17, 2.16.2) —
+			// `versioned()`'s proof that a transaction is actually open on
+			// THIS session, issued immediately after START TRANSACTION and
+			// released right before the final COMMIT. Recorded on the
+			// CURRENT (innermost) transaction frame — real MySQL scopes a
+			// savepoint to the transaction it was set in.
+			//
+			// `_sa_reconnect_before_savepoint` models a reconnect landing
+			// anywhere between START TRANSACTION and this statement taking
+			// effect: on a real server, a fresh connection has autocommit
+			// ON, so SAVEPOINT there opens (and instantly closes) its own
+			// implicit one-statement transaction — the savepoint vanishes
+			// the moment that statement completes, and RELEASE SAVEPOINT
+			// later finds nothing. Modelled by simply not recording it on
+			// the frame, so the later RELEASE sees a mismatch. Fires once.
+			if ( preg_match( '/^SAVEPOINT (\w+)$/', $query, $m ) ) {
+				if ( empty( $this->sa_txn_stack ) ) {
+					throw new RuntimeException( 'wpdb stub: SAVEPOINT with no open transaction on this connection' );
+				}
+				if ( ! empty( $GLOBALS['_sa_reconnect_before_savepoint'] ) ) {
+					$GLOBALS['_sa_reconnect_before_savepoint'] = false; // fires once
+					return true; // the statement "succeeds" — on a session that discards it instantly
+				}
+				$top                                                     = count( $this->sa_txn_stack ) - 1;
+				$this->sa_txn_stack[ $top ]['savepoint'] = stripslashes( $m[1] );
+				return true;
+			}
+			// ROLLBACK TO SAVEPOINT (Ruling S21, 2.16.2) — `versioned()`'s
+			// verification, issued right after SAVEPOINT and before any
+			// callback write, that the savepoint just set really is open on
+			// THIS session. Unlike RELEASE SAVEPOINT below, this does NOT
+			// clear the frame's savepoint marker — a real ROLLBACK TO
+			// SAVEPOINT leaves the savepoint itself intact, valid for a
+			// later RELEASE. Same mismatch check, same MySQL error 1305.
+			if ( preg_match( '/^ROLLBACK TO SAVEPOINT (\w+)$/', $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				$top  = empty( $this->sa_txn_stack ) ? null : count( $this->sa_txn_stack ) - 1;
+				if ( null === $top || $this->sa_txn_stack[ $top ]['savepoint'] !== $name ) {
+					$this->last_error = "Error 1305: SAVEPOINT $name does not exist";
+					return false;
+				}
+				return true;
+			}
+			// The release this savepoint exists for: proves the CURRENT
+			// transaction frame still holds the savepoint this connection
+			// set — a reconnect anywhere in between (whether it skipped the
+			// SAVEPOINT above or, per Ruling S16's own gap, let a retried
+			// SET land on a fresh session with a matching nonce) leaves
+			// nothing here to release, and MySQL answers error 1305
+			// ("SAVEPOINT … does not exist").
+			if ( preg_match( '/^RELEASE SAVEPOINT (\w+)$/', $query, $m ) ) {
+				$name = stripslashes( $m[1] );
+				$top  = empty( $this->sa_txn_stack ) ? null : count( $this->sa_txn_stack ) - 1;
+				if ( null === $top || $this->sa_txn_stack[ $top ]['savepoint'] !== $name ) {
+					$this->last_error = "Error 1305: SAVEPOINT $name does not exist";
+					return false;
+				}
+				$this->sa_txn_stack[ $top ]['savepoint'] = null;
+				return true;
+			}
+			// A MySQL session (user) variable assignment (Ruling S16,
+			// 2.16.2) — `versioned()`'s per-unit nonce, set right after the
+			// savepoint so a later reconnect can be told apart from the
+			// session that opened the transaction.
+			//
+			// `_sa_reconnect_during_set` (Ruling S25, 2.16.2) models a
+			// reconnect landing WHILE this exact SET is being issued: on a
+			// real server, `wpdb` can transparently retry the statement on
+			// a fresh session, which still assigns the nonce there (this is
+			// what makes the nonce ALONE insufficient proof) but never held
+			// the savepoint from the OLD session — so the frame's own
+			// savepoint marker is cleared here, and the `ROLLBACK TO
+			// SAVEPOINT` that Ruling S25 moved to run right after this
+			// statement finds the mismatch. Fires once.
+			if ( preg_match( "/^SET @(\w+) = '(.*)'$/s", $query, $m ) ) {
+				if ( ! empty( $GLOBALS['_sa_reconnect_during_set'] ) ) {
+					$GLOBALS['_sa_reconnect_during_set'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						$top                                      = count( $this->sa_txn_stack ) - 1;
+						$this->sa_txn_stack[ $top ]['savepoint'] = null;
+					}
+				}
+				$this->sa_session_vars[ $m[1] ] = stripslashes( $m[2] );
+				return true;
+			}
+			if ( 'COMMIT' === trim( $query ) ) {
+				// Ruling S34 (Codex round-15 P1 on #88): the ACK of a COMMIT
+				// that genuinely landed can be lost on its own — a dropped
+				// connection on the way back, no reconnect involved in
+				// unwinding anything. Modelled as: the transaction commits
+				// for REAL (the witness row and every other write stay,
+				// exactly like an ordinary successful COMMIT), the session
+				// variable is gone (the same connection loss that ate the
+				// ack also drops it, per Ruling S16), but the STATEMENT
+				// itself reports failure — `last_error` set, `query()`
+				// answering false — which is what makes this "ambiguous"
+				// rather than the already-modelled `_sa_reconnect_before_commit`
+				// (a real, total unwind that also happens to return success).
+				if ( ! empty( $GLOBALS['_sa_commit_ambiguous_ack'] ) ) {
+					$GLOBALS['_sa_commit_ambiguous_ack'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						array_pop( $this->sa_txn_stack ); // real commit — nothing unwound
+					}
+					$this->sa_session_vars = array();
+					$this->last_error      = 'server closed the connection unexpectedly';
+					return false;
+				}
+				// The other half: the ack is ALSO lost, but this time
+				// because the COMMIT genuinely did not land — proving the
+				// durable-witness fallback answers false just as readily
+				// when there is really nothing to find, not only when the
+				// caller assumes an error means failure.
+				if ( ! empty( $GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] ) ) {
+					$GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						$snap                   = array_pop( $this->sa_txn_stack );
+						$GLOBALS['_rows']       = $snap['rows'];
+						$GLOBALS['_options']    = $snap['options'];
+						$GLOBALS['_notoptions'] = $snap['notoptions'];
+					}
+					$this->sa_session_vars = array();
+					$this->last_error      = 'server closed the connection unexpectedly';
+					return false;
+				}
+				// Ruling S40 (Codex round-17 P1 on #88): a COMMIT that fails
+				// OUTRIGHT while the connection stays alive — a lock-wait
+				// timeout, a deferred constraint violation — never a
+				// dropped connection at all. The transaction is left OPEN
+				// (nothing popped from the stack), session vars are
+				// UNTOUCHED (so a nonce read-back would still, wrongly,
+				// match), and `last_error` is set. Only versioned()'s own
+				// explicit ROLLBACK closes it; without one, a bare SELECT
+				// on this same live connection would read this session's
+				// own uncommitted witness row back.
+				if ( ! empty( $GLOBALS['_sa_commit_fails_connection_alive'] ) ) {
+					$GLOBALS['_sa_commit_fails_connection_alive'] = false; // fires once
+					$this->last_error                             = 'Lock wait timeout exceeded; try restarting transaction';
+					return false;
+				}
+				// Ruling S35 (Codex round-15 P1 on #88): a POSITIVE INT lets that
+				// many commits through untouched first, then fires on the
+				// one after — the same "fail after N" shape
+				// `_sa_option_write_fail` already uses — so a test can make
+				// ONE specific `versioned()` call inside a longer flow
+				// (Aura_Worker_Door_Holds::release(), deep inside
+				// Aura_Worker_Elementor_Door::replay()) the one that never
+				// commits, while every commit before it lands for real.
+				if ( is_int( $GLOBALS['_sa_reconnect_before_commit'] ?? null ) && $GLOBALS['_sa_reconnect_before_commit'] > 1 ) {
+					--$GLOBALS['_sa_reconnect_before_commit'];
+				} elseif ( ! empty( $GLOBALS['_sa_reconnect_before_commit'] ) ) {
+					// Ruling S16: models a reconnect landing between the version
+					// bump and this COMMIT. WordPress can transparently
+					// reconnect on a dropped connection, and MySQL rolls back
+					// whatever transaction the OLD session had open the instant
+					// it is lost — so the "database" this call's writes landed
+					// in unwinds here, exactly as a real disconnect would do it.
+					// The fresh session this COMMIT actually runs on has no
+					// transaction open at all, so the statement itself is a
+					// harmless no-op that still returns success — trusting that
+					// success without the nonce check is the bug this ruling
+					// closes. Session variables do not survive the reconnect
+					// either, which is what lets the read-back catch it.
+					$GLOBALS['_sa_reconnect_before_commit'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						$snap                   = array_pop( $this->sa_txn_stack );
+						$GLOBALS['_rows']       = $snap['rows'];
+						$GLOBALS['_options']    = $snap['options'];
+						$GLOBALS['_notoptions'] = $snap['notoptions'];
+					}
+					$this->sa_session_vars = array();
+					return true;
+				}
+				if ( empty( $this->sa_txn_stack ) ) {
+					throw new RuntimeException( 'wpdb stub: COMMIT with no open transaction on this connection' );
+				}
+				array_pop( $this->sa_txn_stack );
+				$this->sa_commit_landed_this_txn = true;
+				return true;
+			}
+			if ( 'ROLLBACK' === trim( $query ) ) {
+				// Ruling S40 (Codex round-17 P1 on #88): versioned()'s
+				// explicit best-effort ROLLBACK after an ambiguous COMMIT
+				// may land on a session whose COMMIT already genuinely
+				// popped this stack — real MySQL answers a ROLLBACK with no
+				// open transaction as a harmless no-op, never an error, and
+				// the stub must model that now that production code has a
+				// legitimate reason to issue exactly this. Before this
+				// ruling nothing did, so an empty stack here was reliably a
+				// bug; it no longer is.
+				if ( empty( $this->sa_txn_stack ) ) {
+					return true;
+				}
+				$snap                       = array_pop( $this->sa_txn_stack );
+				$GLOBALS['_rows']           = $snap['rows'];
+				$GLOBALS['_options']        = $snap['options'];
+				$GLOBALS['_notoptions']     = $snap['notoptions'];
+				return true;
+			}
 
 			if ( preg_match( "/^DELETE o FROM \S+ o JOIN \S+ c ON c\.option_name = '([^']+)' AND c\.option_value LIKE '([^']*)' WHERE o\.option_name = '([^']+)'(?: AND o\.option_value = '(.*)')?$/s", $query, $m ) ) {
 				// The optional trailing `AND o.option_value = …` is the log
@@ -3028,6 +3626,44 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return 1;
 			}
 
+			// Aura_Worker_Door_Log::versioned()'s bounded janitor (Ruling
+			// S32, 2.16.2): sweeps up commit-witness rows a DIED process
+			// left behind — its own COMMIT landed, but the process never
+			// reached its own self-cleanup delete above. Bounded on age
+			// (CAST(option_value AS UNSIGNED), the row's stored unix
+			// timestamp) and on row count, so this never becomes a
+			// full-table scan on every single door mutation.
+			if ( preg_match( "/^DELETE FROM \S+ WHERE option_name LIKE '([^']+)' AND CAST\(option_value AS UNSIGNED\) < (\d+) LIMIT (\d+)$/", $query, $m ) ) {
+				// $m[1] is esc_like()'s escaping THEN prepare()'s addslashes,
+				// stacked — the exact same double-escaping the expired-notice
+				// claim sweep's LIKE handler above already has to undo.
+				// stripslashes() undoes prepare()'s layer; sa_like_to_regex()
+				// then reads esc_like()'s own backslash-escapes so a LITERAL
+				// underscore in the prefix (this option name is full of them)
+				// is never mistaken for LIKE's "any single character"
+				// wildcard.
+				$re     = sa_like_to_regex( stripslashes( $m[1] ) );
+				$before = (int) $m[2];
+				$limit  = (int) $m[3];
+				$n      = 0;
+				foreach ( array_keys( $GLOBALS['_options'] ) as $name ) {
+					if ( $n >= $limit ) {
+						break;
+					}
+					if ( ! preg_match( $re, $name ) ) {
+						continue;
+					}
+					if ( (int) $GLOBALS['_rows'][ $name ] >= $before ) {
+						continue;
+					}
+					unset( $GLOBALS['_options'][ $name ], $GLOBALS['_rows'][ $name ], $GLOBALS['_rows_autoload'][ $name ] );
+					$GLOBALS['_notoptions'][ $name ] = true;
+					$GLOBALS['_option_writes'][]     = array( 'delete', $name );
+					++$n;
+				}
+				return $n;
+			}
+
 			// Emulate the counters' atomic create-or-increment: one statement,
 			// no read, so a first bump inserts '1' and every later bump in the
 			// same hour adds one to whatever is there — never the two-step
@@ -3042,6 +3678,116 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$name = stripslashes( $m[1] );
 				$GLOBALS['_rows'][ $name ]    = isset( $GLOBALS['_rows'][ $name ] ) ? (string) ( (int) $GLOBALS['_rows'][ $name ] + 1 ) : '1';
 				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
+				return 1;
+			}
+			// Aura_Worker_Door_Log::versioned()'s DURABLE commit witness
+			// (Ruling S32, 2.16.2 — supersedes S30's shared-row upsert): a
+			// PLAIN insert, no ON DUPLICATE KEY UPDATE, into a row named BY
+			// this unit's own nonce ('aura_worker_door_tx_<nonce>') so two
+			// concurrent units can never collide on the same key — written
+			// INSIDE the transaction, BEFORE the version bump. A real MySQL
+			// UNIQUE index on option_name would refuse a genuine second
+			// INSERT of the same name; modelled the same way the ruleset's
+			// own plain insert does elsewhere in this stub.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', '([^']*)', 'no'\)$/", $query, $m ) ) {
+				$name  = stripslashes( $m[1] );
+				$value = stripslashes( $m[2] );
+				if ( null !== sa_read_option_uncached( $name ) ) {
+					$this->last_error = "Duplicate entry '{$name}' for key 'option_name'";
+					return false;
+				}
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = $value;
+				return 1;
+			}
+			// Aura_Worker_Door_Log::bump_door_version()'s upsert (Rulings S2,
+			// S4 and S6, 2.16.2): the SAME atomic create-or-increment as
+			// above, but CLOCK-FLOORED — GREATEST( current + 1, the caller's
+			// own wall-clock microseconds, captured twice as %s (a DECIMAL
+			// STRING, never assembled as one PHP int — Ruling S7) because it
+			// is bound into both the VALUES and the UPDATE clause of the
+			// SAME statement — so a `wp_options` restore that rolls the
+			// stored value back can never make this counter reissue a value
+			// it already served. The value this statement assigns is ALSO
+			// captured into MySQL's session-level LAST_INSERT_ID() via the
+			// LAST_INSERT_ID(expr) trick — connection-scoped, so a caller's
+			// own immediately following `SELECT LAST_INSERT_ID()` answers
+			// what THIS statement assigned, never a re-read of a row another
+			// connection may have moved on again in between (Ruling S2).
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', LAST_INSERT_ID\(GREATEST\(1, '(\d+)'\)\), 'no'\) ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID\(GREATEST\(CAST\(option_value AS UNSIGNED\) \+ 1, '(\d+)'\)\)$/", $query, $m ) ) {
+				$name  = stripslashes( $m[1] );
+				$clock = (int) $m[2]; // the same decimal string the statement bound into both %s slots — this stub always runs on a 64-bit test host
+				// The statement itself failing — a driver error, not a race —
+				// scoped by option name like every other CAS write path here.
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( null ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						$this->last_error = 'write failed';
+						return false;
+					}
+				}
+				// GREATEST(1, clock) for a fresh row and GREATEST(current+1,
+				// clock) for an existing one are the SAME formula once a
+				// fresh row's "current" is taken as 0 — unified here exactly
+				// as production's single SQL expression covers both cases.
+				$current                       = isset( $GLOBALS['_rows'][ $name ] ) ? (int) $GLOBALS['_rows'][ $name ] : 0;
+				$next                          = max( $current + 1, $clock );
+				$GLOBALS['_rows'][ $name ]     = (string) $next;
+				$GLOBALS['_options'][ $name ]  = (string) $next;
+				// Set on THIS instance only — never on a value a racer wrote
+				// directly to $_rows/$_options, which must leave this
+				// connection's own session variable untouched (Ruling S2).
+				$this->sa_last_insert_id = $next;
+				// The window between THIS statement and this SAME caller's
+				// own following `SELECT LAST_INSERT_ID()` — the exact window
+				// Ruling S2 exists to close. A test fires an interleaved
+				// bump here, typically on a SECOND SA_Test_Wpdb instance (a
+				// second connection), to prove this instance's own
+				// LAST_INSERT_ID() is immune to it. Fires once.
+				if ( isset( $GLOBALS['_sa_after_door_version_bump'] ) && is_callable( $GLOBALS['_sa_after_door_version_bump'] ) ) {
+					$racer = $GLOBALS['_sa_after_door_version_bump'];
+					unset( $GLOBALS['_sa_after_door_version_bump'] );
+					$racer();
+				}
+				return 1;
+			}
+			// Aura_Worker_Door_Log::restamp_observation_forward()'s own
+			// upsert (Ruling S82/S83, 2.16.2): the SAME create-or-increment
+			// shape as bump_door_version()'s own statement just above, but
+			// with ONE more clock-floor term — the caller's own capped
+			// `$seen + 1` (a plain %d — Ruling S83 already proved this
+			// value can never approach PHP_INT_MAX, so it is safe as a
+			// genuine PHP int, unlike the %s-bound clock string above,
+			// which Ruling S7 still requires stay text). No
+			// LAST_INSERT_ID() wrapping here — this method's own caller
+			// never reads a per-connection witness back (its own docblock:
+			// every outcome is treated identically), so the simpler
+			// three-way GREATEST alone is what production actually issues.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', GREATEST\(1, (\d+), '(\d+)'\), 'no'\) ON DUPLICATE KEY UPDATE option_value = GREATEST\(CAST\(option_value AS UNSIGNED\) \+ 1, (\d+), '(\d+)'\)$/", $query, $m ) ) {
+				$name      = stripslashes( $m[1] );
+				$seen_plus = (int) $m[2]; // == $m[4] -- the SAME capped $seen + 1 bound into both clauses
+				$clock     = (int) $m[3]; // == $m[5] -- the SAME clock string bound into both clauses
+				if ( ! empty( $GLOBALS['_sa_option_write_fail'][ $name ] ) ) {
+					$fail = $GLOBALS['_sa_option_write_fail'][ $name ];
+					if ( is_callable( $fail ) && ! $fail( null ) ) {
+						// allowed through
+					} else {
+						if ( is_int( $fail ) ) {
+							--$GLOBALS['_sa_option_write_fail'][ $name ];
+						}
+						$this->last_error = 'write failed';
+						return false;
+					}
+				}
+				$current                      = isset( $GLOBALS['_rows'][ $name ] ) ? (int) $GLOBALS['_rows'][ $name ] : 0;
+				$next                         = max( $current + 1, $seen_plus, $clock );
+				$GLOBALS['_rows'][ $name ]    = (string) $next;
+				$GLOBALS['_options'][ $name ] = (string) $next;
 				return 1;
 			}
 			// The conditional DELETE a magic-link claim release issues: the row
@@ -3077,6 +3823,48 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		}
 	}
 
+	/**
+	 * Ruling S56 (Codex round-22 P1 on #88): a `db.php` drop-in that
+	 * REPLACES wpdb outright (never a subclass, which would inherit the
+	 * declaration) and simply never declares `reconnect_retries` at all
+	 * — the one case `Aura_Worker_Door_Log::reconnect_guard_available()`
+	 * must answer false for. A plain subclass of SA_Test_Wpdb cannot
+	 * model this (PHP inherits declared properties unconditionally,
+	 * and property_exists() answers true for a declared property even
+	 * after unset() on the instance — verified: this is not a case a
+	 * runtime unset() can fake). This class instead declares NOTHING of
+	 * its own and proxies every method call and every property read/
+	 * write to a real, fully-functional SA_Test_Wpdb instance via magic
+	 * methods, so it still speaks the whole protocol
+	 * Aura_Worker_Door_Log::versioned() needs — property_exists() on
+	 * THIS object for 'reconnect_retries' genuinely answers false,
+	 * because this class's own declaration has none.
+	 */
+	class SA_Test_Wpdb_No_Reconnect_Guard {
+		/** @var SA_Test_Wpdb */
+		private $inner;
+
+		public function __construct( SA_Test_Wpdb $inner ) {
+			$this->inner = $inner;
+		}
+
+		public function __call( $name, $args ) {
+			return $this->inner->$name( ...$args );
+		}
+
+		public function __get( $name ) {
+			return $this->inner->$name;
+		}
+
+		public function __set( $name, $value ) {
+			$this->inner->$name = $value;
+		}
+
+		public function __isset( $name ) {
+			return isset( $this->inner->$name );
+		}
+	}
+
 	$GLOBALS['_db_rows']          = array();
 	$GLOBALS['_db_results_queue'] = array();
 	$GLOBALS['_db_var']           = 0;
@@ -3095,8 +3883,10 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_cas_always_lose']   = false;
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
+	$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false; // Ruling S11's opt-in — see wp_cache_delete()'s own comment.
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
+	$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // Ruling S91: a `query` filter blanking ONE targeted statement by substring match.
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
 	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
@@ -3105,16 +3895,32 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
+	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_mid_query']      = false; // versioned()'s $writes() callback issues a statement while the connection drops (Ruling S50).
+	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
+	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_fails_connection_alive']       = false; // versioned()'s COMMIT fails outright, connection alive, transaction left open (Ruling S40).
+	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
+	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_lease_release_after_check'] = array(); // a lease that FLIPS on every read, forever, once armed for a name (Ruling S52).
+	$GLOBALS['_sa_delete_option_fail']            = array(); // delete_option() leaves a named row standing and answers false (Ruling S60).
+	$GLOBALS['_sa_delete_option_fail_with_error'] = array(); // ...and additionally sets last_error (Ruling S60).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
+	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
+	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
+	$GLOBALS['_sa_after_computed_state_steady'] = null; // Fires once right after sync_computed_state()'s own steady-state verdict (Ruling S28).
+	$GLOBALS['_sa_after_rows_read'] = array(); // Keyed by PREFIX: runs immediately after that rows-by-prefix read completes, once (Ruling S20).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
@@ -4359,8 +5165,10 @@ function sa_reset_state(): void {
 	$GLOBALS['_cas_always_lose']   = false;
 	$GLOBALS['_db_query_error']    = false;
 	$GLOBALS['_sa_option_cache']      = array(); // This request's option cache — see get_option().
+	$GLOBALS['_sa_option_cache_honors_wp_cache_delete'] = false; // Ruling S11's opt-in — see wp_cache_delete()'s own comment.
 	$GLOBALS['_sa_wpdb_error']        = '';      // A driver-level failure on the next $wpdb read.
 	$GLOBALS['_sa_wpdb_query_filtered_out'] = false; // A `query` filter blanks the SQL: wpdb::query() returns before flush() (#434 M12).
+	$GLOBALS['_sa_wpdb_query_blank_matching'] = ''; // Ruling S91: a `query` filter blanking ONE targeted statement by substring match.
 	$GLOBALS['_sa_wpdb_prepare_null']       = false; // wpdb::prepare() refuses the call and answers null (#434 N3).
 	$GLOBALS['_sa_wpdb_results_error']      = ''; // A get_results() driver-level failure: last_error set, empty array returned (Codex round-2 P2).
 	$GLOBALS['_sa_option_read_fail']  = array(); // Option names whose UNCACHED read fails at the driver.
@@ -4369,16 +5177,32 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_option_delete_fail'] = array(); // Option names the claim-conditional DELETE must fail on.
 	$GLOBALS['_sa_door_top_error']       = false;  // the log's MAX(seq) read fails (Ruling P77).
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
+	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
+	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_mid_query']      = false; // versioned()'s $writes() callback issues a statement while the connection drops (Ruling S50).
+	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
+	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_fails_connection_alive']       = false; // versioned()'s COMMIT fails outright, connection alive, transaction left open (Ruling S40).
+	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
+	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
 	$GLOBALS['_sa_named_lock_error']     = false;   // GET_LOCK/IS_USED_LOCK fail, as on a server without them (Ruling P52).
+	$GLOBALS['_sa_lease_release_after_check'] = array(); // a lease that FLIPS on every read, forever, once armed for a name (Ruling S52).
+	$GLOBALS['_sa_delete_option_fail']            = array(); // delete_option() leaves a named row standing and answers false (Ruling S60).
+	$GLOBALS['_sa_delete_option_fail_with_error'] = array(); // ...and additionally sets last_error (Ruling S60).
 	$GLOBALS['_sa_named_lock_fail']      = false;   // GET_LOCK fails TRANSIENTLY — an engine that has locks (Ruling P70).
 	$GLOBALS['_sa_rows_read_error']      = array(); // Option-name PREFIXES whose bulk read fails at the driver (Ruling P49').
+	$GLOBALS['_sa_stale_pending_read_error'] = false; // stale_pending()'s own scan fails at the driver (Ruling S37/S38).
 	$GLOBALS['_sa_option_cas_fail']   = array(); // Option names whose byte-exact compare-and-swap fails at the driver (2.16.0).
 	$GLOBALS['_sa_insert_unique_fail'] = false; // insert_unique()'s row-insert failure seam — every name except the door hold-queue lock.
 	$GLOBALS['_option_writes']        = array(); // Witnessed update_option()/delete_option() calls.
 	$GLOBALS['_sa_before_swap']       = null;    // Runs between a read and its compare-and-swap.
 	$GLOBALS['_sa_before_fenced_delete'] = array(); // Keyed by OPTION NAME: runs between a caller's raw read and the DELETE fenced on those bytes (the hold-queue lock, the door's creation mutex) — scoped by name, unlike _sa_before_swap.
 	$GLOBALS['_sa_after_insert_unique'] = array(); // Keyed by OPTION NAME: runs immediately after that insert_unique() row lands, once — the window open_pending()'s post-insert floor re-check protects (Ruling P37).
+	$GLOBALS['_sa_after_wp_cache_delete'] = array(); // Keyed by OPTION NAME: runs immediately after that wp_cache_delete() call, once (Ruling S18).
+	$GLOBALS['_sa_after_computed_state_steady'] = null; // Fires once right after sync_computed_state()'s own steady-state verdict (Ruling S28).
+	$GLOBALS['_sa_after_rows_read'] = array(); // Keyed by PREFIX: runs immediately after that rows-by-prefix read completes, once (Ruling S20).
 	$GLOBALS['_sa_force_door']        = false;   // Aura_Worker_Elementor_Door::active()'s override (2.16.0): stands in for Elementor's MCP module class, which this suite cannot define. A test that wants the module present sets it.
 	// Aura_Worker_Elementor_Door::kit_id()'s override (2.16.0): Elementor's
 	// kits_manager cannot be instantiated here, so a test that needs an active
@@ -4455,6 +5279,16 @@ function sa_reset_state(): void {
 		Aura_Worker_Rules::$rest_request_override = null;
 		Aura_Worker_Rules::$cookie_auth_override  = null;
 	}
+	if ( class_exists( 'Aura_Worker_Door_Log' ) ) {
+		// Ruling S7's test seam: a test that fakes a 32-bit build and forgets
+		// to clear it would otherwise poison every later test's door version
+		// with a permanent `null` witness.
+		Aura_Worker_Door_Log::set_int_size_for_tests( null );
+		// Ruling S13's test seam: same reasoning, for the cached
+		// transactional-engine answer.
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+	}
+	$GLOBALS['_sa_table_engines'] = array( $GLOBALS['wpdb']->options => 'InnoDB' ); // engine_is_transactional()'s SHOW TABLE STATUS WHERE Name = ... answer (Rulings S13/S23) - a test adds more table names to model a decoy.
 	// Update-tool fixtures: a test that seeds these and forgets to clear them
 	// would otherwise leak into every later test's get_plugins()/
 	// get_core_updates()/wp_get_theme() stub, in place of the intended
