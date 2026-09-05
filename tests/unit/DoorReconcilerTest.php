@@ -255,6 +255,31 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array(), $frag['running'] );
 	}
 
+	/**
+	 * Ruling S44 (Codex round-18 P2 on #88): partition_stale_claims() cast
+	 * a failed claimed-queue read to `(array) null` — the SAME empty set a
+	 * genuinely quiet queue answers — so neither stale_unleased_claims()
+	 * nor running_claims() ever saw the difference, and BOTH of
+	 * status_fragment()'s bracketing version reads agreed on a version
+	 * that CERTIFIED an empty `interrupted`/`running`, over a queue that
+	 * actually holds a stale, unleased claim.
+	 */
+	public function test_a_failing_claimed_queue_read_withholds_observation_and_never_certifies_empty_arrays(): void {
+		$ref = $this->hold();
+		$this->claim( $ref ); // backdated past CLAIM_STALE_MS — genuinely interrupted-eligible
+		$this->assertSame( array( $ref ), array_column( $this->fragment()['interrupted'], 'ref' ), 'the fixture assumption this test is built on' );
+
+		$key = $GLOBALS['wpdb']->esc_like( Aura_Worker_Door_Holds::CLAIMED );
+		$GLOBALS['_sa_rows_read_error'][ $key ] = true;
+
+		$frag = $this->fragment();
+
+		$GLOBALS['_sa_rows_read_error'] = array();
+		$this->assertNull( $frag['observation'], 'an unreadable claimed queue must not be paired with a confident observation' );
+		$this->assertNull( $frag['interrupted'], 'never a certified-empty array over a queue this call could not read' );
+		$this->assertNull( $frag['running'], 'the SAME uncertainty applies to both — one failed read feeds both lists' );
+	}
+
 	public function test_a_claim_younger_than_the_stale_bound_is_left_alone(): void {
 		$ref = $this->hold();
 		$this->claim( $ref, array(), true );

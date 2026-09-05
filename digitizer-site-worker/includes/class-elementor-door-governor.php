@@ -412,7 +412,7 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { active, epoch, binding, observation, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full }
+	 * @return array|null { active, epoch, binding, observation, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::present() ) {
@@ -437,6 +437,10 @@ class Aura_Worker_Elementor_Door {
 				// out of a previous attempt this same call already
 				// handled.
 				Aura_Worker_Door_Log::reset_floor_unreadable_for_attempt();
+				// Ruling S44 (Codex round-18 P2 on #88): same placement,
+				// same reasoning — a claimed-queue read failure belongs
+				// to the attempt that hit it.
+				Aura_Worker_Door_Holds::reset_claimed_queue_unreadable_for_attempt();
 				// Ruling S33 (Codex round-15 P1 on #88): the bracket opens
 				// BEFORE detect_rewind() ever runs — see
 				// version_bracketed()'s own docblock for the before/after
@@ -523,7 +527,13 @@ class Aura_Worker_Elementor_Door {
 					|| Aura_Worker_Door_Log::log_walk_was_unreadable()
 					|| Aura_Worker_Door_Log::floor_was_unreadable_this_attempt()
 					|| Aura_Worker_Door_Log::full_report_raw_was_unreadable()
-					|| (bool) $rewind_info['top_unreadable'];
+					|| (bool) $rewind_info['top_unreadable']
+					// Ruling S44 (Codex round-18 P2 on #88): the claimed
+					// queue feeds this attempt's own `interrupted`/`running`
+					// fields (build_status_fragment_state(), just above),
+					// already nulled out there when this is true — this is
+					// what makes `observation` follow them.
+					|| Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt();
 			}
 		);
 	}
@@ -1049,7 +1059,7 @@ class Aura_Worker_Elementor_Door {
 	 *                                 (the only case: the caller's sync
 	 *                                 could not be trusted at all, Rulings
 	 *                                 S24/S26).
-	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
+	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
 	 */
 	private static function build_status_fragment_state( array $rewind_info, $computed = null ) {
 		$after          = (int) $rewind_info['after'];
@@ -1098,6 +1108,21 @@ class Aura_Worker_Elementor_Door {
 				'ref'        => (string) $ref,
 				'claimed_at' => (string) ( isset( $claim['claimed_at'] ) ? $claim['claimed_at'] : '' ),
 			);
+		}
+		if ( Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt() ) {
+			// Ruling S44 (Codex round-18 P2 on #88): a transient failure on
+			// the claimed-queue read used to be cast to an empty array by
+			// partition_stale_claims() and never reach either loop above —
+			// both this bracket's before/after version reads then agreed
+			// on a version that CERTIFIED an empty `interrupted`/`running`,
+			// exactly like a queue with genuinely nothing stale in it.
+			// Neither is a certified fact this attempt can vouch for: null
+			// on the wire, never `[]`, and the caller (checked immediately
+			// after this method returns, the same placement as every other
+			// unreadable signal here) withholds `observation` for this
+			// poll too.
+			$interrupted = null;
+			$running     = null;
 		}
 		return array(
 			// Is Elementor STILL here? A fragment with `active: false` is a

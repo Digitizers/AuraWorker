@@ -33,6 +33,17 @@ class Aura_Worker_Door_Holds {
 	 */
 	private static $option_read_unreadable = false;
 
+	/**
+	 * @var bool Set by partition_stale_claims() (Ruling S44, Codex
+	 * round-18 P2 on #88): did the MOST RECENT call fail to prove its
+	 * read of the claimed queue, rather than finding it genuinely empty?
+	 * Sticky across every partition_stale_claims() call THIS ATTEMPT
+	 * (stale_unleased_claims() and running_claims() each call it once) —
+	 * reset once, at the top of the attempt, by
+	 * reset_claimed_queue_unreadable_for_attempt().
+	 */
+	private static $claimed_queue_unreadable_this_attempt = false;
+
 	const HELD    = 'aura_worker_door_held_';
 	const CLAIMED = 'aura_worker_door_claimed_';
 	const TTL_S   = 604800;
@@ -1115,7 +1126,17 @@ class Aura_Worker_Door_Holds {
 		$cut  = time() - (int) floor( (int) $ms / 1000 );
 		$cap  = time() - self::LEASE_HARD_CAP_S;
 		$out  = array( 'stale' => array(), 'running' => array() );
-		foreach ( (array) self::rows( self::CLAIMED ) as $ref => $row ) { // null ⇒ nothing stale (Ruling P57)
+		$rows = self::rows( self::CLAIMED );
+		if ( null === $rows ) {
+			// Ruling S44 (Codex round-18 P2 on #88): a transient failure
+			// here used to cast to `(array) null` — the SAME empty set a
+			// genuinely quiet claimed queue answers — and neither
+			// stale_unleased_claims() nor running_claims() (both callers
+			// of this method) ever saw the difference. Sticky for the
+			// rest of this attempt: see the property's own docblock.
+			self::$claimed_queue_unreadable_this_attempt = true;
+		}
+		foreach ( (array) $rows as $ref => $row ) { // null ⇒ nothing stale (Ruling P57) — see also claimed_queue_was_unreadable_this_attempt()
 			if ( ! ( strtotime( (string) ( isset( $row['claimed_at'] ) ? $row['claimed_at'] : '' ) ) <= $cut ) ) {
 				continue; // young: not stale, and not "running" either — just in progress
 			}
@@ -1123,6 +1144,29 @@ class Aura_Worker_Door_Holds {
 			$out[ $side ][ $ref ] = $row;
 		}
 		return $out;
+	}
+
+	/**
+	 * Whether ANY `partition_stale_claims()` call this attempt (via
+	 * `stale_unleased_claims()`/`running_claims()`) failed to prove its
+	 * read of the claimed queue (Ruling S44, Codex round-18 P2 on #88).
+	 * Checked by the caller once, immediately after both have run.
+	 *
+	 * @return bool
+	 */
+	public static function claimed_queue_was_unreadable_this_attempt() {
+		return self::$claimed_queue_unreadable_this_attempt;
+	}
+
+	/**
+	 * Reset at the top of EVERY `status_fragment()` attempt — both the
+	 * first and any retry — mirroring
+	 * `Aura_Worker_Door_Log::reset_floor_unreadable_for_attempt()` (Ruling
+	 * S38): a failure from a PREVIOUS attempt or a previous request must
+	 * never leak into this one.
+	 */
+	public static function reset_claimed_queue_unreadable_for_attempt() {
+		self::$claimed_queue_unreadable_this_attempt = false;
 	}
 
 	/**
