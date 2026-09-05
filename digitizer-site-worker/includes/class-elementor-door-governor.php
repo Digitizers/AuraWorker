@@ -511,7 +511,20 @@ class Aura_Worker_Elementor_Door {
 				// before sync_computed_state() needs their identities and
 				// before build_status_fragment_state() reports them.
 				$interrupted_now = $claim_partition['stale'];
-				$held_identity   = Aura_Worker_Door_Holds::held_identity();
+				// Ruling S69 (Codex round-26 P2 on #88, the S52 pattern):
+				// the SAME shape ONE MORE TIME — held_identity() and the
+				// served `held` listing build_status_fragment_state()
+				// reports below used to be two INDEPENDENT calls, each its
+				// own time() — a hold crossing its own expires_at between
+				// them changed the served listing while the identity fold
+				// still answered from before the crossing (or the reverse),
+				// with nothing about that torn pair visible to
+				// version_bracketed()'s own before/after check (expiry
+				// bumps no version). ONE held_snapshot() call, here, feeds
+				// BOTH: the identity fold immediately below, and the
+				// listing threaded into build_status_fragment_state().
+				$held_snapshot = Aura_Worker_Door_Holds::held_snapshot();
+				$held_identity = $held_snapshot['identity'];
 				// Ruling S58 (Codex round-22 P2 on #88): explicit —
 				// previously this failure only reached the verdict
 				// INDIRECTLY, through sync_computed_state()'s own
@@ -590,7 +603,7 @@ class Aura_Worker_Elementor_Door {
 				if ( Aura_Worker_Door_Log::raw_option_was_unreadable() ) {
 					self::mark_unreadable( 'binding' );
 				}
-				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now, $binding );
+				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now, $binding, $held_snapshot );
 			}
 		);
 	}	/**
@@ -1360,9 +1373,24 @@ class Aura_Worker_Elementor_Door {
 	 * held queue. One raw floor read now backs both fields, so they can
 	 * never disagree about which floor they were computed against.
 	 *
+	 * @param array $held_snapshot `Aura_Worker_Door_Holds::held_snapshot()`'s
+	 *                              own return, taken ONCE by the caller
+	 *                              (Ruling S69, Codex round-26 P2 on #88,
+	 *                              the S52 pattern) — before this method
+	 *                              AND before `sync_computed_state()`'s own
+	 *                              identity fold, which reads
+	 *                              `$held_snapshot['identity']` straight
+	 *                              from the SAME snapshot this method's
+	 *                              own `held` field reads
+	 *                              `$held_snapshot['listing']` from. Never
+	 *                              a second, independent `listing()` call
+	 *                              in here — a hold crossing `expires_at`
+	 *                              between two separate calls used to
+	 *                              leave the identity and the served
+	 *                              listing disagreeing about the SAME row.
 	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
 	 */
-	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array(), array $interrupted_now = array(), $binding = '' ) {
+	private static function build_status_fragment_state( array $rewind_info, $computed = null, array $running_now = array(), array $interrupted_now = array(), $binding = '', array $held_snapshot = array( 'identity' => null, 'listing' => array() ) ) {
 		$after          = (int) $rewind_info['after'];
 		$site           = (string) $rewind_info['site'];
 		$rewind         = $rewind_info['rewind'];
@@ -1445,8 +1473,18 @@ class Aura_Worker_Elementor_Door {
 		// and its own check are the SAME two adjacent statements — never
 		// a check made from a separate closure, once removed from the
 		// read it describes.
-		$held         = Aura_Worker_Door_Holds::listing();
-		$held_unreadable = Aura_Worker_Door_Holds::queue_unreadable();
+		//
+		// Ruling S69 (Codex round-26 P2 on #88): both read from the
+		// CALLER's own $held_snapshot — never a second, independent
+		// listing()/queue_unreadable() call in here, which used to be
+		// free to disagree with the identity fold sync_computed_state()
+		// already ran against the SAME snapshot's 'identity' half.
+		// 'identity' is null under EXACTLY the condition
+		// queue_unreadable() itself checks (held_rows() being null), so
+		// deriving $held_unreadable from it is the same fact, not a new
+		// one.
+		$held            = $held_snapshot['listing'];
+		$held_unreadable = ( null === $held_snapshot['identity'] );
 		if ( $held_unreadable ) {
 			self::mark_unreadable( 'held' );
 		}
@@ -4555,7 +4593,16 @@ class Aura_Worker_Elementor_Door {
 				// held_count and queue_full are the same fact, so both
 				// say "unknown" together rather than one of them
 				// inventing a zero.
-				$held = Aura_Worker_Door_Holds::count(); // read once
+				//
+				// Ruling S69 (Codex round-26 P2 on #88, the S52 pattern):
+				// ONE held_snapshot() here, fed straight into
+				// count_from_identity() — never count()'s own standalone
+				// call, which would take a SECOND, independent snapshot at
+				// a SECOND time() a hold could cross expires_at against
+				// between the two, this audit's `held_count` disagreeing
+				// with whatever a status_fragment() poll in the same
+				// request already reported for the identical row.
+				$held = Aura_Worker_Door_Holds::count_from_identity( Aura_Worker_Door_Holds::held_snapshot()['identity'] ); // read once
 				// Ruling S58 (Codex round-22 P2 on #88): registered —
 				// count() itself already answers null for EITHER of its
 				// own two internal reads (the claimed queue's rows(), the

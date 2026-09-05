@@ -458,6 +458,58 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S69 (Codex round-26 P2 on #88, the S52 pattern): `held_identity()`
+	 * and the served `listing()` call used to be two SEPARATE reads, each
+	 * its OWN `time()` — a hold crossing `expires_at` in the window
+	 * between them left the served `held` array excluding a row the
+	 * identity fold (and therefore `sync_computed_state()`'s own persisted
+	 * comparison) still counted as present. Nothing about that
+	 * disagreement looks torn to `version_bracketed()` — expiry bumps no
+	 * version on its own, which is the whole reason the identity fold
+	 * exists (Ruling S46) — so the fragment served a `held` listing one
+	 * row short of what its own (unbumped) `observation` implicitly
+	 * vouched for.
+	 *
+	 * `Aura_Worker_Door_Holds::held_snapshot()` closes the window: ONE
+	 * `$now`, captured before ANY row's expiry is evaluated, feeds both
+	 * the identity fold and the served listing from the SAME loop. The
+	 * seam below fires the FIRST time an expiry check runs this attempt
+	 * and sleeps a full real second — landing exactly where the OLD
+	 * design's gap between "read for the identity" and "read for the
+	 * listing" used to be. Because `$now` is captured before that delay,
+	 * the delay changes nothing: the hold has not expired from either the
+	 * identity fold's or the served listing's point of view, because both
+	 * are the SAME point of view.
+	 */
+	public function test_a_hold_expiring_during_the_attempt_is_reported_consistently(): void {
+		$ref = $this->hold();
+		$this->patchOption( Aura_Worker_Door_Holds::HELD . $ref, array( 'expires_at' => gmdate( 'c', time() + 1 ) ) );
+
+		// Baseline, comfortably before expiry: held, persisted.
+		$this->assertSame( array( $ref ), array_column( $this->fragment()['held'], 'ref' ), 'the fixture assumption this test is built on' );
+		$v1 = Aura_Worker_Elementor_Door::governor_block()['observation'];
+		$this->assertIsInt( $v1 );
+
+		$GLOBALS['_sa_after_is_expired_check'] = static function () {
+			unset( $GLOBALS['_sa_after_is_expired_check'] ); // fires once
+			usleep( 1100000 ); // a real second — past the hold's own expires_at
+		};
+		$fragment = $this->fragment();
+		unset( $GLOBALS['_sa_after_is_expired_check'] ); // in case the attempt never reached it
+
+		$this->assertSame(
+			array( $ref ),
+			array_column( $fragment['held'], 'ref' ),
+			'the served listing is read from the SAME $now the identity fold already used — never a later one taken after the delay'
+		);
+		$this->assertSame(
+			$v1,
+			$fragment['observation'],
+			'nothing crossed from this attempt\'s own single, consistent point of view — no premature bump'
+		);
+	}
+
+	/**
 	 * Ruling S67 (Codex round-25 P2 on #88): `count_unacked()` used to
 	 * filter its own COUNT against `self::floor()` — `get_option()`'s
 	 * cached read — rather than the proven `floor_raw()` a version bracket

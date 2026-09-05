@@ -287,6 +287,18 @@ class Aura_Worker_Door_Holds {
 	 * @return bool
 	 */
 	private static function is_expired( array $row, $now ) {
+		// Test seam only: fires immediately before this evaluation runs —
+		// models a real delay landing between what USED to be two separate
+		// callers each taking their own time() (held_identity() then,
+		// later, listing()'s own inline check — Ruling S69, Codex round-26
+		// P2 on #88; see held_snapshot()'s own docblock for the race this
+		// proves closed). Never armed by production code, and never
+		// cleared here either — the callable clearing itself, like every
+		// other "fires once" seam's own callback does, is what keeps this
+		// READ-ONLY from this file's point of view.
+		if ( isset( $GLOBALS['_sa_after_is_expired_check'] ) && is_callable( $GLOBALS['_sa_after_is_expired_check'] ) ) {
+			( $GLOBALS['_sa_after_is_expired_check'] )();
+		}
 		return strtotime( (string) ( isset( $row['expires_at'] ) ? $row['expires_at'] : '' ) ) <= (int) $now;
 	}
 
@@ -812,31 +824,64 @@ class Aura_Worker_Door_Holds {
 	}
 
 	/**
-	 * What `/status` reports: no inputs, no claimed twins, nothing expired.
+	 * ONE read of the held queue, at ONE `$now` — feeding every caller that
+	 * used to take its own separate snapshot (Ruling S69, Codex round-26 P2
+	 * on #88, the S52 pattern `partition_stale_claims()` already
+	 * established for `running`/`interrupted`): `held_identity()`'s
+	 * broader, non-expired set (`identity` below) and `listing()`'s
+	 * narrower one, which additionally excludes a claimed twin (`listing`
+	 * below) — see `held_identity()`'s own docblock for why the two sets
+	 * differ.
 	 *
-	 * @return array[]
+	 * THE BUG THIS CLOSES: `held_identity()` and `listing()` used to be two
+	 * INDEPENDENT calls, each with its own `time()`. A hold crossing its own
+	 * `expires_at` in the (however short) window between the two calls
+	 * changed the served `listing()` — or the identity `sync_computed_state()`
+	 * folds into its persisted comparison — while the OTHER of the pair
+	 * still answered from before the crossing: the SAME row, in the SAME
+	 * poll, reported as both still-held and already-gone depending on which
+	 * of the two a caller happened to read. Expiry mutates nothing and bumps
+	 * no version, so `version_bracketed()`'s own before/after read agreed
+	 * regardless — nothing about a torn `held`/identity pair looks torn to
+	 * it. One snapshot, one `$now`, closes the window: whichever side of the
+	 * crossing this call lands on, `identity` and `listing` agree about it.
+	 *
+	 * `$now` defaults to `time()` for a STANDALONE caller (`listing()`,
+	 * `held_identity()`, `count()` below all still call this fresh, once,
+	 * on their own) — a BRACKETED caller (`status_fragment()`,
+	 * `governor_block()`) takes this ONCE per attempt and threads the SAME
+	 * snapshot to everywhere in that attempt that needs either half.
+	 *
+	 * @param int|null $now Unix time; null defaults to time().
+	 * @return array{ identity: string[]|null, listing: array[] } `identity`
+	 *         is null only when the held queue itself could not be read
+	 *         (Ruling P57); `listing` is `array()` either way — a caller
+	 *         needing to tell "empty" from "unreadable" reads `identity`
+	 *         (or `queue_unreadable()`, which now checks the same fact).
 	 */
-	public static function listing() {
-		$out  = array();
-		$now  = time();
+	public static function held_snapshot( $now = null ) {
+		$now  = null === $now ? time() : (int) $now;
 		$held = self::held_rows();
 		if ( null === $held ) {
-			// Nothing to LIST is not the same as nothing HELD (Ruling P57), and
-			// the caller must not read an empty list as an empty queue —
-			// status_fragment() carries `held_unreadable: true` beside it.
-			return array();
+			return array(
+				'identity' => null,
+				'listing'  => array(),
+			);
 		}
+		$identity = array();
+		$listing  = array();
 		foreach ( $held as $ref => $row ) {
 			if ( ! self::row_is_current( $row ) ) {
 				continue; // another binding's queue (Ruling P58)
 			}
+			if ( self::is_expired( $row, $now ) ) {
+				continue;
+			}
+			$identity[] = (string) $ref;
 			if ( null !== self::get_claimed( $ref ) ) {
 				continue;
 			}
-			if ( strtotime( (string) ( $row['expires_at'] ?? '' ) ) <= $now ) {
-				continue;
-			}
-			$out[] = array(
+			$listing[] = array(
 				'ref'        => $ref,
 				'ability'    => $row['ability'] ?? '',
 				'actor'      => $row['actor'] ?? array(),
@@ -846,7 +891,26 @@ class Aura_Worker_Door_Holds {
 				'created_at' => $row['created_at'] ?? '',
 			);
 		}
-		return $out;
+		sort( $identity, SORT_STRING );
+		return array(
+			'identity' => $identity,
+			'listing'  => $listing,
+		);
+	}
+
+	/**
+	 * What `/status` reports: no inputs, no claimed twins, nothing expired.
+	 *
+	 * A standalone `held_snapshot()` call, at this call's own `time()`
+	 * (Ruling S69) — a caller that also needs the identity fold in the SAME
+	 * instant (`status_fragment()`'s own builder) takes ONE `held_snapshot()`
+	 * itself instead of calling this method, so the two never disagree
+	 * about a hold crossing `expires_at` between them.
+	 *
+	 * @return array[]
+	 */
+	public static function listing() {
+		return self::held_snapshot()['listing'];
 	}
 
 	/**
@@ -1372,12 +1436,38 @@ class Aura_Worker_Door_Holds {
 	 * @return int|null
 	 */
 	public static function count() {
-		$claimed       = self::rows( self::CLAIMED );
 		// Ruling S46 (Codex round-19, S45 class): the SAME non-expired
 		// held identity status_fragment()'s own transition fold uses
 		// (held_identity()'s own docblock) — never a second, independent
-		// expiry scan that could in principle disagree with it.
-		$held_identity = self::held_identity();
+		// expiry scan that could in principle disagree with it. Ruling
+		// S69: routed through count_from_identity() below so a caller
+		// that already took its OWN held_snapshot() this attempt
+		// (governor_block()) can feed count_from_identity() that SAME
+		// identity instead of this method taking a second, independent
+		// one.
+		return self::count_from_identity( self::held_snapshot()['identity'] );
+	}
+
+	/**
+	 * `count()`'s own merge, from an ALREADY-TAKEN `held_snapshot()`
+	 * identity (Ruling S69, Codex round-26 P2 on #88, the S52 pattern) —
+	 * `$held_identity` is never re-derived here, so a caller that took ONE
+	 * `held_snapshot()` this attempt for the served `held` listing and the
+	 * identity fold (`status_fragment()`'s own builder) or simply for this
+	 * count (`governor_block()`'s own builder) feeds the SAME snapshot here
+	 * rather than risk a hold's `expires_at` crossing between an
+	 * independent read here and the one it already made.
+	 *
+	 * CLAIMED rows are read fresh every call regardless: a claim is a real,
+	 * already-versioned mutation (Ruling P58's own reasoning), never a
+	 * silent time-based crossing, so there is no snapshot for it to share.
+	 *
+	 * @param string[]|null $held_identity A `held_snapshot()`'s own
+	 *                                     `'identity'`.
+	 * @return int|null
+	 */
+	public static function count_from_identity( $held_identity ) {
+		$claimed = self::rows( self::CLAIMED );
 		if ( null === $claimed || null === $held_identity ) {
 			return null;
 		}
@@ -1512,26 +1602,16 @@ class Aura_Worker_Door_Holds {
 	 * expiry is the one fact here that changes silently, and it is the
 	 * SAME fact whether or not the row happens to be claimed too.
 	 *
+	 * A standalone `held_snapshot()` call, at this call's own `time()`
+	 * (Ruling S69) — `status_fragment()`'s own builder takes ONE
+	 * `held_snapshot()` itself instead of calling this method, so this
+	 * identity and the served `held` listing can never disagree about a
+	 * hold crossing `expires_at` between two separate calls.
+	 *
 	 * @return string[]|null Null when the held queue could not be read.
 	 */
 	public static function held_identity() {
-		$held = self::held_rows();
-		if ( null === $held ) {
-			return null;
-		}
-		$now  = time();
-		$refs = array();
-		foreach ( $held as $ref => $row ) {
-			if ( ! self::row_is_current( $row ) ) {
-				continue;
-			}
-			if ( self::is_expired( $row, $now ) ) {
-				continue;
-			}
-			$refs[] = (string) $ref;
-		}
-		sort( $refs, SORT_STRING );
-		return $refs;
+		return self::held_snapshot()['identity'];
 	}
 
 	/**
