@@ -188,8 +188,17 @@ class Aura_Worker_Door_Log {
 	 *
 	 * @param string $name  Option name.
 	 * @param mixed  $value Value; serialized like an option.
-	 * @return bool True only when exactly one row was inserted (and, for a
-	 *              non-exempt name, its version bump also landed).
+	 * @return bool|null True only when exactly one row was inserted (and,
+	 *              for a non-exempt name, its version bump also landed);
+	 *              false for a PROVEN miss (a real name collision, or
+	 *              versioned() proving the commit did not land); null —
+	 *              UNKNOWN, never the same as false (Ruling S51, Codex
+	 *              round-20 P1 on #88) — when versioned() could not prove
+	 *              whether this insert's own commit landed or not. A
+	 *              caller that treats a plain false as "try a different
+	 *              name" or "this one is already taken by someone else"
+	 *              must not read null that way — see each such caller for
+	 *              its own retryable answer.
 	 */
 	public static function insert_unique( $name, $value ) {
 		if ( in_array( $name, self::VERSION_EXEMPT_INSERTS, true ) ) {
@@ -209,6 +218,9 @@ class Aura_Worker_Door_Log {
 				);
 			}
 		);
+		if ( null === $outcome['committed'] ) {
+			return null; // Ruling S51: UNKNOWN, not a proven miss.
+		}
 		return $outcome['committed'] && $outcome['result'];
 	}
 
@@ -2336,27 +2348,43 @@ class Aura_Worker_Door_Log {
 	 *                         wrote, for the post-commit repeat (Ruling S11).
 	 *                         `result` is handed back to the CALLER of
 	 *                         versioned().
-	 * @return array{ committed: bool, result?: mixed, observation?: int|null }
-	 *         `committed` is false when the savepoint could not be PROVEN
-	 *         open before $writes() ever ran (Ruling S21), $writes() asked
-	 *         for a rollback, a mutation's version bump then failed its own
-	 *         WRITE, the savepoint could not be RELEASED at the close of
-	 *         the unit (Ruling S17), or the final COMMIT could not be
-	 *         PROVEN to have run on the session that opened the transaction
-	 *         (Ruling S16) — every one of those rolls the WHOLE unit back
+	 * @return array{ committed: bool|null, result?: mixed, observation?: int|null }
+	 *         `committed` is `false` — a PROVEN negative — when the savepoint
+	 *         could not be PROVEN open before $writes() ever ran (Ruling
+	 *         S21), $writes() asked for a rollback, a mutation's version
+	 *         bump then failed its own WRITE, the savepoint could not be
+	 *         RELEASED at the close of the unit (Ruling S17), or the final
+	 *         COMMIT's own durable witness was read back and PROVEN absent
+	 *         (Ruling S32) — every one of those rolls the WHOLE unit back
 	 *         (on a transactional engine only — see Ruling S13 above),
 	 *         including every statement $writes() itself ran (nothing, for
 	 *         the S21 case, which is what makes it safe to retry outright)
 	 *         AND every cache entry it evicted and re-read before this
-	 *         method decided to fail (Ruling S18), so the caller must treat
-	 *         this exactly like $writes() failing outright — and `result` is
-	 *         ABSENT whenever `committed` is false (Ruling S15): never read
-	 *         it without checking `committed` first. `observation` is
-	 *         likewise absent on failure, and otherwise the witness THIS call
-	 *         produced — null whenever it could not be proven, which can
-	 *         happen even while `committed` is true (Ruling S10): a reconnect
-	 *         between the COMMIT and the read-back, or a non-transactional
-	 *         engine, or 32-bit PHP.
+	 *         method decided to fail (Ruling S18).
+	 *
+	 *         `committed` is `null` — UNKNOWN, never the same fact as
+	 *         `false` (Ruling S51, Codex round-20 P1 on #88) — when the
+	 *         durable witness's own read could not be proven either way: the
+	 *         COMMIT's own statement or the session-nonce read-back
+	 *         (Ruling S16) already looked clean enough to reach that
+	 *         fallback, but this method genuinely cannot tell whether the
+	 *         mutation landed. The witness row is left UNTOUCHED in this
+	 *         case — deleting it would erase the only evidence a later,
+	 *         healthier read (the janitor, or a caller's own retry) could
+	 *         still use. A caller MUST treat `null` as retryable, exactly
+	 *         like `false` (never proceed as if it were `true`), but MUST
+	 *         NOT report it as a definite refusal the way a proven `false`
+	 *         may be (`claim()` answering `not_held()` — "this approval is
+	 *         gone for good" — on what was actually an unproven maybe is
+	 *         the shape of bug this ruling closes).
+	 *
+	 *         `result` is ABSENT whenever `committed` is not `true` (Ruling
+	 *         S15): never read it without checking `committed === true`
+	 *         first. `observation` is likewise absent then, and otherwise
+	 *         the witness THIS call produced — null whenever it could not
+	 *         be proven, which can happen even while `committed` is `true`
+	 *         (Ruling S10): a reconnect between the COMMIT and the
+	 *         read-back, or a non-transactional engine, or 32-bit PHP.
 	 */
 	public static function versioned( callable $writes ) {
 		global $wpdb;
@@ -2610,6 +2638,22 @@ class Aura_Worker_Door_Log {
 					$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
 				}
+				// Ruling S51 (Codex round-20 P1 on #88): TRI-STATE from here —
+				// `$commit_tristate` is `true`/`false` exactly like the
+				// boolean `$commit_ok` above whenever the nonce check already
+				// settled it, but the DURABLE-WITNESS fallback below can also
+				// answer a THIRD state: `null`, unknown, when the read of the
+				// witness itself could not be proven. `is_string( $durable )`
+				// used to answer `false` for EITHER "genuinely absent" (this
+				// commit did not land) OR "the SELECT failed" (this method
+				// has no idea) — collapsing "definitely did not happen" and
+				// "cannot tell" into the SAME `committed: false` a caller
+				// reads as a proven negative. `claim()` is the sharpest
+				// example: reading THAT `false` as "already claimed by
+				// someone else" told Aura a still-open approval was gone for
+				// good, when the truth was this site could not prove whether
+				// its own claim attempt landed.
+				$commit_tristate = $commit_ok;
 				if ( ! $commit_ok ) {
 					// Ruling S40: an EXPLICIT ROLLBACK, best effort, BEFORE the
 					// durable witness is ever read. Without it, a COMMIT that
@@ -2635,13 +2679,23 @@ class Aura_Worker_Door_Log {
 					// Read RAW, and only now — AFTER the ROLLBACK above closed
 					// this session's own open transaction, if it had one — so
 					// this SELECT can only ever see what is genuinely durable.
-					$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-						$wpdb->prepare(
-							"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-							$tx_witness
-						)
-					);
-					$commit_ok = is_string( $durable );
+					//
+					// PROVEN, not a plain get_var() (Ruling S51): the earlier
+					// `is_string( $wpdb->get_var(...) )` answered `false` for
+					// BOTH a proven-absent row and a driver failure that
+					// proved NOTHING — `raw_option_read()`'s nonce-probed
+					// idiom is what tells the two apart, exactly as it
+					// already does for every other option this class reads
+					// raw.
+					$witness_read = self::raw_option_read( $tx_witness );
+					if ( ! $witness_read['ok'] ) {
+						// UNREADABLE: this method cannot tell whether the
+						// commit landed. Never `false` — a proven negative
+						// this is not.
+						$commit_tristate = null;
+					} else {
+						$commit_tristate = is_string( $witness_read['value'] );
+					}
 				}
 				// Ruling S32: both branches above are now settled — clean up
 				// THIS unit's own witness row, best effort, OUTSIDE the
@@ -2653,7 +2707,17 @@ class Aura_Worker_Door_Log {
 				// of those the witness row this unit wrote was rolled back
 				// along with everything else, so there is nothing of THIS
 				// unit's own to delete.
-				$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $tx_witness ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				//
+				// NEVER ON UNKNOWN (Ruling S51). Deleting a witness this
+				// method could not prove existed or not would erase the
+				// ONLY evidence a later read (the janitor, or Aura's own
+				// retry landing on a session that CAN read it) could still
+				// use to tell a real commit from a real rollback — turning
+				// a transient read failure into a permanent, unrecoverable
+				// "nobody will ever know" for this one unit's outcome.
+				if ( null !== $commit_tristate ) {
+					$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $tx_witness ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				}
 				// A BOUNDED JANITOR for whatever a DIED process left behind — a
 				// disconnect landing between ITS OWN COMMIT and ITS OWN delete
 				// above is the only way a witness row outlives the unit that
@@ -2671,15 +2735,26 @@ class Aura_Worker_Door_Log {
 						self::LAST_TX_JANITOR_LIMIT
 					)
 				);
-				if ( ! $commit_ok ) {
+				if ( true !== $commit_tristate ) {
 					// Ruling S15: no callback result — see the bump-failure
 					// branch above for why. Neither the session variable nor
 					// the durable witness could prove this COMMIT landed on a
 					// session that ever held this transaction; nothing here is
 					// trusted to have happened.
+					//
+					// `$commit_tristate` carries through UNCHANGED here
+					// (Ruling S51): `false` when the witness read PROVED this
+					// commit did not land, `null` when that read itself could
+					// not be proven either way — the caller must not read
+					// `null` as the same fact `false` is. Every eviction the
+					// callback performed is still repeated (Ruling S18)
+					// regardless of which of the two this is: a rollback (or
+					// an unproven commit) means nothing here may be trusted
+					// to have landed, so a stale, uncommitted value must not
+					// be left in any cache either way.
 					self::evict_after_rollback( $evict ); // Ruling S18
 					return array(
-						'committed' => false,
+						'committed' => $commit_tristate,
 					);
 				}
 			}
@@ -2946,18 +3021,26 @@ class Aura_Worker_Door_Log {
 				return self::ack_write( $epoch, $seq );
 			}
 		);
-		if ( ! $outcome['committed'] ) {
+		if ( true !== $outcome['committed'] ) {
 			// Ruling S15 (Codex round-6 P2 on #88): a rolled-back unit
 			// carries no `result` — `ack_write()`'s own `acked`/`floor`
 			// were computed BEFORE the bump's write failed (or the COMMIT
 			// could not be proven, Ruling S16) and undone with everything
 			// else. Reading `self::floor()` now answers the floor as the
-			// rollback actually left it, never the value this ack thought
-			// it had raised.
+			// rollback actually left it — NOT advanced — never the value
+			// this ack thought it had raised.
+			//
+			// `committed` carries the tri-state THROUGH, unchanged (Ruling
+			// S51, Codex round-20 P1 on #88): `false` when the durable
+			// witness PROVED this ack did not land, `null` when even that
+			// could not be proven. `ack_door_log()` (class-aura-worker-api.php)
+			// already answers a retryable 503 for either — `!$result['committed']`
+			// is `true` for both `false` and `null` — so this is a
+			// pass-through for honesty, not a behaviour change.
 			return array(
 				'acked'     => 0,
 				'floor'     => self::floor(),
-				'committed' => false,
+				'committed' => $outcome['committed'],
 			);
 		}
 		return $outcome['result'];

@@ -1846,4 +1846,54 @@ final class DoorLogTest extends TestCase {
 		$this->assertTrue( $won_retry );
 		$this->assertSame( $before_retries, $GLOBALS['wpdb']->reconnect_retries );
 	}
+
+	/**
+	 * Ruling S51 (Codex round-20 P1 on #88): the ambiguous-COMMIT fallback
+	 * used to read its own durable witness through a plain get_var(), with
+	 * no last_error check -- `is_string( $durable )` answered `false` for
+	 * BOTH a proven-absent row (this commit genuinely did not land) and a
+	 * driver failure that proved NOTHING (this method has no idea), then
+	 * deleted the witness row regardless. If the commit had actually
+	 * landed and this read merely failed, that delete erased the ONLY
+	 * surviving evidence of it, permanently, while the caller was told
+	 * `committed: false` -- a proven negative for a fact nobody could
+	 * still prove.
+	 *
+	 * `committed` is now `null` for exactly this case -- UNKNOWN, never
+	 * the same as `false` -- and the witness row is left untouched so a
+	 * later, healthier read (the janitor, or a fresh attempt) can still
+	 * find it.
+	 */
+	public function test_an_unreadable_durable_witness_read_answers_null_and_never_deletes_the_witness(): void {
+		$name = 'aura_worker_door_log_test_s51';
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s51';
+		// Reaches the durable-witness fallback: the COMMIT statement itself
+		// looks clean, but the post-commit session-nonce read-back finds no
+		// session variables (Ruling S16's own reconnect-after-commit model).
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s51';
+		// And THIS fallback's own read of that witness fails outright.
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $outcome['committed'], 'unreadable is not the same fact as a proven negative' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result unless committed is strictly true' );
+		$this->assertArrayHasKey( $witness, $GLOBALS['_options'], 'the witness row is left untouched -- deleting it on an unproven read would erase the only evidence this unit ever ran' );
+	}
 }

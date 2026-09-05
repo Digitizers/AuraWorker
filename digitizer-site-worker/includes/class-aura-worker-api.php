@@ -1557,6 +1557,15 @@ class Aura_Worker_API {
 		// with for the identical shape of fact — this site could not record
 		// an outcome, so the caller repeats the call rather than assuming its
 		// ack landed.
+		//
+		// `committed` is now TRI-STATE (Ruling S51, Codex round-20 P1 on
+		// #88): `null` when even the durable witness itself could not be
+		// read. `! $result['committed']` is already `true` for BOTH `false`
+		// and `null` — retrying an ack is always safe regardless of which
+		// (ack_write() is itself idempotent on a repeat with the SAME
+		// epoch/seq, per its own docblock), so this check is unchanged and
+		// correct as written; it is not the `not_held()`-style permanent
+		// refusal `claim()` had to stop conflating the two for.
 		if ( array_key_exists( 'committed', $result ) && ! $result['committed'] ) {
 			return new WP_Error(
 				'aura_log_failed',

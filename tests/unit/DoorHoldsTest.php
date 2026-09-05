@@ -784,6 +784,39 @@ final class DoorHoldsTest extends TestCase {
 		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
 	}
 
+	/**
+	 * Ruling S51 (Codex round-20 P1 on #88): claim()'s own CLAIMED insert
+	 * reaching versioned()'s durable-witness fallback, whose OWN read then
+	 * cannot be proven either way, used to answer `not_held()` -- a
+	 * permanent 404 Aura reads as "this approval is gone for good" -- for
+	 * an attempt that may, in fact, have just claimed the row. Retryable,
+	 * and it says so via `may_have_run`, so Aura re-polls instead of
+	 * giving up on a still-live approval.
+	 */
+	public function test_claim_answers_retry_later_with_may_have_run_when_its_own_insert_is_unproven(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-claim-s51';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-claim-s51';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Door_Holds::claim( $ref );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( WP_Error::class, $out );
+		$this->assertSame( 'aura_hold_failed', $out->get_error_code() );
+		$this->assertSame( 503, $out->get_error_data()['status'] );
+		$this->assertTrue( $out->get_error_data()['may_have_run'], 'never a bare retry -- this attempt may already have claimed the ref' );
+		// The durable witness this insert wrote was left UNTOUCHED (Ruling
+		// S51) -- proving this really is the unreadable path, not some
+		// other retryable one that would have cleaned it up.
+		$this->assertArrayHasKey( $witness, $GLOBALS['_options'] );
+	}
+
 	public function test_a_claim_that_finds_the_held_row_gone_backs_out(): void {
 		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
 		// A reject wins the race between the replay's read and its claim.

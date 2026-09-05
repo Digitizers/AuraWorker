@@ -247,6 +247,18 @@ class Aura_Worker_Door_Holds {
 		}
 		$queued = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $row );
 		self::forget_held();
+		if ( null === $queued ) {
+			// Ruling S51 (Codex round-20 P1 on #88): $ref is a fresh random
+			// UUID EVERY call (unlike claim()'s CLAIMED insert, which is
+			// keyed by the caller-supplied $ref) — a caller retrying on an
+			// ordinary `false` from below inserts a brand-new row and is
+			// safe. Retrying blind on an UNPROVEN outcome is not: if this
+			// attempt's own insert actually landed, a retry queues a SECOND,
+			// duplicate approval for the same call under a different ref.
+			// `may_have_run` is what tells the caller not to just retry —
+			// check whether this call was already admitted first.
+			return self::retry_may_have_run();
+		}
 		if ( ! $queued ) {
 			return new WP_Error( 'aura_hold_failed', 'This site could not store the call for approval; it was not run.', array( 'status' => 503 ) );
 		}
@@ -507,7 +519,17 @@ class Aura_Worker_Door_Holds {
 			}
 			$claimed['binding'] = $fill;
 		}
-		if ( ! Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed ) ) {
+		// Ruling S51 (Codex round-20 P1 on #88): UNKNOWN (this insert's own
+		// commit could not be proven) is never the same fact as a PROVEN
+		// miss — reading it as "already claimed by someone else"
+		// (not_held(), a permanent 404) told Aura a still-open approval was
+		// gone for good, when this site genuinely does not know whether it
+		// just claimed the row or not. Retryable, and it says so.
+		$claimed_won = Aura_Worker_Door_Log::insert_unique( self::CLAIMED . $ref, $claimed );
+		if ( null === $claimed_won ) {
+			return self::retry_may_have_run();
+		}
+		if ( ! $claimed_won ) {
 			return self::not_held(); // already claimed
 		}
 		// Ruling S8: versioned like every other fenced delete here — see
@@ -515,7 +537,18 @@ class Aura_Worker_Door_Holds {
 		// established by the CLAIMED insert's own uniqueness above, so a
 		// plain by-name delete (delete_option()'s own shape) is exactly
 		// what a real fence would additionally buy nothing over.
-		if ( ! self::delete_versioned( self::HELD . $ref ) ) {
+		$held_gone = self::delete_versioned( self::HELD . $ref );
+		if ( null === $held_gone ) {
+			// Ruling S51: the CLAIMED insert just above is CONFIRMED
+			// durable — backing it out on an UNPROVEN delete here would
+			// compound one uncertainty with a second one, on top of a row
+			// this call already knows it owns. Leave the claim in place
+			// (harmless: an admitted claim nothing then runs is exactly
+			// what the reconciler's stale-claim sweep already exists to
+			// settle) and tell the truth instead of guessing either way.
+			return self::retry_may_have_run();
+		}
+		if ( ! $held_gone ) {
 			// A reject or the sweep won the race: the entry we claimed from
 			// no longer exists. Back out; nothing runs.
 			self::delete_versioned( self::CLAIMED . $ref );
@@ -1475,7 +1508,15 @@ class Aura_Worker_Door_Holds {
 	 *                           uses. Null for an unconditional
 	 *                           `delete_option()`, used only where no race
 	 *                           is possible (see call sites).
-	 * @return bool One row removed.
+	 * @return bool|null One row removed; null — UNKNOWN, never the same as
+	 *         false (Ruling S51, Codex round-20 P1 on #88) — when
+	 *         versioned() could not prove whether this delete's own commit
+	 *         landed. Most callers here already only ever ACT on a strict
+	 *         `true`, so a caller that does not explicitly check for null
+	 *         still fails exactly as safely as it did for a proven `false`
+	 *         (a falsy value either way) — it simply does not get told the
+	 *         difference. `claim()` is the one caller for whom that
+	 *         difference matters and checks for it explicitly.
 	 */
 	private static function delete_versioned( $name, $fence = null ) {
 		$outcome = Aura_Worker_Door_Log::versioned(
@@ -1517,6 +1558,9 @@ class Aura_Worker_Door_Holds {
 			}
 		);
 		self::forget_held(); // cache-only now (see its own docblock) — safe whether or not the delete above landed
+		if ( null === $outcome['committed'] ) {
+			return null; // Ruling S51: UNKNOWN, not a proven miss.
+		}
 		return $outcome['committed'] && $outcome['result'];
 	}
 
@@ -1625,5 +1669,25 @@ class Aura_Worker_Door_Holds {
 	/** @return WP_Error */
 	private static function not_held() {
 		return new WP_Error( 'not_held', 'No held call with that reference.', array( 'status' => 404 ) );
+	}
+
+	/**
+	 * Ruling S51 (Codex round-20 P1 on #88): the answer for an insert whose
+	 * OWN commit could not be proven one way or the other — never `not_held()`
+	 * (a proven, permanent 404 an unproven maybe is not) and never a bare
+	 * retry (which drops the one fact Aura needs: this site's own PREVIOUS
+	 * attempt may already have landed, so retrying blind risks a caller
+	 * acting twice on what it believes is a fresh admission). `may_have_run`
+	 * in the error data is the flag every such caller carries this signal
+	 * through with.
+	 *
+	 * @return WP_Error
+	 */
+	private static function retry_may_have_run() {
+		return new WP_Error(
+			'aura_hold_failed',
+			'This site could not prove whether the previous attempt landed; retry.',
+			array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+		);
 	}
 }
