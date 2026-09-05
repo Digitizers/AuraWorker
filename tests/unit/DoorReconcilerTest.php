@@ -2614,6 +2614,76 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertGreaterThan( $current + 1, Aura_Worker_Door_Log::door_version_raw() );
 	}
 
+	/**
+	 * Ruling S88 (Codex round-38 P2 on #88): S83's own ceiling left NO
+	 * headroom for what honouring a legal value actually costs -- a
+	 * "legal" `door_observation_seen = MAX_OBSERVATION_SEEN - 1` came
+	 * back out the OTHER end as a SERVED observation of
+	 * `MAX_OBSERVATION_SEEN + 1` (restamp_observation_forward()'s own
+	 * `$seen + 1`, THEN versioned()'s own generic version bump on the
+	 * SAME mutating unit -- a SECOND, unconditional increment), which
+	 * this SAME validator then refused FOREVER. The validator now
+	 * refuses at `MAX_OBSERVATION_SEEN - 1` (reserving the top TWO
+	 * integers, not one), so the LARGEST legal input
+	 * (`MAX_OBSERVATION_SEEN - 2`) can absorb both increments without
+	 * the served observation ever exceeding `MAX_OBSERVATION_SEEN`
+	 * itself -- the invariant this ruling names: no value this site
+	 * could ever be made to serve exceeds what this class's own ceiling
+	 * permits.
+	 *
+	 * Pinned at the boundary, per the ruling's own test recipe:
+	 *   seen = MAX-2 -> accepted, served <= MAX;
+	 *   the SAME seen = MAX-2 sent again on a LATER request is STILL
+	 *     accepted (the validator's ceiling is a fixed check on the
+	 *     INPUT alone, never affected by what the site has since
+	 *     served -- "the next request with that value is accepted");
+	 *   seen = MAX-1 -> 400, never honoured.
+	 */
+	public function test_door_observation_seen_round_trip_is_pinned_at_the_boundary(): void {
+		$this->fragment(); // establishes a real baseline
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$max   = Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN;
+
+		// seen = MAX-2: accepted, served <= MAX. Direct handler call
+		// (matching this file's own established S82/S83 pattern) -- arg
+		// validation is what this test cares about proving here, and
+		// the LAST assertion below reaches it through the real
+		// registered route instead, where validation genuinely runs
+		// before any handler.
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', $max - 2 );
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
+		$this->assertIsInt( $door['observation'] );
+		$this->assertGreaterThan( $max - 2, $door['observation'] );
+		$this->assertLessThanOrEqual( $max, $door['observation'], 'Ruling S88: never above the class ceiling itself, even at the boundary' );
+		$served = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertLessThanOrEqual( $max, $served );
+
+		// The SAME seen = MAX-2, sent again: still accepted (a fixed
+		// input-side check, unaffected by the site's now-higher
+		// observation) -- silently a no-op at the application layer
+		// (Ruling S82: not strictly greater than current), but never a
+		// 400 at the door.
+		$req2 = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req2->set_param( 'door_epoch', $epoch );
+		$req2->set_param( 'door_observation_seen', $max - 2 );
+		$door2 = (array) $this->api->get_status( $req2 )->get_data()['door'];
+		$this->assertSame( $served, $door2['observation'], 'a no-op -- MAX-2 is no longer greater than the now-served observation' );
+		$this->assertSame( $served, Aura_Worker_Door_Log::door_version_raw() );
+
+		// seen = MAX-1: refused outright, 400, never honoured -- through
+		// the REAL registered route, since arg validation runs BEFORE
+		// the permission callback (no auth needed to prove this).
+		$req3 = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req3->set_param( 'door_epoch', $epoch );
+		$req3->set_param( 'door_observation_seen', $max - 1 );
+		$resp3 = sa_dispatch_route( $req3 );
+		$this->assertSame( 400, $resp3->get_status() );
+		$this->assertSame( 'aura_invalid_param', $resp3->get_data()['code'] );
+		$this->assertSame( $served, Aura_Worker_Door_Log::door_version_raw(), 'refused before the handler -- completely untouched' );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (k) a claim whose entry cannot be written is KEPT                   */
 	/* ------------------------------------------------------------------ */

@@ -186,6 +186,30 @@ class Aura_Worker_Door_Log {
 	 * this millennium is anywhere near this cap, so no real
 	 * `door_observation_seen` Aura could ever legitimately send is
 	 * refused by it.
+	 *
+	 * THIS CONSTANT NAMES THE FLOOR OF THE CHECK, NEVER THE CEILING OF
+	 * THE INPUT (Ruling S88, Codex round-38 P2 on #88). One
+	 * `door_observation_seen` request costs TWO increments past
+	 * whatever `$seen` it names — `restamp_observation_forward()`'s own
+	 * `GREATEST( …, $seen + 1, … )` (+1), THEN `versioned()`'s own
+	 * generic version bump on the SAME mutating unit, which runs
+	 * UNCONDITIONALLY after ANY unit that reports `mutated: true`
+	 * (`GREATEST( current + 1, clock )`, and `current` is now what the
+	 * restamp just wrote — a SECOND +1). The `/status` route's own REST
+	 * arg `validate_callback` — the place this arithmetic must be
+	 * documented beside, per this ruling, since it is the ONE caller
+	 * this constant gates — therefore refuses at `MAX_OBSERVATION_SEEN
+	 * - 1`, not at `MAX_OBSERVATION_SEEN` itself: accepting the
+	 * legal-looking `MAX_OBSERVATION_SEEN - 1` let the SAME two
+	 * increments carry the SERVED observation to
+	 * `MAX_OBSERVATION_SEEN + 1` — a value the validator would then
+	 * refuse FOREVER, since `MAX_OBSERVATION_SEEN` is that check's own
+	 * ceiling. Reserving the top TWO integers — the validator accepts
+	 * only `seen <= MAX_OBSERVATION_SEEN - 2` — leaves exactly enough
+	 * headroom that the largest legal input (`MAX_OBSERVATION_SEEN - 2`)
+	 * can absorb BOTH increments (restamp: `MAX_OBSERVATION_SEEN - 1`;
+	 * the bump: `MAX_OBSERVATION_SEEN`) without the served value ever
+	 * exceeding this constant itself.
 	 */
 	const MAX_OBSERVATION_SEEN = 4611686018427387904; // 2^62
 

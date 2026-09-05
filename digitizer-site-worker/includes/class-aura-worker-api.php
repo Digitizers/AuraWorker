@@ -123,6 +123,28 @@ class Aura_Worker_API {
 				// `aura_invalid_param` WP_Error (never a bare `false`,
 				// which core would answer with its own generic
 				// `rest_invalid_param`) names the actual reason plainly.
+				//
+				// Ruling S88 (Codex round-38 P2 on #88): the ceiling is
+				// `MAX_OBSERVATION_SEEN - 2`, NEVER `MAX_OBSERVATION_SEEN`
+				// itself — see that constant's own docblock
+				// (Aura_Worker_Door_Log) for the exact arithmetic this
+				// mirrors. A legal `MAX_OBSERVATION_SEEN - 1` used to
+				// pass this check and come back out the OTHER end as a
+				// SERVED observation of `MAX_OBSERVATION_SEEN + 1` --
+				// restamp_observation_forward()'s own `$seen + 1` (one
+				// increment), THEN versioned()'s own generic version
+				// bump on the SAME mutating unit (a SECOND, unconditional
+				// increment on top of what the restamp just wrote) --
+				// which this SAME validator would then refuse FOREVER,
+				// since it exceeds `MAX_OBSERVATION_SEEN`. Reserving the
+				// top TWO integers means the largest value THIS check
+				// ever accepts (`MAX_OBSERVATION_SEEN - 2`) can absorb
+				// BOTH increments (restamp: `MAX_OBSERVATION_SEEN - 1`;
+				// the bump: `MAX_OBSERVATION_SEEN`) without the served
+				// observation ever exceeding `MAX_OBSERVATION_SEEN`
+				// itself — the INVARIANT this ruling exists to hold: no
+				// value this site could ever be made to serve is a value
+				// ABOVE what this class's own ceiling constant permits.
 				'door_observation_seen' => array(
 					'required'          => false,
 					'type'              => 'integer',
@@ -133,12 +155,12 @@ class Aura_Worker_API {
 						if ( ! is_numeric( $value ) || (int) $value != $value || (int) $value < 0 ) { // phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
 							return new WP_Error( 'aura_invalid_param', 'door_observation_seen must be a non-negative integer.', array( 'status' => 400 ) );
 						}
-						if ( (int) $value >= Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN ) {
+						if ( (int) $value > Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2 ) {
 							return new WP_Error( 'aura_invalid_param', 'door_observation_seen exceeds the maximum accepted value.', array( 'status' => 400 ) );
 						}
 						return true;
 					},
-					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — a non-negative integer, capped at Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN (2^62). When it EXCEEDS this site's current door version under that SAME epoch, the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored (never honoured, never a bump) when it is not greater than the current version, or when `door_epoch` does not name this site's CURRENT epoch. A value above the cap is refused outright with a 400 `aura_invalid_param`, never honoured.", 'digitizer-site-worker' ),
+					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — a non-negative integer, capped at Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2 (two below the class constant, reserved so the restamp's own +1 and the version bump's own +1 that follow it can never carry the SERVED observation past the constant itself). When it EXCEEDS this site's current door version under that SAME epoch, the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored (never honoured, never a bump) when it is not greater than the current version, or when `door_epoch` does not name this site's CURRENT epoch. A value above the cap is refused outright with a 400 `aura_invalid_param`, never honoured.", 'digitizer-site-worker' ),
 				),
 			),
 		) );
