@@ -113,7 +113,7 @@ final class McpExposureGovernorTest extends TestCase {
 				'epoch',
 				'binding',
 				'observation_unsupported',
-				'reconnect_guard',
+				'door_write_unsupported',
 				'seam',
 				'door',
 				'held_count',
@@ -142,7 +142,7 @@ final class McpExposureGovernorTest extends TestCase {
 		$this->assertIsInt( $b['observation'], "this call's own epoch mint is a real mutation (Ruling S6), not the audit itself bumping anything" );
 		$this->assertSame( Aura_Worker_Door_Log::door_version_raw(), $b['observation'], 'a second read of the row changes nothing' );
 		$this->assertNull( $b['observation_unsupported'], 'a normal test run is on a transactional engine and 64-bit PHP, so nothing is unsupported (Ruling S13)' );
-		$this->assertNull( $b['reconnect_guard'], 'the test double declares reconnect_retries same as real core, so the guard is available (Ruling S56)' );
+		$this->assertNull( $b['door_write_unsupported'], 'the test double declares reconnect_retries same as real core, so writes are supported (Ruling S65)' );
 		$this->assertSame( 'ok', $b['seam'], 'verify_coverage() ran and every registered elementor/* ability is wrapped' );
 		$this->assertSame( 'open', $b['door'] );
 		$this->assertSame( 0, $b['held_count'] );

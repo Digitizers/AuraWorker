@@ -412,7 +412,7 @@ class Aura_Worker_Elementor_Door {
 	 *
 	 * @param int    $after Aura's cursor.
 	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
-	 * @return array|null { active, epoch, binding, observation, reconnect_guard, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full }
+	 * @return array|null { active, epoch, binding, observation, door_write_unsupported, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
 	public static function status_fragment( $after = 0, $epoch = '' ) {
 		if ( ! self::present() ) {
@@ -1445,14 +1445,19 @@ class Aura_Worker_Elementor_Door {
 			// `entry.binding` with it to label a departed client's entries;
 			// null when the record cannot be read (Ruling A5b).
 			'binding'     => ( '' === $binding ) ? null : $binding,
-			// Ruling S56 (Codex round-22 P1 on #88): null on every normal
-			// site; 'unavailable' when this site's own $wpdb (a custom
-			// db.php drop-in) has no reconnect_retries property at all,
-			// so Ruling S50's reconnect-PREVENTION could not be applied
-			// to this poll's own versioned() writes and fell back to
-			// DETECTION alone (see Aura_Worker_Door_Log::reconnect_guard_available()'s
-			// own docblock). Visible here, never silent.
-			'reconnect_guard' => Aura_Worker_Door_Log::reconnect_guard_available() ? null : 'unavailable',
+			// Ruling S65 (Codex round-25 P1 on #88), replacing Ruling
+			// S56's own `reconnect_guard` field: null on every normal
+			// site; 'reconnect_guard_unavailable' when this site's own
+			// $wpdb (a full db.php REPLACEMENT, never a subclass — see
+			// Aura_Worker_Door_Log::reconnect_guard_available()'s own
+			// docblock) has no reconnect_retries property at all, so
+			// EVERY versioned() write on this site fails closed — see
+			// Aura_Worker_Door_Log::door_write_unsupported_reason()'s
+			// own docblock for why this is no longer "detection alone".
+			// Visible here, never silent, so Aura's audit can name it
+			// rather than silently retrying writes that will keep
+			// failing until the drop-in is fixed.
+			'door_write_unsupported' => Aura_Worker_Door_Log::door_write_unsupported_reason(),
 			'seam'        => $seam,
 			'door'        => $door,
 			'held'        => $held,
@@ -4379,7 +4384,7 @@ class Aura_Worker_Elementor_Door {
 	 * describe without needing (or ever getting) a witness for it — this
 	 * block is live evidence for them, not gated by `observation`.
 	 *
-	 * @return array { active, epoch, binding, observation, observation_unsupported, reconnect_guard, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, counters_as_of, queue_full, log_full }
+	 * @return array { active, epoch, binding, observation, observation_unsupported, door_write_unsupported, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, counters_as_of, queue_full, log_full }
 	 */
 	public static function governor_block() {
 		if ( ! self::present() ) {
@@ -4529,9 +4534,10 @@ class Aura_Worker_Elementor_Door {
 					'observation_unsupported' => Aura_Worker_Door_Log::observation_unsupported_reason(),
 					// Ruling S56 (Codex round-22 P1 on #88): the SAME
 					// field status_fragment() carries — see
-					// Aura_Worker_Door_Log::reconnect_guard_available()'s
-					// own docblock.
-					'reconnect_guard'     => Aura_Worker_Door_Log::reconnect_guard_available() ? null : 'unavailable',
+					// Ruling S65 (Codex round-25 P1 on #88), replacing
+					// Ruling S56's own `reconnect_guard` field — see
+					// status_fragment()'s own identical field.
+					'door_write_unsupported' => Aura_Worker_Door_Log::door_write_unsupported_reason(),
 					'seam'                => $seam,
 					'door'                => $door,
 					'held_count'          => $held,

@@ -2091,63 +2091,64 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
-	 * Ruling S56: the "guard unavailable" path — a $wpdb whose own class
+	 * Ruling S65 (Codex round-25 P1 on #88), OVERTURNING Ruling S56's own
+	 * "proceed on detection alone" design: a $wpdb whose own class
 	 * declares no reconnect_retries property at all (a db.php drop-in
-	 * that replaces wpdb outright, modelled by
+	 * that REPLACES wpdb outright, modelled by
 	 * SA_Test_Wpdb_No_Reconnect_Guard, which proxies everything else to
-	 * a real SA_Test_Wpdb but declares no properties of its own).
-	 * versioned() must not fatal, must not attempt the property write,
-	 * and must still WORK — a normal mutation lands successfully with no
-	 * prevention guard in force, relying on detection (the post-$writes()
-	 * nonce re-check) alone for the one hazard prevention would
-	 * otherwise have closed.
+	 * a real SA_Test_Wpdb but declares no properties of its own) can
+	 * still transparently reconnect and autocommit a retried statement
+	 * BEFORE the post-$writes() nonce check ever gets a chance to notice
+	 * -- detecting a mutation that already landed twice is not the same
+	 * fact as preventing it. versioned() now FAILS CLOSED instead: it
+	 * refuses BEFORE `$writes()` is ever invoked -- no callback
+	 * invocation at all, proven here directly against versioned() itself,
+	 * not merely inferred from insert_unique()'s own outcome -- reports
+	 * the ordinary retryable committed:false, and names the reason on
+	 * the wire via door_write_unsupported_reason().
 	 */
-	public function test_reconnect_guard_is_unavailable_on_a_wpdb_with_no_such_property(): void {
+	public function test_reconnect_guard_unavailable_fails_closed_before_writes_ever_runs(): void {
 		$real            = $GLOBALS['wpdb'];
 		$GLOBALS['wpdb'] = new SA_Test_Wpdb_No_Reconnect_Guard( $real );
 		try {
 			$this->assertFalse( Aura_Worker_Door_Log::reconnect_guard_available() );
+			$this->assertSame( 'reconnect_guard_unavailable', Aura_Worker_Door_Log::door_write_unsupported_reason(), 'the reason is visible on the wire, never silent' );
 
-			$name    = 'aura_worker_door_log_test_s56_unavailable';
-			$outcome = Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) );
+			$invocations = 0;
+			$outcome     = Aura_Worker_Door_Log::versioned(
+				function () use ( &$invocations ) {
+					++$invocations;
+					return array( 'mutated' => true, 'result' => true );
+				}
+			);
 
-			$this->assertTrue( $outcome, 'versioned() still works end to end with no property to guard through' );
-			$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+			$this->assertSame( 0, $invocations, 'the callback never runs at all -- refused BEFORE $writes(), not detected after it' );
+			$this->assertFalse( $outcome['committed'], 'the ordinary retryable answer, the same shape every other early refusal here already uses' );
+			$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result when committed is not true' );
+
+			// And the end-to-end shape through a real caller: no row lands.
+			$name = 'aura_worker_door_log_test_s65_fail_closed';
+			$this->assertFalse( Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) ) );
+			$this->assertArrayNotHasKey( $name, $GLOBALS['_options'] );
 		} finally {
 			$GLOBALS['wpdb'] = $real;
 		}
 	}
 
 	/**
-	 * Ruling S56: with the prevention guard unavailable, a reconnect
-	 * mid-$writes() can no longer be PREVENTED (reconnect_retries is
-	 * never forced to 0) -- but it is still DETECTED, by the SAME
-	 * post-$writes() session-nonce re-check Ruling S50 added as
-	 * belt-and-braces alongside prevention. The unit still refuses to
-	 * commit rather than trusting a statement that may have run on a
-	 * reconnected session.
+	 * Ruling S65: the guard being unavailable is a property of the LIVE
+	 * $wpdb, not of any one call -- restoring a real $wpdb (with the
+	 * property back) makes the very next call work normally again, with
+	 * no reason reported.
 	 */
-	public function test_a_reconnect_mid_writes_is_still_detected_when_the_guard_is_unavailable(): void {
+	public function test_reconnect_guard_unavailable_does_not_stick_once_a_real_wpdb_is_back(): void {
 		$real            = $GLOBALS['wpdb'];
 		$GLOBALS['wpdb'] = new SA_Test_Wpdb_No_Reconnect_Guard( $real );
-		try {
-			$name = 'aura_worker_door_log_test_s56_detect';
-			// insert_unique_write()'s own statement shape -- with no
-			// prevention in force, this seam takes the "transparent
-			// reconnect succeeded" branch: the statement itself still
-			// runs, but session state is cleared exactly as a real
-			// reconnect would leave it.
-			$GLOBALS['_sa_reconnect_mid_query'] = 'FROM DUAL';
+		$this->assertFalse( Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_log_test_s65_stuck', array( 'x' => 1 ) ) );
+		$GLOBALS['wpdb'] = $real;
 
-			$outcome = Aura_Worker_Door_Log::insert_unique( $name, array( 'x' => 1 ) );
-
-			$GLOBALS['_sa_reconnect_mid_query'] = false;
-
-			$this->assertFalse( $outcome, 'detected after the fact by the nonce re-check, even with no prevention available' );
-			$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'rolled back once the mismatch was caught' );
-		} finally {
-			$GLOBALS['wpdb'] = $real;
-		}
+		$this->assertNull( Aura_Worker_Door_Log::door_write_unsupported_reason() );
+		$this->assertTrue( Aura_Worker_Door_Log::insert_unique( 'aura_worker_door_log_test_s65_recovered', array( 'x' => 1 ) ) );
 	}
 
 	/**

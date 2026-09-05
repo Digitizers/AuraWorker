@@ -2630,28 +2630,55 @@ class Aura_Worker_Door_Log {
 	/**
 	 * Whether Ruling S56's reconnect-PREVENTION guard can actually be
 	 * applied to the LIVE `$wpdb` — false only for a `db.php` drop-in
-	 * that replaces wpdb outright without declaring `reconnect_retries`
-	 * at all (a subclass inherits the property and this stays true).
-	 * Checked fresh every call — `property_exists()` costs nothing, and
-	 * a drop-in cannot change mid-request — never cached, so the
-	 * fragment/audit always reports the CURRENT truth rather than a memo
-	 * from an earlier attempt.
+	 * that REPLACES wpdb outright without declaring `reconnect_retries`
+	 * at all. A SUBCLASS (HyperDB and the like — extending wpdb rather
+	 * than replacing it) inherits the declared property, so
+	 * `property_exists()` still finds it and the scope-bound closure in
+	 * `reconnect_retries_get()`/`_set()` still reaches it exactly like
+	 * it reaches stock core's own; this is false only for an object that
+	 * is not a `wpdb` (sub)class at all. Checked fresh every call —
+	 * `property_exists()` costs nothing, and a drop-in cannot change
+	 * mid-request — never cached, so the fragment/audit always reports
+	 * the CURRENT truth rather than a memo from an earlier attempt.
 	 *
-	 * `false` here does not mean this site's door writes are unsafe: it
-	 * means Ruling S50's PREVENTION (zeroing reconnect_retries so a
-	 * dropped connection cannot replay a write) could not be applied,
-	 * and every `versioned()` unit on this site falls back to DETECTION
-	 * alone (the post-$writes() session-nonce re-check) — a real
-	 * mutation is still never miscounted, but a torn statement is caught
-	 * one step later, after it already ran once. Reported through
-	 * `status_fragment()`/`governor_block()`'s own `reconnect_guard`
-	 * field so this is visible, never silent.
+	 * `false` here is NOT merely informational (Ruling S65, Codex
+	 * round-25 P1 on #88, overturning Ruling S56's own original
+	 * "detection alone" design): `versioned()` FAILS CLOSED when this is
+	 * false, refusing every write on this site — before `$writes()` ever
+	 * runs — rather than proceeding on the post-$writes() session-nonce
+	 * re-check alone, which only detects a reconnect AFTER a mutation
+	 * may already have landed twice. `door_write_unsupported_reason()`
+	 * is what `status_fragment()`/`governor_block()` report this
+	 * through, so it is visible, never silent, and never confused with
+	 * `observation_unsupported_reason()`'s own, unrelated READ-side
+	 * reasons.
 	 *
 	 * @return bool
 	 */
 	public static function reconnect_guard_available() {
 		global $wpdb;
 		return is_object( $wpdb ) && property_exists( $wpdb, 'reconnect_retries' );
+	}
+
+	/**
+	 * Why WRITES are unsupported on this site right now, if they are
+	 * (Ruling S65, Codex round-25 P1 on #88) — the SAME shape
+	 * `observation_unsupported_reason()` already established for READS,
+	 * for the write side. `'reconnect_guard_unavailable'` is the one
+	 * reason this reports today: `versioned()` fails EVERY write on this
+	 * site closed (refusing before `$writes()` ever runs) for as long as
+	 * `reconnect_guard_available()` cannot be applied to the live
+	 * `$wpdb` — see that method's own docblock for exactly which `db.php`
+	 * shape this is (a full replacement, never a subclass). Surfaced
+	 * through `status_fragment()`/`governor_block()`'s own
+	 * `door_write_unsupported` field so Aura's audit can name it, rather
+	 * than silently retrying writes that will keep failing until the
+	 * drop-in itself is fixed.
+	 *
+	 * @return string|null
+	 */
+	public static function door_write_unsupported_reason() {
+		return self::reconnect_guard_available() ? null : 'reconnect_guard_unavailable';
 	}
 
 	public static function versioned( callable $writes ) {
@@ -2714,18 +2741,40 @@ class Aura_Worker_Door_Log {
 		// is the one case nothing here can safely paper over.
 		$prior_reconnect_retries   = self::reconnect_retries_get( $wpdb );
 		$reconnect_guard_available = ( null !== $prior_reconnect_retries );
-		if ( $reconnect_guard_available ) {
-			self::reconnect_retries_set( $wpdb, 0 );
+		// Ruling S65 (Codex round-25 P1 on #88): FAIL CLOSED, not "proceed
+		// on detection alone" (Ruling S56's own original design, now
+		// overturned). Detection runs the post-$writes() session-nonce
+		// re-check AFTER the statement already ran — but a replacement
+		// $wpdb still capable of transparently reconnecting (it lacks
+		// only the PROPERTY this class uses to turn that off, not the
+		// reconnect behaviour itself) can autocommit the retried
+		// statement on a fresh, un-transacted session the instant the
+		// connection drops, exactly the S50 hazard, before the nonce
+		// check ever gets a chance to notice — noticing AFTER a mutation
+		// already landed a second time is not the same fact as
+		// preventing it from landing twice at all. When the guard cannot
+		// be applied, this unit refuses BEFORE $writes() is ever
+		// invoked: nothing has run, so there is nothing to roll back,
+		// and the caller's own existing retryable path (the same
+		// `committed: false` shape every other early refusal here
+		// already answers) is what it gets instead.
+		//
+		// ONLY A FULL `db.php` REPLACEMENT IS AFFECTED. `wpdb`'s own
+		// PROTECTED `$reconnect_retries` (Ruling S56) is a DECLARED
+		// property every SUBCLASS inherits — HyperDB and the like extend
+		// `wpdb` rather than replacing it, so `property_exists()` still
+		// finds it and the scope-bound closure in
+		// `reconnect_retries_get()`/`_set()` still reaches it exactly
+		// like it reaches stock core's own. This path is reached only by
+		// an object that is not a `wpdb` (sub)class at all — a `db.php`
+		// that reimplements the whole interface from scratch without
+		// ever declaring this specific property.
+		if ( ! $reconnect_guard_available ) {
+			return array(
+				'committed' => false,
+			);
 		}
-		// Ruling S56: when the guard is UNAVAILABLE, this unit proceeds
-		// WITHOUT the prevention above and relies on DETECTION alone —
-		// the post-$writes() session-nonce re-check a few lines down
-		// (Ruling S50's own belt-and-braces addition) still catches a
-		// reconnect that happened to land mid-$writes(), just after the
-		// fact rather than before it. `reconnect_guard_available()`
-		// (public, below) is what the fragment/audit report this
-		// through, so a site running such a drop-in is told, never left
-		// to find out the weaker way.
+		self::reconnect_retries_set( $wpdb, 0 );
 		try {
 			if ( $transactional ) {
 				$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
