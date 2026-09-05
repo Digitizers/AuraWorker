@@ -60,6 +60,13 @@ class Aura_Worker_Door_Log {
 	 */
 	private static $closure_read_unreadable = false;
 	/**
+	 * @var bool Set by full_report_raw() (Ruling S42, Codex round-17 P2 on
+	 * #88): did the MOST RECENT call fail to prove ANY part of its read —
+	 * whether the log is closed at all, or (once closed) either the
+	 * since/refused rows? Reset at the start of every such call.
+	 */
+	private static $full_report_unreadable = false;
+	/**
 	 * @var bool Set by row_from_db() (Ruling S37, Codex round-15 class
 	 * sweep on #88): did the MOST RECENT call fail to prove its read,
 	 * rather than finding the row genuinely absent? Reset at the start of
@@ -2673,18 +2680,55 @@ class Aura_Worker_Door_Log {
 	 * the reasoning; used by the fragment builder in place of
 	 * `full_report()`.
 	 *
-	 * @return array{ since: string|null, refused: int }|null
+	 * UNREADABLE IS NOT "NOT CLOSED", AND IS NOT A FALSE ZERO (Ruling S42,
+	 * Codex round-17 P2 on #88). Three separate raw reads feed this
+	 * report — is_closed_raw() itself, then (once closed) the marker and
+	 * the refusal counter — and each used to fold a failure into a value
+	 * that looks exactly like a real one: an unreadable marker made a
+	 * CLOSED log report as though it were open (null, the same answer a
+	 * genuinely open door gives), and an unreadable since/refused reported
+	 * '' / 0 under whatever observation the poll still claimed. Each
+	 * failure now propagates instead — full_report_raw_was_unreadable(),
+	 * checked by the caller immediately afterwards — and the two fields
+	 * are reported independently: null for whichever one could not be
+	 * proven, the real value for the other.
+	 *
+	 * @return array{ since: string|null, refused: int|null }|null
 	 */
 	public static function full_report_raw() {
-		if ( ! self::is_closed_raw() ) {
-			return null;
+		self::$full_report_unreadable = false;
+		$closed                       = self::is_closed_raw();
+		if ( self::closure_read_was_unreadable() ) {
+			self::$full_report_unreadable = true;
+			return null; // unknown whether the log is even closed — never reported as "open"
 		}
-		$since   = self::raw_option( self::FULL_MARKER );
-		$refused = self::raw_option( self::FULL_COUNTER );
+		if ( ! $closed ) {
+			return null; // genuinely not closed
+		}
+		$since            = self::raw_option( self::FULL_MARKER );
+		$since_unreadable = self::raw_option_was_unreadable();
+		$refused            = self::raw_option( self::FULL_COUNTER );
+		$refused_unreadable = self::raw_option_was_unreadable();
+		if ( $since_unreadable || $refused_unreadable ) {
+			self::$full_report_unreadable = true;
+		}
 		return array(
-			'since'   => (string) ( $since ?? '' ),
-			'refused' => (int) ( $refused ?? 0 ),
+			'since'   => $since_unreadable ? null : (string) ( $since ?? '' ),
+			'refused' => $refused_unreadable ? null : (int) ( $refused ?? 0 ),
 		);
+	}
+
+	/**
+	 * Whether the MOST RECENT `full_report_raw()` call could not prove
+	 * some part of its read (Ruling S42, Codex round-17 P2 on #88). The
+	 * caller must read this immediately after — before anything else in
+	 * this same request can call `full_report_raw()` again and overwrite
+	 * it.
+	 *
+	 * @return bool
+	 */
+	public static function full_report_raw_was_unreadable() {
+		return self::$full_report_unreadable;
 	}
 
 	/**

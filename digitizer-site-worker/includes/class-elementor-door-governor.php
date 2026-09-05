@@ -491,8 +491,13 @@ class Aura_Worker_Elementor_Door {
 			// 'log_floor' field and inside log_after()), before anything
 			// else this attempt can read the floor again.
 			$floor_unreadable = Aura_Worker_Door_Log::floor_was_unreadable_this_attempt();
-			$after_version    = Aura_Worker_Door_Log::door_version_raw();
-			if ( $log_unreadable || $floor_unreadable ) {
+			// Ruling S42 (Codex round-17 P2 on #88): same placement, same
+			// reasoning — build_status_fragment_state() is what calls
+			// full_report_raw() for the 'log_full' field, and this must be
+			// read before anything else this attempt can call it again.
+			$full_report_unreadable = Aura_Worker_Door_Log::full_report_raw_was_unreadable();
+			$after_version          = Aura_Worker_Door_Log::door_version_raw();
+			if ( $log_unreadable || $floor_unreadable || $full_report_unreadable ) {
 				// Served immediately, never retried — the same shape as the
 				// `!$synced` branch just below: a retry re-runs the SAME
 				// walk against the SAME transient condition and, whether it

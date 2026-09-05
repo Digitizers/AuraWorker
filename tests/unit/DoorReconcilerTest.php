@@ -1233,6 +1233,31 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( $version_before, Aura_Worker_Door_Log::door_version_raw(), 'no CAS write landed — the version never moved' );
 	}
 
+	/**
+	 * Ruling S42 (Codex round-17 P2 on #88): full_report_raw() answering a
+	 * fabricated `''`/`0` for a since/refused read that could not be
+	 * proven — indistinguishable from a log that genuinely closed with no
+	 * refusals yet — reported that fabrication under whatever observation
+	 * the poll still claimed. The unreadable field now reports null
+	 * instead, independently of its sibling (which is still reported when
+	 * it read fine), and observation is withheld for the poll.
+	 */
+	public function test_a_suppressed_refusal_counter_read_on_a_closed_log_never_reports_a_false_zero(): void {
+		Aura_Worker_Door_Log::close();
+		Aura_Worker_Door_Log::bump_refused(); // a real refusal, so a false 0 would be a real lie
+		$frag1 = $this->fragment();
+		$this->assertSame( 1, $frag1['log_full']['refused'], 'the fixture assumption this test is built on' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::FULL_COUNTER ] = true;
+		$frag2 = $this->fragment();
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $frag2['observation'], 'an unreadable refusal counter must not be paired with a confident observation' );
+		$this->assertNotNull( $frag2['log_full'], 'the log is still genuinely closed — is_closed_raw() itself read fine' );
+		$this->assertNull( $frag2['log_full']['refused'], 'never a false 0 over a real refusal this call could not read' );
+		$this->assertIsString( $frag2['log_full']['since'], 'the SIBLING field, which read fine, is still reported' );
+	}
+
 	public function test_a_closed_log_is_reported_as_a_closed_door(): void {
 		$this->assertSame( 'open', $this->fragment()['door'], 'nothing is wrong yet' );
 
