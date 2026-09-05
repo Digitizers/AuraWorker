@@ -2262,6 +2262,90 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * Ruling S82 (Codex round-33 P2 on #88): forces `self::OBSERVATION`
+	 * strictly past a value AURA has already accepted, when this site's
+	 * OWN copy of it has fallen behind — see
+	 * `Aura_Worker_Elementor_Door::status_fragment()`'s own
+	 * `$observation_seen` parameter for why this exists at all. The
+	 * identity baseline `sync_served_identities()` guards lives in the
+	 * SAME `wp_options` snapshot as the content it describes, so a
+	 * whole-DB restore that leaves the site's user-visible content
+	 * unchanged (a "top-preserving" restore) rewinds BOTH together — the
+	 * site's own copy of `OBSERVATION` looks perfectly self-consistent
+	 * with its own (also-restored) content, so nothing INTERNAL to the
+	 * site's own CAS-based checks (`sync_computed_state()`,
+	 * `sync_served_identities()`) ever fires again, and the version this
+	 * site reports is frozen at the restored value forever. Only AURA's
+	 * own, externally-held record of what it already accepted can name
+	 * this — hence the parameter comes FROM the caller, never inferred
+	 * here.
+	 *
+	 * SAME CLOCK FLOOR as `bump_door_version_write()` (Ruling S4/S7),
+	 * with one more term: `GREATEST( current + 1, $seen + 1, clock )`.
+	 * The wall clock alone almost always exceeds `$seen` (a value AURA
+	 * accepted at some strictly EARLIER moment) — but Ruling S4's own
+	 * docblock already accepts a backward NTP correction as a fault this
+	 * counter cannot see around; flooring on `$seen + 1` explicitly means
+	 * this restamp lands strictly past it even then, rather than
+	 * depending on clock monotonicity alone.
+	 *
+	 * WRAPPED IN `versioned()` — never a bare write — so a caller gets
+	 * the SAME committed/false/null tri-state every other door mutation
+	 * already answers through it. This is a real state transition
+	 * (AURA's witness demonstrably moved this site's own clock forward),
+	 * never exempt bookkeeping — unlike `bump_door_version()` itself,
+	 * which callers already invoke from INSIDE their own open
+	 * transaction and therefore cannot re-wrap.
+	 *
+	 * @param int $seen A non-negative observation AURA has already
+	 *                   accepted for the door epoch this call concerns —
+	 *                   validated non-negative by the caller (the REST
+	 *                   arg's own `validate_callback`); clamped to zero
+	 *                   here regardless, defensively.
+	 * @return array{ committed: bool|null } versioned()'s own outcome
+	 *              shape — the caller (`Aura_Worker_Elementor_Door`'s own
+	 *              `maybe_restamp_observation_forward()`) does not act
+	 *              differently on any of the three outcomes: an
+	 *              ambiguous or failed restamp simply means the version
+	 *              this poll serves may still be stale, exactly as if
+	 *              this call had never been made — the NEXT poll
+	 *              carrying the same `$observation_seen` tries again.
+	 */
+	public static function restamp_observation_forward( $seen ) {
+		$seen = max( 0, (int) $seen );
+		return self::versioned(
+			function () use ( $seen ) {
+				global $wpdb;
+				$wpdb->last_error = '';
+				// Built as TEXT, never assembled as one PHP int (Ruling
+				// S7) — see bump_door_version_write()'s own docblock for
+				// why.
+				list( $frac, $sec ) = explode( ' ', microtime( false ), 2 );
+				$usec  = min( 999999, (int) ( ( (float) $frac ) * 1000000 ) );
+				$clock = sprintf( '%d%06d', (int) $sec, $usec );
+				$ok    = $wpdb->query(
+					$wpdb->prepare(
+						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, GREATEST(1, %d, %s), 'no') ON DUPLICATE KEY UPDATE option_value = GREATEST(CAST(option_value AS UNSIGNED) + 1, %d, %s)",
+						self::OBSERVATION,
+						$seen + 1,
+						$clock,
+						$seen + 1,
+						$clock
+					)
+				);
+				wp_cache_delete( self::OBSERVATION, 'options' );
+				$won = ( false !== $ok && '' === (string) $wpdb->last_error );
+				return array(
+					'mutated' => $won,
+					'result'  => $won,
+					// Ruling S11: repeated by versioned() after commit.
+					'evict'   => array( self::OBSERVATION, 'notoptions' ),
+				);
+			}
+		);
+	}
+
+	/**
 	 * Just the upsert — split out from `bump_door_version()` so `versioned()`
 	 * (Ruling S8, Codex round-4 P1 on #88) can gate a transaction's COMMIT on
 	 * whether this WRITE landed, without that decision depending on the

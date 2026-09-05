@@ -410,14 +410,30 @@ class Aura_Worker_Elementor_Door {
 	 * honest answer — unordered this poll, exactly like every other field
 	 * here that cannot be proven.
 	 *
-	 * @param int    $after Aura's cursor.
-	 * @param string $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
+	 * @param int      $after Aura's cursor.
+	 * @param string   $epoch The epoch that cursor belongs to; '' ⇒ served from 0.
+	 * @param int|null $observation_seen Ruling S82 (Codex round-33 P2 on
+	 *                   #88): AURA's own last-accepted `observation` for
+	 *                   the epoch named by `$epoch` — see
+	 *                   `maybe_restamp_observation_forward()`'s own
+	 *                   docblock for why this parameter exists and what
+	 *                   it does. Null (the default; every caller before
+	 *                   this ruling) is a no-op — unchanged behaviour.
 	 * @return array|null { active, epoch, binding, observation, door_write_unsupported, seam, door, held, held_unreadable, interrupted (array[]|null, Ruling S44), running (array[]|null, Ruling S44), rewind, log, log_floor, log_unacked (int|null), log_full }
 	 */
-	public static function status_fragment( $after = 0, $epoch = '' ) {
+	public static function status_fragment( $after = 0, $epoch = '', $observation_seen = null ) {
 		if ( ! self::present() ) {
 			return null;
 		}
+		// Ruling S82: BEFORE the bracket below ever opens — see this
+		// method's own docblock for the version_bracketed() read protocol
+		// this must precede, never join. A bump landing INSIDE the
+		// bracket would show up as an ordinary mid-build mutation (a torn
+		// read, forcing a harmless extra retry); landing before it means
+		// the bracket's own before/after reads already agree on the
+		// CORRECTED version from the start, and the fragment this poll
+		// serves reports it directly.
+		self::maybe_restamp_observation_forward( $epoch, $observation_seen );
 		$synced      = false;
 		$rewind_info = array( 'top_unreadable' => false );
 		return self::version_bracketed(
@@ -1508,6 +1524,91 @@ class Aura_Worker_Elementor_Door {
 		$raw       = Aura_Worker_Door_Log::raw_option_for( self::COMPUTED );
 		$persisted = null === $raw ? null : maybe_unserialize( $raw );
 		return is_array( $persisted ) ? $persisted : null;
+	}
+
+	/**
+	 * Ruling S82 (Codex round-33 P2 on #88): the identity baseline
+	 * `sync_served_identities()` guards (`fragment_identity`/
+	 * `audit_identity`, persisted alongside `{ active, seam, door }` in
+	 * `self::COMPUTED`) lives in the SAME `wp_options` snapshot as the
+	 * content it describes. A whole-DB restore that leaves the site's
+	 * user-visible content unchanged (a "top-preserving" restore — some
+	 * OTHER table's own high-water mark survives it, but `wp_options`
+	 * itself rewinds) rewinds the baseline right along with it: the
+	 * restored `COMPUTED` tuple is perfectly self-consistent with the
+	 * restored `OBSERVATION` counter, because both were captured
+	 * together at that earlier moment. `sync_computed_state()`'s CAS
+	 * finds nothing to write (the content matches), `sync_served_identities()`'s
+	 * own comparison finds both hashes already matching (ditto) — so
+	 * NEITHER ever runs again, and `bump_door_version()` (the only writer
+	 * of `OBSERVATION`) is never called either. The version this site
+	 * reports is frozen at the restored value FOREVER: no read-only
+	 * comparison INSIDE this site can ever tell "genuinely unchanged
+	 * since the last poll" apart from "rewound to a self-consistent past
+	 * state" — both look identical from here.
+	 *
+	 * No site-local store survives every restore scope (that is
+	 * precisely the hole above) — the only witness that does is AURA's
+	 * OWN, held entirely outside this site's database. So `/status`
+	 * accepts an optional `door_observation_seen`: AURA's own
+	 * last-accepted `observation` for the epoch it names in `door_epoch`.
+	 * When it EXCEEDS what this site currently holds under that SAME
+	 * epoch, this site treats it as a rewind of the WITNESS itself — the
+	 * `detect_rewind()` pattern (a cursor from AURA above what this site
+	 * can currently prove, under the same epoch, is only ever possible
+	 * after a restore) applied to `OBSERVATION` rather than the log's own
+	 * top — and forces its own clock-floored restamp
+	 * (`Aura_Worker_Door_Log::restamp_observation_forward()`) BEFORE
+	 * `status_fragment()`'s own version bracket ever opens, so AURA's
+	 * strictly-greater CAS accepts the corrected fragment this poll
+	 * serves.
+	 *
+	 * SAME EPOCH ONLY — mirrors `detect_rewind()`'s own epoch-match gate,
+	 * one door down. `$observation_seen` describes a specific door
+	 * LIFETIME (the one AURA had epoch `$epoch` on record for); a value
+	 * recorded against an epoch this site has since legitimately rotated
+	 * PAST describes an instance this site has already left behind, and
+	 * comparing it against the CURRENT `OBSERVATION` would force a
+	 * spurious bump on the strength of a witness that belongs to a
+	 * different door lifetime entirely. An unreadable current epoch read
+	 * refuses the SAME way `detect_rewind()`'s own unreadable-epoch case
+	 * does — never guessed either way.
+	 *
+	 * REJECTS SILENTLY, NEVER LOUDLY, when `$observation_seen` is not
+	 * strictly greater than what this site can currently prove: this is
+	 * the steady-state case (AURA is not ahead of this site, so there is
+	 * nothing to repair) on every ordinary poll, and it must cost
+	 * nothing — no error, no log line, simply nothing to do. The SAME is
+	 * true when `door_version_raw()` itself cannot be proven: acting on
+	 * an unproven `$current` risks bumping a value that may already be
+	 * fine, and the next poll carrying the same `$observation_seen` tries
+	 * again once a read succeeds.
+	 *
+	 * @param string   $epoch            The epoch `$observation_seen` was recorded against ('' ⇒ never matches, since a real epoch is never '').
+	 * @param int|null $observation_seen AURA's own last-accepted observation, or null (no-op — the caller passed none).
+	 * @return void
+	 */
+	private static function maybe_restamp_observation_forward( $epoch, $observation_seen ) {
+		if ( null === $observation_seen ) {
+			return;
+		}
+		$seen = (int) $observation_seen;
+		if ( $seen < 0 ) {
+			return; // never negative — the REST arg's own validate_callback already refuses this; defence in depth.
+		}
+		Aura_Worker_Door_Log::epoch(); // idempotent mint, same as detect_rewind()'s own priming
+		$site_epoch = Aura_Worker_Door_Log::epoch_raw();
+		if ( Aura_Worker_Door_Log::raw_option_was_unreadable() ) {
+			return; // cannot prove which epoch this site is even on — refuse, never guess.
+		}
+		if ( (string) $epoch !== $site_epoch ) {
+			return; // a witness for a door lifetime this site has since rotated past.
+		}
+		$current = Aura_Worker_Door_Log::door_version_raw();
+		if ( null === $current || $seen <= $current ) {
+			return; // steady state, or $current cannot be proven either way — nothing to repair on unproven ground.
+		}
+		Aura_Worker_Door_Log::restamp_observation_forward( $seen );
 	}
 
 	/**

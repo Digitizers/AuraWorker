@@ -105,6 +105,20 @@ class Aura_Worker_API {
 			'methods'             => 'GET',
 			'callback'            => array( $this, 'get_status' ),
 			'permission_callback' => array( $this->security, 'check_read_permission' ),
+			'args'                => array(
+				// Ruling S82 (Codex round-33 P2 on #88): see
+				// Aura_Worker_Elementor_Door::maybe_restamp_observation_forward()'s
+				// own docblock for the whole-DB-restore hole this closes
+				// and why only Aura's own record can name it.
+				'door_observation_seen' => array(
+					'required'          => false,
+					'type'              => 'integer',
+					'validate_callback' => function( $value ) {
+						return null === $value || ( is_numeric( $value ) && (int) $value == $value && (int) $value >= 0 ); // phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
+					},
+					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — a non-negative integer. When it EXCEEDS this site's current door version under that SAME epoch, the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored when it is not greater than the current version, or when `door_epoch` does not name this site's CURRENT epoch.", 'digitizer-site-worker' ),
+				),
+			),
 		) );
 
 		// Available updates (read-only).
@@ -557,9 +571,16 @@ class Aura_Worker_API {
 		// Elementor is still there.
 		if ( class_exists( 'Aura_Worker_Elementor_Door' ) && Aura_Worker_Elementor_Door::present() ) {
 			Aura_Worker_Elementor_Door::reconcile();
-			$status['door'] = (object) Aura_Worker_Elementor_Door::status_fragment(
+			// Ruling S82 (Codex round-33 P2 on #88): the REST arg's own
+			// `validate_callback` already refused anything but a
+			// non-negative integer or absence; `get_param()` answers
+			// `null` when the caller sent nothing at all, which
+			// `status_fragment()`'s own default treats as a no-op.
+			$observation_seen = $request->get_param( 'door_observation_seen' );
+			$status['door']   = (object) Aura_Worker_Elementor_Door::status_fragment(
 				(int) $request->get_param( 'door_after' ),
-				(string) $request->get_param( 'door_epoch' ) // the epoch the cursor belongs to; '' ⇒ served from 0
+				(string) $request->get_param( 'door_epoch' ), // the epoch the cursor belongs to; '' ⇒ served from 0
+				null === $observation_seen ? null : (int) $observation_seen
 			);
 		}
 

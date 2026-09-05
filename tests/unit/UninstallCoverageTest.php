@@ -151,6 +151,14 @@ final class UninstallCoverageTest extends TestCase {
 	 *   increment (bump_door_version()'s INSERT … ON DUPLICATE KEY UPDATE on
 	 *   'aura_worker_door_observation'), the same upsert shape bump_refused()
 	 *   above already uses. Also under the swept 'aura_worker_' prefix. And —
+	 *   since Ruling S82, Codex round-33 P2 on #88 — restamp_observation_forward()'s
+	 *   OWN INSERT … ON DUPLICATE KEY UPDATE on that SAME
+	 *   'aura_worker_door_observation' key: a clock-and-witness-floored
+	 *   restamp Aura's own `door_observation_seen` (see
+	 *   Aura_Worker_Elementor_Door::maybe_restamp_observation_forward()'s
+	 *   own docblock) forces past a value this site's copy has fallen
+	 *   behind after a whole-DB restore. Same key as bump_door_version()'s
+	 *   own write above, already under the swept 'aura_worker_' prefix. And —
 	 *   since Ruling S30, Codex round-13 P1 on #88, superseded by Ruling S32,
 	 *   Codex round-14 P1 on #88 — versioned()'s DURABLE commit-witness
 	 *   write, a PLAIN INSERT (no ON DUPLICATE KEY UPDATE — a real second
@@ -183,7 +191,7 @@ final class UninstallCoverageTest extends TestCase {
 	 *   'aura_worker_' prefix.
 	 */
 	private const ACKNOWLEDGED_RAW_OPTION_WRITES = array(
-		'includes/class-aura-worker-door-log.php'    => 11,
+		'includes/class-aura-worker-door-log.php'    => 12,
 		'includes/class-aura-worker-magic-link.php'  => 3,
 		'includes/class-aura-worker-rules.php'       => 5,
 		'includes/class-aura-worker.php'             => 2,

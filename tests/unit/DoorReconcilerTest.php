@@ -2484,6 +2484,71 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array( 2 ), array_column( $door['log'], 'seq' ) );
 	}
 
+	/**
+	 * Ruling S82 (Codex round-33 P2 on #88): the identity baseline
+	 * `sync_served_identities()` guards lives in the SAME `wp_options`
+	 * snapshot as the content it describes -- a whole-DB restore that
+	 * leaves this site's content unchanged (a "top-preserving" restore)
+	 * rewinds `OBSERVATION` right along with it, self-consistent with the
+	 * also-restored content. Nothing INTERNAL to this site can ever tell
+	 * that apart from genuinely nothing having changed -- proven here
+	 * first, then closed by `door_observation_seen`.
+	 */
+	public function test_status_forces_the_version_forward_when_aura_reports_a_higher_observation_than_a_restored_site_holds(): void {
+		// A real poll establishes real content and a real baseline.
+		$before_frag = $this->fragment();
+		$epoch       = Aura_Worker_Door_Log::epoch();
+		$this->assertIsInt( $before_frag['observation'], 'the fixture assumption this test is built on' );
+
+		// The whole DB is restored to an earlier, self-consistent
+		// snapshot -- modelled here by rewinding ONLY the raw OBSERVATION
+		// counter, since nothing else in this test touches the door's own
+		// { active, seam, door, identity } tuple, so it genuinely IS
+		// unchanged, exactly as a top-preserving restore leaves it.
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::OBSERVATION ] = '100';
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::OBSERVATION ]    = '100';
+		unset( $GLOBALS['_notoptions'][ Aura_Worker_Door_Log::OBSERVATION ] );
+		$this->assertSame( 100, Aura_Worker_Door_Log::door_version_raw(), 'the fixture assumption this test is built on' );
+
+		// Sanity: an ORDINARY poll (no door_observation_seen) leaves the
+		// restored, self-consistent value untouched -- this IS the hole
+		// Ruling S82 closes, proven here so the fix below is proven
+		// against a REAL frozen baseline, not an assumption.
+		$stuck = $this->fragment();
+		$this->assertSame( 100, $stuck['observation'], 'the fixture assumption this test is built on -- nothing internal to this site can repair a self-consistent restore on its own' );
+
+		// Aura reports its own last-accepted observation: 5000, well
+		// above what this restored site can currently prove.
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', 5000 );
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
+
+		$this->assertIsInt( $door['observation'] );
+		$this->assertGreaterThan( 5000, $door['observation'], 'Ruling S82: strictly past what Aura already accepted' );
+		$this->assertGreaterThan( 5000, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/**
+	 * The other half of Ruling S82: an observation at or below what this
+	 * site can ALREADY prove is the steady-state case on every ORDINARY
+	 * poll and must cost nothing -- silently, never a bump.
+	 */
+	public function test_status_does_not_bump_when_aura_reports_an_observation_at_or_below_the_current_one(): void {
+		$this->fragment(); // establishes a real baseline
+		$epoch   = Aura_Worker_Door_Log::epoch();
+		$current = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertIsInt( $current, 'the fixture assumption this test is built on' );
+
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', $current ); // exactly current -- not GREATER
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
+
+		$this->assertSame( $current, $door['observation'], 'not strictly greater than what this site already proves -- steady state, never a bump' );
+		$this->assertSame( $current, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* (k) a claim whose entry cannot be written is KEPT                   */
 	/* ------------------------------------------------------------------ */
