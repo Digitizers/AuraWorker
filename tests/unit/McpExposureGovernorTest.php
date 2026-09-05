@@ -121,6 +121,7 @@ final class McpExposureGovernorTest extends TestCase {
 				'unobserved_30d',
 				'hook_missed_30d',
 				'unknown_ability_30d',
+				'counters_as_of',
 				'queue_full',
 				'log_full',
 				'observation',
@@ -148,6 +149,12 @@ final class McpExposureGovernorTest extends TestCase {
 		$this->assertSame( 0, $b['unobserved_30d'] );
 		$this->assertSame( 0, $b['hook_missed_30d'] );
 		$this->assertSame( 0, $b['unknown_ability_30d'] );
+		// Ruling S49 (Codex round-19 P2 on #88): the cutoff the four
+		// `_30d` fields above were computed against — not covered by
+		// `observation` (they shrink on their own as this cutoff
+		// advances, with no mutation for anything to version).
+		$this->assertIsString( $b['counters_as_of'] );
+		$this->assertMatchesRegularExpression( '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/', $b['counters_as_of'] );
 		$this->assertFalse( $b['queue_full'] );
 		$this->assertNull( $b['log_full'] );
 	}
@@ -212,6 +219,27 @@ final class McpExposureGovernorTest extends TestCase {
 	}
 
 	// --- the _30d counters read what Tasks 5/7 already bump -----------------
+
+	/**
+	 * Ruling S49 (Codex round-19 P2 on #88): `counters_as_of` is the SAME
+	 * hour-bucket cutoff `count_30d()` computed the four `_30d` fields
+	 * against, not a separately-derived approximation of it — asserted by
+	 * recomputing the cutoff from wall time bracketing the call, the same
+	 * before/after tolerance a real `time()`-based read needs (the window
+	 * is only actually different across these two computations if this
+	 * assertion runs in the exact same second an hour boundary ticks
+	 * over).
+	 */
+	public function test_governor_block_reports_the_same_cutoff_count_30d_used(): void {
+		$this->bringUpTheDoor();
+		$before = time();
+		$b      = $this->block();
+		$after  = time();
+
+		$expected_min = gmdate( 'c', (int) floor( ( $before - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS ) * HOUR_IN_SECONDS );
+		$expected_max = gmdate( 'c', (int) floor( ( $after - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS ) * HOUR_IN_SECONDS );
+		$this->assertContains( $b['counters_as_of'], array_unique( array( $expected_min, $expected_max ) ), "the exact cutoff count_30d()'s own arithmetic produces for a real call taken in this same window" );
+	}
 
 	public function test_count_30d_sums_the_window_in_one_query_and_excludes_older_buckets_and_other_names(): void {
 		$now      = strtotime( '2026-09-02T12:00:00Z' );

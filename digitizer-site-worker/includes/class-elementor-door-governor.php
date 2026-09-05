@@ -4004,6 +4004,21 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
+	 * The hour-bucket floor `count_30d()` treats as the OLDEST bucket still
+	 * inside its 30-day window — shared so the four `_30d` counters
+	 * `governor_block()` reports and the `counters_as_of` cutoff it reports
+	 * beside them (Ruling S49, Codex round-19 P2 on #88) are provably the
+	 * SAME arithmetic on the SAME `$now`, never two separate computations
+	 * that could drift a bucket apart.
+	 *
+	 * @param int $now Unix time.
+	 * @return int Hour-bucket index (unix time / HOUR_IN_SECONDS, floored).
+	 */
+	private static function count_30d_cutoff_bucket( $now ) {
+		return (int) floor( ( (int) $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+	}
+
+	/**
 	 * The last 30 days of one bump_counter() name, in ONE query — the shape
 	 * `Aura_Worker_Rules::sweep_options()`'s value-parsed branch already reads
 	 * by (name, value) pairs under a single LIKE, with the cutoff applied in
@@ -4034,7 +4049,7 @@ class Aura_Worker_Elementor_Door {
 	public static function count_30d( $name, $now = null ) {
 		global $wpdb;
 		$now              = null === $now ? time() : (int) $now;
-		$oldest           = (int) floor( ( $now - 30 * DAY_IN_SECONDS ) / HOUR_IN_SECONDS );
+		$oldest           = self::count_30d_cutoff_bucket( $now );
 		$prefix           = self::COUNTER_PREFIX . $name . '_h';
 		$wpdb->last_error = '';
 		$rows             = $wpdb->get_results(
@@ -4142,7 +4157,18 @@ class Aura_Worker_Elementor_Door {
 	 * observation of the last state transition, on-demand, never allocated
 	 * by this read.
 	 *
-	 * @return array { active, epoch, binding, observation, observation_unsupported, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, queue_full, log_full }
+	 * `observation` DOES NOT COVER `log_ungoverned_30d` / `unobserved_30d` /
+	 * `hook_missed_30d` / `unknown_ability_30d` (Ruling S49, Codex round-19
+	 * P2 on #88). Those four counters shrink on their own as their hourly
+	 * cutoff advances — no row is mutated when a bucket ages out, so there
+	 * is nothing for `sync_computed_state()` to version, and versioning an
+	 * hourly-driven shrink would be a FABRICATED mutation rather than a
+	 * real one. `counters_as_of` reports the cutoff those four fields were
+	 * computed against, ISO 8601, so a caller can read the window they
+	 * describe without needing (or ever getting) a witness for it — this
+	 * block is live evidence for them, not gated by `observation`.
+	 *
+	 * @return array { active, epoch, binding, observation, observation_unsupported, seam, door, held_count, log_unacked, log_ungoverned_30d, unobserved_30d, hook_missed_30d, unknown_ability_30d, counters_as_of, queue_full, log_full }
 	 */
 	public static function governor_block() {
 		if ( ! self::present() ) {
@@ -4219,6 +4245,12 @@ class Aura_Worker_Elementor_Door {
 				// say "unknown" together rather than one of them
 				// inventing a zero.
 				$held = Aura_Worker_Door_Holds::count(); // read once
+				// Ruling S49 (Codex round-19 P2 on #88): ONE `$now` for
+				// every `_30d` counter AND the cutoff reported beside
+				// them — four separate `time()` calls could straddle an
+				// hour boundary mid-audit and report counters computed
+				// against DIFFERENT windows under one `counters_as_of`.
+				$now_30d = time();
 				return array(
 					'active'              => $active,
 					'epoch'               => '' === $epoch ? null : $epoch,
@@ -4241,10 +4273,22 @@ class Aura_Worker_Elementor_Door {
 					// when THIS count could not be read — joining
 					// log_unacked/held_count above rather than reporting
 					// a false zero.
-					'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned' ),
-					'unobserved_30d'      => self::count_30d( 'unobserved' ),
-					'hook_missed_30d'     => self::count_30d( 'hook_missed' ),
-					'unknown_ability_30d' => self::count_30d( 'unknown_ability' ),
+					'log_ungoverned_30d'  => self::count_30d( 'log_ungoverned', $now_30d ),
+					'unobserved_30d'      => self::count_30d( 'unobserved', $now_30d ),
+					'hook_missed_30d'     => self::count_30d( 'hook_missed', $now_30d ),
+					'unknown_ability_30d' => self::count_30d( 'unknown_ability', $now_30d ),
+					// Ruling S49 (Codex round-19 P2 on #88): the hourly
+					// cutoff the four `_30d` fields above were just
+					// computed against, ISO 8601. These counters SHRINK
+					// on their own as the cutoff advances — no row is
+					// mutated, so `sync_computed_state()` has nothing to
+					// version and never will (versioning an hourly-driven
+					// shrink would be a FABRICATED mutation, not a real
+					// one). `observation` therefore does NOT cover them
+					// — see this method's own docblock — and this field
+					// is how a caller reads what window they describe
+					// without needing a witness for it.
+					'counters_as_of'      => gmdate( 'c', self::count_30d_cutoff_bucket( $now_30d ) * HOUR_IN_SECONDS ),
 					'queue_full'          => null === $held ? null : ( $held >= Aura_Worker_Door_Holds::CAP ),
 					// RAW (Ruling S43): full_report_raw(), not
 					// full_report() — the same reasoning as every other
