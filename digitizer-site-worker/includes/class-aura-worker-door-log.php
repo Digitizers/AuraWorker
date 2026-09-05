@@ -1830,7 +1830,19 @@ class Aura_Worker_Door_Log {
 	 * can hold constant while still flipping what a specific row between
 	 * them says.
 	 *
-	 * @return array{ top: int, floor: int, pending_count: int, terminal_count_above_floor: int, terminal_top: int|null }|null
+	 * `fingerprint` (Ruling S64, Codex round-24 P2 on #88) closes the
+	 * remaining gap: a restore that flips a TERMINAL row's own verdict
+	 * (`ok` back to `failed`, say) with the seq, the floor and every
+	 * count above all UNCHANGED passes `top`/`floor`/`pending_count`/
+	 * `terminal_count_above_floor`/`terminal_top` unnoticed — none of
+	 * them look at a row's content past its `result` field's PENDING/
+	 * TERMINAL distinction. `fingerprint` is a sha1 over the SORTED
+	 * `seq|status|sha1(full row JSON)` tuple of every row above the
+	 * floor, pending or terminal alike, from THIS SAME per-row read —
+	 * never a second query — so any row's own content changing, whatever
+	 * field, changes this even when nothing else in the shape does.
+	 *
+	 * @return array{ top: int, floor: int, pending_count: int, terminal_count_above_floor: int, terminal_top: int|null, fingerprint: string }|null
 	 *         Null when `top`, the floor, or the row read itself could not
 	 *         be proven — check `log_shape_was_unreadable()` immediately
 	 *         after.
@@ -1873,6 +1885,20 @@ class Aura_Worker_Door_Log {
 		$pending_count              = 0;
 		$terminal_count_above_floor = 0;
 		$terminal_top               = null;
+		// Ruling S64 (Codex round-24 P2 on #88): a per-row FINGERPRINT
+		// tuple, collected from this SAME loop — never a second query —
+		// for every row above the floor, pending or terminal alike. The
+		// counts above answer "how many, and which top", which a restore
+		// that flips a TERMINAL row's own verdict (e.g. `ok` back to
+		// `failed`) with the seq, the floor and every count UNCHANGED
+		// sails straight through: same top, same floor, same
+		// pending/terminal counts, same terminal_top — nothing here
+		// would notice. The fingerprint is what does: `seq|status|sha1(
+		// full row JSON)` per row, sorted (never insertion order, which
+		// this SQL query does not guarantee), then hashed as ONE string —
+		// any row's own CONTENT changing, whatever field, changes this
+		// even when nothing else in the shape does.
+		$tuples = array();
 		foreach ( $rows as $r ) {
 			// ROW_REGEXP already scoped the SQL match to a purely numeric
 			// suffix, but the trailing digits are still pulled explicitly
@@ -1888,6 +1914,9 @@ class Aura_Worker_Door_Log {
 				continue;
 			}
 			$result = isset( $row['result'] ) ? (string) $row['result'] : 'pending';
+			if ( $seq > $floor ) {
+				$tuples[] = $seq . '|' . $result . '|' . sha1( (string) wp_json_encode( $row ) );
+			}
 			if ( 'pending' === $result ) {
 				++$pending_count;
 				continue;
@@ -1897,12 +1926,14 @@ class Aura_Worker_Door_Log {
 				$terminal_top = null === $terminal_top ? $seq : max( $terminal_top, $seq );
 			}
 		}
+		sort( $tuples, SORT_STRING );
 		return array(
 			'top'                        => $top,
 			'floor'                      => $floor,
 			'pending_count'              => $pending_count,
 			'terminal_count_above_floor' => $terminal_count_above_floor,
 			'terminal_top'               => $terminal_top,
+			'fingerprint'                => sha1( implode( "\n", $tuples ) ),
 		);
 	}
 

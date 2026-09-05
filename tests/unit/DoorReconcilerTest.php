@@ -417,6 +417,40 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S64 (Codex round-24 P2 on #88): a restore that changes a
+	 * TERMINAL row's own VERDICT (`ok` back to `failed`, say) while its
+	 * seq, the floor, and every COUNT Ruling S61's own log-shape identity
+	 * tracks stay unchanged -- the row is terminal before and after,
+	 * still above the floor, so pending_count/terminal_count_above_floor/
+	 * terminal_top all pass unnoticed. The new fingerprint (a sha1 over
+	 * each row's own seq|status|content, sorted) is what catches this:
+	 * the row's own CONTENT changed even though nothing about ITS SHAPE
+	 * did.
+	 */
+	public function test_a_terminal_rows_verdict_flipped_with_no_bump_still_advances_the_observation(): void {
+		$seq = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+
+		$before = $this->fragment();
+		$v1     = $before['observation'];
+		$this->assertIsInt( $v1, 'the fixture assumption this test is built on' );
+
+		// The restore: seq $seq's own verdict flips from ok to failed,
+		// raw -- no versioned() unit runs, no bump of any kind. Still
+		// terminal, still the SAME seq, still above the SAME floor: every
+		// count Ruling S61 tracks is unchanged by this flip alone.
+		$this->patchOption( Aura_Worker_Door_Log::PREFIX . $seq, array( 'result' => 'failed' ) );
+
+		$after = $this->fragment();
+		$this->assertNotNull( $after['observation'], 'a single retry resolves this -- never "torn twice"' );
+		$this->assertGreaterThan( $v1, $after['observation'], 'the flipped verdict is a REAL transition, served under a witness strictly greater than the pre-restore poll' );
+
+		// A second serve of the SAME (now steady) shape does not bump again.
+		$again = $this->fragment();
+		$this->assertSame( $after['observation'], $again['observation'], 'the flip is already recorded -- a repeat serve does not bump again' );
+	}
+
+	/**
 	 * Ruling S46 (Codex round-19, S45 class): the SAME transition-fold as
 	 * `running`, for `interrupted` — a claim crosses into "stale,
 	 * unleased" SOLELY by its own `claimed_at` ageing past CLAIM_STALE_MS,
