@@ -2668,6 +2668,25 @@ class Aura_Worker_Door_Log {
 					// that did not, so this session can no longer see anything
 					// it never durably wrote.
 					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					// Ruling S53 (Codex round-21 P1 on #88): RECONNECTS
+					// RE-ENABLED, here, before the witness read — never
+					// earlier. Ruling S50 zeroed `reconnect_retries` for
+					// every statement $writes() itself could still issue,
+					// because a reconnect THERE would replay a write on a
+					// fresh, un-transacted session. Nothing below this
+					// line writes anything: $writes() already ran, and the
+					// transaction it ran inside has already committed or
+					// (via the ROLLBACK just above) been undone. A
+					// connection lost exactly on the way back from a real
+					// COMMIT — the window this durable witness exists to
+					// resolve — otherwise left `reconnect_retries` at 0
+					// from S50 still in force, so THIS read could not
+					// reconnect either, and answered unreadable for a
+					// commit that had, in fact, already landed. Restoring
+					// before the read, not only in the method's own
+					// `finally`, is what lets it actually find the
+					// witness a healthy reconnect would reveal.
+					$wpdb->reconnect_retries = $prior_reconnect_retries;
 					// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): the DURABLE
 					// witness, written BEFORE the bump inside this same
 					// transaction — a plain option row survives what neither a

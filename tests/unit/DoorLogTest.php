@@ -1896,4 +1896,56 @@ final class DoorLogTest extends TestCase {
 		$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result unless committed is strictly true' );
 		$this->assertArrayHasKey( $witness, $GLOBALS['_options'], 'the witness row is left untouched -- deleting it on an unproven read would erase the only evidence this unit ever ran' );
 	}
+	/**
+	 * Ruling S53 (Codex round-21 P1 on #88): Ruling S50 zeroes
+	 * reconnect_retries for the WHOLE unit, so $writes() can never be
+	 * replayed on a reconnected session -- but the durable-witness
+	 * fallback runs strictly AFTER $writes() already committed or rolled
+	 * back, and exists PRECISELY to resolve a connection lost on the way
+	 * back from a real COMMIT. Leaving reconnect_retries at 0 through
+	 * that read meant the one case the witness exists for -- a genuinely
+	 * landed commit whose ack got lost -- could not reconnect either, and
+	 * answered committed: null for a commit that had, in fact, already
+	 * happened. reconnect_retries is restored right before this read
+	 * (not only in the method's own closing `finally`), so a reconnect
+	 * here succeeds and finds the witness a healthy connection would.
+	 */
+	public function test_a_connection_lost_after_a_durable_commit_reconnects_to_find_its_own_witness(): void {
+		$name = 'aura_worker_door_log_test_s53';
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s53';
+		// Reaches the durable-witness fallback: the COMMIT statement
+		// itself looks clean, but the post-commit session-nonce
+		// read-back finds no session variables (Ruling S16's own
+		// reconnect-after-commit model) -- the ack of a real commit,
+		// lost.
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		// The fallback's OWN witness read needs a reconnect to succeed:
+		// while reconnect_retries is still 0 (the bug this ruling
+		// closes), the read fails outright; once S53 restores it first,
+		// the read proceeds normally and finds the witness this unit's
+		// own COMMIT already made durable.
+		$GLOBALS['_sa_reconnect_mid_query']    = 'AS probe, (SELECT option_value FROM';
+
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_reconnect_mid_query']    = false;
+
+		$this->assertTrue( $outcome['committed'], 'the witness this unit\'s own real COMMIT wrote is found once the fallback read can reconnect' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
+	}
+
 }

@@ -2276,6 +2276,14 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
 			}
+			// Ruling S53 (Codex round-21 P1 on #88): see
+			// sa_reconnect_mid_query_check()'s own docblock — the post-COMMIT
+			// nonce read-back (Ruling S16) is one of the two get_var()/
+			// get_row() reads that seam must be able to land on.
+			if ( $this->sa_reconnect_mid_query_check( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return null;
+			}
 			// Aura_Worker_Elementor_Door::has_state() (Ruling P46): how many
 			// door rows are left, excluding the 30-day counter buckets and the
 			// hold-queue lock. Counted over the merged "database" view, the
@@ -2577,6 +2585,15 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
 				return null;
 			}
+			// Ruling S53 (Codex round-21 P1 on #88): see
+			// sa_reconnect_mid_query_check()'s own docblock —
+			// raw_option_read()'s nonce-probed witness read (Ruling S51) is
+			// one of the two get_var()/get_row() reads that seam must be
+			// able to land on.
+			if ( $this->sa_reconnect_mid_query_check( (string) $query ) ) {
+				$GLOBALS['_db_queries'][] = (string) $query;
+				return null;
+			}
 			// Aura_Worker_Door_Log::engine_is_transactional()'s own probe
 			// (Ruling S13, 2.16.2; queried by EXACT name, never LIKE, as of
 			// Ruling S23, Codex round-9 P2 on #88 — see that method's own
@@ -2857,44 +2874,57 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 * respectively (on both statements — a real driver doesn't care which
 		 * statement it was asked to run when the connection is the problem).
 		 */
+		/**
+		 * Ruling S50 (Codex round-20 P1 on #88), shared by query()/
+		 * get_row()/get_var() (Ruling S53, Codex round-21 P1 on #88 —
+		 * raw_option_read()'s witness fallback reads via get_row(), and
+		 * the post-commit nonce read-back via get_var(), so a test
+		 * simulating a dropped connection mid-statement must be able to
+		 * land on ANY of the three, exactly like real wpdb's
+		 * check_connection() gate, which applies to every statement a
+		 * connection issues regardless of which method sent it): armed
+		 * by a test to land on whichever query it names (or the very
+		 * next one, for `true`). A real dropped connection sends
+		 * wpdb::check_connection() into up to `reconnect_retries`
+		 * reconnect attempts: with retries left it reconnects and
+		 * TRANSPARENTLY REPLAYS this exact statement on the fresh session
+		 * — modelled by clearing session state exactly like every other
+		 * reconnect seam here, then letting the statement run normally
+		 * (a replay on a fresh session still lands the same row). With
+		 * `reconnect_retries` already at 0 — what Ruling S50 itself sets
+		 * for versioned()'s whole unit — check_connection() gives up
+		 * before ever retrying, and the caller must report the honest
+		 * "server has gone away" failure instead. Fires once.
+		 *
+		 * @param string $query The query about to run.
+		 * @return bool True when THIS exact call must fail outright —
+		 *              `last_error` is already set by the time this
+		 *              returns.
+		 */
+		private function sa_reconnect_mid_query_check( $query ) {
+			$armed = $GLOBALS['_sa_reconnect_mid_query'] ?? false;
+			$hit   = true === $armed
+				|| ( is_string( $armed ) && '' !== $armed && false !== strpos( (string) $query, $armed ) );
+			if ( ! $hit ) {
+				return false;
+			}
+			$GLOBALS['_sa_reconnect_mid_query'] = false; // fires once
+			if ( 0 === (int) $this->reconnect_retries ) {
+				$this->last_error = 'MySQL server has gone away';
+				return true;
+			}
+			$this->sa_session_vars = array(); // the fresh, reconnected session
+			return false;
+		}
+
 		public function query( $query ) {
 			$query                    = (string) $query;
 			$this->last_query         = $query;
 			$this->last_error         = ''; // As wpdb::flush() does before every statement.
 			$GLOBALS['_db_queries'][] = $query;
 
-			// Ruling S50 (Codex round-20 P1 on #88): models a connection
-			// dropping WHILE the very next statement is in flight — armed
-			// by a test to land on whichever query versioned()'s own
-			// $writes() callback happens to issue. A real dropped
-			// connection sends wpdb::check_connection() into up to
-			// `reconnect_retries` reconnect attempts: with retries left it
-			// reconnects and TRANSPARENTLY REPLAYS this exact statement on
-			// the fresh session — modelled by clearing session state
-			// exactly like every other reconnect seam here, then letting
-			// the statement run normally below (a replay on a fresh
-			// session still lands the same row). With `reconnect_retries`
-			// already at 0 — what Ruling S50 itself sets for versioned()'s
-			// whole unit — check_connection() gives up before ever
-			// retrying, and the ORIGINAL statement never runs at all: the
-			// honest "server has gone away" failure this seam reports
-			// instead. Fires once.
-			$reconnect_mid_query_armed = $GLOBALS['_sa_reconnect_mid_query'] ?? false;
-			// Either `true` (fires on the very next query, whatever it is)
-			// or a substring naming which query to land on — a test needs
-			// to pick $writes()'s OWN statement out of the fixed control
-			// statements (START TRANSACTION, SAVEPOINT, the nonce SET)
-			// versioned() always issues first, to prove Ruling S50's
-			// protection covers $writes() itself and not only those.
-			$reconnect_mid_query_hit = true === $reconnect_mid_query_armed
-				|| ( is_string( $reconnect_mid_query_armed ) && '' !== $reconnect_mid_query_armed && false !== strpos( $query, $reconnect_mid_query_armed ) );
-			if ( $reconnect_mid_query_hit ) {
-				$GLOBALS['_sa_reconnect_mid_query'] = false; // fires once
-				if ( 0 === (int) $this->reconnect_retries ) {
-					$this->last_error = 'MySQL server has gone away';
-					return false;
-				}
-				$this->sa_session_vars = array(); // the fresh, reconnected session
+			if ( $this->sa_reconnect_mid_query_check( $query ) ) {
+				return false;
 			}
 
 			// Aura_Worker_Door_Log::versioned() (Ruling S8, 2.16.2): a state
