@@ -62,6 +62,11 @@ class Aura_Worker_Elementor_Door {
 	const CREATING = 'aura_worker_door_creating';
 	/** The rolling counter buckets' shared prefix: `<prefix><name>_h<hour>`. */
 	const COUNTER_PREFIX = 'aura_worker_door_c_';
+	/**
+	 * The last { active, seam, door } tuple this site VERSIONED (Ruling S22,
+	 * Codex round-9 P2 on #88) — see `sync_computed_state()`'s own docblock.
+	 */
+	const COMPUTED = 'aura_worker_door_computed';
 
 	/** Kit meta the design system lives in (4.3.0-beta1, R3). */
 	const KIT_META_KEYS = array(
@@ -421,6 +426,11 @@ class Aura_Worker_Elementor_Door {
 				// own docblock for the memo this closes.
 				self::reset_request_caches();
 			}
+			// Ruling S22 (Codex round-9 P2 on #88): a COMPUTED transition —
+			// Elementor deactivating, the coverage seam changing — is state,
+			// and must land BEFORE the bracketed reads below can prove
+			// anything about it. See sync_computed_state()'s own docblock.
+			self::sync_computed_state();
 			$before_version = Aura_Worker_Door_Log::door_version_raw();
 			$fragment       = self::build_status_fragment_state( (int) $after, $epoch );
 			$after_version  = Aura_Worker_Door_Log::door_version_raw();
@@ -475,6 +485,69 @@ class Aura_Worker_Elementor_Door {
 	private static function reset_request_caches() {
 		Aura_Worker_Door_Holds::forget_held();
 		self::$active = null;
+	}
+
+	/**
+	 * Persist the computed tuple `{ active, seam, door }` as door STATE, not
+	 * merely a REPORT of it (Ruling S22, Codex round-9 P2 on #88).
+	 *
+	 * THE BUG THIS CLOSES: Elementor deactivating, or the coverage seam
+	 * changing, does not itself touch `wp_options` — nothing here mutates
+	 * the door log or the hold queue — so `status_fragment()`'s bracketing
+	 * version reads both answer the SAME (unchanged) observation even
+	 * though `active` and `door` in the fragment just flipped. Aura's
+	 * strictly-greater observation comparison then REJECTS the fragment
+	 * carrying the new, correct values — its observation is not greater
+	 * than the one Aura already has — and keeps serving the STALE
+	 * active/open state indefinitely, until some UNRELATED door mutation
+	 * happens to bump the version for other reasons.
+	 *
+	 * Computed state is compared against what was last PERSISTED under
+	 * `self::COMPUTED` and, on any difference — including "nothing
+	 * persisted yet", the first poll a site ever serves — written through
+	 * `Aura_Worker_Door_Log::versioned()`, the SAME choke point every other
+	 * door mutation goes through, so the transition itself becomes a real,
+	 * version-bumping mutation Aura's comparison can see. A STEADY state
+	 * (no difference from what is already persisted) writes NOTHING: this
+	 * must not bump the version on every single poll, only on an actual
+	 * transition — one mutation per transition, none on a steady state.
+	 *
+	 * Called from `status_fragment()` before its bracketed version reads —
+	 * on EVERY attempt, not only a retry, since the bug bites on the very
+	 * first attempt with no torn read required — and from
+	 * `governor_block()` before it reads `door_version_raw()`; both report
+	 * these same three fields.
+	 *
+	 * @return void
+	 */
+	private static function sync_computed_state() {
+		$current = array(
+			'active' => self::active(),
+			'seam'   => self::$seam,
+			'door'   => self::door_state(),
+		);
+		$persisted = get_option( self::COMPUTED, null );
+		// Strict: both sides are built from the SAME literal key order every
+		// time (this array literal, and PHP's serialize()/unserialize()
+		// round-trip preserves it exactly) — no legacy format predates this
+		// option, so there is nothing a loose comparison would need to
+		// tolerate that a strict one would wrongly reject.
+		if ( is_array( $persisted ) && $persisted === $current ) {
+			return; // steady state: nothing to version
+		}
+		Aura_Worker_Door_Log::versioned(
+			function () use ( $current ) {
+				update_option( self::COMPUTED, $current, false ); // autoload no
+				wp_cache_delete( self::COMPUTED, 'options' );
+				return array(
+					'mutated' => true,
+					'result'  => null,
+					// Rulings S11/S18: repeated by versioned() after commit
+					// or rollback.
+					'evict'   => array( self::COMPUTED ),
+				);
+			}
+		);
 	}
 
 	/**
@@ -3277,6 +3350,10 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
+		// Ruling S22 (Codex round-9 P2 on #88): a computed transition is
+		// state, and must land BEFORE `observation` below is read — see
+		// sync_computed_state()'s own docblock.
+		self::sync_computed_state();
 		$epoch   = Aura_Worker_Door_Log::epoch();
 		$binding = Aura_Worker_Door_Log::binding_raw();
 		// NULL when the queue could not be read (Ruling P57) — held_count and

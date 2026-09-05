@@ -1352,4 +1352,63 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( $after, $frag['observation'], 'the rebuild found an agreeing pair of reads under the NEW version' );
 		$this->assertCount( 1, $frag['held'], 'the hold that caused the retry is IN the rebuilt fragment, not missing from a stale memo' );
 	}
+
+	/**
+	 * Ruling S22 (Codex round-9 P2 on #88): Elementor deactivating (or the
+	 * coverage seam changing) touches no `wp_options` row at all — nothing
+	 * here mutates the door log or the hold queue — so the two bracketing
+	 * version reads both answer the SAME observation even though `active`
+	 * and `door` in the fragment just flipped. Aura's strictly-greater
+	 * comparison would then reject the corrected fragment forever, since
+	 * its observation is never greater than the one already served.
+	 * `sync_computed_state()` closes this by treating the computed tuple
+	 * itself as door state: a transition is written through
+	 * `Aura_Worker_Door_Log::versioned()`, which is what actually advances
+	 * the version here — not any hold or log mutation.
+	 *
+	 * `self::$active` is a request-local memo that is STICKY once true
+	 * (Elementor cannot vanish mid-request in real WordPress, so `active()`
+	 * never re-checks once it has answered true) — a real deactivation is
+	 * only ever observed by the NEXT request's own fresh check. Modelled
+	 * here by clearing the ability registry AND resetting the memo by
+	 * Reflection, the same technique this file already uses to read
+	 * WP_Ability's own stored (unexposed) properties.
+	 */
+	public function test_elementor_deactivating_between_two_serves_raises_the_observation(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+		$this->assertSame( 'open', $first['door'] );
+
+		// The next request: no elementor/* ability is registered at all,
+		// and active()'s own memo is reset to model a fresh process.
+		$GLOBALS['_abilities'] = array();
+		$prop                  = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'active' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, null );
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertFalse( $second['active'] );
+		$this->assertSame( 'closed', $second['door'] );
+		$this->assertNotSame(
+			$first['observation'],
+			$second['observation'],
+			'the computed transition itself must advance the version — otherwise Aura keeps the stale active/open state forever'
+		);
+	}
+
+	/** The other half of Ruling S22: a steady state must not bump the version on every poll. */
+	public function test_two_steady_serves_do_not_raise_the_observation(): void {
+		$this->registerAll();
+
+		$first  = Aura_Worker_Elementor_Door::status_fragment();
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertSame(
+			$first['observation'],
+			$second['observation'],
+			'nothing changed between two polls — sync_computed_state() must write nothing on a steady state'
+		);
+	}
 }
