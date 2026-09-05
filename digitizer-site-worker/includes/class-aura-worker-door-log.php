@@ -2553,13 +2553,38 @@ class Aura_Worker_Door_Log {
 				// under this exact name is the proof — so it carries the
 				// write's own unix timestamp, which is all the later janitor
 				// sweep needs to judge a leaked row's age.
-				$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				//
+				// GATES THE UNIT (Ruling S54, Codex round-21 P2 on #88). This
+				// INSERT's own return and last_error used to be ignored —
+				// and bump_door_version_write(), the very next statement,
+				// clears $wpdb->last_error at its own first line, erasing
+				// any trace of THIS statement having failed. A unit could
+				// therefore COMMIT for real (the state write and the bump
+				// both landing) without its own witness ever existing — and
+				// if that same commit's ack was ALSO separately lost, the
+				// post-COMMIT fallback (Ruling S30 below) would read for a
+				// witness that was never written, find nothing, and report
+				// `committed: false` for a mutation that, in fact, had
+				// already landed: a PROVEN negative for what was actually a
+				// true positive, the mirror image of the false positive
+				// Ruling S51 closed on the read side. Checked and gated
+				// HERE, before the bump ever runs, exactly like the
+				// SAVEPOINT check above: a witness this unit cannot prove
+				// it wrote is a unit that must not commit at all.
+				$witness_insert_ok = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$wpdb->prepare(
 						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
 						self::LAST_TX_PREFIX . $tx_nonce,
 						(string) time()
 					)
 				);
+				if ( false === $witness_insert_ok || '' !== (string) $wpdb->last_error ) {
+					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					self::evict_after_rollback( $evict ); // Ruling S18
+					return array(
+						'committed' => false,
+					);
+				}
 			}
 			$bump_ok = self::bump_door_version_write();
 			if ( ! $bump_ok && $transactional ) {

@@ -1896,6 +1896,7 @@ final class DoorLogTest extends TestCase {
 		$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result unless committed is strictly true' );
 		$this->assertArrayHasKey( $witness, $GLOBALS['_options'], 'the witness row is left untouched -- deleting it on an unproven read would erase the only evidence this unit ever ran' );
 	}
+
 	/**
 	 * Ruling S53 (Codex round-21 P1 on #88): Ruling S50 zeroes
 	 * reconnect_retries for the WHOLE unit, so $writes() can never be
@@ -1948,4 +1949,51 @@ final class DoorLogTest extends TestCase {
 		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
 	}
 
+	/**
+	 * Ruling S54 (Codex round-21 P2 on #88): the durable witness's own
+	 * INSERT had its return and last_error ignored, and
+	 * bump_door_version_write() -- the VERY NEXT statement -- clears
+	 * last_error at its own first line, erasing any trace of a failed
+	 * witness write. A unit could therefore COMMIT for real (state +
+	 * bump both landing) with no witness of its own ever having been
+	 * written -- and a later ambiguous ack on that SAME commit would then
+	 * read "no witness" as a PROVEN false for a mutation that had, in
+	 * fact, already landed. The witness INSERT now gates the unit exactly
+	 * like the savepoint check before it: a failure here rolls back
+	 * before the bump ever runs, reporting the ordinary retryable
+	 * committed:false, with nothing landed at all.
+	 */
+	public function test_a_failing_witness_insert_aborts_the_whole_unit_before_the_bump(): void {
+		$name = 'aura_worker_door_log_test_s54';
+
+		$before_version = Aura_Worker_Door_Log::door_version_raw();
+
+		$GLOBALS['_sa_uuid_fixed']          = 'nonce-s54';
+		$witness                            = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s54';
+		// Fails the witness INSERT itself -- reconnect_retries is 0 for
+		// this whole unit's duration (Ruling S50), and this seam fails a
+		// matched query outright while that holds.
+		$GLOBALS['_sa_reconnect_mid_query'] = $witness;
+
+		$outcome = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_reconnect_mid_query'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'a witness this unit could not prove it wrote must not let the unit commit' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'Ruling S15: no result when committed is not true' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the state write itself was rolled back -- never landed alone, without its witness' );
+		$this->assertArrayNotHasKey( $witness, $GLOBALS['_options'], 'the failed witness never landed either' );
+		$this->assertSame( $before_version, Aura_Worker_Door_Log::door_version_raw(), 'no bump ran -- the version is unchanged' );
+	}
 }
