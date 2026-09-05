@@ -430,10 +430,23 @@ class Aura_Worker_Elementor_Door {
 			// Elementor deactivating, the coverage seam changing — is state,
 			// and must land BEFORE the bracketed reads below can prove
 			// anything about it. See sync_computed_state()'s own docblock.
-			self::sync_computed_state();
+			$synced         = self::sync_computed_state();
 			$before_version = Aura_Worker_Door_Log::door_version_raw();
 			$fragment       = self::build_status_fragment_state( (int) $after, $epoch );
 			$after_version  = Aura_Worker_Door_Log::door_version_raw();
+			if ( ! $synced ) {
+				// Ruling S24 (Codex round-10 P2 on #88): the computed-state
+				// transition ITSELF could not be committed — see
+				// sync_computed_state()'s own docblock for why this fragment
+				// (already built with the FRESH active/seam/door values,
+				// since those are read live, not from the persisted option)
+				// must not be paired with an observation the caller could
+				// read as proof it was witnessed. Served immediately, never
+				// retried: a retry re-attempts the same sync and, on the
+				// same underlying failure, would only repeat this outcome.
+				$fragment['observation'] = null;
+				return $fragment;
+			}
 			if ( $before_version === $after_version ) {
 				$fragment['observation'] = $before_version;
 				return $fragment;
@@ -518,7 +531,31 @@ class Aura_Worker_Elementor_Door {
 	 * `governor_block()` before it reads `door_version_raw()`; both report
 	 * these same three fields.
 	 *
-	 * @return void
+	 * THE RETURN VALUE MUST BE HEEDED (Ruling S24, Codex round-10 P2 on
+	 * #88). When a transition WAS needed but `versioned()` could not commit
+	 * it — a bump-write failure, a failed savepoint, an unproven COMMIT —
+	 * this method used to return nothing and the caller carried straight
+	 * on: `self::active()`/`self::door_state()` already answer the FRESH
+	 * (correct, just-computed) values regardless of whether the persist
+	 * landed, so the fragment/block built right after still reported the
+	 * new `active`/`door` — but paired with whatever `door_version_raw()`
+	 * happened to read, which is the OLD, unchanged version (nothing
+	 * committed). Aura's strictly-greater comparison then discarded the
+	 * correction it had just been handed, forever, since a caller cannot
+	 * tell "this observation truly describes this state" from "the version
+	 * read raced an uncommitted write and just happens to match". A caller
+	 * that gets `false` back MUST report `observation: null` instead of
+	 * whatever it reads — honest: the site could not witness this state.
+	 *
+	 * @return bool True when the current computed tuple is either UNCHANGED
+	 *              from what is persisted (nothing to version) or a needed
+	 *              transition was COMMITTED — either way, `door_version_raw()`
+	 *              read right after may be reported as this state's
+	 *              observation. False when a transition was needed and could
+	 *              NOT be committed: the tuple `self::active()`/`self::$seam`/
+	 *              `self::door_state()` answer may already be the new one,
+	 *              but nothing proves it landed paired with any version, and
+	 *              the caller must serve `observation: null` alongside it.
 	 */
 	private static function sync_computed_state() {
 		$current = array(
@@ -533,9 +570,9 @@ class Aura_Worker_Elementor_Door {
 		// option, so there is nothing a loose comparison would need to
 		// tolerate that a strict one would wrongly reject.
 		if ( is_array( $persisted ) && $persisted === $current ) {
-			return; // steady state: nothing to version
+			return true; // steady state: nothing to version, nothing unproven
 		}
-		Aura_Worker_Door_Log::versioned(
+		$outcome = Aura_Worker_Door_Log::versioned(
 			function () use ( $current ) {
 				update_option( self::COMPUTED, $current, false ); // autoload no
 				wp_cache_delete( self::COMPUTED, 'options' );
@@ -548,6 +585,7 @@ class Aura_Worker_Elementor_Door {
 				);
 			}
 		);
+		return (bool) $outcome['committed'];
 	}
 
 	/**
@@ -3353,7 +3391,7 @@ class Aura_Worker_Elementor_Door {
 		// Ruling S22 (Codex round-9 P2 on #88): a computed transition is
 		// state, and must land BEFORE `observation` below is read — see
 		// sync_computed_state()'s own docblock.
-		self::sync_computed_state();
+		$synced  = self::sync_computed_state();
 		$epoch   = Aura_Worker_Door_Log::epoch();
 		$binding = Aura_Worker_Door_Log::binding_raw();
 		// NULL when the queue could not be read (Ruling P57) — held_count and
@@ -3370,8 +3408,13 @@ class Aura_Worker_Elementor_Door {
 			'binding'             => '' === $binding ? null : $binding,
 			// READ-ONLY (Ruling A65): this is an on-demand AUDIT, never a
 			// poll, and must not itself advance the counter Aura orders
-			// `/status` polls by. Null when the row cannot be proven read.
-			'observation'         => Aura_Worker_Door_Log::door_version_raw(),
+			// `/status` polls by. Null when the row cannot be proven read —
+			// including when sync_computed_state() above needed to commit a
+			// transition and could not (Ruling S24, Codex round-10 P2 on
+			// #88): the `active`/`door` fields below are already the FRESH
+			// values, but nothing proves they landed paired with any
+			// version, so none is reported alongside them.
+			'observation'         => $synced ? Aura_Worker_Door_Log::door_version_raw() : null,
 			// null when 'observation' is null for an ORDINARY (transient)
 			// reason; 'engine' or 'php32' when it is null for good — this
 			// site can never report a witness (Ruling S13).

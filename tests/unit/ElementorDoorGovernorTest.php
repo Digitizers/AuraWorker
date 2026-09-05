@@ -1411,4 +1411,55 @@ final class ElementorDoorGovernorTest extends TestCase {
 			'nothing changed between two polls — sync_computed_state() must write nothing on a steady state'
 		);
 	}
+
+	/**
+	 * Ruling S24 (Codex round-10 P2 on #88): sync_computed_state()'s own
+	 * versioned() call can fail to commit exactly like any other door
+	 * mutation — a bump-write failure, a failed savepoint, an unproven
+	 * COMMIT. active()/door_state() answer the FRESH values regardless
+	 * (read live, never from the persisted option), so the fragment built
+	 * right after still carries the CORRECT active/door — but pairing it
+	 * with door_version_raw() would report an observation that never
+	 * actually witnessed this transition (the version is whatever it was
+	 * BEFORE the failed bump). status_fragment() must instead serve
+	 * `observation: null` — honest: the site could not witness this state.
+	 */
+	public function test_a_failed_computed_state_commit_serves_the_new_values_with_a_null_observation(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+		$this->assertSame( 'open', $first['door'] );
+
+		// The next request: Elementor is gone, AND the version bump this
+		// transition needs cannot be committed.
+		$GLOBALS['_abilities'] = array();
+		$prop                  = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'active' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, null );
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_option_write_fail'] = array();
+
+		$this->assertFalse( $second['active'], 'the fresh computed value is still correct even though it could not be committed' );
+		$this->assertSame( 'closed', $second['door'] );
+		$this->assertNull( $second['observation'], 'nothing proves this transition landed paired with any version' );
+	}
+
+	/** The other half of Ruling S24: a STEADY poll is unaffected by an armed but unneeded bump failure. */
+	public function test_a_steady_poll_is_unaffected_by_an_unneeded_bump_failure(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+
+		$GLOBALS['_sa_option_write_fail'][ Aura_Worker_Door_Log::OBSERVATION ] = true;
+		$second                                                                = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_option_write_fail']                                      = array();
+
+		$this->assertSame(
+			$first['observation'],
+			$second['observation'],
+			'nothing changed, so sync_computed_state() never attempted a write the armed failure could catch'
+		);
+	}
 }
