@@ -340,6 +340,37 @@ final class DoorLogTest extends TestCase {
 		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'], 'the row itself is untouched -- the purge never actually landed' );
 	}
 
+	/**
+	 * Ruling S85 (Codex round-36 P1 on #88), the SAME scenario as the
+	 * sibling test just above, but on a NON-transactional engine: there
+	 * is no ROLLBACK to issue at all (Ruling S13), and the pre-S85 answer
+	 * here was `committed: true` with NO `result` key -- ack()'s own
+	 * `true === $outcome['committed']` check (Ruling S15) then trusted
+	 * it and returned `null` as its own "success". `committed: null` --
+	 * unknown, never a false "committed" -- is the honest answer: an
+	 * EARLIER statement in this SAME callback (the floor-raise UPDATE)
+	 * may already have autocommitted before the purge DELETE's own
+	 * failure was ever seen, and nothing on this engine can prove either
+	 * way.
+	 */
+	public function test_ack_on_a_non_transactional_engine_answers_committed_null_when_its_purge_delete_fails(): void {
+		Aura_Worker_Door_Log::close();
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$seq   = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+		$GLOBALS['_sa_reconnect_mid_query'] = 'DELETE f FROM';
+		$out                                = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_reconnect_mid_query']  = false;
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+
+		$this->assertArrayHasKey( 'committed', $out, 'Ruling S85: the caller-safe tri-state, never a bare success shape with no committed key at all' );
+		$this->assertNull( $out['committed'], 'Ruling S85: unknown, never `true` -- an earlier statement in the SAME callback may already have autocommitted' );
+		$this->assertArrayNotHasKey( 'result', $out, 'the SAME shape Ruling S51 already established for committed:null elsewhere in this method -- nothing here may be indexed as a success payload' );
+	}
+
 	public function test_rotate_epoch_mints_a_new_epoch_clears_closure_and_keeps_the_floor_and_every_row(): void {
 		$before = Aura_Worker_Door_Log::epoch();
 		$seq    = Aura_Worker_Door_Log::open_pending( $this->entry() );

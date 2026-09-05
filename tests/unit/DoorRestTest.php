@@ -275,6 +275,42 @@ final class DoorRestTest extends TestCase {
 		$this->assertIsArray( get_option( 'aura_worker_door_log_1' ), 'the row this ack would have purged is still there' );
 	}
 
+	/**
+	 * Ruling S85 (Codex round-36 P2 on #88): on a NON-transactional
+	 * engine (MyISAM ...), a guarded write's own must_succeed() failure
+	 * inside ack_write() -- its purge DELETE, here -- used to make
+	 * versioned() answer `committed: true` with NO `result` key at all
+	 * (Ruling S13's own reasoning: "nothing CAN be rolled back here, so
+	 * the most honest answer is committed"). ack()'s own `true ===
+	 * $outcome['committed']` check (Ruling S15) then trusted that and
+	 * returned `$outcome['result']` -- `null` -- as if it were the
+	 * ordinary success shape. This route's `array_key_exists( 'committed',
+	 * $result )` check then ran on a NULL `$result`: a TypeError, not a
+	 * warning, since array_key_exists() requires an array. Fixed at the
+	 * source -- versioned() now answers `committed: null` (unknown, never
+	 * a false "committed") for exactly this case, and this route's own
+	 * EXISTING handling -- already required to treat `committed: null`
+	 * as retryable for the durable-witness-unreadable case -- catches it
+	 * for free, with no route-level change at all.
+	 */
+	public function test_ack_answers_503_not_a_fatal_when_a_guarded_write_fails_on_a_non_transactional_engine(): void {
+		Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+		// ack_write()'s purge DELETE opens with "DELETE f FROM" -- see
+		// DoorLogTest's own sibling seam for the same statement.
+		$GLOBALS['_sa_reconnect_mid_query'] = 'DELETE f FROM';
+		$res                                = $this->api->ack_door_log( $this->request( array( 'epoch' => $epoch, 'seq' => 1 ) ) );
+		$GLOBALS['_sa_reconnect_mid_query']  = false;
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+
+		$this->assertInstanceOf( WP_Error::class, $res, 'Ruling S85: retryable, never a fatal and never a false 200' );
+		$this->assertSame( 'aura_log_failed', $res->get_error_code() );
+		$this->assertSame( 503, $res->get_error_data()['status'] );
+		$this->assertIsArray( get_option( 'aura_worker_door_log_1' ), 'the row this ack would have purged is still there' );
+	}
+
 	public function test_a_stale_ack_at_or_below_the_current_floor_is_a_no_op(): void {
 		Aura_Worker_Door_Log::open_pending( array( 'ability' => 'x', 'actor' => array(), 'touches' => array(), 'verdict' => 'allow' ) );
 		$epoch = Aura_Worker_Door_Log::epoch();

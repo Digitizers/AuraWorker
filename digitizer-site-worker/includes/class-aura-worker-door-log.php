@@ -3123,14 +3123,46 @@ class Aura_Worker_Door_Log {
 						'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
 					);
 				}
-				// Ruling S13: nothing CAN be rolled back here — whatever
-				// $writes() already ran landed the moment it ran. The most
-				// honest answer left is that the unit "committed", exactly as
-				// every other statement on this engine always has; $writes()'s
-				// own `result` already reflects what it could prove happened.
+				// Ruling S85 (Codex round-36 P2 on #88) OVERTURNS Ruling
+				// S13's own answer here. S13 reasoned "nothing CAN be
+				// rolled back, so the most honest answer is that the unit
+				// committed" — true as far as it goes, but "committed"
+				// implies a CLEAN, TRUSTED mutation, and a demanded
+				// rollback (Ruling S12) is proof of the opposite: an
+				// EARLIER statement in this SAME callback — ack_write()'s
+				// own floor-raise UPDATE, ahead of its purge DELETE, is
+				// the concrete case this ruling names — may already have
+				// autocommitted before the statement that triggered this
+				// demand ever ran, since there is no transaction here to
+				// have grouped them. `committed: true` paired with NO
+				// `result` (every $writes() callback that ever demands
+				// rollback either omits `result` entirely or sets it to a
+				// pre-failure placeholder never meant to be served) is
+				// what let `ack()`/`rotate_epoch()` — both of which gate
+				// their OWN `return $outcome['result'];` behind `true ===
+				// $outcome['committed']`, exactly as Ruling S15 requires —
+				// serve `null` as if it were their normal success shape,
+				// which their own REST handlers then index
+				// (`ack_door_log()`'s `array_key_exists( 'committed', $result )`
+				// on a `null` `$result` is a TypeError, not a warning).
+				//
+				// UNKNOWN, not proven either way, is the honest fact
+				// (Ruling S13's own "no witness is possible on this
+				// engine" already applies here too — nothing can tell a
+				// partial autocommit apart from a no-op that never
+				// touched anything). `committed: null`, with NO `result`
+				// key, is the EXACT shape Ruling S51 already established
+				// for the durable-witness-unreadable case a few lines
+				// below this one — every consumer already audited for
+				// THIS finding (ack, rotate_epoch, insert_unique's own
+				// hold/close/epoch-mint callers, write_option_where,
+				// delete_versioned, release, rotate_binding,
+				// sync_computed_state) already treats `committed !== true`
+				// as "do not touch `result`", so reusing that SAME shape
+				// here needs no change to any of them — only to this one
+				// branch that was lying about which shape it was.
 				return array(
-					'committed' => true,
-					'result'    => array_key_exists( 'result', $outcome ) ? $outcome['result'] : null,
+					'committed' => null,
 				);
 			}
 			$mutated = ! empty( $outcome['mutated'] );
