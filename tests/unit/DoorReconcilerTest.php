@@ -1322,6 +1322,59 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertSame( array( 1 ), array_column( $frag['log'], 'seq' ), 'served from 0' );
 	}
 
+	/**
+	 * Ruling S29 (Codex round-13 P1 on #88): `wp_options` restored to a
+	 * snapshot whose persisted computed tuple `{ active, seam, door }`
+	 * still matches today's LIVE values takes `sync_computed_state()`'s
+	 * steady-state fast path — nothing versions, so both of
+	 * `status_fragment()`'s bracket reads answer the restored, LOWER
+	 * version, and the fragment (including `rewind.detected`) is REJECTED
+	 * by Aura's strictly-greater comparison: recovery stalls until some
+	 * UNRELATED mutation happens to advance the version again.
+	 *
+	 * `rewind_top` — the top the fragment builder observed WHEN a rewind is
+	 * detected — is folded into that same tuple, so the FIRST serve that
+	 * detects one looks like a real transition and is versioned through the
+	 * SAME fenced CAS, which bumps via `Aura_Worker_Door_Log::versioned()`'s
+	 * ordinary CLOCK-FLOORED bump (Ruling S4) — a restore rolls the STORED
+	 * counter back but never the WALL CLOCK, so this one bump already lands
+	 * above the restored value.
+	 */
+	public function test_a_detected_rewind_persists_as_a_transition_and_bumps_above_the_restored_version(): void {
+		$one = $this->entry( array(), true, false ); // seq 1, admitted and settled below
+		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
+		$epoch = Aura_Worker_Door_Log::epoch();
+
+		// A steady poll first — no rewind — to establish a persisted
+		// computed tuple (rewind_top: null) at some version X.
+		$first = $this->fragment( 0, $epoch );
+		$this->assertNull( $first['rewind'] );
+		$x = $first['observation'];
+		$this->assertIsInt( $x, 'a real witness to restore "back to"' );
+
+		// Simulate the restore: the door version reads X again — the SAME
+		// value this call just saw — while the persisted computed tuple is
+		// UNTOUCHED (still matches today's live active/seam/door): exactly
+		// the condition that took the OLD code's steady-state fast path
+		// and skipped the bump entirely.
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::OBSERVATION ]    = (string) $x;
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::OBSERVATION ] = $x;
+
+		// Aura's cursor is now above the site's real top (seq 1) — a rewind.
+		$second = $this->fragment( 40, $epoch );
+
+		$this->assertSame( array( 'detected' => true, 'top' => 1 ), $second['rewind'] );
+		$this->assertIsInt( $second['observation'] );
+		$this->assertGreaterThan( $x, $second['observation'], 'the rewind is a transition and must bump ABOVE the restored value, clock-floored' );
+
+		// A second serve of the SAME rewind condition is now a steady
+		// state: the tuple (rewind_top included) already matches what was
+		// just persisted, so nothing bumps again.
+		$third = $this->fragment( 40, $epoch );
+		$this->assertSame( array( 'detected' => true, 'top' => 1 ), $third['rewind'], 'still reported — Aura has not rotated' );
+		$this->assertSame( $second['observation'], $third['observation'], 'the rewind is already recorded — a repeat detection does not bump again' );
+	}
+
 	public function test_get_status_reads_the_cursor_and_the_epoch_from_the_request(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );

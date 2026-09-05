@@ -426,11 +426,18 @@ class Aura_Worker_Elementor_Door {
 				// own docblock for the memo this closes.
 				self::reset_request_caches();
 			}
+			// Ruling S29 (Codex round-13 P1 on #88): rewind detection runs
+			// FIRST — sync_computed_state() needs to know about a DETECTED
+			// rewind to persist it as a state transition (see that method's
+			// own docblock), and build_status_fragment_state() must report
+			// the SAME detection, never a second, possibly different one.
+			$rewind_info = self::detect_rewind( (int) $after, $epoch );
 			// Ruling S22 (Codex round-9 P2 on #88): a COMPUTED transition —
-			// Elementor deactivating, the coverage seam changing — is state,
-			// and must land BEFORE the bracketed reads below can prove
-			// anything about it. See sync_computed_state()'s own docblock.
-			$synced         = self::sync_computed_state();
+			// Elementor deactivating, the coverage seam changing, and now
+			// (Ruling S29) a newly DETECTED rewind — is state, and must
+			// land BEFORE the bracketed reads below can prove anything
+			// about it. See sync_computed_state()'s own docblock.
+			$synced         = self::sync_computed_state( $rewind_info['rewind'] );
 			$before_version = Aura_Worker_Door_Log::door_version_raw();
 			// Ruling S28 (Codex round-12 P1 on #88): INSIDE the bracket,
 			// after sync_computed_state() — read back whatever is actually
@@ -441,7 +448,7 @@ class Aura_Worker_Elementor_Door {
 			// nothing this call may credit itself with, and the fragment
 			// falls back to live computation below.
 			$computed       = $synced ? self::persisted_computed_state() : null;
-			$fragment       = self::build_status_fragment_state( (int) $after, $epoch, $computed );
+			$fragment       = self::build_status_fragment_state( $rewind_info, $computed );
 			$after_version  = Aura_Worker_Door_Log::door_version_raw();
 			if ( ! $synced ) {
 				// Ruling S24 (Codex round-10 P2 on #88): the computed-state
@@ -585,6 +592,30 @@ class Aura_Worker_Elementor_Door {
 	 * the winner, not to this call's own (possibly stale) read of
 	 * `active()`/`door_state()`.
 	 *
+	 * A DETECTED REWIND IS A STATE TRANSITION TOO (Ruling S29, Codex
+	 * round-13 P1 on #88). `wp_options` restored to a snapshot whose
+	 * persisted `{ active, seam, door }` still matches today's live values
+	 * takes the STEADY-STATE fast path above — nothing versions, so the
+	 * restored (LOWER) door version stands, and a fragment reporting
+	 * `rewind.detected` under that lower observation is REJECTED by Aura's
+	 * strictly-greater comparison: recovery stalls until some UNRELATED
+	 * mutation happens to advance the version again. `$rewind` — the top
+	 * `detect_rewind()` observed WHEN a rewind is currently detected, null
+	 * otherwise — is folded into the tuple as `rewind_top`: the FIRST serve
+	 * that detects a NEW rewind (or a resolved one clearing an old one) now
+	 * looks like a real transition and is versioned through the SAME fenced
+	 * CAS, which bumps the version via `Aura_Worker_Door_Log::versioned()`'s
+	 * ordinary CLOCK-FLOORED bump (Ruling S4) — no separate mechanism
+	 * needed, since a restore rolls the STORED counter back but never the
+	 * WALL CLOCK, so this one bump already lands above every pre-restore
+	 * value. A steady poll with no rewind detected (the overwhelming
+	 * majority) still bumps nothing (Ruling S6 stands): `rewind_top` is
+	 * `null` on both sides and the comparison is unaffected.
+	 *
+	 * @param array|null $rewind `detect_rewind()`'s own `rewind` field:
+	 *                            `{ detected: true, top: int }` when a
+	 *                            rewind is CURRENTLY detected, null
+	 *                            otherwise.
 	 * @return bool True when the current computed tuple is either UNCHANGED
 	 *              from what is persisted (nothing to version), or this
 	 *              call's OWN write won its fence and was COMMITTED —
@@ -599,11 +630,15 @@ class Aura_Worker_Elementor_Door {
 	 *              and the caller must serve `observation: null` alongside
 	 *              it.
 	 */
-	private static function sync_computed_state() {
+	private static function sync_computed_state( $rewind = null ) {
 		$current = array(
-			'active' => self::active(),
-			'seam'   => self::$seam,
-			'door'   => self::door_state(),
+			'active'     => self::active(),
+			'seam'       => self::$seam,
+			'door'       => self::door_state(),
+			// Ruling S29: null when no rewind is currently detected — the
+			// overwhelming majority of polls — so those compare exactly as
+			// before this ruling.
+			'rewind_top' => ( is_array( $rewind ) && isset( $rewind['top'] ) ) ? (int) $rewind['top'] : null,
 		);
 		$persisted = get_option( self::COMPUTED, null );
 		// Strict: both sides are built from the SAME literal key order every
@@ -734,37 +769,32 @@ class Aura_Worker_Elementor_Door {
 	}
 
 	/**
-	 * Every state read `status_fragment()` reports, EXCEPT `observation` —
-	 * split out so that method can run it TWICE, bracketed by the version
-	 * reads that decide whether either run is trustworthy (Ruling S6, see
-	 * `status_fragment()`'s own docblock for the read protocol and every
-	 * other semantic — absence, the cursor/epoch rule, rewind detection —
-	 * which is unchanged from before that ruling and not repeated here).
+	 * Detect a REWIND — a cursor from Aura above the site's own top under
+	 * the SAME epoch, only ever possible after `wp_options` is restored to
+	 * a snapshot predating this site's log — split out (Ruling S29, Codex
+	 * round-13 P1 on #88) so `status_fragment()` can run it ONCE per
+	 * attempt and hand the SAME answer to both `sync_computed_state()`
+	 * (which needs to know about it to persist the detection as a state
+	 * transition) and `build_status_fragment_state()` (which reports it) —
+	 * never two separate detections that could disagree.
 	 *
-	 * @param int        $after    Already normalised to (int) by the caller.
-	 * @param string     $epoch    The epoch that cursor belongs to.
-	 * @param array|null $computed Ruling S28: the PERSISTED { active, seam,
-	 *                              door } tuple, read inside the caller's
-	 *                              version bracket — served AS IS when given;
-	 *                              null falls back to this request's own
-	 *                              live computation (the only case: the
-	 *                              caller's sync could not be trusted at all,
-	 *                              Rulings S24/S26).
-	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
+	 * AN UNREADABLE TOP SUPPRESSES DETECTION (Ruling P77). A failed MAX
+	 * used to cast to 0, so any cursor above the floor read as a rewind:
+	 * Aura rotated a healthy epoch, invalidated an in-flight ack and
+	 * resynchronised the log with nothing having been rewound. Reported as
+	 * `top_unreadable` instead, and the cursor is served as given.
+	 *
+	 * @param int    $after Aura's cursor, already (int) cast by the caller.
+	 * @param string $epoch The epoch that cursor belongs to.
+	 * @return array{ site: string, after: int, rewind: array{ detected: true, top: int }|null, top_unreadable: bool }
+	 *         `after` is 0 whenever `rewind` is non-null or the epoch does
+	 *         not match `site` — ignored, never acted on here; the read
+	 *         reports, Aura decides.
 	 */
-	private static function build_status_fragment_state( $after, $epoch, $computed = null ) {
-		$after   = (int) $after;
-		$active  = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
-		$seam    = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
-		$door    = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
-		$site    = Aura_Worker_Door_Log::epoch();
-		$binding = Aura_Worker_Door_Log::binding_raw();
-		$rewind  = null;
-		// AN UNREADABLE TOP SUPPRESSES REWIND DETECTION (Ruling P77). A failed
-		// MAX used to cast to 0, so any cursor above the floor read as a rewind:
-		// Aura rotated a healthy epoch, invalidated an in-flight ack and
-		// resynchronised the log with nothing having been rewound. Reported as
-		// `log_top_unreadable` instead, and the cursor is served as given.
+	private static function detect_rewind( $after, $epoch ) {
+		$after  = (int) $after;
+		$site   = Aura_Worker_Door_Log::epoch();
+		$rewind = null;
 		$top_unreadable = false;
 		if ( (string) $epoch !== $site ) {
 			$after = 0;
@@ -777,9 +807,51 @@ class Aura_Worker_Elementor_Door {
 					'detected' => true,
 					'top'      => (int) $top,
 				);
-				$after  = 0; // ignored, never acted on: the read reports, Aura decides
+				$after  = 0;
 			}
 		}
+		return array(
+			'site'           => $site,
+			'after'          => $after,
+			'rewind'         => $rewind,
+			'top_unreadable' => $top_unreadable,
+		);
+	}
+
+	/**
+	 * Every state read `status_fragment()` reports, EXCEPT `observation` —
+	 * split out so that method can run it TWICE, bracketed by the version
+	 * reads that decide whether either run is trustworthy (Ruling S6, see
+	 * `status_fragment()`'s own docblock for the read protocol and every
+	 * other semantic — absence, the cursor/epoch rule — which is unchanged
+	 * from before that ruling and not repeated here).
+	 *
+	 * @param array      $rewind_info `detect_rewind()`'s own return —
+	 *                                 computed ONCE by the caller, before
+	 *                                 this method and before
+	 *                                 `sync_computed_state()`, and handed to
+	 *                                 both (Ruling S29) so neither can
+	 *                                 disagree with the other about whether
+	 *                                 a rewind is detected.
+	 * @param array|null $computed    Ruling S28: the PERSISTED { active,
+	 *                                 seam, door } tuple, read inside the
+	 *                                 caller's version bracket — served AS
+	 *                                 IS when given; null falls back to
+	 *                                 this request's own live computation
+	 *                                 (the only case: the caller's sync
+	 *                                 could not be trusted at all, Rulings
+	 *                                 S24/S26).
+	 * @return array { active, epoch, binding, seam, door, held, held_unreadable, interrupted, running, rewind, log, log_floor, log_unacked (int|null), log_full } — without `observation`, which the caller supplies.
+	 */
+	private static function build_status_fragment_state( array $rewind_info, $computed = null ) {
+		$after          = (int) $rewind_info['after'];
+		$site           = (string) $rewind_info['site'];
+		$rewind         = $rewind_info['rewind'];
+		$top_unreadable = (bool) $rewind_info['top_unreadable'];
+		$active  = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
+		$seam    = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
+		$door    = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
+		$binding = Aura_Worker_Door_Log::binding_raw();
 		// THE SAME PREDICATE THE RECONCILER ACTS ON (Ruling P54). Reporting from
 		// `stale_claims()` — age alone — while reconcile() skipped anything
 		// holding an execution lease meant a long-running replay was listed as
