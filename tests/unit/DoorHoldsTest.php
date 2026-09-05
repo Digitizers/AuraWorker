@@ -1168,6 +1168,61 @@ final class DoorHoldsTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S72 (Codex round-28 P2 on #88): `release()` reported a
+	 * mutation whenever `delete_row_provably()` PROVED a row gone —
+	 * whether this call actually deleted it, or the row was already
+	 * absent (an idempotent second release(), or the loser of a race
+	 * against another release()/reject()/sweep() that got there first).
+	 * Both rows already gone changes nothing, so a second release() must
+	 * not bump the door version or write a commit witness for it —
+	 * `committed: true` as a pure no-op, the same "release confirmed"
+	 * answer the caller already gets from the first, real release().
+	 */
+	public function test_a_second_release_of_an_already_released_ref_bumps_nothing(): void {
+		$ref = Aura_Worker_Door_Holds::hold( $this->call() );
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) );
+		$claimed_name = Aura_Worker_Door_Holds::CLAIMED . $ref;
+		$held_name    = Aura_Worker_Door_Holds::HELD . $ref;
+		$this->assertTrue( Aura_Worker_Door_Holds::release( $ref ), 'the fixture assumption this test is built on' );
+		$this->assertArrayNotHasKey( $claimed_name, $GLOBALS['_options'], 'the fixture assumption this test is built on' );
+		$this->assertArrayNotHasKey( $held_name, $GLOBALS['_options'], 'the fixture assumption this test is built on' );
+
+		$count_witnesses = static function () {
+			return count(
+				array_filter(
+					array_keys( $GLOBALS['_rows'] ),
+					static function ( $name ) {
+						return 0 === strpos( $name, Aura_Worker_Door_Log::LAST_TX_PREFIX );
+					}
+				)
+			);
+		};
+		$witnesses_before = $count_witnesses();
+		$version_before    = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertIsInt( $version_before );
+
+		// The stub's own delete_option() always answers `true` (it does
+		// not model "nothing there to delete" the way real WordPress
+		// does), so a second, ordinary release() call could never reach
+		// delete_row_provably()'s own raw-read confirmation on its own.
+		// Arming the SAME seam Ruling S60's own tests use — for a row
+		// that is ALREADY gone this time, not one that still exists —
+		// puts delete_option() in exactly the shape real WordPress takes
+		// for an idempotent delete: `false`, no error, and the row
+		// genuinely absent underneath it.
+		$GLOBALS['_sa_delete_option_fail'][ $claimed_name ] = true;
+		$GLOBALS['_sa_delete_option_fail'][ $held_name ]    = true;
+
+		$second = Aura_Worker_Door_Holds::release( $ref );
+
+		$GLOBALS['_sa_delete_option_fail'] = array();
+
+		$this->assertTrue( $second, 'an idempotent release of an already-released ref still reports success' );
+		$this->assertSame( $version_before, Aura_Worker_Door_Log::door_version_raw(), 'no bump — nothing changed for a pure no-op release' );
+		$this->assertSame( $witnesses_before, $count_witnesses(), 'no commit witness written for a pure no-op release' );
+	}
+
+	/**
 	 * Ruling S60 (Codex round-23 P1 on #88): delete_option() answers
 	 * `false` for BOTH "there was genuinely nothing to delete" and "the
 	 * delete failed" -- casting that straight to a boolean and OR-ing the

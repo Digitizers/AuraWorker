@@ -741,7 +741,20 @@ class Aura_Worker_Door_Holds {
 					return array( 'rollback' => true );
 				}
 				return array(
-					'mutated' => $claimed_gone || $held_gone,
+					// Ruling S72 (Codex round-28 P2 on #88): `mutated`
+					// only when a delete ACTUALLY removed a row —
+					// `delete_row_provably()` returning `true` — never
+					// merely PROVING both rows already absent (`false`),
+					// which is what an idempotent release() of an
+					// already-released ref, or the loser of a race
+					// against another release()/reject()/sweep() that
+					// already removed both rows, looks like. Nothing
+					// changed, so nothing here may bump the version or
+					// write a witness for it — `committed: true` as a
+					// pure no-op, versioned()'s own existing `!$mutated`
+					// path, is exactly the "release confirmed" answer
+					// release()'s own caller already expects.
+					'mutated' => ( true === $claimed_gone || true === $held_gone ),
 					'result'  => null,
 					// Ruling S11 (Codex round-5 P1 on #88): repeated by
 					// versioned() after commit.
@@ -770,9 +783,24 @@ class Aura_Worker_Door_Holds {
 	 * sitting there. Either one is definitive; neither being true is
 	 * what makes "gone" provable rather than merely claimed.
 	 *
+	 * TRUE vs FALSE, AS OF RULING S72 (Codex round-28 P2 on #88): `true`
+	 * and "provably gone" used to be the SAME answer regardless of which
+	 * of the two ways a row can be gone this call actually proved —
+	 * delete_option() genuinely removing one (a REAL mutation), or the
+	 * raw re-read proving one was never there to begin with (NO
+	 * mutation at all). `release()` folded both into a single `mutated`
+	 * signal, so an idempotent or racing-loser release() — every row it
+	 * touches already gone — still reported a mutation, bumped the
+	 * version, and wrote a witness for a call that changed nothing.
+	 * `false` was never actually reachable before this ruling (every
+	 * "gone" path returned `true`); it is repurposed here as its own
+	 * distinct, provable answer rather than added as a fourth state.
+	 *
 	 * @param string $name Option name.
-	 * @return bool|null True when this row is gone (this call deleted it,
-	 *                    or the raw read proves it was already absent);
+	 * @return bool|null True when THIS CALL deleted a row that was really
+	 *                    there — a real mutation; false when the row is
+	 *                    PROVABLY gone but this call did not remove it
+	 *                    (already absent) — provable, but no mutation;
 	 *                    null — UNKNOWN, never a proven miss — when a
 	 *                    failure could be neither ruled out nor confirmed.
 	 */
@@ -799,7 +827,7 @@ class Aura_Worker_Door_Holds {
 			// that claim cannot be trusted for.
 			return null;
 		}
-		return true; // the raw read itself proves it: genuinely absent, whatever delete_option() claimed to have done
+		return false; // provably absent, but not by THIS call (Ruling S72) — no mutation
 	}
 
 	/**
