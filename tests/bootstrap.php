@@ -2963,6 +2963,21 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 					$this->last_error      = 'server closed the connection unexpectedly';
 					return false;
 				}
+				// Ruling S40 (Codex round-17 P1 on #88): a COMMIT that fails
+				// OUTRIGHT while the connection stays alive — a lock-wait
+				// timeout, a deferred constraint violation — never a
+				// dropped connection at all. The transaction is left OPEN
+				// (nothing popped from the stack), session vars are
+				// UNTOUCHED (so a nonce read-back would still, wrongly,
+				// match), and `last_error` is set. Only versioned()'s own
+				// explicit ROLLBACK closes it; without one, a bare SELECT
+				// on this same live connection would read this session's
+				// own uncommitted witness row back.
+				if ( ! empty( $GLOBALS['_sa_commit_fails_connection_alive'] ) ) {
+					$GLOBALS['_sa_commit_fails_connection_alive'] = false; // fires once
+					$this->last_error                             = 'Lock wait timeout exceeded; try restarting transaction';
+					return false;
+				}
 				// Ruling S35 (Codex round-15 P1 on #88): a POSITIVE INT lets that
 				// many commits through untouched first, then fires on the
 				// one after — the same "fail after N" shape
@@ -3003,8 +3018,17 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return true;
 			}
 			if ( 'ROLLBACK' === trim( $query ) ) {
+				// Ruling S40 (Codex round-17 P1 on #88): versioned()'s
+				// explicit best-effort ROLLBACK after an ambiguous COMMIT
+				// may land on a session whose COMMIT already genuinely
+				// popped this stack — real MySQL answers a ROLLBACK with no
+				// open transaction as a harmless no-op, never an error, and
+				// the stub must model that now that production code has a
+				// legitimate reason to issue exactly this. Before this
+				// ruling nothing did, so an empty stack here was reliably a
+				// bug; it no longer is.
 				if ( empty( $this->sa_txn_stack ) ) {
-					throw new RuntimeException( 'wpdb stub: ROLLBACK with no open transaction on this connection' );
+					return true;
 				}
 				$snap                       = array_pop( $this->sa_txn_stack );
 				$GLOBALS['_rows']           = $snap['rows'];
@@ -3631,6 +3655,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
 	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
 	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_fails_connection_alive']       = false; // versioned()'s COMMIT fails outright, connection alive, transaction left open (Ruling S40).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
@@ -4907,6 +4932,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
 	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
 	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_fails_connection_alive']       = false; // versioned()'s COMMIT fails outright, connection alive, transaction left open (Ruling S40).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).

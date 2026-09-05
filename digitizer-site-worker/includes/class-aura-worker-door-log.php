@@ -2441,65 +2441,65 @@ class Aura_Worker_Door_Log {
 					'committed' => false,
 				);
 			}
-			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
-			// Ruling S16 (Codex round-6 P1 on #88): PROVE this COMMIT ran on
-			// the SAME session that opened the transaction and set the nonce
-			// above — not a fresh session WordPress transparently reconnected
-			// onto after the real one dropped mid-flight. A reconnect at any
-			// point between the SET and here lands on a session with no
-			// transaction open at all, so the COMMIT just issued is a
-			// harmless no-op that STILL returns success; trusting that
-			// success is exactly the gap this closes. Session (user)
-			// variables do not survive a reconnect — MySQL scopes them to
-			// the connection — so reading the nonce back and comparing tells
-			// the two apart without needing COMMIT's own return value to be
-			// honest about which session it ran on (its return/last_error
-			// are still consulted below, for the ordinary case where the
-			// statement itself simply fails). The RELEASE above already
-			// catches most of this window; this check remains for the
-			// narrower one still open between it and the COMMIT itself.
-			$tx_witness    = self::LAST_TX_PREFIX . $tx_nonce;
-			$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
+			$commit_return     = $wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery — Ruling S10: COMMIT before the read-back
+			$commit_last_error = (string) $wpdb->last_error;
+			// Ruling S40 (Codex round-17 P1 on #88): capture COMMIT's OWN
+			// return and last_error IMMEDIATELY — before any other
+			// statement runs, including the session-nonce and
+			// durable-witness reads below, either of which would reset
+			// $wpdb->last_error before this COMMIT's own outcome could
+			// ever be consulted. Rulings S16/S30/S32/S34 decided
+			// `committed` from a SEPARATE `SELECT @aura_door_tx`
+			// read-back ALONE: a matching session nonce proved the
+			// connection never dropped, and that alone reported
+			// committed:true — even across a COMMIT that had already
+			// reported failure on a connection that never moved. A
+			// matching nonce proves session CONTINUITY; it does not prove
+			// COMMIT SUCCESS, and the two are not the same fact — this
+			// gate now runs FIRST, and only a COMMIT that already looks
+			// clean gets to the nonce check at all.
+			$tx_witness = self::LAST_TX_PREFIX . $tx_nonce;
+			$commit_ok  = ( false !== $commit_return && '' === $commit_last_error );
+			if ( $commit_ok ) {
+				// Ruling S16 (Codex round-6 P1 on #88), preserved: a CLEAN
+				// return/last_error only proves the STATEMENT succeeded —
+				// not WHICH session it ran on. A reconnect landing exactly
+				// during this COMMIT call lands on a fresh, autocommit
+				// session with no transaction open, so the COMMIT it
+				// silently retries there is a harmless no-op that ALSO
+				// returns true with no error — passing the check above
+				// while the original session's transaction was rolled
+				// back the instant the connection dropped. Session (user)
+				// variables do not survive that reconnect, so reading the
+				// nonce back and comparing tells the two apart.
+				$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
+			}
 			if ( ! $commit_ok ) {
-				// Ruling S30 (Codex round-13 P1 on #88): the session
-				// variable ALONE cannot tell two very different cases
-				// apart — "COMMIT ran on a fresh, reconnected session
-				// that never opened this transaction" (nothing landed)
-				// versus "COMMIT genuinely landed on THIS session, but
-				// the connection then dropped and reconnected before
-				// this SELECT could run" (everything landed; only the
-				// session variable itself was lost). Both answer NULL
-				// or a mismatch here. The DURABLE witness written
-				// BEFORE the bump, inside this same transaction,
-				// resolves it: a plain option row — unlike a session
-				// variable — survives a reconnect, because it lives in
-				// the table the COMMIT that wrote it just made durable.
-				// Ruling S32 (Codex round-14 P1 on #88): that row is
-				// named BY this unit's own nonce, so its mere EXISTENCE
-				// — never a value comparison — is the whole proof; a
-				// row a DIFFERENT, unrelated unit wrote can never share
-				// this exact name. Read RAW: no option-cache layer, a
-				// fresh statement.
-				//
-				// Ruling S34 (Codex round-15 P1 on #88): this durable
-				// check now runs whenever the session variable did not
-				// already prove success — REGARDLESS of whether the
-				// COMMIT statement itself reported an error. An AMBIGUOUS
-				// COMMIT (the ack lost — `$wpdb->last_error` non-empty, or
-				// a false return, typically a dropped connection during
-				// the round trip) does not mean nothing landed: the
-				// server can have applied the COMMIT and only the
-				// acknowledgement failed to make it back. Gating this
-				// check on "COMMIT reported success" treated that
-				// ambiguity as a definite "no", deleted this unit's own
-				// witness, and answered committed:false over writes that
-				// were, in fact, durable. Checking the SAME witness here
-				// is safe either way: if the transaction genuinely did
-				// not commit, the witness INSERT — issued inside that
-				// same transaction, before the bump — was rolled back
-				// with everything else, so this read finds nothing and
-				// correctly answers false.
+				// Ruling S40: an EXPLICIT ROLLBACK, best effort, BEFORE the
+				// durable witness is ever read. Without it, a COMMIT that
+				// failed on a connection that never dropped can leave the
+				// transaction still OPEN on this very session — and a bare
+				// SELECT on that same, still-open connection reads back its
+				// OWN uncommitted witness row (ordinary read-your-own-writes
+				// visibility within an open transaction), reporting a row
+				// that was never made durable as if it already were. A
+				// no-op on a session whose COMMIT genuinely landed (nothing
+				// is left open to roll back); ends the transaction after one
+				// that did not, so this session can no longer see anything
+				// it never durably wrote.
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+				// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): the DURABLE
+				// witness, written BEFORE the bump inside this same
+				// transaction — a plain option row survives what neither a
+				// session variable nor an open-but-doomed transaction's own
+				// local view can be trusted for. Named BY this unit's own
+				// nonce (S32), so its mere EXISTENCE — never a value
+				// comparison — is the whole proof; a row a DIFFERENT,
+				// unrelated unit wrote can never share this exact name.
+				// Read RAW, and only now — AFTER the ROLLBACK above closed
+				// this session's own open transaction, if it had one — so
+				// this SELECT can only ever see what is genuinely durable.
 				$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$wpdb->prepare(
 						"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",

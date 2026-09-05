@@ -1177,6 +1177,71 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S40 (Codex round-17 P1 on #88): a COMMIT that fails OUTRIGHT
+	 * — a lock-wait timeout, a deferred constraint violation — on a
+	 * connection that never dropped used to be reported committed:true
+	 * anyway, because the session-variable nonce (Ruling S16) still
+	 * matched: nothing had reconnected, so nothing had cleared it.
+	 * COMMIT's own return and last_error are now checked FIRST and
+	 * decide on their own when they look bad; the nonce is never asked.
+	 * The explicit ROLLBACK this failure now triggers closes the
+	 * still-open transaction, taking this unit's own witness INSERT
+	 * down with it.
+	 */
+	public function test_a_commit_that_fails_outright_on_a_live_connection_reports_committed_false(): void {
+		$name = 'aura_worker_door_s40_test';
+
+		$GLOBALS['_sa_commit_fails_connection_alive'] = true;
+		$outcome                                       = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_fails_connection_alive'] = false;
+
+		$this->assertFalse( $outcome['committed'], 'COMMIT reported failure on a connection that never dropped — the nonce matching does not override that' );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'the explicit ROLLBACK undid it, along with the witness INSERT in the same transaction' );
+	}
+
+	/**
+	 * The other half of Ruling S40: an ack lost on a COMMIT that genuinely
+	 * landed must still answer committed:true — the new gate (COMMIT's own
+	 * return/last_error, checked first) does not regress Rulings
+	 * S30/S32/S34's own durable-witness fallback for exactly this case,
+	 * and the explicit ROLLBACK this branch now issues first is a no-op on
+	 * a session whose COMMIT already popped its own transaction, so the
+	 * witness — genuinely durable — is still exactly where it landed.
+	 */
+	public function test_an_ack_lost_commit_that_genuinely_landed_still_reports_committed_true(): void {
+		$name = 'aura_worker_door_s40_landed_test';
+
+		$GLOBALS['_sa_commit_ambiguous_ack'] = true;
+		$outcome                             = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_ambiguous_ack'] = false;
+
+		$this->assertTrue( $outcome['committed'], 'the durable witness — read after a no-op ROLLBACK on an already-committed session — proves it landed' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'] );
+	}
+
+	/**
 	 * Ruling S30 (Codex round-13 P1 on #88): the session-variable nonce
 	 * (Ruling S16) has a gap of its own — if COMMIT genuinely lands on
 	 * THIS session but the connection then drops and reconnects before
