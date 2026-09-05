@@ -1124,8 +1124,12 @@ class Aura_Worker_Elementor_Door {
 		$seq = (int) ( isset( $claim['terminal_seq'] ) ? $claim['terminal_seq'] : 0 );
 		if ( $seq > 0 ) {
 			if ( $seq <= Aura_Worker_Door_Log::floor() ) {
-				Aura_Worker_Door_Holds::release( $ref );
-				$out['settled_claims']++;
+				// Ruling S35 (Codex round-15 P1 on #88): count this claim
+				// settled only once release() PROVES it committed — never
+				// on the strength of having merely called it.
+				if ( Aura_Worker_Door_Holds::release( $ref ) ) {
+					$out['settled_claims']++;
+				}
 				return;
 			}
 			// THE TRI-STATE READ (Ruling P86, on P74's helper): present, MISSING,
@@ -1145,15 +1149,19 @@ class Aura_Worker_Elementor_Door {
 			}
 			$row = is_array( $read ) ? $read : null;
 			if ( null !== $row && 'pending' !== ( isset( $row['result'] ) ? $row['result'] : 'pending' ) ) {
-				Aura_Worker_Door_Holds::release( $ref );
-				$out['settled_claims']++;
+				// Ruling S35: same — only a committed release counts.
+				if ( Aura_Worker_Door_Holds::release( $ref ) ) {
+					$out['settled_claims']++;
+				}
 				return;
 			}
 			if ( null !== $row ) {
 				if ( self::settle_interrupted( $row ) ) {
 					$out['interrupted']++;
-					Aura_Worker_Door_Holds::release( $ref );
-					$out['settled_claims']++;
+					// Ruling S35: same — only a committed release counts.
+					if ( Aura_Worker_Door_Holds::release( $ref ) ) {
+						$out['settled_claims']++;
+					}
 					return;
 				}
 				// The settle did not land. If the entry is TERMINAL now, the
@@ -1165,8 +1173,10 @@ class Aura_Worker_Elementor_Door {
 				// terminal underneath. Keeping the claim would strand the hold
 				// on every poll for ever.
 				if ( Aura_Worker_Door_Log::is_terminal( $seq ) ) {
-					Aura_Worker_Door_Holds::release( $ref );
-					$out['settled_claims']++;
+					// Ruling S35: same — only a committed release counts.
+					if ( Aura_Worker_Door_Holds::release( $ref ) ) {
+						$out['settled_claims']++;
+					}
 				}
 				return;
 			}
@@ -1184,8 +1194,10 @@ class Aura_Worker_Elementor_Door {
 			array( 'ref' => $ref )
 		) ) {
 			$out['interrupted']++;
-			Aura_Worker_Door_Holds::release( $ref );
-			$out['settled_claims']++;
+			// Ruling S35: same — only a committed release counts.
+			if ( Aura_Worker_Door_Holds::release( $ref ) ) {
+				$out['settled_claims']++;
+			}
 		}
 		// Not written — a closed log, a failed insert. The claim STAYS: it is
 		// the only evidence a replay may have mutated the site, and
@@ -3129,7 +3141,10 @@ class Aura_Worker_Elementor_Door {
 						'reason' => 'ability_missing',
 					)
 				);
-				Aura_Worker_Door_Holds::release( $ref );
+				$retry = self::release_or_retry_later( $ref );
+				if ( null !== $retry ) {
+					return $retry;
+				}
 				return array(
 					'ok'     => false,
 					'reason' => 'refused_by_missing_ability',
@@ -3239,7 +3254,10 @@ class Aura_Worker_Elementor_Door {
 						'error'  => $why,
 					)
 				);
-				Aura_Worker_Door_Holds::release( $ref );
+				$retry = self::release_or_retry_later( $ref );
+				if ( null !== $retry ) {
+					return $retry;
+				}
 				return array(
 					'ok'     => false,
 					'reason' => 'refused_by_permission',
@@ -3324,7 +3342,10 @@ class Aura_Worker_Elementor_Door {
 				return self::give_back( $ref, $code, $result->get_error_message(), $slug, (array) $held['actor'], $touches );
 			}
 			if ( 'ok' === $outcome ) {
-				Aura_Worker_Door_Holds::release( $ref );
+				$retry = self::release_or_retry_later( $ref );
+				if ( null !== $retry ) {
+					return $retry;
+				}
 				return array(
 					'ok'               => true,
 					'result'           => $result,
@@ -3347,7 +3368,10 @@ class Aura_Worker_Elementor_Door {
 			// `failed`: it ran (or it was refused under a code no retry can
 			// help), and the entry says what came of it — including what a
 			// creation left behind.
-			Aura_Worker_Door_Holds::release( $ref );
+			$retry = self::release_or_retry_later( $ref );
+			if ( null !== $retry ) {
+				return $retry;
+			}
 			$out = array(
 				'ok'     => false,
 				'reason' => 'failed',
@@ -3468,12 +3492,50 @@ class Aura_Worker_Elementor_Door {
 	 * @return array
 	 */
 	private static function spend_refusal( $ref, $code, $message ) {
-		Aura_Worker_Door_Holds::release( $ref );
+		$retry = self::release_or_retry_later( $ref );
+		if ( null !== $retry ) {
+			return $retry;
+		}
 		return array(
 			'ok'     => false,
 			'reason' => 'refused',
 			'code'   => $code,
 			'error'  => $message,
+		);
+	}
+
+	/**
+	 * Ruling S35 (Codex round-15 P1 on #88): every DEFINITIVE answer this
+	 * class builds on top of `Aura_Worker_Door_Holds::release()` — a
+	 * refusal or a success — must be withheld when that release did not
+	 * actually commit. See `release()`'s own docblock for what
+	 * `committed:false` means (a lost SAVEPOINT, an unreadable session
+	 * nonce with no durable witness, a failed version bump): the claimed
+	 * row is still there, still claimed, and telling Aura this approval is
+	 * fully spent — either way — would be wrong. Every one of this
+	 * method's own definitive returns is built through this gate rather
+	 * than five near-identical copies of the same check.
+	 *
+	 * The claimed row itself needs no separate handling here: an
+	 * uncommitted release is `versioned()` reporting nothing landed at
+	 * all, so the row this call was about to delete is exactly as it was
+	 * before this call ran — still claimed, and `settle_stale_claim()`'s
+	 * reconciler sweep is what finishes releasing it once the claim goes
+	 * stale, whatever record (or entry) this attempt already wrote.
+	 *
+	 * @param string $ref Ref.
+	 * @return array|null Null once the release is confirmed committed —
+	 *                     the caller proceeds with its own definitive
+	 *                     answer. The retryable answer to return
+	 *                     immediately otherwise.
+	 */
+	private static function release_or_retry_later( $ref ) {
+		if ( Aura_Worker_Door_Holds::release( $ref ) ) {
+			return null;
+		}
+		return array(
+			'ok'     => false,
+			'reason' => 'retry_later',
 		);
 	}
 

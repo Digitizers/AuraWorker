@@ -597,11 +597,24 @@ class Aura_Worker_Door_Holds {
 	 * logical release, and either one alone is enough to bump — a ref with
 	 * only a claimed row, only a held row, or both, all release cleanly.
 	 *
+	 * RETURNS whether it actually committed (Ruling S35, Codex round-15 P1
+	 * on #88). Every caller MUST check it: an approval is spent, or a claim
+	 * counted settled, only once THIS call is known to have landed — never
+	 * on the strength of having merely invoked it. A caller that ignored
+	 * this treated `committed:false` (a lost SAVEPOINT, an unreadable
+	 * session nonce with no durable witness, a failed version bump) exactly
+	 * like success: a "definitive" refusal or success was reported to Aura
+	 * while the row it claimed to have released sat there, still claimed,
+	 * replayable behind an answer that said it never would be again — or,
+	 * on the success path, a claimed row stranded with no way back into the
+	 * queue after Aura was told the approval was fully spent.
+	 *
 	 * @param string $ref Ref.
+	 * @return bool True once the release is durably committed.
 	 */
 	public static function release( $ref ) {
-		$ref = self::clean( $ref );
-		Aura_Worker_Door_Log::versioned(
+		$ref     = self::clean( $ref );
+		$outcome = Aura_Worker_Door_Log::versioned(
 			function () use ( $ref ) {
 				$claimed_gone = (bool) delete_option( self::CLAIMED . $ref );
 				$held_gone    = (bool) delete_option( self::HELD . $ref );
@@ -615,6 +628,7 @@ class Aura_Worker_Door_Holds {
 			}
 		);
 		self::forget_held();
+		return ! empty( $outcome['committed'] );
 	}
 
 	/**

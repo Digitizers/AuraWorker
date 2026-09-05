@@ -1530,6 +1530,100 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ) );
 	}
 
+	/**
+	 * Ruling S35 (Codex round-15 P1 on #88): `Aura_Worker_Door_Holds::release()`
+	 * discarded `versioned()`'s own outcome, so a call that never actually
+	 * committed (a lost SAVEPOINT, an unreadable session nonce with no
+	 * durable witness, a failed version bump) was treated exactly like a
+	 * successful one — this REFUSAL path answered `refused_by_missing_ability`
+	 * (Aura marks the approval spent) even though the claimed row this
+	 * release was supposed to remove is still sitting there, claimed,
+	 * replayable behind an answer that said it never would be again.
+	 *
+	 * `release()` now RETURNS whether it committed, and every caller in
+	 * `class-elementor-door-governor.php` checks it through
+	 * `release_or_retry_later()` before building a definitive answer.
+	 */
+	public function test_an_uncommitted_release_on_the_missing_ability_path_is_retryable_and_leaves_the_claim_held(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+		unset( $GLOBALS['_abilities']['elementor/publish-document'] ); // Elementor deactivated
+
+		// The terminal `refused` entry above is the 1st and only mutating
+		// commit in this flow before `release()`'s own — every commit
+		// this run issues before that one is let through untouched, and
+		// only the LAST (release()'s) one is made to never land.
+		$GLOBALS['_db_queries']                 = array();
+		$GLOBALS['_sa_reconnect_before_commit']  = 3;
+		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$GLOBALS['_sa_reconnect_before_commit']  = false;
+
+		$commits = count(
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static function ( $q ) {
+					return 'COMMIT' === trim( (string) $q );
+				}
+			)
+		);
+		$this->assertSame( 3, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'retry_later', $out['reason'], 'never the definitive refusal — the release that was supposed to spend the approval did not commit' );
+		$this->assertArrayNotHasKey( 'reason', array_intersect_key( $out, array( 'refused_by_missing_ability' => null ) ) );
+		// The terminal `refused` entry itself already landed (a separate,
+		// earlier, successfully-committed transaction) — only the
+		// release is uncommitted. The ability-missing check runs BEFORE
+		// the claim (Ruling P42), so this ref was never claimed at all —
+		// its HELD row is what release() was about to remove, and that
+		// row is the one that must still be there.
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'refused', $log[1]['result'] );
+		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'never claimed on this path (Ruling P42) — nothing to strand here' );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_held( $ref ), 'the held row is still there — the release never committed' );
+	}
+
+	/**
+	 * The other half of Ruling S35: an uncommitted release on the SUCCESS
+	 * path must not tell Aura the approval was spent either — a claimed
+	 * row stranded with no way back into the queue after Aura was told the
+	 * write was fully done and the approval fully spent would never be
+	 * revisited by anything.
+	 */
+	public function test_an_uncommitted_release_on_the_success_path_is_retryable_and_leaves_the_claim_claimed(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		$GLOBALS['_current_user_id']            = 9;
+		$GLOBALS['_db_queries']                 = array();
+		$GLOBALS['_sa_reconnect_before_commit']  = 9;
+		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
+		$GLOBALS['_sa_reconnect_before_commit']  = false;
+
+		$commits = count(
+			array_filter(
+				$GLOBALS['_db_queries'],
+				static function ( $q ) {
+					return 'COMMIT' === trim( (string) $q );
+				}
+			)
+		);
+		$this->assertSame( 9, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+
+		// The ability genuinely ran, and its terminal 'ok' entry genuinely
+		// landed — proving the skip count let every EARLIER commit through
+		// untouched, and only release()'s own failed to commit.
+		$this->assertSame( 1, $this->ran['elementor/publish-document'] );
+		$log = Aura_Worker_Door_Log::log_after( 0 );
+		$this->assertSame( 'ok', $log[1]['result'] );
+
+		$this->assertFalse( $out['ok'], 'never a success answer over an uncommitted release' );
+		$this->assertSame( 'retry_later', $out['reason'] );
+		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claimed row is still claimed — the release never committed' );
+	}
+
 	// -----------------------------------------------------------------------
 	// The permission re-check is the ACTOR's
 	// -----------------------------------------------------------------------
