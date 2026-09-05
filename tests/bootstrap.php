@@ -1939,13 +1939,26 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 		 */
 		public bool $ready = true;
 		/**
-		 * wpdb::$reconnect_retries (Ruling S50, 2.16.2): how many times
-		 * check_connection() tries to reconnect a dropped connection before
-		 * giving up. Real wpdb defaults this to 3; modelled here so
-		 * Aura_Worker_Door_Log::versioned() setting it to 0 for its own
-		 * unit is something a test can actually observe and depend on.
+		 * wpdb::$reconnect_retries (Ruling S50, 2.16.2) — PROTECTED, to
+		 * mirror WordPress core exactly (verified against core
+		 * 7.0/7.0.4/7.1's own wp-includes/class-wpdb.php: `protected
+		 * $reconnect_retries = 5;`). A PUBLIC declaration here is what let
+		 * Ruling S50's own `$wpdb->reconnect_retries = 0` direct property
+		 * write pass every test while still being a real fatal
+		 * (`Error: Cannot access protected property`) on a genuine
+		 * `db.php` drop-in without matching magic methods — Ruling S56,
+		 * Codex round-22 P1 on #88. Production code now reads/writes this
+		 * ONLY through `Aura_Worker_Door_Log::reconnect_retries_get()`/
+		 * `_set()`'s scope-bound closures, exactly as it must for a real
+		 * protected property; `sa_reconnect_retries_for_tests()` below is
+		 * this test double's OWN accessor, for tests that need to observe
+		 * the value without reproducing the closure-bind dance themselves.
 		 */
-		public int $reconnect_retries = 3;
+		protected int $reconnect_retries = 5;
+		/** Ruling S56: a test's own window onto the protected property above — never used by production code. */
+		public function sa_reconnect_retries_for_tests() {
+			return $this->reconnect_retries;
+		}
 		/**
 		 * What the LAST statement that actually ran left behind — wpdb keeps
 		 * it in $last_result, and get_var() extracts from there whether or not
@@ -3730,6 +3743,48 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			}
 
 			return isset( $GLOBALS['_db_query_result'] ) ? $GLOBALS['_db_query_result'] : 0;
+		}
+	}
+
+	/**
+	 * Ruling S56 (Codex round-22 P1 on #88): a `db.php` drop-in that
+	 * REPLACES wpdb outright (never a subclass, which would inherit the
+	 * declaration) and simply never declares `reconnect_retries` at all
+	 * — the one case `Aura_Worker_Door_Log::reconnect_guard_available()`
+	 * must answer false for. A plain subclass of SA_Test_Wpdb cannot
+	 * model this (PHP inherits declared properties unconditionally,
+	 * and property_exists() answers true for a declared property even
+	 * after unset() on the instance — verified: this is not a case a
+	 * runtime unset() can fake). This class instead declares NOTHING of
+	 * its own and proxies every method call and every property read/
+	 * write to a real, fully-functional SA_Test_Wpdb instance via magic
+	 * methods, so it still speaks the whole protocol
+	 * Aura_Worker_Door_Log::versioned() needs — property_exists() on
+	 * THIS object for 'reconnect_retries' genuinely answers false,
+	 * because this class's own declaration has none.
+	 */
+	class SA_Test_Wpdb_No_Reconnect_Guard {
+		/** @var SA_Test_Wpdb */
+		private $inner;
+
+		public function __construct( SA_Test_Wpdb $inner ) {
+			$this->inner = $inner;
+		}
+
+		public function __call( $name, $args ) {
+			return $this->inner->$name( ...$args );
+		}
+
+		public function __get( $name ) {
+			return $this->inner->$name;
+		}
+
+		public function __set( $name, $value ) {
+			$this->inner->$name = $value;
+		}
+
+		public function __isset( $name ) {
+			return isset( $this->inner->$name );
 		}
 	}
 

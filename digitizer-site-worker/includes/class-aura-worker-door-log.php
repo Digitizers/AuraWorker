@@ -2386,6 +2386,90 @@ class Aura_Worker_Door_Log {
 	 *         (Ruling S10): a reconnect between the COMMIT and the
 	 *         read-back, or a non-transactional engine, or 32-bit PHP.
 	 */
+
+	/**
+	 * Read `wpdb::$reconnect_retries` through a scope-bound closure
+	 * (Ruling S56, Codex round-22 P1 on #88) rather than a plain property
+	 * access — see `versioned()`'s own docblock at its call site for why
+	 * a direct `$wpdb->reconnect_retries` touch cannot be trusted against
+	 * every possible `$wpdb`. `Closure::bind()` reads the property from
+	 * INSIDE the object's own class scope, which can always see a
+	 * protected member REGARDLESS of whether that specific object's
+	 * class happens to define matching `__get()`/`__set()` magic methods
+	 * — the one thing a plain external property access depends on that
+	 * this method does not.
+	 *
+	 * @param object $wpdb The live `$wpdb` (or a drop-in standing in for
+	 *                      it).
+	 * @return int|null Null when the property does not exist on this
+	 *                   object AT ALL — the "guard unavailable" case
+	 *                   `reconnect_guard_available()` reports.
+	 */
+	private static function reconnect_retries_get( $wpdb ) {
+		if ( ! is_object( $wpdb ) || ! property_exists( $wpdb, 'reconnect_retries' ) ) {
+			return null;
+		}
+		$reader = \Closure::bind(
+			function () {
+				return $this->reconnect_retries;
+			},
+			$wpdb,
+			get_class( $wpdb )
+		);
+		return $reader();
+	}
+
+	/**
+	 * The write half of `reconnect_retries_get()` — same reasoning, same
+	 * guard.
+	 *
+	 * @param object $wpdb  The live `$wpdb`.
+	 * @param int    $value The value to set.
+	 * @return bool True when the write actually ran (the property
+	 *              exists); false when there was nothing to write to.
+	 */
+	private static function reconnect_retries_set( $wpdb, $value ) {
+		if ( ! is_object( $wpdb ) || ! property_exists( $wpdb, 'reconnect_retries' ) ) {
+			return false;
+		}
+		$writer = \Closure::bind(
+			function ( $n ) {
+				$this->reconnect_retries = $n;
+			},
+			$wpdb,
+			get_class( $wpdb )
+		);
+		$writer( $value );
+		return true;
+	}
+
+	/**
+	 * Whether Ruling S56's reconnect-PREVENTION guard can actually be
+	 * applied to the LIVE `$wpdb` — false only for a `db.php` drop-in
+	 * that replaces wpdb outright without declaring `reconnect_retries`
+	 * at all (a subclass inherits the property and this stays true).
+	 * Checked fresh every call — `property_exists()` costs nothing, and
+	 * a drop-in cannot change mid-request — never cached, so the
+	 * fragment/audit always reports the CURRENT truth rather than a memo
+	 * from an earlier attempt.
+	 *
+	 * `false` here does not mean this site's door writes are unsafe: it
+	 * means Ruling S50's PREVENTION (zeroing reconnect_retries so a
+	 * dropped connection cannot replay a write) could not be applied,
+	 * and every `versioned()` unit on this site falls back to DETECTION
+	 * alone (the post-$writes() session-nonce re-check) — a real
+	 * mutation is still never miscounted, but a torn statement is caught
+	 * one step later, after it already ran once. Reported through
+	 * `status_fragment()`/`governor_block()`'s own `reconnect_guard`
+	 * field so this is visible, never silent.
+	 *
+	 * @return bool
+	 */
+	public static function reconnect_guard_available() {
+		global $wpdb;
+		return is_object( $wpdb ) && property_exists( $wpdb, 'reconnect_retries' );
+	}
+
 	public static function versioned( callable $writes ) {
 		global $wpdb;
 		$transactional = self::engine_is_transactional();
@@ -2401,7 +2485,6 @@ class Aura_Worker_Door_Log {
 				'committed' => false,
 			);
 		}
-		$tx_nonce = null;
 		$tx_nonce = null;
 		// Ruling S50 (Codex round-20 P1 on #88): no statement of this
 		// unit — not $writes()'s own queries, not START TRANSACTION,
@@ -2426,8 +2509,39 @@ class Aura_Worker_Door_Log {
 		// rethrown exception (the `finally` below), so a caller
 		// elsewhere in this same request is never left running with
 		// reconnects disabled by a unit that already finished.
-		$prior_reconnect_retries = isset( $wpdb->reconnect_retries ) ? $wpdb->reconnect_retries : 3;
-		$wpdb->reconnect_retries = 0;
+		//
+		// Ruling S56 (Codex round-22 P1 on #88): `wpdb::$reconnect_retries`
+		// is PROTECTED in WordPress core (verified against core
+		// 7.0/7.0.4/7.1's own wp-includes/class-wpdb.php) — a plain
+		// `$wpdb->reconnect_retries = 0` from THIS class's own scope is
+		// not something every `$wpdb` can be trusted to tolerate. Stock
+		// wpdb happens to define matching `__get()`/`__set()` magic
+		// methods for backward compatibility that do not block this
+		// specific property, so a direct assignment against genuine core
+		// wpdb does not fatal in practice — but a CUSTOM `db.php`
+		// drop-in that REPLACES wpdb outright (not a subclass — a
+		// subclass inherits the magics) need not define either, and a
+		// direct property touch there throws `Error: Cannot access
+		// protected property`. `reconnect_retries_get()`/`_set()` read
+		// and write through a scope-bound closure instead — the same
+		// mechanism regardless of whether the object's own magic methods
+		// happen to cover this property — and answer/report `null`/false
+		// when the property does not exist on the object AT ALL, which
+		// is the one case nothing here can safely paper over.
+		$prior_reconnect_retries   = self::reconnect_retries_get( $wpdb );
+		$reconnect_guard_available = ( null !== $prior_reconnect_retries );
+		if ( $reconnect_guard_available ) {
+			self::reconnect_retries_set( $wpdb, 0 );
+		}
+		// Ruling S56: when the guard is UNAVAILABLE, this unit proceeds
+		// WITHOUT the prevention above and relies on DETECTION alone —
+		// the post-$writes() session-nonce re-check a few lines down
+		// (Ruling S50's own belt-and-braces addition) still catches a
+		// reconnect that happened to land mid-$writes(), just after the
+		// fact rather than before it. `reconnect_guard_available()`
+		// (public, below) is what the fragment/audit report this
+		// through, so a site running such a drop-in is told, never left
+		// to find out the weaker way.
 		try {
 			if ( $transactional ) {
 				$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -2711,7 +2825,9 @@ class Aura_Worker_Door_Log {
 					// before the read, not only in the method's own
 					// `finally`, is what lets it actually find the
 					// witness a healthy reconnect would reveal.
-					$wpdb->reconnect_retries = $prior_reconnect_retries;
+					if ( $reconnect_guard_available ) {
+						self::reconnect_retries_set( $wpdb, $prior_reconnect_retries );
+					}
 					// Ruling S30/S32 (Codex rounds 13/14 P1 on #88): the DURABLE
 					// witness, written BEFORE the bump inside this same
 					// transaction — a plain option row survives what neither a
@@ -2828,7 +2944,9 @@ class Aura_Worker_Door_Log {
 				'observation' => $observation,
 			);
 		} finally {
-			$wpdb->reconnect_retries = $prior_reconnect_retries;
+			if ( $reconnect_guard_available ) {
+				self::reconnect_retries_set( $wpdb, $prior_reconnect_retries );
+			}
 		}
 	}
 
