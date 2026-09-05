@@ -3656,10 +3656,23 @@ class Aura_Worker_Elementor_Door {
 				// `not_held` from claim() is a LOST RACE (a reject or the
 				// sweep took the row), not a rejection of this replay: Aura
 				// retries it, and finds out what happened from the hold list.
-				return array(
-					'ok'     => false,
-					'reason' => 'not_held',
-				);
+				//
+				// Ruling S59 (Codex round-23 P1 on #88): EVERY error
+				// claim() can return used to collapse into this SAME
+				// blanket `not_held` — including
+				// Aura_Worker_Door_Holds::retry_may_have_run()'s own 503,
+				// which carries `may_have_run: true` (Ruling S51) for the
+				// one case that is NOT a lost race at all: this replay's
+				// own claim attempt landed ambiguously and MAY have
+				// already claimed the ref. Reporting that as `not_held`
+				// told Aura the approval was gone for good, exactly the
+				// bug Ruling S51 closed at claim()'s own boundary,
+				// reopened here at replay()'s. propagate_claim_error()
+				// forwards claim()'s own code/message/data (status,
+				// retry_after, may_have_run) whole; a GENUINE `not_held`
+				// (claim() found nothing, or lost the race) still maps to
+				// `reason: 'not_held'` below, unchanged.
+				return self::propagate_claim_error( $claimed );
 			}
 			// THE EXECUTION LEASE (Ruling P52). A MySQL named lock lives exactly
 			// as long as this request's database connection, so while it is
@@ -4027,6 +4040,38 @@ class Aura_Worker_Elementor_Door {
 			'ok'     => false,
 			'reason' => 'retry_later',
 		);
+	}
+
+	/**
+	 * Turn a WP_Error claim() (or any other Aura_Worker_Door_Holds
+	 * claim-shaped call) returned into replay()'s own wire answer,
+	 * WHOLE — its code, message and every field its own data carries
+	 * (Ruling S59, Codex round-23 P1 on #88).
+	 *
+	 * replay()'s own answer is a PLAIN ARRAY, never a WP_Error object
+	 * (Aura_Worker_Tools::execute_tool() wraps whatever execute() returns
+	 * as `result` with no WP_Error-aware unwrapping — a raw WP_Error
+	 * there would JSON-encode to `{}`, silently losing everything).
+	 * `reason` carries the error's own CODE — `not_held` for a genuine
+	 * lost race, `aura_hold_failed` for retry_may_have_run() and every
+	 * other retryable claim() failure — so a caller reading `reason`
+	 * still gets `not_held` exactly where it always did, and gets the
+	 * real code everywhere else, never a blanket substitute for it.
+	 * `$data` (status, retry_after, may_have_run — whatever the error
+	 * carries) is merged in beside `ok`/`reason`/`error`, which always
+	 * win any name collision.
+	 *
+	 * @param WP_Error $error
+	 * @return array{ ok: false, reason: string, error: string }
+	 */
+	private static function propagate_claim_error( WP_Error $error ) {
+		$data = $error->get_error_data();
+		$out  = array(
+			'ok'     => false,
+			'reason' => (string) $error->get_error_code(),
+			'error'  => $error->get_error_message(),
+		);
+		return is_array( $data ) ? ( $out + $data ) : $out;
 	}
 
 	/**

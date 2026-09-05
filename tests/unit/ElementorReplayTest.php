@@ -869,6 +869,45 @@ final class ElementorReplayTest extends TestCase {
 		$this->assertNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim backed out' );
 	}
 
+	/**
+	 * Ruling S59 (Codex round-23 P1 on #88): claim() answering
+	 * retry_may_have_run() (Ruling S51 -- its own CLAIMED insert landed
+	 * ambiguously, so it may have already claimed the ref) used to be
+	 * collapsed into the SAME blanket `not_held` a genuine lost race
+	 * gets -- telling Aura the approval is gone for good, when the truth
+	 * is this replay attempt may have already run it. replay() now
+	 * propagates claim()'s own error whole: the retryable code, its
+	 * status and every field its data carries (`may_have_run`,
+	 * `retry_after`).
+	 */
+	public function test_claim_answering_retry_may_have_run_reaches_replays_own_wire_answer(): void {
+		$this->registerAll();
+		$this->installRuleset( array() );
+		$ref = $this->holdCall();
+
+		// The SAME ambiguous-commit scenario DoorHoldsTest proves makes
+		// claim() answer retry_may_have_run(): the CLAIMED insert's own
+		// commit ack is lost, and the durable-witness fallback's own read
+		// then fails too.
+		$GLOBALS['_sa_uuid_fixed']              = 'nonce-s59';
+		$GLOBALS['_sa_reconnect_after_commit']  = true;
+		$witness                                = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s59';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Elementor_Door::replay( $ref, null );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertFalse( $out['ok'] );
+		$this->assertSame( 'aura_hold_failed', $out['reason'], 'claim()\'s own code, never a blanket not_held' );
+		$this->assertTrue( $out['may_have_run'] ?? null, 'Aura must not treat this like a plain retry' );
+		$this->assertSame( 503, $out['status'] ?? null );
+		$this->assertSame( 5, $out['retry_after'] ?? null );
+		$this->assertSame( array(), $this->ran, 'nothing ran -- this is a retryable answer, not a claim' );
+	}
+
 	public function test_a_claim_racing_the_reject_answers_already_claimed(): void {
 		$this->registerAll();
 		$this->installRuleset( array() );
