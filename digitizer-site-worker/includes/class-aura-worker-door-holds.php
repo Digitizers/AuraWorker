@@ -1892,22 +1892,32 @@ class Aura_Worker_Door_Holds {
 				// of them fence their own next step on. A raw
 				// DELETE ... WHERE option_name = %s is the exact shape
 				// those callers always issued, fence or not.
+				// Ruling S84 (Codex round-35 P1 on #88): must_succeed()
+				// before the (int) cast in both branches — a real driver
+				// failure must abort the unit; a genuine "0 rows, nothing
+				// there" (an int 0, never `false`) still passes through
+				// untouched, exactly as claim()'s own null-check for this
+				// method already depends on.
 				if ( null === $fence ) {
-					$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-						$wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $name )
+					$gone = (int) Aura_Worker_Door_Log::must_succeed(
+						$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+							$wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s", $name )
+						)
 					);
 				} else {
-					$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-						$wpdb->prepare(
-							"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
-							$name,
-							$fence
+					$gone = (int) Aura_Worker_Door_Log::must_succeed(
+						$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+							$wpdb->prepare(
+								"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+								$name,
+								$fence
+							)
 						)
 					);
 				}
 				wp_cache_delete( $name, 'options' );
 				wp_cache_delete( 'notoptions', 'options' );
-				$won = 1 === (int) $gone;
+				$won = 1 === $gone;
 				return array(
 					'mutated' => $won,
 					'result'  => $won,

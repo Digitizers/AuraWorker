@@ -4640,7 +4640,15 @@ class Aura_Worker_Elementor_Door {
 			function () use ( $name ) {
 				global $wpdb;
 				$option = self::COUNTER_PREFIX . $name . '_h' . (int) floor( time() / HOUR_IN_SECONDS );
-				$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1", $option ) );
+				// Ruling S84 (Codex round-35 P1 on #88): this statement's
+				// own return used to be ignored entirely — the SAME
+				// shape Aura_Worker_Door_Log::bump_refused() had before
+				// this same ruling. A failed upsert must abort the unit,
+				// never report `mutated: true` on the strength of a
+				// write that never landed.
+				Aura_Worker_Door_Log::must_succeed(
+					$wpdb->query( $wpdb->prepare( "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1", $option ) )
+				);
 				wp_cache_delete( $option, 'options' );
 				wp_cache_delete( 'notoptions', 'options' );
 				return array(

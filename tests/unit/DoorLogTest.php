@@ -301,6 +301,45 @@ final class DoorLogTest extends TestCase {
 		$this->assertFalse( Aura_Worker_Door_Log::is_closed() );
 	}
 
+	/**
+	 * Ruling S84 (Codex round-35 P1 on #88): ack_write()'s own purge
+	 * DELETE used to be cast to `(int)` with NEITHER its own `false` NOR
+	 * $wpdb->last_error checked -- a deadlock aborting the whole InnoDB
+	 * transaction there cast to `0`, indistinguishable from an ordinary
+	 * "nothing above the floor yet" outcome, and count_unacked($floor)
+	 * right after went on to decide the log was under capacity using the
+	 * ALREADY-raised (and, on a deadlock, already ROLLED BACK by MySQL
+	 * itself) floor -- reopening the door via delete_option(FULL_MARKER)
+	 * on what is by then an autocommit session versioned()'s own later
+	 * commit-witness check cannot undo. must_succeed() now catches the
+	 * purge DELETE's own failure immediately and aborts the WHOLE unit
+	 * (Ruling S12's `rollback: true`) before count_unacked() -- let alone
+	 * the reopen -- ever runs.
+	 */
+	public function test_ack_aborts_when_its_own_purge_delete_fails(): void {
+		Aura_Worker_Door_Log::close();
+		$epoch        = Aura_Worker_Door_Log::epoch();
+		$seq          = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		Aura_Worker_Door_Log::admit( $seq );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		$floor_before = Aura_Worker_Door_Log::floor();
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed(), 'the fixture assumption this test is built on' );
+
+		// ack_write()'s purge DELETE opens with "DELETE f FROM" -- distinct
+		// from the floor-raise UPDATE just before it (which opens
+		// "UPDATE ... f JOIN") -- so this seam lands on the purge alone,
+		// modelling a deadlock that aborts the whole transaction the
+		// instant this ONE statement runs.
+		$GLOBALS['_sa_reconnect_mid_query'] = 'DELETE f FROM';
+		$out                                = Aura_Worker_Door_Log::ack( $epoch, $seq );
+		$GLOBALS['_sa_reconnect_mid_query'] = false;
+
+		$this->assertFalse( $out['committed'], 'Ruling S84: the purge DELETE\'s own failure aborts the whole unit -- never a false "committed" on the strength of a statement that never landed' );
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed(), 'FULL_MARKER intact -- the door was never reopened on an aborted/autocommit session' );
+		$this->assertSame( $floor_before, Aura_Worker_Door_Log::floor(), 'the floor raise earlier in the SAME unit was rolled back too, not left standing while only the purge failed' );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $seq, $GLOBALS['_options'], 'the row itself is untouched -- the purge never actually landed' );
+	}
+
 	public function test_rotate_epoch_mints_a_new_epoch_clears_closure_and_keeps_the_floor_and_every_row(): void {
 		$before = Aura_Worker_Door_Log::epoch();
 		$seq    = Aura_Worker_Door_Log::open_pending( $this->entry() );

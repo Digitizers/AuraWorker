@@ -17,6 +17,26 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+if ( ! class_exists( 'Aura_Worker_Door_Write_Failed', false ) ) {
+	/**
+	 * Thrown by Aura_Worker_Door_Log::must_succeed() (Ruling S84, Codex
+	 * round-35 P1 on #88) — see that method's own docblock. Caught in
+	 * EXACTLY one place, versioned()'s own $writes() invocation, and
+	 * turned into the SAME `{ rollback: true }` shape a $writes()
+	 * callback already signals by RETURNING it (Ruling S12) — a
+	 * write-unit abort by exception is indistinguishable, from
+	 * versioned()'s own point of view, from one signalled the ordinary
+	 * way. Never caught anywhere else: a callback that wants a
+	 * DIFFERENT outcome on a specific failure (rotate_epoch_write()'s
+	 * own fence-miss branches, which treat "0 rows" as a meaningful
+	 * BUSINESS answer rather than a failure) simply never calls
+	 * must_succeed() on that particular statement's result — this
+	 * exception exists for the OTHER case: a statement whose failure has
+	 * no honest business meaning at all, only "abort".
+	 */
+	class Aura_Worker_Door_Write_Failed extends RuntimeException {}
+}
+
 class Aura_Worker_Door_Log {
 
 	const PREFIX       = 'aura_worker_door_log_';
@@ -2098,10 +2118,18 @@ class Aura_Worker_Door_Log {
 		self::versioned(
 			function () {
 				global $wpdb;
-				$wpdb->query(
-					$wpdb->prepare(
-						"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
-						self::FULL_COUNTER
+				// Ruling S84 (Codex round-35 P1 on #88): this statement's
+				// own return used to be ignored entirely — a failed
+				// upsert (a deadlock, a driver error) still reported
+				// `mutated: true` unconditionally below, telling
+				// versioned() to COMMIT and bump the door version for a
+				// counter that never actually changed.
+				self::must_succeed(
+					$wpdb->query(
+						$wpdb->prepare(
+							"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+							self::FULL_COUNTER
+						)
 					)
 				);
 				wp_cache_delete( self::FULL_COUNTER, 'options' );
@@ -2835,6 +2863,69 @@ class Aura_Worker_Door_Log {
 		return self::reconnect_guard_available() ? null : 'reconnect_guard_unavailable';
 	}
 
+	/**
+	 * Ruling S84 (Codex round-35 P1 on #88), generalising Ruling S54: EVERY
+	 * raw `$wpdb->query()` a `versioned()` write unit issues — directly in
+	 * its own `$writes()` callback, or in a helper that callback calls,
+	 * exclusively FROM inside a `versioned()` unit — is routed through
+	 * this ONE checkpoint immediately after the statement that produced
+	 * its `$result`, before that result is used for anything else this
+	 * same unit does.
+	 *
+	 * THE BUG THIS CLOSES (`ack_write()`'s own purge DELETE,
+	 * class-aura-worker-door-log.php:3571 as this ruling names it): a
+	 * `$wpdb->query()` failure — a deadlock aborting the WHOLE InnoDB
+	 * transaction, not merely this one statement — returns `false`.
+	 * `(int) false` is `0`, silently indistinguishable from a genuine,
+	 * harmless "zero rows matched" outcome once cast. A callback that
+	 * only checks the CAST value (`0 === $rows`) reads a deadlock exactly
+	 * like an ordinary no-op and carries on: `ack_write()`'s own
+	 * `count_unacked( $floor )` used the ALREADY-raised (and, on a
+	 * deadlock, subsequently ROLLED BACK by MySQL itself) floor to decide
+	 * the log was under capacity, and issued `delete_option( FULL_MARKER )`
+	 * — a REAL, independent statement — on what is by then an aborted
+	 * transaction's connection, back to autocommit. `versioned()` still
+	 * correctly answers `committed: false` once it notices (the SAVEPOINT/
+	 * nonce checks below already catch a deadlocked session), but by then
+	 * the door has already been reopened for real, durably, and nothing in
+	 * `committed: false` undoes it.
+	 *
+	 * NEVER APPLIED to a statement whose "failure" (0 rows, or `false` with
+	 * a clean `last_error`) IS itself a meaningful business answer a
+	 * callback already branches on correctly — `rotate_epoch_write()`'s own
+	 * fence-miss checks (`1 !== (int) $gone`) are a good example: `false`
+	 * casts to `0`, which is `!== 1` exactly like a genuine fence miss, and
+	 * that branch does nothing destructive on either reading (it returns a
+	 * fresh READ, never a further write). Calling this there would be
+	 * harmless but redundant; it is not required for those statements to
+	 * be safe. It IS required wherever a LATER statement or decision in the
+	 * SAME callback trusts an earlier one's cast return without checking
+	 * `$wpdb->last_error` too — which this file's own grep table (see the
+	 * PR body's "Review rounds" section for Ruling S84) confirms is
+	 * everywhere the actual bug lived.
+	 *
+	 * @throws Aura_Worker_Door_Write_Failed When `$result` is `false`, or
+	 *         `$wpdb->last_error` is non-empty despite a non-`false`
+	 *         `$result` (a partial/warning outcome a caller must not treat
+	 *         as clean).
+	 * @param mixed $result Whatever `$wpdb->query()` (or, in principle, its
+	 *                       `insert()`/`update()`/`delete()`/`replace()`
+	 *                       siblings — this codebase issues every write as
+	 *                       a raw `query()`, never those, but the check is
+	 *                       identical either way) just returned.
+	 * @return mixed `$result`, UNCHANGED, when it passed — so a caller
+	 *              chains this around the statement itself
+	 *              (`$rows = (int) self::must_succeed( $wpdb->query( … ) );`)
+	 *              with no restructuring of its own existing logic.
+	 */
+	public static function must_succeed( $result ) {
+		global $wpdb;
+		if ( false === $result || '' !== (string) $wpdb->last_error ) {
+			throw new Aura_Worker_Door_Write_Failed( 'A door-log write statement failed inside a versioned() unit.' );
+		}
+		return $result;
+	}
+
 	public static function versioned( callable $writes ) {
 		global $wpdb;
 		$transactional = self::engine_is_transactional();
@@ -2975,6 +3066,19 @@ class Aura_Worker_Door_Log {
 			}
 			try {
 				$outcome = $writes();
+			} catch ( Aura_Worker_Door_Write_Failed $e ) {
+				// Ruling S84 (Codex round-35 P1 on #88): must_succeed()'s
+				// own signal — a statement inside THIS unit failed and
+				// there is no honest business meaning to give that,
+				// only "abort". Converted to the SAME `{ rollback: true }`
+				// shape a $writes() callback already signals by
+				// RETURNING it (Ruling S12) — the `if ( ! empty(
+				// $outcome['rollback'] ) )` branch just below this try/
+				// catch is what actually issues ROLLBACK and answers
+				// `committed: false`; this catch's only job is to reach
+				// it rather than let the exception fall through to the
+				// generic handler below, which re-throws instead.
+				$outcome = array( 'rollback' => true );
 			} catch ( \Throwable $e ) {
 				if ( $transactional ) {
 					$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
@@ -3642,14 +3746,21 @@ class Aura_Worker_Door_Log {
 		//
 		// The epoch row is a condition of the statement itself, so the ack
 		// linearises before or after a rotation and never across one.
-		$raised = (int) $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->prepare(
-				"UPDATE {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x SET f.option_value = %s WHERE f.option_name = %s AND x.e = %s AND CAST(f.option_value AS UNSIGNED) < %d",
-				self::EPOCH,
-				(string) $seq,
-				self::FLOOR,
-				(string) $epoch,
-				$seq
+		// Ruling S84 (Codex round-35 P1 on #88): must_succeed() checks
+		// BOTH the return value AND $wpdb->last_error before the (int)
+		// cast below ever runs — a deadlock aborting the whole
+		// transaction here must never be read as "zero rows, ordinary
+		// idempotent repeat" by the branch just below.
+		$raised = (int) self::must_succeed(
+			$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x SET f.option_value = %s WHERE f.option_name = %s AND x.e = %s AND CAST(f.option_value AS UNSIGNED) < %d",
+					self::EPOCH,
+					(string) $seq,
+					self::FLOOR,
+					(string) $epoch,
+					$seq
+				)
 			)
 		);
 		wp_cache_delete( self::FLOOR, 'options' );
@@ -3686,15 +3797,23 @@ class Aura_Worker_Door_Log {
 			// destructive half, and it must not run under an epoch this ack
 			// was never for — including one installed between the raise above
 			// and this statement.
-			$acked = (int) $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->prepare(
-					"DELETE f FROM {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x WHERE f.option_name LIKE %s AND f.option_name REGEXP %s AND x.e = %s AND CAST(SUBSTRING(f.option_name, %d) AS UNSIGNED) <= %d",
-					self::EPOCH,
-					$like,
-					self::ROW_REGEXP,
-					(string) $epoch,
-					strlen( self::PREFIX ) + 1,
-					$floor
+			// Ruling S84 (Codex round-35 P1 on #88): THE named bug —
+			// this DELETE's own `false` used to cast straight to `0` and
+			// let count_unacked() below decide the log was under
+			// capacity using a floor this same deadlock had already
+			// rolled back, reopening the door on an autocommit session
+			// versioned()'s own later commit-witness check cannot undo.
+			$acked = (int) self::must_succeed(
+				$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->prepare(
+						"DELETE f FROM {$wpdb->options} f JOIN ( SELECT option_value AS e FROM {$wpdb->options} WHERE option_name = %s ) x WHERE f.option_name LIKE %s AND f.option_name REGEXP %s AND x.e = %s AND CAST(SUBSTRING(f.option_name, %d) AS UNSIGNED) <= %d",
+						self::EPOCH,
+						$like,
+						self::ROW_REGEXP,
+						(string) $epoch,
+						strlen( self::PREFIX ) + 1,
+						$floor
+					)
 				)
 			);
 			for ( $i = $prev_floor + 1; $i <= $floor; $i++ ) {
@@ -4114,18 +4233,26 @@ class Aura_Worker_Door_Log {
 		// The grant-gated `/door/rotate` route passes none: it is Aura moving
 		// the cursor it owns, not a rebind, and holds no site claim.
 		if ( '' !== $claim && '' !== $fence ) {
-			$gone = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->prepare(
-					"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name = %s AND o.option_value = %s",
-					$claim,
-					$wpdb->esc_like( $fence . '|' ) . '%',
-					self::EPOCH,
-					$expected
+			// Ruling S84 (Codex round-35 P1 on #88): must_succeed() before
+			// the (int) cast — a real driver failure here must abort the
+			// unit, never be silently read as an ordinary fence miss (the
+			// branch just below, which the exact `1 !==` match already
+			// catches `false`→`0` into, but without ever NAMING
+			// last_error, which this generalises the rule to require).
+			$gone = (int) self::must_succeed(
+				$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->prepare(
+						"DELETE o FROM {$wpdb->options} o JOIN {$wpdb->options} c ON c.option_name = %s AND c.option_value LIKE %s WHERE o.option_name = %s AND o.option_value = %s",
+						$claim,
+						$wpdb->esc_like( $fence . '|' ) . '%',
+						self::EPOCH,
+						$expected
+					)
 				)
 			);
 			wp_cache_delete( self::EPOCH, 'options' );
 			wp_cache_delete( 'notoptions', 'options' );
-			if ( 1 !== (int) $gone ) {
+			if ( 1 !== $gone ) {
 				// Ruling S78 (Codex round-32 P1 on #88): a fence miss whose
 				// CURRENT epoch already equals THIS call's own $new_epoch
 				// is not a lost race to some OTHER rotation — it is this
@@ -4177,10 +4304,16 @@ class Aura_Worker_Door_Log {
 				'evict'   => array( self::EPOCH, 'notoptions', 'alloptions', self::FULL_MARKER, self::FULL_COUNTER ),
 			);
 		}
-		$gone = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::EPOCH, $expected ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		// Ruling S84 (Codex round-35 P1 on #88): the SAME must_succeed()
+		// this file's own class docblock table names for the claim-
+		// conditioned branch above -- this is the branch rotate_epoch()'s
+		// own /door/rotate route actually reaches.
+		$gone = (int) self::must_succeed(
+			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", self::EPOCH, $expected ) ) // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		);
 		wp_cache_delete( self::EPOCH, 'options' );
 		wp_cache_delete( 'notoptions', 'options' );
-		if ( 1 !== (int) $gone ) {
+		if ( 1 !== $gone ) {
 			// Ruling S78 (Codex round-32 P1 on #88): the SAME recognition
 			// as the claim-conditioned branch above — this is the branch
 			// `rotate_epoch()`'s own `/door/rotate` route actually reaches
