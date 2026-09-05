@@ -2149,4 +2149,43 @@ final class DoorLogTest extends TestCase {
 			$GLOBALS['wpdb'] = $real;
 		}
 	}
+
+	/**
+	 * Ruling S63 (Codex round-24 P1 on #88): insert_unique() now answers
+	 * null for "committed, but the witness could not be proven" (Ruling
+	 * S51) -- open_pending()'s own allocation loop tested it as a plain
+	 * boolean, and `if ( null )` is falsy, so an ambiguous insert fell
+	 * straight into "collision, try the next number": a SECOND seq was
+	 * allocated and admitted while the FIRST row -- which may already
+	 * exist, pending, at the number this call actually wanted -- sat
+	 * there unadmitted, permanently splitting the log's own contiguous
+	 * numbering. null now STOPS the loop outright: no further
+	 * allocation, a retryable answer carrying may_have_run, and never a
+	 * second, sibling row.
+	 */
+	public function test_an_ambiguous_insert_stops_allocation_never_a_second_seq(): void {
+		// An unarmed call first, so epoch/binding are already minted and
+		// primed before the armed call's own seam takes effect.
+		$first_seq = Aura_Worker_Door_Log::open_pending( $this->entry() );
+		$this->assertIsInt( $first_seq );
+		$target_seq = $first_seq + 1;
+
+		$GLOBALS['_sa_uuid_fixed']             = 'nonce-s63';
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$witness                               = Aura_Worker_Door_Log::LAST_TX_PREFIX . 'nonce-s63';
+		$GLOBALS['_sa_option_read_fail'][ $witness ] = true;
+
+		$out = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+		unset( $GLOBALS['_sa_uuid_fixed'] );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertInstanceOf( 'WP_Error', $out, 'never a seq handed back for a write this call could not prove' );
+		$data = $out->get_error_data();
+		$this->assertSame( 503, $data['status'] );
+		$this->assertTrue( $data['may_have_run'] );
+		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $target_seq, $GLOBALS['_options'], 'the row this attempt actually wrote is exactly where it landed -- the real commit the ambiguous witness could not prove' );
+		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::PREFIX . ( $target_seq + 1 ), $GLOBALS['_options'], 'never a SECOND, sibling row allocated behind the ambiguous first one' );
+	}
 }

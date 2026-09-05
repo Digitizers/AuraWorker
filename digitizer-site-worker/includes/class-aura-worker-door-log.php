@@ -646,7 +646,32 @@ class Aura_Worker_Door_Log {
 					'admitted' => false,
 				)
 			);
-			if ( self::insert_unique( self::PREFIX . $seq, $row ) ) {
+			$won = self::insert_unique( self::PREFIX . $seq, $row );
+			if ( null === $won ) {
+				// Ruling S63 (Codex round-24 P1 on #88): STOP — never
+				// allocate a SECOND seq behind an ambiguous first one.
+				// insert_unique() now answers null for "committed but the
+				// witness could not be proven" (Ruling S51), and this
+				// loop used to test it as a plain boolean: `if (null)` is
+				// falsy, so this fell straight into "collision, try the
+				// next number" — allocating $seq+1 while THIS row may
+				// already exist, pending, at $seq, permanently splitting
+				// the log's own contiguous numbering. Only a PROVEN
+				// `false` (insert_unique_write()'s own conditional INSERT
+				// finding the name already taken) is a genuine collision
+				// worth retrying past. Ambiguous is retryable, but not by
+				// looping here: the row may already be exactly what this
+				// call wanted at $seq, and the reconciler's own
+				// stale-pending sweep (or a healthy retry of this SAME
+				// call, once state can be re-read) is what finds it
+				// either way — never a second, sibling row.
+				return new WP_Error(
+					'aura_log_failed',
+					'This site could not prove whether the previous attempt landed; retry.',
+					array( 'status' => 503, 'retry_after' => 5, 'may_have_run' => true )
+				);
+			}
+			if ( $won ) {
 				// The ack raises the floor with raw SQL, so this request's
 				// option cache can still hold the value from before it.
 				wp_cache_delete( self::FLOOR, 'options' );

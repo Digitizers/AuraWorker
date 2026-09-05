@@ -614,6 +614,21 @@ class Aura_Worker_Door_Holds {
 		// (Ruling P41). Stamped BEFORE the insert, so a row that exists always
 		// carries it.
 		$held['restored_at'] = gmdate( 'c' );
+		// Ruling S63 (Codex round-24 P1 on #88), audited: insert_unique()
+		// can answer null — committed, but the witness could not be
+		// proven (Ruling S51) — never a proven collision. `!$back` folds
+		// that into the SAME `false` a genuine "a held row is already
+		// there" collision gets, which could leave BOTH a (now real)
+		// held row and this ref's own claimed row standing together —
+		// but this is safe rather than a fix target: give_back(), the
+		// one caller that reads this return value, never trusts it at
+		// face value either way (its own docblock: "it reports what it
+		// could SEE"), and re-derives `claim_retained` from a FRESH
+		// get_held()/get_claimed() read regardless of what `$back` said
+		// — a coexisting held+claimed pair is already the exact shape
+		// listing()/sweep() hide and leave for the reconciler. The other
+		// caller (the lease-race backup) discards this return value
+		// entirely.
 		$back = Aura_Worker_Door_Log::insert_unique( self::HELD . $ref, $held );
 		self::forget_held();
 		if ( ! $back ) {
