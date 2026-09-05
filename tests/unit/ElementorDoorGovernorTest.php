@@ -1462,4 +1462,53 @@ final class ElementorDoorGovernorTest extends TestCase {
 			'nothing changed, so sync_computed_state() never attempted a write the armed failure could catch'
 		);
 	}
+
+	/**
+	 * Ruling S26 (Codex round-11 P1 on #88): the computed-state persist is
+	 * a FENCED compare-and-swap on the exact bytes read, never a plain
+	 * `update_option()`. A request that computed its own tuple and paused
+	 * before writing it can otherwise overwrite a NEWER transition another
+	 * (faster) request already persisted — while its own bump still
+	 * advances the version, so the STALE tuple this call writes would be
+	 * reported under a HIGHER, more-recent-looking observation than the
+	 * honest transition it just clobbered. The racer here lands the
+	 * instant this call's own CAS UPDATE checks the row — exactly the
+	 * window between this call's read of the persisted tuple and its
+	 * write — and must win: this call's fence then matches zero rows, and
+	 * `sync_computed_state()` must report the loss rather than silently
+	 * treating it as a normal commit.
+	 */
+	public function test_a_racing_transition_that_wins_the_fence_first_is_never_overwritten(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertTrue( $first['active'] );
+
+		// The next request: Elementor is gone for THIS process too — so it
+		// attempts its own persist — but a DIFFERENT, faster request wins
+		// the very fence this call is about to use.
+		$GLOBALS['_abilities'] = array();
+		$prop                  = new ReflectionProperty( Aura_Worker_Elementor_Door::class, 'active' );
+		$prop->setAccessible( true );
+		$prop->setValue( null, null );
+
+		$GLOBALS['_sa_before_swap'] = static function () {
+			// The racer: a tuple this call never computed, persisted under
+			// a version this call's own fence never accounted for.
+			$winner = array(
+				'active' => false,
+				'seam'   => 'racer-seam',
+				'door'   => 'closed',
+			);
+			$GLOBALS['_rows'][ Aura_Worker_Elementor_Door::COMPUTED ]    = maybe_serialize( $winner );
+			$GLOBALS['_options'][ Aura_Worker_Elementor_Door::COMPUTED ] = $winner;
+			Aura_Worker_Door_Log::bump_door_version(); // the racer's own transition, already committed
+		};
+
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+
+		$this->assertFalse( $second['active'], 'the fresh computed value from THIS process is still what is reported' );
+		$this->assertSame( 'closed', $second['door'] );
+		$this->assertNotSame( 'racer-seam', $second['seam'], 'the reported seam is THIS process own, never the racer persisted value' );
+		$this->assertNull( $second['observation'], 'the fence lost — a newer transition already won, and this call may not claim credit for any version' );
+	}
 }

@@ -547,15 +547,41 @@ class Aura_Worker_Elementor_Door {
 	 * that gets `false` back MUST report `observation: null` instead of
 	 * whatever it reads — honest: the site could not witness this state.
 	 *
+	 * THE PERSIST IS A FENCED COMPARE-AND-SWAP, NEVER AN UNCONDITIONAL
+	 * OVERWRITE (Ruling S26, Codex round-11 P1 on #88). A request that
+	 * loaded Elementor before deactivation can compute `active: true` /
+	 * `door: open` here and then PAUSE — a slow poll, a stalled process —
+	 * while a NEWER request observes the real deactivation, computes
+	 * `active: false` / `door: closed`, and persists THAT, bumping the
+	 * version to N. If this older request then resumed and wrote its own,
+	 * now-STALE tuple with a plain `update_option()`, it would overwrite
+	 * the newer, CORRECT tuple with the older, WRONG one — while its own
+	 * bump advances the version to N+1, so a caller reading afterwards sees
+	 * the stale `active: true` under a HIGHER, more-recent-looking
+	 * observation than the honest transition it just clobbered. The write
+	 * is fenced instead: `UPDATE … WHERE option_name = %s AND option_value
+	 * = %s`, the exact bytes this call read as `$persisted` — or a
+	 * conditional INSERT (`insert_unique_write()`'s own shape) when nothing
+	 * was persisted yet. A fence that matches ZERO rows means the tuple has
+	 * ALREADY moved since this call read it: a newer transition won, this
+	 * call's OWN tuple is not (or no longer) the truth, and nothing here
+	 * may claim credit for whatever version is now current — it belongs to
+	 * the winner, not to this call's own (possibly stale) read of
+	 * `active()`/`door_state()`.
+	 *
 	 * @return bool True when the current computed tuple is either UNCHANGED
-	 *              from what is persisted (nothing to version) or a needed
-	 *              transition was COMMITTED — either way, `door_version_raw()`
-	 *              read right after may be reported as this state's
-	 *              observation. False when a transition was needed and could
-	 *              NOT be committed: the tuple `self::active()`/`self::$seam`/
-	 *              `self::door_state()` answer may already be the new one,
-	 *              but nothing proves it landed paired with any version, and
-	 *              the caller must serve `observation: null` alongside it.
+	 *              from what is persisted (nothing to version), or this
+	 *              call's OWN write won its fence and was COMMITTED —
+	 *              either way, `door_version_raw()` read right after may be
+	 *              reported as this state's observation. False when a
+	 *              transition was needed and this call's write either could
+	 *              NOT be committed (Ruling S24) OR LOST its fence to a
+	 *              newer transition (Ruling S26): the tuple
+	 *              `self::active()`/`self::$seam`/`self::door_state()`
+	 *              answer may already be the new one, but nothing proves it
+	 *              landed paired with any version THIS call can vouch for,
+	 *              and the caller must serve `observation: null` alongside
+	 *              it.
 	 */
 	private static function sync_computed_state() {
 		$current = array(
@@ -573,19 +599,62 @@ class Aura_Worker_Elementor_Door {
 			return true; // steady state: nothing to version, nothing unproven
 		}
 		$outcome = Aura_Worker_Door_Log::versioned(
-			function () use ( $current ) {
-				update_option( self::COMPUTED, $current, false ); // autoload no
+			function () use ( $current, $persisted ) {
+				global $wpdb;
+				$wpdb->last_error = '';
+				if ( null === $persisted ) {
+					// The first tuple this site ever persists: a real
+					// conditional INSERT, the same shape
+					// insert_unique_write() uses, so a concurrent minter
+					// cannot be overwritten blind.
+					$rows = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare(
+							"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) SELECT %s, %s, %s FROM DUAL WHERE NOT EXISTS ( SELECT 1 FROM {$wpdb->options} WHERE option_name = %s )",
+							self::COMPUTED,
+							maybe_serialize( $current ),
+							'no',
+							self::COMPUTED
+						)
+					);
+				} else {
+					// The fenced CAS (Ruling S26): the exact bytes THIS call
+					// read, so a newer transition that already landed is
+					// never overwritten blind.
+					$rows = $wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare(
+							"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+							maybe_serialize( $current ),
+							self::COMPUTED,
+							maybe_serialize( $persisted )
+						)
+					);
+				}
+				$won = ( 1 === (int) $rows && '' === (string) $wpdb->last_error );
 				wp_cache_delete( self::COMPUTED, 'options' );
+				wp_cache_delete( 'notoptions', 'options' );
+				if ( ! $won ) {
+					// Ruling S26: the fence lost — a newer transition
+					// already won and persisted something else since this
+					// call read $persisted. Nothing to version on this
+					// call's behalf.
+					return array(
+						'mutated' => false,
+						'result'  => false,
+					);
+				}
 				return array(
 					'mutated' => true,
-					'result'  => null,
+					'result'  => true,
 					// Rulings S11/S18: repeated by versioned() after commit
 					// or rollback.
-					'evict'   => array( self::COMPUTED ),
+					'evict'   => array( self::COMPUTED, 'notoptions' ),
 				);
 			}
 		);
-		return (bool) $outcome['committed'];
+		if ( ! $outcome['committed'] ) {
+			return false; // Ruling S24: the write itself could not commit
+		}
+		return (bool) ( $outcome['result'] ?? false ); // Ruling S26: false when the fence lost
 	}
 
 	/**
