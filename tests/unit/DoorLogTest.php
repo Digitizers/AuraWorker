@@ -706,6 +706,68 @@ final class DoorLogTest extends TestCase {
 		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
 	}
 
+	/**
+	 * Ruling S81 (Codex round-33 P1 on #88): `binding_raw()` answers ''
+	 * for BOTH a genuinely unbound site and an UNREADABLE read -- the
+	 * same sentinel every other raw_option()-backed read shares. Feeding
+	 * that sentinel into `derive_rotation_target()` unseen mints a target
+	 * from the WRONG (empty) generation whenever this read fails --
+	 * reopening the exact S78 bug an unreadable INPUT, not a random
+	 * mint, this time. Checked immediately after the read: an unreadable
+	 * binding is retryable ambiguity, never a target this call derives
+	 * at all.
+	 */
+	public function test_rotate_epoch_answers_retryable_ambiguity_when_the_binding_read_fails(): void {
+		$before = Aura_Worker_Door_Log::epoch(); // mints it for real, primes the cache
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$out = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $out['rotated'], 'an unreadable binding is unknown, never a target derived from the sentinel' );
+		$this->assertNull( $out['epoch'] );
+		// Nothing was even attempted -- versioned() never ran, so the
+		// epoch this site actually holds is completely untouched.
+		$this->assertSame( $before, get_option( Aura_Worker_Door_Log::EPOCH ) );
+	}
+
+	/**
+	 * Ruling S81's own "unreadable on the retry" scenario: a first
+	 * attempt lands cleanly, a RETRY (the caller re-deriving the same
+	 * now-stale $expected) hits an unreadable binding and must answer
+	 * retryable ambiguity rather than a wrongly-derived target's false
+	 * "rotated: false" -- and once the read recovers, the NEXT retry
+	 * recognises its own already-landed target and restamps (Ruling
+	 * S78), exactly as if the binding read had never failed at all.
+	 */
+	public function test_a_retry_with_an_unreadable_binding_stays_ambiguous_then_recognises_once_readable(): void {
+		$before = Aura_Worker_Door_Log::epoch();
+		$target = $this->rotationTarget( $before );
+
+		$first = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $first['rotated'], 'the fixture assumption this test is built on -- a clean first landing' );
+		$this->assertSame( $target, $first['epoch'] );
+
+		// The retry: same (now stale) $expected, but this time the
+		// binding read itself fails.
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::BINDING ] = true;
+		$retry = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertNull( $retry['rotated'], 'Ruling S81: unreadable, never a false built on the wrong (sentinel) generation' );
+		$this->assertNull( $retry['epoch'] );
+		// The FIRST attempt's own landed rotation is untouched by the
+		// retry's own refusal to guess.
+		$this->assertSame( $target, get_option( Aura_Worker_Door_Log::EPOCH ) );
+
+		// The binding read recovers -- the NEXT retry derives the SAME
+		// target the first attempt already reached (the real binding
+		// generation never actually changed) and recognises it.
+		$again = Aura_Worker_Door_Log::rotate_epoch( $before );
+		$this->assertTrue( $again['rotated'], 'Ruling S78: once readable, the retry derives the correct target and recognises its own prior landing' );
+		$this->assertSame( $target, $again['epoch'] );
+	}
+
 	public function test_stale_pending_finds_only_pending_rows_older_than_the_cutoff(): void {
 		$old = Aura_Worker_Door_Log::open_pending( $this->entry() );
 		$this->backdate( $old, 3600 );

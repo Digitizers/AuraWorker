@@ -3822,9 +3822,33 @@ class Aura_Worker_Door_Log {
 		// binding generation (so a rebind installing a brand-new binding
 		// mid-sequence still derives a fresh target, never reusing one a
 		// PREVIOUS binding's own rotation already reached).
+		//
+		// Ruling S81 (Codex round-33 P1 on #88): `binding_raw()` answers
+		// '' for BOTH a genuinely unbound site and an UNREADABLE read
+		// (the same sentinel `epoch_raw()`/every other raw_option()-backed
+		// read already shares — Ruling S57's own lesson, one door down).
+		// Feeding that sentinel into the derivation unseen mints a target
+		// from the WRONG generation whenever this read fails: a retry,
+		// landing after the read recovers, derives a DIFFERENT target
+		// against the REAL generation and can never recognise the first
+		// attempt's own (possibly landed) write as its own — the exact
+		// S78 bug, reopened by an unproven input instead of a random
+		// mint. Checked IMMEDIATELY after the read it describes (Ruling
+		// S57/S58's own discipline): an unreadable binding here is
+		// retryable ambiguity, not a target this call has any business
+		// deriving at all — the SAME `rotated: null` shape Ruling S77
+		// already gives an unreadable VERIFY, now given to an unreadable
+		// INPUT before versioned() ever runs.
+		$binding_for_target = self::binding_raw();
+		if ( self::raw_option_was_unreadable() ) {
+			return array(
+				'rotated' => null,
+				'epoch'   => null,
+			);
+		}
 		$new_epoch = self::derive_rotation_target(
 			self::ROTATE_TARGET_NAMESPACE,
-			(string) $expected . '|' . self::binding_raw()
+			(string) $expected . '|' . $binding_for_target
 		);
 		$outcome   = self::versioned(
 			function () use ( $expected, $claim, $fence, $new_epoch ) {
