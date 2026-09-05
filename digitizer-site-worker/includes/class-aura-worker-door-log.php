@@ -55,33 +55,18 @@ class Aura_Worker_Door_Log {
 	/**
 	 * Ruling S86 (Codex round-37 P1 on #88), the S80 pattern applied to
 	 * `open_pending()`'s own seq allocation: a FIXED namespace for the
-	 * derived RESERVATION identity — see `RESERVATION_PREFIX`'s own
-	 * docblock for the whole mechanism. Distinct from
+	 * derived RESERVATION identity a pending row stamps on itself (its
+	 * own `reservation` field — see `open_pending()`'s and
+	 * `find_reserved_seq()`'s own docblocks for the whole mechanism, and
+	 * Ruling S89, Codex round-39 P1 on #88, for why NO separate index
+	 * row exists any more: the row itself is the only place this
+	 * identity is ever recorded). Distinct from
 	 * `ROTATE_TARGET_NAMESPACE`/`Aura_Worker_Door_Holds::HOLD_REF_NAMESPACE`
 	 * (each a different derivation, a different purpose) — RFC 4122 §4.3
 	 * guarantees no two of these three ever collide with each other's
 	 * inputs by construction.
 	 */
 	const LOG_RESERVATION_NAMESPACE = '9c1e5a2d-4f7b-5e3a-8d6c-1b0f2a9e7c4d';
-	/**
-	 * One option row per RESERVED seq allocation (Ruling S86, Codex
-	 * round-37 P1 on #88) — `{ seq: int }`, named by a caller's derived
-	 * reservation identity (see `open_pending()`'s own docblock for the
-	 * bug this closes: an ambiguous pending-row INSERT used to leave a
-	 * retry with nothing to recognise its own prior attempt by, so it
-	 * allocated a SECOND seq behind the first, unadmitted one — blocking
-	 * `log_after()` for every later entry until the reconciler's
-	 * CLAIM_STALE_MS sweep). A retry supplying the SAME idempotency
-	 * material (`aura_ref` + a hash of `touches`, the identical
-	 * derivation `Aura_Worker_Door_Holds::HOLD_REF_NAMESPACE` uses for a
-	 * hold's own ref) regenerates the SAME reservation name, finds this
-	 * row, and — once it verifies the seq it names is a REAL row, never
-	 * blindly — recognises its own reservation instead of allocating
-	 * again. `insert_unique()`-written (a real conditional INSERT), so
-	 * two concurrent attempts under the SAME identity cannot both "win"
-	 * a DIFFERENT seq into it.
-	 */
-	const RESERVATION_PREFIX = 'aura_worker_door_log_rsv_';
 
 	/** The BINDING generation (Rulings P51/P58): minted like the epoch, rotated ONLY by a rebind. */
 	const BINDING      = 'aura_worker_door_binding';
@@ -732,14 +717,17 @@ class Aura_Worker_Door_Log {
 		if ( null === $binding ) {
 			return new WP_Error( 'aura_log_failed', 'This site could not establish which Aura binding this call belongs to; it was not run.', array( 'status' => 503 ) );
 		}
-		// Ruling S86 (Codex round-37 P1 on #88): the S80 pattern applied
-		// here — see RESERVATION_PREFIX's own docblock for the whole
-		// mechanism, and this method's own updated docblock (below the
-		// class-level constants) for the bug it closes. Derived from the
-		// SAME two ingredients Aura_Worker_Door_Holds::hold() derives a
-		// hold's own ref from: `aura_ref` (Aura's own correlation id for
-		// the intercepted request, or any other identifier of the
-		// request itself) and a hash of `touches`.
+		// Ruling S86 (Codex round-37 P1 on #88), replaced by Ruling S89
+		// (Codex round-39 P1 on #88): the S80 pattern applied here — see
+		// `find_reserved_seq()`'s own docblock for why NO separate index
+		// row exists any more (the pending row itself, via its own
+		// stamped `reservation` field, IS the reservation), and this
+		// method's own docblock for the bug the mechanism closes.
+		// Derived from the SAME two ingredients
+		// Aura_Worker_Door_Holds::hold() derives a hold's own ref from:
+		// `aura_ref` (Aura's own correlation id for the intercepted
+		// request, or any other identifier of the request itself) and a
+		// hash of `touches`.
 		$touches        = is_array( $entry['touches'] ?? null ) ? $entry['touches'] : array();
 		$aura_ref       = isset( $entry['aura_ref'] ) ? (string) $entry['aura_ref'] : '';
 		$reservation_id = '' !== $aura_ref
@@ -755,29 +743,21 @@ class Aura_Worker_Door_Log {
 				);
 			}
 			if ( is_int( $reserved ) ) {
-				// PRESENT, and its row PROVEN still real (find_reserved_seq()
-				// never trusts a reservation whose row is gone): this
-				// request's own prior — possibly ambiguous — attempt
-				// already landed. Recognised, not re-allocated.
+				// A PENDING row was found carrying this EXACT identity —
+				// this request's own prior — possibly ambiguous —
+				// attempt already landed. Recognised, not re-allocated.
 				return $reserved;
 			}
-			// Proven absent (or the reservation named a row that no
-			// longer exists — already acked/purged, or never actually
-			// landed): fall through and allocate fresh, below.
+			// None found: fall through and allocate fresh, below.
 		}
 		// BELT-AND-BRACES, NEVER "ELSE" (Ruling S86): a caller may supply
 		// `reserved_seq` ALONGSIDE `aura_ref` — echoing back what an
 		// EARLIER ambiguous answer from THIS SAME call handed it — and
 		// this check runs regardless of whether the block above found
-		// anything. It matters even when `aura_ref` IS given: the
-		// reservation-index write above is itself best-effort (a SEPARATE
-		// statement from the pending row's own INSERT, so it can fail or
-		// go ambiguous independently of it) — `reserved_seq` names the
-		// row DIRECTLY, with no dependency on that second write having
-		// landed at all. It is ALSO the sound fallback for a caller with
-		// NO idempotency material to derive a reservation from in the
-		// first place (see this method's own docblock for why this is
-		// the answer, not S80's own unrecoverable random-ref fallback):
+		// anything. It is the sound fallback for a caller with NO
+		// idempotency material to derive a reservation from in the first
+		// place (see this method's own docblock for why this is the
+		// answer, not S80's own unrecoverable random-ref fallback):
 		// `reserved_seq` is a PLAIN INTEGER this method already hands
 		// back in EVERY ambiguous answer below, regardless of whether
 		// `aura_ref` was ever given — a caller need only echo it back on
@@ -854,17 +834,14 @@ class Aura_Worker_Door_Log {
 				// call, once state can be re-read) is what finds it
 				// either way — never a second, sibling row.
 				//
-				// Ruling S86 (Codex round-37 P1 on #88): best-effort
-				// registration of the reservation index BEFORE answering
-				// — whether or not THIS ambiguous insert actually landed,
-				// so a retry (with the SAME `aura_ref`, or echoing back
-				// `reserved_seq` from THIS error) can find $seq directly,
-				// never re-deriving a fresh one behind it. Never trusted
-				// blind: find_reserved_seq() re-verifies the row itself
-				// exists before ever recognising a reservation.
-				if ( '' !== $reservation_id ) {
-					self::insert_unique( self::RESERVATION_PREFIX . $reservation_id, array( 'seq' => $seq ) );
-				}
+				// Ruling S86 (Codex round-37 P1 on #88), superseded by
+				// Ruling S89 (Codex round-39 P1 on #88): NO second write
+				// happens here any more. A retry (with the SAME
+				// `aura_ref`, or echoing back `reserved_seq` from THIS
+				// error) finds this row directly — by its OWN stamped
+				// `reservation` field, or by `reserved_seq` naming it —
+				// with nothing here that could itself go ambiguous,
+				// stale, or point at the wrong row.
 				return new WP_Error(
 					'aura_log_failed',
 					'This site could not prove whether the previous attempt landed; retry.',
@@ -882,14 +859,10 @@ class Aura_Worker_Door_Log {
 				// option cache can still hold the value from before it.
 				wp_cache_delete( self::FLOOR, 'options' );
 				if ( $seq > self::floor() ) {
-					if ( '' !== $reservation_id ) {
-						// Registered on a CLEAN win too (Ruling S86): a
-						// response lost in transit between this write and
-						// Aura is the identical ambiguity from Aura's own
-						// point of view, and a retry deserves the SAME
-						// recognition either way.
-						self::insert_unique( self::RESERVATION_PREFIX . $reservation_id, array( 'seq' => $seq ) );
-					}
+					// Ruling S89 (Codex round-39 P1 on #88): nothing to
+					// register here either — the row's own `reservation`
+					// field (stamped above, before this INSERT ran) is
+					// already everything a later retry needs.
 					return $seq;
 				}
 				// Acked out from under this reservation: hand the number back
@@ -929,65 +902,96 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
-	 * Ruling S86 (Codex round-37 P1 on #88): does a reservation identity
-	 * already name a REAL row — never trusted on the reservation-index
-	 * row's own say-so alone, since that row can outlive the pending row
-	 * it once named (already acked/purged since) or point at a seq an
-	 * ambiguous insert never actually landed at.
+	 * Ruling S89 (Codex round-39 P1 on #88), REPLACING the S86 reservation
+	 * INDEX outright: the pending row itself IS the reservation. Its own
+	 * stamped `reservation` field (Ruling S87: namespaced by purpose,
+	 * and — for `record_terminal_only()`'s own terminal rows — by
+	 * outcome too, so the SAME underlying ref never collides across two
+	 * genuinely different log rows) is the lookup key, found by
+	 * SCANNING the pending rows themselves rather than trusting a
+	 * separate index row's own say-so.
 	 *
-	 * STILL PENDING, NOT MERELY PRESENT (Ruling S87, Codex round-38 P1 on
-	 * #88): a caller can legitimately reach `open_pending()` MORE THAN
-	 * ONCE with the SAME derived identity across genuinely SEPARATE
-	 * attempts — a replay whose FIRST try was settled terminally (a
-	 * snapshot failure, an interrupted claim) and is later retried fresh
-	 * derives the SAME `aura_ref` (the hold's own ref never changes)
-	 * both times. Recognising a reservation whose row has ALREADY moved
-	 * past `pending` handed the retry back the OLD, already-terminal
-	 * seq — `admit()`/`settle()` on it then correctly refuse (PENDING-ONLY,
-	 * Ruling P27), silently swallowing what should have been a brand
-	 * new attempt. Only a row STILL `pending` (never admitted, never
-	 * settled) is the SAME logical attempt an ambiguous insert leaves
-	 * behind — which is the ONLY case this mechanism exists to
-	 * recognise; anything further along is a genuinely new attempt
-	 * against an old identity, and allocates fresh exactly like a
-	 * proven-absent reservation would.
+	 * THE INDEX THIS REPLACES HAD TWO WAYS TO LIE, BOTH NAMED BY CODEX
+	 * ROUND-39 (#88): it could point at a FREE seq a later, entirely
+	 * unrelated writer had since recreated there (Ruling P37's own
+	 * "recreate N at or below the floor" case — a pending row genuinely
+	 * belonging to a DIFFERENT request, wrongly recognised as this
+	 * one's), or it could go STALE the moment the row it named moved
+	 * past `pending` (Ruling S87 already caught this ONE way — checking
+	 * the row was still pending — but the index row ITSELF remained, a
+	 * second piece of state that could disagree with the row at any
+	 * moment in between). A separate write has no such failure mode
+	 * once there is no separate write: this method reads ONLY the rows
+	 * that are themselves the source of truth, so there is nothing
+	 * against which the answer could ever be stale, orphaned, or
+	 * mismatched.
+	 *
+	 * PENDING, NOT MERELY MATCHING (Ruling S87's own reasoning, carried
+	 * over unchanged): a caller can legitimately reach `open_pending()`
+	 * MORE THAN ONCE with the SAME derived identity across genuinely
+	 * SEPARATE attempts — a replay whose FIRST try was settled
+	 * terminally (a snapshot failure, an interrupted claim) and is
+	 * later retried fresh derives the SAME `aura_ref` both times. Only a
+	 * row STILL `pending` is the SAME logical attempt an ambiguous
+	 * insert leaves behind; anything further along is a genuinely new
+	 * attempt against an old identity, and allocates fresh.
+	 *
+	 * ONE bulk read, never a second query per candidate — the SAME
+	 * primitive `log_shape_raw()` (Ruling S61) already uses for the
+	 * log's own shape fingerprint: `SELECT option_name, option_value`
+	 * for every row under this prefix, filtered and matched in PHP.
+	 * Bounded in practice by `MAX_UNACKED`: the log never carries more
+	 * pending-or-terminal-above-floor rows than that at once (every
+	 * admission path refuses once the count reaches it), so this scan
+	 * is never effectively unbounded even though it carries no SQL
+	 * `LIMIT` of its own.
 	 *
 	 * @param string $reservation_id A derived reservation identity (see
-	 *                                `RESERVATION_PREFIX`'s own docblock).
-	 * @return int|string|null The seq, PROVEN still real AND still
-	 *                          pending; `'unreadable'` when any raw read
-	 *                          could not be proven (the caller answers
-	 *                          its own retryable 503); `null` when this
-	 *                          identity has no reservation on record, or
-	 *                          the one it named no longer points at a
-	 *                          real, still-pending row — either way, the
-	 *                          caller allocates fresh.
+	 *                                `LOG_RESERVATION_NAMESPACE`'s own
+	 *                                docblock).
+	 * @return int|string|null The seq of the ONE pending row carrying
+	 *                          this exact identity; `'unreadable'` when
+	 *                          the scan itself could not be proven (the
+	 *                          caller answers its own retryable 503);
+	 *                          `null` when no pending row carries it —
+	 *                          the caller allocates fresh.
 	 */
 	private static function find_reserved_seq( $reservation_id ) {
-		$raw = self::raw_option_for( self::RESERVATION_PREFIX . $reservation_id );
-		if ( self::raw_option_was_unreadable() ) {
+		global $wpdb;
+		$like             = $wpdb->esc_like( self::PREFIX ) . '%';
+		$wpdb->last_error = '';
+		// LIKE alone, never a second SQL-side REGEXP clause — the SAME
+		// shape `log_shape_raw()` (Ruling S61) already uses for this
+		// identical prefix: a second filter here would only narrow what
+		// MySQL itself returns, never what this method trusts, and the
+		// numeric-suffix check below (the SAME defensive read
+		// count_unacked()/highest_row_seq()/log_shape_raw() all apply)
+		// already excludes FLOOR/FULL_MARKER/FULL_COUNTER, which share
+		// this prefix but never end in digits.
+		$rows = $wpdb->get_results( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$like
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $rows ) || '' !== (string) $wpdb->last_error ) {
 			return 'unreadable';
 		}
-		if ( null === $raw ) {
-			return null;
+		foreach ( $rows as $r ) {
+			if ( ! preg_match( '/^' . preg_quote( self::PREFIX, '/' ) . '\d+$/', (string) $r['option_name'] ) ) {
+				continue;
+			}
+			$row = maybe_unserialize( $r['option_value'] );
+			if ( ! is_array( $row ) || 'pending' !== ( $row['result'] ?? null ) ) {
+				continue;
+			}
+			if ( ! isset( $row['reservation'] ) || $reservation_id !== (string) $row['reservation'] ) {
+				continue;
+			}
+			return isset( $row['seq'] ) ? (int) $row['seq'] : null;
 		}
-		$rec = maybe_unserialize( $raw );
-		$seq = is_array( $rec ) && isset( $rec['seq'] ) ? (int) $rec['seq'] : 0;
-		if ( $seq < 1 ) {
-			return null;
-		}
-		$row_raw = self::raw_option_for( self::PREFIX . $seq );
-		if ( self::raw_option_was_unreadable() ) {
-			return 'unreadable';
-		}
-		if ( null === $row_raw ) {
-			return null; // stale: the reservation outlived (or never landed at) the row it names
-		}
-		$row = maybe_unserialize( $row_raw );
-		if ( ! is_array( $row ) || 'pending' !== ( $row['result'] ?? null ) ) {
-			return null; // moved on: a genuinely new attempt, not the ambiguous one this mechanism recognises
-		}
-		return $seq;
+		return null;
 	}
 
 	/** @param int $seq Seq. @return bool */

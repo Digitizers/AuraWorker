@@ -1627,13 +1627,14 @@ final class ElementorReplayTest extends TestCase {
 		// this run issues before that one is let through untouched, and
 		// only the LAST (release()'s) one is made to never land.
 		$GLOBALS['_db_queries']                 = array();
-		// Ruling S86/S87 (Codex rounds 37-38 on #88): open_pending()'s own
-		// reservation-index write adds a SEPARATE commit alongside every
-		// pending/terminal row it opens -- the count below (and the skip
-		// position, which must still land on release()'s own commit,
-		// the LAST one) moved accordingly. Re-counted, not merely bumped
-		// by guesswork.
-		$GLOBALS['_sa_reconnect_before_commit']  = 4;
+		// Ruling S86/S87 (Codex rounds 37-38 on #88), reverted by Ruling
+		// S89 (Codex round-39 P1 on #88): the reservation-index write
+		// that once added a SEPARATE commit per pending/terminal row is
+		// gone -- the count below (and the skip position, which must
+		// still land on release()'s own commit, the LAST one) is back
+		// to what it was before that index ever existed. Re-counted, not
+		// merely bumped by guesswork.
+		$GLOBALS['_sa_reconnect_before_commit']  = 3;
 		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
 		$GLOBALS['_sa_reconnect_before_commit']  = false;
 
@@ -1645,7 +1646,7 @@ final class ElementorReplayTest extends TestCase {
 				}
 			)
 		);
-		$this->assertSame( 4, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+		$this->assertSame( 3, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
 
 		$this->assertFalse( $out['ok'] );
 		$this->assertSame( 'retry_later', $out['reason'], 'never the definitive refusal — the release that was supposed to spend the approval did not commit' );
@@ -1676,13 +1677,13 @@ final class ElementorReplayTest extends TestCase {
 
 		$GLOBALS['_current_user_id']            = 9;
 		$GLOBALS['_db_queries']                 = array();
-		// Ruling S86/S87 (Codex rounds 37-38 on #88): open_pending()'s own
-		// reservation-index write adds a SEPARATE commit alongside the
-		// pending row it opens -- the count below (and the skip
-		// position, which must still land on release()'s own commit,
-		// the LAST one) moved accordingly. Re-counted, not merely bumped
-		// by guesswork.
-		$GLOBALS['_sa_reconnect_before_commit']  = 10;
+		// Ruling S86/S87 (Codex rounds 37-38 on #88), reverted by Ruling
+		// S89 (Codex round-39 P1 on #88): the reservation-index write
+		// that once added a SEPARATE commit is gone -- the count below
+		// (and the skip position, which must still land on release()'s
+		// own commit, the LAST one) is back to what it was before that
+		// index ever existed. Re-counted, not merely bumped by guesswork.
+		$GLOBALS['_sa_reconnect_before_commit']  = 9;
 		$out                                     = Aura_Worker_Elementor_Door::replay( $ref, null );
 		$GLOBALS['_sa_reconnect_before_commit']  = false;
 
@@ -1694,7 +1695,7 @@ final class ElementorReplayTest extends TestCase {
 				}
 			)
 		);
-		$this->assertSame( 10, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
+		$this->assertSame( 9, $commits, 'the fixture assumption this test is built on — re-count if this ever changes' );
 
 		// The ability genuinely ran, and its terminal 'ok' entry genuinely
 		// landed — proving the skip count let every EARLIER commit through

@@ -2491,9 +2491,11 @@ final class DoorLogTest extends TestCase {
 	 * behind the first, unadmitted one -- blocking log_after() (and
 	 * every later entry) until the reconciler's CLAIM_STALE_MS sweep.
 	 * With a derived reservation identity (`aura_ref` + a hash of
-	 * `touches`), the retry regenerates the SAME identity, finds the
-	 * reservation this attempt registered, verifies the row it names is
-	 * real, and recognises it -- no new allocation, and the row can be
+	 * `touches`) STAMPED ON THE PENDING ROW ITSELF (Ruling S89, Codex
+	 * round-39 P1 on #88, replacing the SEPARATE index row Ruling S86
+	 * originally wrote alongside it), the retry regenerates the SAME
+	 * identity, SCANS the pending rows for one carrying it, and
+	 * recognises it -- no new allocation, and the row can be
 	 * admitted/executed normally from there.
 	 */
 	public function test_a_retry_of_an_ambiguous_open_pending_with_the_same_aura_ref_recognises_the_reservation(): void {
@@ -2526,20 +2528,16 @@ final class DoorLogTest extends TestCase {
 		// unreadable witness.
 		$this->assertArrayHasKey( Aura_Worker_Door_Log::PREFIX . $reserved_seq, $GLOBALS['_options'] );
 
+		// The retry: same aura_ref, same touches -- no ambiguity seam of
+		// its own, exactly what a caller re-sending the SAME intercepted
+		// request after the first attempt's own 503 would do. Recognised
+		// by the SCAN alone (Ruling S89): unlike the old index-based
+		// mechanism, there is no SEPARATE write here for anything to
+		// have corrupted -- the pending row's own stamped `reservation`
+		// field is the only thing this lookup ever reads.
+		$second = Aura_Worker_Door_Log::open_pending( $entry );
 
-		// The retry: same aura_ref, same touches, ALSO echoing back
-		// reserved_seq from the error above (Ruling S86's own
-		// belt-and-braces: the reservation-index write is itself a
-		// SEPARATE, best-effort statement that can go ambiguous
-		// independently of the pending row's own insert -- a robust
-		// caller sends both) -- no ambiguity seam of its own, exactly
-		// what a caller re-sending the SAME intercepted request after
-		// the first attempt's own 503 would do.
-		$retry_entry                 = $entry;
-		$retry_entry['reserved_seq'] = $reserved_seq;
-		$second                      = Aura_Worker_Door_Log::open_pending( $retry_entry );
-
-		$this->assertSame( $reserved_seq, $second, 'Ruling S86: the SAME aura_ref recognises the existing reservation -- never a second, sibling seq' );
+		$this->assertSame( $reserved_seq, $second, 'Ruling S86/S89: the SAME aura_ref recognises the existing reservation -- never a second, sibling seq' );
 		$this->assertArrayNotHasKey( Aura_Worker_Door_Log::PREFIX . ( $reserved_seq + 1 ), $GLOBALS['_options'], 'no N+1 allocated behind the recognised reservation' );
 
 		// The recognised row admits and executes normally from here --
@@ -2560,6 +2558,84 @@ final class DoorLogTest extends TestCase {
 		$this->assertIsInt( $first );
 		$this->assertIsInt( $second );
 		$this->assertNotSame( $first, $second );
+	}
+
+	/**
+	 * Ruling S89 (Codex round-39 P1 on #88): the bug the OLD reservation
+	 * INDEX had -- "index points at a free/other request's seq" --
+	 * cannot exist once there is no index. A row this SAME seq once
+	 * held for aura_ref A can be acked and purged, and a genuinely
+	 * UNRELATED later call (a DIFFERENT aura_ref, or none) can recreate
+	 * a pending row at that SAME number (Ruling P37's own "recreate N at
+	 * or below the floor"). A retry for aura_ref A must never recognise
+	 * THAT row -- the scan matches on the row's own STAMPED identity,
+	 * never merely its position, so a row belonging to someone else at
+	 * the SAME seq is never mistaken for this request's own.
+	 */
+	public function test_a_different_requests_row_recreated_at_the_same_seq_is_never_recognised(): void {
+		$entry_a = $this->entry( array( 'aura_ref' => 'aura-ref-s89-a' ) );
+		$seq_a   = Aura_Worker_Door_Log::open_pending( $entry_a );
+		$this->assertIsInt( $seq_a, 'the fixture assumption this test is built on' );
+
+		// aura_ref A's own row is acked and purged -- the number is
+		// free again.
+		Aura_Worker_Door_Log::admit( $seq_a );
+		Aura_Worker_Door_Log::settle( $seq_a, array( 'result' => 'ok' ) );
+		Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), $seq_a );
+		$this->assertFalse( get_option( Aura_Worker_Door_Log::PREFIX . $seq_a ), 'the fixture assumption this test is built on -- the row is genuinely gone' );
+
+		// Ruling P37's own "recreate N at or below the floor" race is
+		// what actually lands a genuinely UNRELATED row back at this
+		// EXACT freed number in production (a floor raise landing
+		// between another writer's own top read and its insert) --
+		// forged directly here, rather than reconstructing that race's
+		// own precise timing, since what THIS test verifies is the
+		// LOOKUP's own behaviour once such a row exists, not how it got
+		// there.
+		$row_b = array(
+			'ability'     => 'elementor/publish-document',
+			'actor'       => array( 'user_id' => 3, 'login' => 'bot' ),
+			'touches'     => array( array( 'type' => 'page', 'id' => '9' ) ),
+			'verdict'     => 'allow',
+			'seq'         => $seq_a,
+			'at'          => gmdate( 'c' ),
+			'binding'     => Aura_Worker_Door_Log::binding(),
+			'result'      => 'pending',
+			'admitted'    => false,
+			'reservation' => 'a-completely-different-requests-identity',
+		);
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::PREFIX . $seq_a ] = $row_b;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::PREFIX . $seq_a ]    = maybe_serialize( $row_b );
+
+		// A retry for aura_ref A -- if the OLD index still pointed at
+		// this seq, this would wrongly recognise B's row as A's own.
+		$retry_a = Aura_Worker_Door_Log::open_pending( $entry_a );
+
+		$this->assertNotSame( $seq_a, $retry_a, 'Ruling S89: the OTHER request\'s row at the reused seq is never recognised as this one\'s' );
+		$this->assertIsInt( $retry_a );
+		$this->assertGreaterThan( $seq_a, $retry_a, 'a genuinely fresh allocation, above the row that already exists' );
+	}
+
+	/**
+	 * Ruling S89: the OTHER bug the OLD index had -- "stale index after
+	 * a terminal row" -- restated directly against the scan (Ruling S87
+	 * already established the RULE; this is the SAME scenario expressed
+	 * with no index in the picture at all). A row that has moved past
+	 * `pending` no longer carries the reservation this scan will ever
+	 * match -- a retry for the SAME aura_ref allocates fresh.
+	 */
+	public function test_a_terminal_row_with_the_same_identity_is_not_reused(): void {
+		$entry = $this->entry( array( 'aura_ref' => 'aura-ref-s89-terminal' ) );
+		$first = Aura_Worker_Door_Log::open_pending( $entry );
+		$this->assertIsInt( $first );
+
+		Aura_Worker_Door_Log::admit( $first );
+		Aura_Worker_Door_Log::settle( $first, array( 'result' => 'ok' ) );
+
+		$second = Aura_Worker_Door_Log::open_pending( $entry );
+
+		$this->assertNotSame( $first, $second, 'Ruling S89: a terminal row is never reused, however identical the identity' );
+		$this->assertIsInt( $second );
 	}
 
 	/**
