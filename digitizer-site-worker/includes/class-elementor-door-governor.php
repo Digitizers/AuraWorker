@@ -679,8 +679,32 @@ class Aura_Worker_Elementor_Door {
 	 * `status_fragment()`/`governor_block()` call in the same request can
 	 * never leak into this call's own first attempt.
 	 *
-	 * @param callable $reset_memos Called before each RETRY only (never
-	 *                              before the first attempt).
+	 * `$reset_memos` is now called BEFORE ATTEMPT 0 TOO (Ruling S66,
+	 * Codex round-25 P1 on #88, overturning this parameter's own
+	 * original "retry only" contract). THE BUG THIS CLOSES: the `/status`
+	 * ROUTE runs `reconcile()` before ever calling `status_fragment()`,
+	 * and `reconcile()`'s own sweep already reads
+	 * `Aura_Worker_Door_Holds::held_rows()` — populating that memo (which
+	 * lives for the WHOLE PHP request, Ruling P71, not per-attempt) BEFORE
+	 * this method's own bracket ever opens. A hold mutating in the window
+	 * between the reconciler's own read and THIS call's own
+	 * `$before_version` read is invisible to the bracket's torn-read
+	 * check — that check only catches a mutation landing DURING the
+	 * bracket, and this one already landed before it opened — so attempt
+	 * 0's own before/after version reads AGREE (nothing moved WHILE this
+	 * attempt ran) and the fragment is served as-is: the door version
+	 * `$before_version` already reflects the hold that happened, but the
+	 * held-queue CONTENT `$builder()` reports still comes from the
+	 * memo taken before it — a fragment describing a version it does not
+	 * actually match, served with full confidence. Resetting the memo
+	 * before attempt 0 too means this attempt's own read is always FRESH
+	 * relative to whatever this call's own `$before_version` just
+	 * observed, closing the gap regardless of what ran before this
+	 * method was ever called.
+	 *
+	 * @param callable $reset_memos Called before EVERY attempt, attempt 0
+	 *                              included (Ruling S66) — never only on
+	 *                              a retry.
 	 * @param callable $builder     Runs this attempt's reads — registering
 	 *                              into the unreadable set as it goes —
 	 *                              and returns the fragment array, WITHOUT
@@ -691,16 +715,18 @@ class Aura_Worker_Elementor_Door {
 		$fragment = array();
 		for ( $attempt = 0; $attempt < 2; $attempt++ ) {
 			// Ruling S58: reset EVERY attempt, attempt 0 included — never
-			// only on a retry (unlike $reset_memos, which is deliberately
-			// retry-only, see that parameter's own docblock) — so a
-			// registration from an earlier attempt, or an earlier,
-			// separate status_fragment()/governor_block() call in the
-			// same request, can never leak into this attempt's own
-			// verdict.
+			// only on a retry — so a registration from an earlier
+			// attempt, or an earlier, separate status_fragment()/
+			// governor_block() call in the same request, can never leak
+			// into this attempt's own verdict.
 			self::$unreadable_this_attempt = array();
-			if ( $attempt > 0 ) {
-				$reset_memos();
-			}
+			// Ruling S66: the SAME "every attempt, attempt 0 included"
+			// reasoning, now for the request-local MEMOS $reset_memos
+			// drops — see this method's own docblock for the reconciler
+			// race this closes. Dropping a memo attempt 0 never actually
+			// used yet costs nothing; the alternative costs a stale
+			// read served under a witness that already moved past it.
+			$reset_memos();
 			$before_version = Aura_Worker_Door_Log::door_version_raw();
 			$fragment       = $builder();
 			$unreadable     = self::any_unreadable_this_attempt();
@@ -722,9 +748,12 @@ class Aura_Worker_Elementor_Door {
 	 * Every request-local memo `build_status_fragment_state()` — and,
 	 * since Ruling S43 (Codex round-18 P1 on #88), `governor_block()`'s
 	 * own builder, which reads `Aura_Worker_Door_Holds::count()` through
-	 * the SAME `held_rows()` memo — reads, dropped before a retry (Ruling
-	 * S20, Codex round-8 P1 on #88). Both callers reach this through
-	 * `version_bracketed()`'s shared `$reset_memos` parameter.
+	 * the SAME `held_rows()` memo — reads, dropped before EVERY attempt
+	 * (Ruling S20, Codex round-8 P1 on #88; Ruling S66, Codex round-25 P1
+	 * on #88 extends this to attempt 0 too, not only a retry — see
+	 * `version_bracketed()`'s own docblock for the reconciler race that
+	 * closes). Both callers reach this through `version_bracketed()`'s
+	 * shared `$reset_memos` parameter.
 	 *
 	 * THE BUG THIS CLOSES: `Aura_Worker_Door_Holds::held_rows()` memoises
 	 * its read "for the request", and is dropped by `forget_held()` —
@@ -774,6 +803,19 @@ class Aura_Worker_Elementor_Door {
 	 * new raw read is added to the builder without a matching line added
 	 * here; a raw read cannot drift, because there is no cached copy for
 	 * this method to have forgotten to clear.
+	 *
+	 * CALLED BEFORE ATTEMPT 0 TOO, AS OF RULING S66 — this reset used to
+	 * run only between retries, on the theory that attempt 0 is always
+	 * the first read this call takes and has nothing stale to drop yet.
+	 * That theory holds for a memo THIS call's own earlier work
+	 * populated, but not for one populated by something ELSE that ran
+	 * before `version_bracketed()` ever opened its bracket — the `/status`
+	 * route's own `reconcile()` call, which runs before
+	 * `status_fragment()` and already reads `held_rows()` through its own
+	 * sweep. Calling this once more, for an attempt 0 that (overwhelmingly
+	 * often) had nothing to drop anyway, costs one cheap re-check; not
+	 * calling it left a stale snapshot standing under a door version that
+	 * had already moved past it.
 	 *
 	 * @return void
 	 */

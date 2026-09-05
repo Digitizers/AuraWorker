@@ -382,6 +382,82 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S66 (Codex round-25 P1 on #88): `version_bracketed()` reset
+	 * every builder memo only from attempt 1 onward — never attempt 0. The
+	 * `/status` route calls `reconcile()` BEFORE `status_fragment()`, and
+	 * `reconcile()`'s own `Aura_Worker_Door_Holds::sweep()` call populates
+	 * the held queue's process-wide `held_rows()` memo (Ruling P71) as a
+	 * side effect, even when nothing is stale enough for it to delete.
+	 *
+	 * A hold that lands afterwards — from a genuinely concurrent request,
+	 * whose write this process's own memo can never observe — bumps the
+	 * door version but leaves that memo exactly as the sweep found it.
+	 * Attempt 0's own before/after version reads then AGREE (nothing
+	 * changes DURING the bracket; the mutation landed before it ever
+	 * opened), so the torn-read check that catches every OTHER kind of
+	 * race is blind to this one, and `status_fragment()` served a queue
+	 * one hold short of what its own `observation` already claimed to
+	 * reflect. The fix: `$reset_memos()` now runs at the top of EVERY
+	 * attempt, attempt 0 included, so the bracket's `$builder()` never
+	 * reads a memo older than the bracket itself.
+	 */
+	public function test_a_hold_landing_between_reconcile_and_the_bracket_is_not_served_stale(): void {
+		$ref1 = $this->hold();
+
+		// Establish a persisted baseline FIRST (held identity: [$ref1]) so
+		// the measurement below is a steady-state poll, never the routine
+		// version bump every FIRST-ever sync_computed_state() call makes to
+		// persist its own baseline (Ruling S22) — that bump would retry into
+		// attempt 1 on its own and mask the bug this test targets.
+		$this->assertSame( array( $ref1 ), array_column( $this->fragment()['held'], 'ref' ), 'the fixture assumption this test is built on' );
+
+		// Mirrors the real /status route: reconcile() runs next. Its own
+		// sweep() call reads (and memoises) the held queue as a side
+		// effect, even though nothing here is stale enough for it to
+		// delete anything.
+		Aura_Worker_Elementor_Door::reconcile();
+
+		// A second hold, landing the way a genuinely CONCURRENT request's
+		// would — written straight into the fixture store, never through
+		// Aura_Worker_Door_Holds' own write path, so this process's
+		// held_rows() memo (already populated by the reconcile() call
+		// above) is never told. `bump_door_version()` models the version
+		// bump that request's own transaction would have carried
+		// atomically with its insert.
+		$row1    = get_option( Aura_Worker_Door_Holds::HELD . $ref1, array() );
+		$binding = is_array( $row1 ) && isset( $row1['binding'] ) ? $row1['binding'] : null;
+		$this->assertNotNull( $binding, 'the fixture assumption this test is built on' );
+		$ref2 = 'door_' . wp_generate_uuid4();
+		$now  = time();
+		$this->patchOption(
+			Aura_Worker_Door_Holds::HELD . $ref2,
+			array(
+				'ref'        => $ref2,
+				'binding'    => $binding,
+				'ability'    => 'elementor/publish-document',
+				'input'      => array(),
+				'touches'    => array(),
+				'actor'      => array( 'user_id' => 3, 'login' => 'bot' ),
+				'verdict'    => 'none',
+				'rule'       => null,
+				'created_at' => gmdate( 'c', $now ),
+				'expires_at' => gmdate( 'c', $now + 999999 ),
+			)
+		);
+		$this->assertIsInt( Aura_Worker_Door_Log::bump_door_version(), 'the fixture assumption this test is built on' );
+
+		// Attempt 0 must reset the memo BEFORE its own `$builder()` runs —
+		// never serve the pre-mutation snapshot reconcile() left behind.
+		$fragment = $this->fragment();
+		$this->assertNotNull( $fragment['observation'] );
+		$refs = array_column( $fragment['held'], 'ref' );
+		sort( $refs, SORT_STRING );
+		$expected = array( $ref1, $ref2 );
+		sort( $expected, SORT_STRING );
+		$this->assertSame( $expected, $refs, 'the new hold is served on the FIRST attempt — never the stale pre-reconcile memo' );
+	}
+
+	/**
 	 * Ruling S61 (Codex round-23 P1 on #88): a wp_options RESTORE that
 	 * happens to keep the epoch, the door version, and every field
 	 * sync_computed_state()'s tuple already tracked (active/seam/door,
