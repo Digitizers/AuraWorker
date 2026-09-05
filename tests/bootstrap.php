@@ -2902,7 +2902,55 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				return true;
 			}
 			if ( 'COMMIT' === trim( $query ) ) {
-				if ( ! empty( $GLOBALS['_sa_reconnect_before_commit'] ) ) {
+				// Ruling S34 (Codex round-15 P1 on #88): the ACK of a COMMIT
+				// that genuinely landed can be lost on its own — a dropped
+				// connection on the way back, no reconnect involved in
+				// unwinding anything. Modelled as: the transaction commits
+				// for REAL (the witness row and every other write stay,
+				// exactly like an ordinary successful COMMIT), the session
+				// variable is gone (the same connection loss that ate the
+				// ack also drops it, per Ruling S16), but the STATEMENT
+				// itself reports failure — `last_error` set, `query()`
+				// answering false — which is what makes this "ambiguous"
+				// rather than the already-modelled `_sa_reconnect_before_commit`
+				// (a real, total unwind that also happens to return success).
+				if ( ! empty( $GLOBALS['_sa_commit_ambiguous_ack'] ) ) {
+					$GLOBALS['_sa_commit_ambiguous_ack'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						array_pop( $this->sa_txn_stack ); // real commit — nothing unwound
+					}
+					$this->sa_session_vars = array();
+					$this->last_error      = 'server closed the connection unexpectedly';
+					return false;
+				}
+				// The other half: the ack is ALSO lost, but this time
+				// because the COMMIT genuinely did not land — proving the
+				// durable-witness fallback answers false just as readily
+				// when there is really nothing to find, not only when the
+				// caller assumes an error means failure.
+				if ( ! empty( $GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] ) ) {
+					$GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] = false; // fires once
+					if ( ! empty( $this->sa_txn_stack ) ) {
+						$snap                   = array_pop( $this->sa_txn_stack );
+						$GLOBALS['_rows']       = $snap['rows'];
+						$GLOBALS['_options']    = $snap['options'];
+						$GLOBALS['_notoptions'] = $snap['notoptions'];
+					}
+					$this->sa_session_vars = array();
+					$this->last_error      = 'server closed the connection unexpectedly';
+					return false;
+				}
+				// Ruling S35 (Codex round-15 P1 on #88): a POSITIVE INT lets that
+				// many commits through untouched first, then fires on the
+				// one after — the same "fail after N" shape
+				// `_sa_option_write_fail` already uses — so a test can make
+				// ONE specific `versioned()` call inside a longer flow
+				// (Aura_Worker_Door_Holds::release(), deep inside
+				// Aura_Worker_Elementor_Door::replay()) the one that never
+				// commits, while every commit before it lands for real.
+				if ( is_int( $GLOBALS['_sa_reconnect_before_commit'] ?? null ) && $GLOBALS['_sa_reconnect_before_commit'] > 1 ) {
+					--$GLOBALS['_sa_reconnect_before_commit'];
+				} elseif ( ! empty( $GLOBALS['_sa_reconnect_before_commit'] ) ) {
 					// Ruling S16: models a reconnect landing between the version
 					// bump and this COMMIT. WordPress can transparently
 					// reconnect on a dropped connection, and MySQL rolls back
@@ -3558,6 +3606,8 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
 	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
+	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
@@ -4831,6 +4881,8 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
 	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
+	$GLOBALS['_sa_commit_ambiguous_ack']               = false; // versioned()'s COMMIT lands for real but the ack is lost (Ruling S34).
+	$GLOBALS['_sa_commit_ambiguous_ack_rolled_back']   = false; // versioned()'s COMMIT does not land AND the ack is lost (Ruling S34).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).

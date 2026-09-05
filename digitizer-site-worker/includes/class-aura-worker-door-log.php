@@ -2319,39 +2319,55 @@ class Aura_Worker_Door_Log {
 			// statement itself simply fails). The RELEASE above already
 			// catches most of this window; this check remains for the
 			// narrower one still open between it and the COMMIT itself.
-			$tx_witness = self::LAST_TX_PREFIX . $tx_nonce;
-			$commit_ok  = ( '' === (string) $wpdb->last_error );
-			if ( $commit_ok ) {
-				$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
-				if ( ! $commit_ok ) {
-					// Ruling S30 (Codex round-13 P1 on #88): the session
-					// variable ALONE cannot tell two very different cases
-					// apart — "COMMIT ran on a fresh, reconnected session
-					// that never opened this transaction" (nothing landed)
-					// versus "COMMIT genuinely landed on THIS session, but
-					// the connection then dropped and reconnected before
-					// this SELECT could run" (everything landed; only the
-					// session variable itself was lost). Both answer NULL
-					// or a mismatch here. The DURABLE witness written
-					// BEFORE the bump, inside this same transaction,
-					// resolves it: a plain option row — unlike a session
-					// variable — survives a reconnect, because it lives in
-					// the table the COMMIT that wrote it just made durable.
-					// Ruling S32 (Codex round-14 P1 on #88): that row is
-					// named BY this unit's own nonce, so its mere EXISTENCE
-					// — never a value comparison — is the whole proof; a
-					// row a DIFFERENT, unrelated unit wrote can never share
-					// this exact name. Read RAW: no option-cache layer, a
-					// fresh statement.
-					$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-						$wpdb->prepare(
-							"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-							$tx_witness
-						)
-					);
-					$commit_ok = is_string( $durable );
-				}
+			$tx_witness    = self::LAST_TX_PREFIX . $tx_nonce;
+			$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
+			if ( ! $commit_ok ) {
+				// Ruling S30 (Codex round-13 P1 on #88): the session
+				// variable ALONE cannot tell two very different cases
+				// apart — "COMMIT ran on a fresh, reconnected session
+				// that never opened this transaction" (nothing landed)
+				// versus "COMMIT genuinely landed on THIS session, but
+				// the connection then dropped and reconnected before
+				// this SELECT could run" (everything landed; only the
+				// session variable itself was lost). Both answer NULL
+				// or a mismatch here. The DURABLE witness written
+				// BEFORE the bump, inside this same transaction,
+				// resolves it: a plain option row — unlike a session
+				// variable — survives a reconnect, because it lives in
+				// the table the COMMIT that wrote it just made durable.
+				// Ruling S32 (Codex round-14 P1 on #88): that row is
+				// named BY this unit's own nonce, so its mere EXISTENCE
+				// — never a value comparison — is the whole proof; a
+				// row a DIFFERENT, unrelated unit wrote can never share
+				// this exact name. Read RAW: no option-cache layer, a
+				// fresh statement.
+				//
+				// Ruling S34 (Codex round-15 P1 on #88): this durable
+				// check now runs whenever the session variable did not
+				// already prove success — REGARDLESS of whether the
+				// COMMIT statement itself reported an error. An AMBIGUOUS
+				// COMMIT (the ack lost — `$wpdb->last_error` non-empty, or
+				// a false return, typically a dropped connection during
+				// the round trip) does not mean nothing landed: the
+				// server can have applied the COMMIT and only the
+				// acknowledgement failed to make it back. Gating this
+				// check on "COMMIT reported success" treated that
+				// ambiguity as a definite "no", deleted this unit's own
+				// witness, and answered committed:false over writes that
+				// were, in fact, durable. Checking the SAME witness here
+				// is safe either way: if the transaction genuinely did
+				// not commit, the witness INSERT — issued inside that
+				// same transaction, before the bump — was rolled back
+				// with everything else, so this read finds nothing and
+				// correctly answers false.
+				$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->prepare(
+						"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+						$tx_witness
+					)
+				);
+				$commit_ok = is_string( $durable );
 			}
 			// Ruling S32: both branches above are now settled — clean up
 			// THIS unit's own witness row, best effort, OUTSIDE the

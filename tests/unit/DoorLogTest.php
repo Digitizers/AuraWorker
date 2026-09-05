@@ -1297,6 +1297,67 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S34 (Codex round-15 P1 on #88): when COMMIT genuinely lands
+	 * but its OWN acknowledgement is lost — `$wpdb->last_error` set, or a
+	 * false return — the guard used to short-circuit on that alone,
+	 * skipping BOTH the session check and the durable fallback, deleting
+	 * this unit's own witness row, and reporting committed:false over
+	 * writes that were, in fact, durable. An ambiguous COMMIT must consult
+	 * the durable witness exactly like an unreadable session variable
+	 * does: the row is there because this same transaction wrote it
+	 * before the bump, and nothing about the ack being lost afterwards
+	 * unwinds that.
+	 */
+	public function test_an_ambiguous_commit_that_really_landed_falls_back_to_the_durable_witness(): void {
+		$name = 'aura_worker_door_s34_test';
+
+		$GLOBALS['_sa_commit_ambiguous_ack'] = true;
+		$outcome                             = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_ambiguous_ack'] = false;
+
+		$this->assertTrue( $outcome['committed'], 'the durable witness proves the COMMIT really landed even though the statement itself reported failure' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
+	}
+
+	/**
+	 * The other half of Ruling S34: an ambiguous COMMIT that did NOT land
+	 * must still answer false — checking the durable witness is not a bias
+	 * toward committed:true, it is the same proof read honestly either way.
+	 */
+	public function test_an_ambiguous_commit_that_did_not_land_still_answers_false(): void {
+		$name = 'aura_worker_door_s34_test2';
+
+		$GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] = true;
+		$outcome                                         = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_commit_ambiguous_ack_rolled_back'] = false;
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the ambiguous COMMIT really did not commit' );
+	}
+
+	/**
 	 * Ruling S17 (Codex round-7 P1 on #88): the nonce alone is not proof — a
 	 * reconnect landing WHILE the nonce's own `SET` is issued can be
 	 * transparently retried by `wpdb` on a fresh autocommit session, and
