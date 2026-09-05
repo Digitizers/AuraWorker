@@ -1522,16 +1522,30 @@ class Aura_Worker_Door_Holds {
 	 * rather than risk a hold's `expires_at` crossing between an
 	 * independent read here and the one it already made.
 	 *
-	 * CLAIMED rows are read fresh every call regardless: a claim is a real,
-	 * already-versioned mutation (Ruling P58's own reasoning), never a
-	 * silent time-based crossing, so there is no snapshot for it to share.
+	 * CLAIMED rows are read fresh every call by default — a claim is a
+	 * real, already-versioned mutation (Ruling P58's own reasoning), never
+	 * a silent time-based crossing, so there was no snapshot for it to
+	 * share prior to Ruling S74. `$claimed` (Codex round-30 P1 on #88) is
+	 * that ruling's own exception: `status_fragment()`'s builder already
+	 * reads the FULL claimed set via `partition_stale_claims()`'s own
+	 * `'all'` key (Ruling S73) to feed its held_count-facing identity
+	 * hash — passing that SAME read here, rather than defaulting to null
+	 * and taking a second one, is what lets that hash and this count
+	 * agree about which claimed rows exist without a duplicate query.
 	 *
 	 * @param string[]|null $held_identity A `held_snapshot()`'s own
 	 *                                     `'identity'`.
+	 * @param array|null    $claimed       `self::rows(self::CLAIMED)`'s own
+	 *                                     shape, already read by the
+	 *                                     caller; null (default) reads it
+	 *                                     fresh here, exactly as before
+	 *                                     Ruling S74.
 	 * @return int|null
 	 */
-	public static function count_from_identity( $held_identity ) {
-		$claimed = self::rows( self::CLAIMED );
+	public static function count_from_identity( $held_identity, $claimed = null ) {
+		if ( null === $claimed ) {
+			$claimed = self::rows( self::CLAIMED );
+		}
 		if ( null === $claimed || null === $held_identity ) {
 			return null;
 		}

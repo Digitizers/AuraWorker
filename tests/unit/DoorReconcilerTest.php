@@ -2177,16 +2177,45 @@ final class DoorReconcilerTest extends TestCase {
 	 * version compare protects. Both reads would agree on the NEW version
 	 * while the fragment served epoch/site/rewind values `detect_rewind()`
 	 * read against the OLD one. The bracket now opens before
-	 * `detect_rewind()` runs at all, so this exact race is now INSIDE it:
-	 * the mismatch forces a retry, and the retry re-reads a fresh epoch.
+	 * `detect_rewind()` runs at all, so this exact race is now INSIDE it.
+	 *
+	 * UPDATED FOR RULING S74 (Codex round-30 P1 on #88): before this
+	 * ruling, a single retry cleanly resolved this — `sync_computed_state()`
+	 * tracks only `{active,seam,door}`, none of which this racer touches,
+	 * so attempt 0 took its steady path for THAT tuple regardless of the
+	 * epoch racing underneath it, and attempt 1 simply re-read a fresh
+	 * epoch with nothing left to reconcile. Now that the served
+	 * fragment's OWN identity is hashed and persisted (`sync_served_identities()`,
+	 * covering epoch/rewind along with everything else — the whole point
+	 * of S74), attempt 0's identity write reflects the STALE (pre-
+	 * rotation) epoch it already read, is provably wrong the instant it
+	 * lands, and attempt 1 must correct it — its OWN necessary write,
+	 * landing on the LAST attempt the bracket allows, self-tears with no
+	 * further attempt left to confirm steady. This is the SAME shape
+	 * `test_a_racer_landing_between_the_steady_check_and_the_bracket_forces_a_second_collision()`
+	 * already documents as correct for a structurally identical timing:
+	 * two independent transitions (the racer's, and this attempt's own
+	 * corrective write) landing inside one poll's two-attempt budget is
+	 * an honest `observation: null`, never a guess — Aura's very next
+	 * poll finds both settled and confirms cleanly. The SERVED content is
+	 * still correct even though the witness is withheld: the fragment
+	 * returned is attempt 1's own, built from a freshly re-run
+	 * `detect_rewind()`, so `epoch` already reflects the rotation.
 	 */
 	public function test_a_rotation_during_detect_rewind_is_caught_and_the_retry_serves_the_new_epoch(): void {
 		$old_epoch = Aura_Worker_Door_Log::epoch();
 		$new_epoch = 'rotated-epoch-' . wp_generate_uuid4();
 
+		// A real poll first, so a baseline identity is persisted BEFORE
+		// the racer below — otherwise the very first ever fragment build
+		// would ALSO need its own first-time identity write regardless of
+		// any racer, muddying which write this test means to attribute to
+		// the rotation.
+		$this->fragment( 0, $old_epoch );
+
 		// floor_raw() is the LAST raw read detect_rewind() performs before
 		// returning — firing the racer here models a rotation landing right
-		// as detect_rewind() finishes, the exact window this ruling closes.
+		// as detect_rewind() finishes, the exact window Ruling S33 closes.
 		$GLOBALS['_sa_after_option_read'] = static function ( string $name ) use ( $new_epoch ) {
 			if ( Aura_Worker_Door_Log::FLOOR !== $name ) {
 				return;
@@ -2203,13 +2232,20 @@ final class DoorReconcilerTest extends TestCase {
 
 		$GLOBALS['_sa_after_option_read'] = null;
 
-		$this->assertNotNull( $frag['observation'], 'a single retry resolves this — never "torn twice"' );
+		$this->assertNull(
+			$frag['observation'],
+			'two independent transitions (the racer\'s rotation, and this attempt\'s own corrective identity write) land inside one poll\'s two-attempt budget — Ruling S74; see this test\'s own docblock'
+		);
 		$this->assertSame(
 			$new_epoch,
 			$frag['epoch'],
-			'the served fragment carries the POST-rotation epoch — the retry re-ran detect_rewind() inside the (correctly widened) bracket, never the stale value the first pass read'
+			'the served fragment still carries the POST-rotation epoch — the retry re-ran detect_rewind() inside the (correctly widened) bracket, never the stale value the first pass read — even though the witness for it is withheld this poll'
 		);
 		$this->assertNotSame( $old_epoch, $frag['epoch'] );
+
+		// The NEXT poll, with nothing further racing, confirms cleanly.
+		$again = $this->fragment( 0, $new_epoch );
+		$this->assertNotNull( $again['observation'], 'both transitions are now settled — the very next poll finds a clean steady state' );
 	}
 
 	/**
@@ -2696,6 +2732,134 @@ final class DoorReconcilerTest extends TestCase {
 			$m->invoke( null, $changed ),
 			'a real (non-excluded) field changing DOES change the identity'
 		);
+	}
+
+	/**
+	 * Ruling S74 (Codex round-30 P1 on #88), mechanism: `served_identity()`
+	 * must be computed from the ACTUAL served array, never a hand-built
+	 * subset (Ruling S73's own mistake, which is exactly how `epoch`/
+	 * `binding` were omitted). Proven here structurally rather than by
+	 * naming fields by hand: a REAL served fragment's own keys are looped
+	 * over via reflection/fixture, so a future field this class grows
+	 * cannot be silently left out of this test either — changing ANY one
+	 * of them alone (every key except the documented exclusions) must
+	 * change the hash.
+	 */
+	public function test_served_identity_changes_for_every_real_fragment_field_except_the_excluded_ones(): void {
+		$this->hold();
+		$baseline = $this->fragment();
+		unset( $baseline['observation'] ); // served_identity() is always called BEFORE observation exists
+
+		$excluded = array(
+			'observation',
+			'counters_as_of',
+			'log_ungoverned_30d',
+			'unobserved_30d',
+			'hook_missed_30d',
+			'unknown_ability_30d',
+			'held_unreadable',
+			'log_top_unreadable',
+		);
+		$this->assertGreaterThan(
+			count( $excluded ),
+			count( $baseline ),
+			'the fixture assumption this test is built on — a real fragment has fields BEYOND the excluded list'
+		);
+
+		$m = new ReflectionMethod( Aura_Worker_Elementor_Door::class, 'served_identity' );
+		if ( PHP_VERSION_ID < 80100 ) {
+			$m->setAccessible( true );
+		}
+		$base_identity = $m->invoke( null, $baseline );
+
+		foreach ( $baseline as $key => $value ) {
+			if ( in_array( $key, $excluded, true ) ) {
+				continue;
+			}
+			$mutated            = $baseline;
+			$mutated[ $key ]    = $this->mutatedForIdentityTest( $value );
+			$this->assertNotSame(
+				$base_identity,
+				$m->invoke( null, $mutated ),
+				"changing the top-level fragment key '{$key}' alone must change served_identity()'s own hash"
+			);
+		}
+	}
+
+	/** A value guaranteed to differ from $value, whatever its type. */
+	private function mutatedForIdentityTest( $value ) {
+		if ( is_bool( $value ) ) {
+			return ! $value;
+		}
+		if ( is_int( $value ) ) {
+			return $value + 1;
+		}
+		if ( is_string( $value ) ) {
+			return $value . '-s74-mutated';
+		}
+		if ( is_array( $value ) ) {
+			return array_merge( $value, array( '__s74_mutation_marker__' => true ) );
+		}
+		return 's74-was-null-now-a-string';
+	}
+
+	/**
+	 * Ruling S74 (Codex round-30 P1 on #88), the finding itself: a
+	 * wp_options RESTORE across an otherwise-empty rotation (epoch and
+	 * binding change; active/seam/door/held/log all stay exactly as they
+	 * were) bumps no version of its own and, under Ruling S73's own
+	 * hand-assembled snapshot (which never included epoch/binding at
+	 * all), passed the identity comparison unnoticed — the restored
+	 * epoch/binding served under an observation that had already moved
+	 * past them. `served_identity()` now hashes the ACTUAL fragment,
+	 * which already carries both fields.
+	 */
+	public function test_a_restore_across_an_otherwise_empty_rotation_still_advances_the_observation(): void {
+		// Deliberately NO hold/claim/log row: a binding-record restore
+		// changes which held rows row_is_current() accepts (Ruling P58),
+		// so creating one here would ALSO move `held`'s own identity —
+		// already tracked before this ruling — and mask exactly the
+		// epoch/binding gap this test means to isolate. "Otherwise
+		// empty" means active/seam/door/held/running/interrupted/log all
+		// stay identical; only epoch and binding rotate.
+		Aura_Worker_Door_Log::binding(); // mints the binding record if this site has never had one
+		$baseline = $this->fragment( 0, Aura_Worker_Door_Log::epoch() );
+		$old_epoch   = $baseline['epoch'];
+		$old_binding = $baseline['binding'];
+		$this->assertIsString( $old_epoch );
+		$this->assertIsString( $old_binding );
+		$v1 = $baseline['observation'];
+		$this->assertIsInt( $v1 );
+
+		// Epoch and binding change RAW — no version bump of its own,
+		// modelling a wp_options RESTORE landing on exactly these two
+		// options and nothing else.
+		$new_epoch = 'restored-epoch-' . wp_generate_uuid4();
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::EPOCH ] = $new_epoch;
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::EPOCH ]    = $new_epoch;
+		unset( $GLOBALS['_notoptions'][ Aura_Worker_Door_Log::EPOCH ] );
+
+		$binding_record = get_option( Aura_Worker_Door_Log::BINDING, array() );
+		$this->assertIsArray( $binding_record, 'the fixture assumption this test is built on' );
+		$new_gen                    = 'restored-binding-' . wp_generate_uuid4();
+		$binding_record['gen']      = $new_gen;
+		$this->patchOption( Aura_Worker_Door_Log::BINDING, $binding_record );
+
+		// $new_epoch, not $old_epoch: this test means to isolate the
+		// SERVED epoch/binding fields alone — passing the caller's OWN
+		// remembered epoch as already-current (matching the site's new
+		// reality) keeps detect_rewind() from ALSO detecting a rewind,
+		// which is its own, already-tracked transition (Ruling S29) and
+		// would confound what this test is isolating.
+		$crossed = $this->fragment( 0, $new_epoch );
+		$this->assertNull( $crossed['rewind'], 'the fixture assumption this test is built on — isolating epoch/binding alone, not a rewind' );
+		$this->assertSame( $new_epoch, $crossed['epoch'], 'the restored epoch is served' );
+		$this->assertSame( $new_gen, $crossed['binding'], 'the restored binding is served' );
+		$this->assertNotNull( $crossed['observation'] );
+		$this->assertGreaterThan( $v1, $crossed['observation'], 'served under a witness strictly greater than the pre-restore poll' );
+
+		$again = $this->fragment( 0, $new_epoch );
+		$this->assertSame( $crossed['observation'], $again['observation'], 'the restored content is already recorded — a repeat serve does not bump again' );
 	}
 
 	private function seedBucket( string $name, int $hour, int $value ): void {

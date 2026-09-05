@@ -568,7 +568,7 @@ class Aura_Worker_Elementor_Door {
 				// (Rulings S24/S26), so the SECOND attempt finds its own
 				// write already there, persists nothing further, and the
 				// bracket closes clean.
-				$synced = self::sync_computed_state( $rewind_info['rewind'], $running_now, $interrupted_now, $held_snapshot, $claim_partition['all'], $log_full );
+				$synced = self::sync_computed_state( $rewind_info['rewind'], $running_now, $interrupted_now );
 				if ( ! $synced ) {
 					self::mark_unreadable( 'computed' ); // Ruling S24/S58: the transition itself could not be committed
 				}
@@ -620,7 +620,31 @@ class Aura_Worker_Elementor_Door {
 				if ( Aura_Worker_Door_Log::raw_option_was_unreadable() ) {
 					self::mark_unreadable( 'binding' );
 				}
-				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now, $binding, $held_snapshot, $log_full );
+				$fragment = self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now, $binding, $held_snapshot, $log_full );
+				// Ruling S74 (Codex round-30 P1 on #88): identity sync
+				// runs LAST, against the fragment $build_status_fragment_state()
+				// just actually produced — never a hand-built stand-in
+				// for it (Ruling S73's own mistake). Only attempted when
+				// $synced: active/seam/door must already be settled (this
+				// fragment was built FROM $computed), and an unsynced
+				// attempt is already withholding `observation` via the
+				// mark_unreadable() call above regardless.
+				if ( $synced ) {
+					$audit_preview = self::audit_identity_payload(
+						$fragment['active'],
+						$rewind_info['site'],
+						$binding,
+						$fragment['seam'],
+						$fragment['door'],
+						Aura_Worker_Door_Holds::count_from_identity( $held_snapshot['identity'], $claim_partition['all'] ),
+						$fragment['log_unacked'],
+						$log_full
+					);
+					if ( ! self::sync_served_identities( $fragment, $audit_preview ) ) {
+						self::mark_unreadable( 'computed' );
+					}
+				}
+				return $fragment;
 			}
 		);
 	}	/**
@@ -938,26 +962,33 @@ class Aura_Worker_Elementor_Door {
 
 	/**
 	 * The persisted IDENTITY of a served payload — sha1 over its own
-	 * canonical JSON (Ruling S73, Codex round-29 P2 on #88, mechanism).
-	 * Three rounds of "this ONE collection's identity missed a field"
+	 * canonical JSON (mechanism: Ruling S73, Codex round-29 P2 on #88).
+	 * Four rounds of "this ONE collection's identity missed a field"
 	 * (Rulings S45/S46's ref-only running/interrupted, S61/S64's
-	 * log-shape counts, S71's held content, and the two that prompted
-	 * THIS ruling — log_full's own fields, a young claim's contribution
-	 * to held_count) proved that enumerating which fields matter is a
-	 * whack-a-mole this class of bug always eventually wins. WHAT IS
-	 * SERVED IS WHAT IS IDENTIFIED: this hashes the WHOLE canonical
-	 * snapshot a builder folds into it, so any field that collection
-	 * ever grows is covered from the day it is added, with nothing here
-	 * to remember to update by hand.
+	 * log-shape counts, S71's held content, S73's own log_full/held_count
+	 * gaps) proved that enumerating which fields matter is a whack-a-mole
+	 * this class of bug always eventually wins — and S73's OWN fix still
+	 * hand-assembled a canonical snapshot rather than hashing the actual
+	 * served array, which is exactly how it went on to miss `epoch`/
+	 * `binding` too (Ruling S74, Codex round-30 P1 on #88).
+	 *
+	 * AS OF RULING S74, callers hand this the ACTUAL array they are about
+	 * to return (or, for `governor_block()`'s own audit — which shares no
+	 * single struct with the fragment — the identical shape
+	 * `audit_identity_payload()` builds for both sides), MINUS ONLY the
+	 * excluded keys below, stripped here regardless of whether the caller
+	 * remembered to leave them out. Never a hand-built subset again: a
+	 * field this class grows next year needs no matching line added
+	 * here, because it is already part of whatever array gets hashed.
 	 *
 	 * EXCLUDED, explicitly, because none of them are STATE whose change
 	 * should ever be reported as a transition:
 	 *
-	 * - `observation` — never actually passed in (every caller folds this
-	 *    BEFORE `observation` exists), named here anyway as the one field
-	 *    that could never be included even if it were: it IS the value
-	 *    this identity's own comparison decides, so it cannot also be an
-	 *    input to that decision.
+	 * - `observation` — callers fold this BEFORE `observation` is added
+	 *    to their own return value, so it is never actually present —
+	 *    named here anyway as the one field that could never be included
+	 *    even if it were: it IS the value this identity's own comparison
+	 *    decides, so it cannot also be an input to that decision.
 	 * - `counters_as_of` (Ruling S49) — the hourly cutoff the four `_30d`
 	 *    counters below are computed against; it advances on its own
 	 *    every hour with no state mutated.
@@ -976,23 +1007,12 @@ class Aura_Worker_Elementor_Door {
 	 *    ever matters for the narrow case where the REST of the payload
 	 *    is fully proven.)
 	 *
-	 * Callers do not literally hand this the byte-identical array a
-	 * builder is about to return over the wire: `sync_computed_state()`
-	 * folds a CANONICAL snapshot built from the SAME per-attempt reads
-	 * (Rulings S52/S69) — `rewind`, the served held/running/interrupted/
-	 * claimed collections, `log_shape` (Ruling S64's own fingerprint
-	 * struct, reused whole rather than re-hashed), `log_full`, and
-	 * `door_write_unsupported` — never a second, independent read to
-	 * reconstruct the literal response. `active`/`seam`/`door` are
-	 * deliberately NOT part of this snapshot: they stay their OWN
-	 * separate tuple fields, because `build_status_fragment_state()`
-	 * reads them BACK OUT of what is persisted, by name (Ruling S28), and
-	 * a one-way hash cannot support that.
-	 *
-	 * @param array $payload The canonical snapshot to hash — already
-	 *                        excludes `observation` by construction (see
-	 *                        above); any OTHER excluded key present is
-	 *                        stripped here regardless.
+	 * @param array $payload The array a caller is ABOUT TO RETURN (or an
+	 *                        equivalent shape — see `audit_identity_payload()`
+	 *                        — for a consumer with no single served
+	 *                        struct of its own), before `observation` is
+	 *                        added; any excluded key present regardless
+	 *                        is stripped here.
 	 * @return string
 	 */
 	private static function served_identity( array $payload ) {
@@ -1088,184 +1108,83 @@ class Aura_Worker_Elementor_Door {
 	 * `active()`/`door_state()`.
 	 *
 	 * A DETECTED REWIND IS A STATE TRANSITION TOO (Ruling S29, Codex
-	 * round-13 P1 on #88). `wp_options` restored to a snapshot whose
-	 * persisted `{ active, seam, door }` still matches today's live values
-	 * takes the STEADY-STATE fast path above — nothing versions, so the
-	 * restored (LOWER) door version stands, and a fragment reporting
-	 * `rewind.detected` under that lower observation is REJECTED by Aura's
-	 * strictly-greater comparison: recovery stalls until some UNRELATED
-	 * mutation happens to advance the version again. `$rewind` — the top
-	 * `detect_rewind()` observed WHEN a rewind is currently detected, null
-	 * otherwise — is folded into the tuple as `rewind_top`: the FIRST serve
-	 * that detects a NEW rewind (or a resolved one clearing an old one) now
-	 * looks like a real transition and is versioned through the SAME fenced
-	 * CAS, which bumps the version via `Aura_Worker_Door_Log::versioned()`'s
-	 * ordinary CLOCK-FLOORED bump (Ruling S4) — no separate mechanism
-	 * needed, since a restore rolls the STORED counter back but never the
-	 * WALL CLOCK, so this one bump already lands above every pre-restore
-	 * value. A steady poll with no rewind detected (the overwhelming
-	 * majority) still bumps nothing (Ruling S6 stands): `rewind_top` is
-	 * `null` on both sides and the comparison is unaffected.
+	 * round-13 P1 on #88), but tracked OUTSIDE this tuple as of Ruling S74
+	 * (Codex round-30 P1 on #88): `rewind` is a field of the served
+	 * fragment itself, so `sync_served_identities()`'s own hash of the
+	 * ACTUAL fragment (never a hand-built subset — see that method's own
+	 * docblock for why this ruling exists) already covers a rewind being
+	 * detected, resolved, or its `top` changing, with no separate
+	 * `rewind_top` tracked here. `detect_rewind()` itself never reads
+	 * anything back from THIS tuple as a decision input (it recomputes
+	 * fresh from `$after`/`$epoch` on every call), so `rewind_top` was
+	 * only ever an OUTPUT this function carried for identity purposes —
+	 * exactly what the fragment hash now does instead, from the ACTUAL
+	 * served value rather than a copy of it.
+	 *
+	 * THIS FUNCTION NOW TRACKS ONLY `{ active, seam, door }` (Ruling S74).
+	 * Rulings S45/S46/S61/S64/S71/S73 each folded ONE MORE collection's
+	 * own identity into this tuple by hand — running/interrupted's
+	 * ref-only identity, the log's shape, held's served content, a
+	 * canonical snapshot approximating the rest — and every single one of
+	 * them, eventually, MISSED a served field a hand-built snapshot never
+	 * happened to include (S74's own finding: `epoch`/`binding`, omitted
+	 * from Ruling S73's own hand-assembled payload). `sync_served_identities()`
+	 * closes the class instead of extending the list again: it runs
+	 * AFTER `build_status_fragment_state()` has produced the fragment
+	 * this method's own caller is ABOUT TO RETURN, and hashes THAT ACTUAL
+	 * ARRAY — so a field this class will grow next year is covered
+	 * automatically, not by remembering to add it here. This function's
+	 * own job shrinks back to exactly what it cannot be: the
+	 * `active`/`seam`/`door` CAS MUST resolve first, because
+	 * `build_status_fragment_state()` needs `$computed`'s PERSISTED
+	 * values for those three fields (Ruling S28 — a live re-read here
+	 * would already be too late to protect against) before it can build
+	 * anything the fragment hash could cover.
 	 *
 	 * @param array|null $rewind          `detect_rewind()`'s own `rewind`
-	 *                                      field: `{ detected: true, top:
-	 *                                      int }` when a rewind is
-	 *                                      CURRENTLY detected, null
-	 *                                      otherwise.
-	 * @param array      $running_now     `Aura_Worker_Door_Holds::running_claims()`'s
-	 *                                      own return, read ONCE by the
-	 *                                      caller and handed to both this
-	 *                                      method and
-	 *                                      `build_status_fragment_state()`
-	 *                                      (Ruling S45, Codex round-18 P2
-	 *                                      on #88) — see this method's
-	 *                                      own `'running'` key below for
-	 *                                      why.
-	 * @param array      $interrupted_now `Aura_Worker_Door_Holds::stale_unleased_claims()`'s
-	 *                                      own return, the SAME shape as
-	 *                                      `$running_now` (Ruling S46,
-	 *                                      Codex round-19, S45 class).
-	 * @param array $held_snapshot `Aura_Worker_Door_Holds::held_snapshot()`'s
-	 *                              own return — `{identity, listing}` —
-	 *                              read ONCE by the caller (Ruling S69)
-	 *                              and handed here whole: both halves now
-	 *                              feed the ONE hashed snapshot
-	 *                              `served_identity()` folds into
-	 *                              `'identity'` below (Ruling S73).
-	 * @param array $claimed_all `Aura_Worker_Door_Holds::partition_stale_claims()`'s
-	 *                            own `'all'` key (Ruling S73, Codex
-	 *                            round-29 P2 on #88) — every claimed ref,
-	 *                            ANY age, from the SAME scan `$running_now`/
-	 *                            `$interrupted_now` already came from.
-	 *                            Needed because a claim too young for
-	 *                            either of those buckets is still counted
-	 *                            by `governor_block()`'s own `held_count`.
-	 * @param array|null $log_full `Aura_Worker_Door_Log::full_report_raw()`'s
-	 *                              own return, read ONCE by the caller
-	 *                              (Ruling S73) and handed here whole —
-	 *                              its `since`/`refused` fields were
-	 *                              served but never identified before
-	 *                              this ruling.
-	 * @return bool True when the current computed tuple is either UNCHANGED
-	 *              from what is persisted (nothing to version), or this
-	 *              call's OWN write won its fence and was COMMITTED —
-	 *              either way, `door_version_raw()` read right after may be
-	 *              reported as this state's observation. False when a
-	 *              transition was needed and this call's write either could
-	 *              NOT be committed (Ruling S24) OR LOST its fence to a
-	 *              newer transition (Ruling S26): the tuple
-	 *              `self::active()`/`self::$seam`/`self::door_state()`
-	 *              answer may already be the new one, but nothing proves it
-	 *              landed paired with any version THIS call can vouch for,
-	 *              and the caller must serve `observation: null` alongside
-	 *              it.
+	 *                                      field — UNUSED by this method
+	 *                                      as of Ruling S74 (see above);
+	 *                                      kept as a parameter so callers
+	 *                                      needing to pass it alongside
+	 *                                      the others do not need special
+	 *                                      casing, and so a future
+	 *                                      decision INPUT (never merely an
+	 *                                      identity output) has somewhere
+	 *                                      obvious to land.
+	 * @param array      $running_now     Unused by this method as of
+	 *                                      Ruling S74 — kept for the SAME
+	 *                                      reason as `$rewind` above.
+	 * @param array      $interrupted_now Unused by this method as of
+	 *                                      Ruling S74 — the SAME reason.
+	 * @return bool True when the current `{active,seam,door}` tuple is
+	 *              either UNCHANGED from what is persisted (nothing to
+	 *              version), or this call's OWN write won its fence and
+	 *              was COMMITTED — either way, `door_version_raw()` read
+	 *              right after may be reported as this state's
+	 *              observation once `sync_served_identities()` (Ruling
+	 *              S74) ALSO agrees. False when a transition was needed
+	 *              and this call's write either could NOT be committed
+	 *              (Ruling S24) OR LOST its fence to a newer transition
+	 *              (Ruling S26): the tuple `self::active()`/`self::$seam`/
+	 *              `self::door_state()` answer may already be the new
+	 *              one, but nothing proves it landed paired with any
+	 *              version THIS call can vouch for, and the caller must
+	 *              serve `observation: null` alongside it.
 	 */
-	private static function sync_computed_state( $rewind = null, array $running_now = array(), array $interrupted_now = array(), array $held_snapshot = array( 'identity' => null, 'listing' => array() ), array $claimed_all = array(), $log_full = null ) {
-		$held_identity = $held_snapshot['identity'] ?? null;
-		// Ruling S73 (Codex round-29 P2 on #88): WHAT IS SERVED IS WHAT IS
-		// IDENTIFIED, taken to its conclusion — THREE separate rounds of
-		// "one collection's own identity missed a field" (S45/S46's
-		// ref-only running/interrupted, S61/S64's log-shape counts, S71's
-		// held content) proved that enumerating per-collection components
-		// is a whack-a-mole this class of bug always eventually wins —
-		// the NEXT two were log_full's own `since`/`refused` fields (never
-		// folded into anything) and a YOUNG claimed ref (too fresh for
-		// either partition_stale_claims() bucket, but still counted by
-		// governor_block()'s own held_count). Rather than add a sixth and
-		// seventh per-field component, this folds EVERY collection this
-		// tuple ever tracked an identity for into ONE hash over a
-		// canonical snapshot of them — see `served_identity()`'s own
-		// docblock for exactly what is (and, explicitly, is not) covered.
-		// `rewind_top` (Ruling S29) is RETIRED as its own tracked field:
-		// `detect_rewind()` never reads it back as a decision INPUT (it
-		// recomputes fresh from `$after`/`$epoch` every call), so it was
-		// only ever an OUTPUT this tuple carried for identity purposes —
-		// exactly what `$rewind` inside the hashed snapshot below now
-		// does instead.
-		$running_served = array();
-		foreach ( $running_now as $ref => $claim ) {
-			$running_served[ (string) $ref ] = self::served_claim_row( $ref, $claim );
-		}
-		$interrupted_served = array();
-		foreach ( $interrupted_now as $ref => $claim ) {
-			$interrupted_served[ (string) $ref ] = self::served_claim_row( $ref, $claim );
-		}
-		// Ruling S73's OWN second finding: partition_stale_claims()'s
-		// `'all'` — every claimed ref, ANY age, from the SAME scan its
-		// `stale`/`running` buckets already came from — never a second
-		// read. A claim too young for either bucket is invisible to
-		// $running_served/$interrupted_served above, but still counts
-		// toward governor_block()'s own held_count, so it needs its own
-		// place in the hashed snapshot.
-		$claimed_served = array();
-		foreach ( $claimed_all as $ref => $claim ) {
-			$claimed_served[ (string) $ref ] = self::served_claim_row( $ref, (array) $claim );
-		}
-		$held_listing = is_array( $held_snapshot['listing'] ?? null ) ? $held_snapshot['listing'] : array();
-		$held_served  = array();
-		foreach ( $held_listing as $row ) {
-			$held_served[ (string) ( $row['ref'] ?? '' ) ] = $row;
-		}
+	private static function sync_computed_state( $rewind = null, array $running_now = array(), array $interrupted_now = array() ) {
 		$current = array(
-			'active'   => self::active(),
-			'seam'     => self::$seam,
-			'door'     => self::door_state(),
-			// Ruling S73: ONE hash over the canonical snapshot below,
-			// replacing rewind_top/log_shape/held_served/running's own
-			// fingerprint/interrupted's own fingerprint/the claimed-set
-			// identity as SEPARATE tuple fields — see served_identity()'s
-			// own docblock for the excluded-field list and why a single
-			// hash closes this CLASS of bug rather than one more field.
-			// `active`/`seam`/`door` stay their OWN fields, never folded
-			// in here: build_status_fragment_state() reads them BACK OUT
-			// of the persisted tuple by name (Ruling S28), which a
-			// one-way hash cannot support.
-			'identity' => self::served_identity(
-				array(
-					'rewind'                 => $rewind,
-					'held'                   => $held_served,
-					'held_identity'          => is_array( $held_identity ) ? $held_identity : array(),
-					'running'                => $running_served,
-					'interrupted'            => $interrupted_served,
-					'claimed'                => $claimed_served,
-					'log_shape'              => Aura_Worker_Door_Log::log_shape_raw(),
-					'log_full'               => $log_full,
-					'door_write_unsupported' => Aura_Worker_Door_Log::door_write_unsupported_reason(),
-				)
-			),
+			'active' => self::active(),
+			'seam'   => self::$seam,
+			'door'   => self::door_state(),
 		);
-		if ( Aura_Worker_Door_Log::closure_read_was_unreadable()
-			|| Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt()
-			|| null === $held_identity
-			|| Aura_Worker_Door_Log::log_shape_was_unreadable()
-			|| Aura_Worker_Door_Log::full_report_raw_was_unreadable()
-		) {
+		if ( Aura_Worker_Door_Log::closure_read_was_unreadable() ) {
 			// Ruling S39 (Codex round-16 P2 on #88): the door_state() call
 			// just above could not prove the closure marker either way —
 			// an unreadable marker used to read as "not closed", so
 			// $current['door'] here may be a fabricated "open" on a log
-			// that is actually full.
-			//
-			// Ruling S45/S46 (Codex rounds 18-19), same reasoning: an
-			// unreadable claimed queue (Ruling S44) means
-			// `$running_served`/`$interrupted_served`/`$claimed_served`
-			// above are built from an empty set this call could not
-			// prove is genuinely empty; an unreadable held queue means
-			// `$held_served`/`$held_identity` are the SAME kind of
-			// fabrication. Any one of them baked into the hashed snapshot
-			// compared against a persisted identity naming a real claim
-			// or hold would look like it LEFT, and persist that
-			// fabrication.
-			//
-			// Ruling S61/S73: an unreadable log-shape or full-report read
-			// is the SAME fabrication risk — feeding `null`/a fabricated
-			// "not closed" into the hashed snapshot would compare as a
-			// real (and false) shape change against whatever the
-			// persisted identity last recorded.
-			//
-			// Either way: neither persist nor bump — exactly like Rulings
-			// S24/S26, return false and let the caller withhold
-			// `observation` for this poll.
+			// that is actually full. Neither persist nor bump — return
+			// false and let the caller withhold `observation` for this
+			// poll.
 			return false;
 		}
 		$persisted = get_option( self::COMPUTED, null );
@@ -1273,8 +1192,21 @@ class Aura_Worker_Elementor_Door {
 		// time (this array literal, and PHP's serialize()/unserialize()
 		// round-trip preserves it exactly) — no legacy format predates this
 		// option, so there is nothing a loose comparison would need to
-		// tolerate that a strict one would wrongly reject.
-		if ( is_array( $persisted ) && $persisted === $current ) {
+		// tolerate that a strict one would wrongly reject. A PRIOR tuple
+		// that also carries `fragment_identity`/`audit_identity` (Ruling
+		// S74) never strictly equals THIS one (which names only
+		// active/seam/door): the comparison below is scoped to those
+		// three keys alone so the two ADDITIONAL keys sync_served_identities()
+		// separately maintains are never mistaken for a spurious
+		// active/seam/door transition.
+		$persisted_core = is_array( $persisted )
+			? array(
+				'active' => $persisted['active'] ?? null,
+				'seam'   => $persisted['seam'] ?? null,
+				'door'   => $persisted['door'] ?? null,
+			)
+			: null;
+		if ( is_array( $persisted ) && $persisted_core === $current ) {
 			// Test seam only: fires immediately after this steady-state
 			// verdict, modelling a racer landing in the exact window Ruling
 			// S28 (Codex round-12 P1 on #88) closes — a DIFFERENT process
@@ -1289,6 +1221,15 @@ class Aura_Worker_Elementor_Door {
 			}
 			return true; // steady state: nothing to version, nothing unproven
 		}
+		// This CAS owns active/seam/door alone — a plain 3-key write,
+		// exactly as before Ruling S71 first grew this tuple.
+		// sync_served_identities() (Ruling S74) owns fragment_identity/
+		// audit_identity separately, in its OWN fenced write, once the
+		// fragment those two describe has actually been built; it runs
+		// immediately after this one on every attempt that reaches it, so
+		// a momentary gap where this write's own commit has not yet
+		// carried them forward is never observable outside this one
+		// attempt's own execution.
 		$outcome = Aura_Worker_Door_Log::versioned(
 			function () use ( $current, $persisted ) {
 				global $wpdb;
@@ -1346,6 +1287,122 @@ class Aura_Worker_Elementor_Door {
 			return false; // Ruling S24: the write itself could not commit
 		}
 		return (bool) ( $outcome['result'] ?? false ); // Ruling S26: false when the fence lost
+	}
+
+	/**
+	 * The SHARED shape `governor_block()`'s own served body and
+	 * `status_fragment()`'s own PREVIEW of it (Ruling S74/S75, Codex
+	 * round-30 on #88) are BOTH built from — so the two can never drift
+	 * about what counts as "the audit's content" for identity purposes.
+	 * Every argument is data the CALLER already has in hand (Ruling S52/
+	 * S69's own "no extra reads" principle) — this method reads nothing
+	 * itself, beyond the two cheap, no-I/O capability checks
+	 * (`observation_unsupported_reason()`/`door_write_unsupported_reason()`)
+	 * every existing caller of this shape already made unconditionally.
+	 *
+	 * Deliberately OMITS `counters_as_of` and the four `_30d` counters:
+	 * `served_identity()` strips them regardless (Ruling S49's own
+	 * exclusion, carried over from Ruling S73), so computing them here
+	 * would cost real reads (`count_30d()` — four of them) for values the
+	 * hash would throw away the moment they were handed to it.
+	 *
+	 * @param bool       $active
+	 * @param string     $epoch       Raw (`''` for absent/unreadable) —
+	 *                                  the `null` translation happens
+	 *                                  HERE, identically for both callers.
+	 * @param string     $binding     Raw, the SAME `''`-for-absent shape.
+	 * @param string     $seam
+	 * @param string     $door
+	 * @param int|null   $held_count
+	 * @param int|null   $log_unacked
+	 * @param array|null $log_full
+	 * @return array
+	 */
+	private static function audit_identity_payload( $active, $epoch, $binding, $seam, $door, $held_count, $log_unacked, $log_full ) {
+		return array(
+			'active'                   => (bool) $active,
+			'epoch'                    => '' === (string) $epoch ? null : (string) $epoch,
+			'binding'                  => '' === (string) $binding ? null : (string) $binding,
+			'observation_unsupported'  => Aura_Worker_Door_Log::observation_unsupported_reason(),
+			'door_write_unsupported'   => Aura_Worker_Door_Log::door_write_unsupported_reason(),
+			'seam'                     => (string) $seam,
+			'door'                     => (string) $door,
+			'held_count'               => $held_count,
+			'log_unacked'              => $log_unacked,
+			'queue_full'               => null === $held_count ? null : ( $held_count >= Aura_Worker_Door_Holds::CAP ),
+			'log_full'                 => $log_full,
+		);
+	}
+
+	/**
+	 * Ruling S74 (Codex round-30 P1 on #88): the persisted identity of
+	 * `status_fragment()`'s served fragment, and the SEPARATE persisted
+	 * identity of what `governor_block()`'s own served body would be
+	 * RIGHT NOW — BOTH computed from the ACTUAL array a caller is about
+	 * to return, never a hand-built subset. Ruling S73's own snapshot was
+	 * exactly that mistake: `epoch`/`binding` were omitted because nobody
+	 * remembered to add them to a hand-assembled payload, so a restore
+	 * across an otherwise-empty rotation served the stale epoch/binding
+	 * under an unchanged identity. Hashing the fragment `build_status_fragment_state()`
+	 * is ABOUT TO RETURN — not a copy of some of its fields — means a
+	 * future field this class grows needs no matching line added here.
+	 *
+	 * Runs strictly AFTER `build_status_fragment_state()` has produced
+	 * `$fragment`, in its OWN separate fenced write against
+	 * `self::COMPUTED`: `sync_computed_state()` must resolve
+	 * active/seam/door FIRST (Ruling S28 — `build_status_fragment_state()`
+	 * needs the PERSISTED values for those three, which `$fragment` was
+	 * built from), so the fragment — and therefore its hash — cannot
+	 * exist before that CAS has already settled. Two sequential
+	 * `versioned()` units in one attempt is not a torn read: nothing
+	 * outside this attempt's own execution can observe the moment
+	 * between them, and `version_bracketed()`'s own before/after check
+	 * (Ruling S6) is unaffected either way.
+	 *
+	 * `governor_block()` never writes (Ruling S27) and has no path of its
+	 * own to persist an `audit_identity` — `status_fragment()` is the
+	 * ONLY writer for both hashes, which is why `$audit_preview` is built
+	 * by `status_fragment()`'s OWN caller (via `audit_identity_payload()`,
+	 * from data it already has in hand) rather than waiting for an audit
+	 * that may never run in this request at all. `governor_block()`
+	 * computes the SAME shape independently (Ruling S75) and compares its
+	 * own live hash against what this method persists here.
+	 *
+	 * @param array $fragment      The EXACT array `status_fragment()` is
+	 *                               about to return (before `observation`
+	 *                               is added).
+	 * @param array $audit_preview `audit_identity_payload()`'s own
+	 *                               return, built from the SAME
+	 *                               already-read inputs.
+	 * @return bool True when both identities are either already
+	 *              persisted unchanged, or this call's own write won its
+	 *              fence and committed. False otherwise — the caller
+	 *              withholds `observation` for this poll (Rulings
+	 *              S24/S26), the same treatment `sync_computed_state()`'s
+	 *              own failure already gets.
+	 */
+	private static function sync_served_identities( array $fragment, array $audit_preview ) {
+		$fragment_identity = self::served_identity( $fragment );
+		$audit_identity    = self::served_identity( $audit_preview );
+		$persisted          = get_option( self::COMPUTED, null );
+		if ( ! is_array( $persisted ) ) {
+			// sync_computed_state() already inserted this row whenever
+			// $synced is true (the only case this method is ever
+			// called) — genuinely absent here means that insert itself
+			// has not landed yet from THIS request's own point of view.
+			// Nothing to fence against; the caller treats this the same
+			// as any other unsynced attempt.
+			return false;
+		}
+		if ( ( $persisted['fragment_identity'] ?? null ) === $fragment_identity
+			&& ( $persisted['audit_identity'] ?? null ) === $audit_identity
+		) {
+			return true; // steady state: both already match
+		}
+		$updated                      = $persisted;
+		$updated['fragment_identity'] = $fragment_identity;
+		$updated['audit_identity']    = $audit_identity;
+		return Aura_Worker_Door_Log::write_option_where( self::COMPUTED, $updated, $persisted );
 	}
 
 	/**
