@@ -1753,6 +1753,134 @@ class Aura_Worker_Door_Log {
 		return (int) $n;
 	}
 
+	/** @var bool Set by log_shape_raw() (Ruling S61, Codex round-23 P1 on #88): did the MOST RECENT call fail to prove its read? */
+	private static $log_shape_unreadable = false;
+
+	/**
+	 * Whether the MOST RECENT `log_shape_raw()` call could not prove its
+	 * read (Ruling S61). Checked by the caller IMMEDIATELY after — before
+	 * anything else in this same request can issue a second
+	 * `log_shape_raw()` read and overwrite it.
+	 *
+	 * @return bool
+	 */
+	public static function log_shape_was_unreadable() {
+		return self::$log_shape_unreadable;
+	}
+
+	/**
+	 * A LOG-SHAPE identity — `{ top, floor, pending_count,
+	 * terminal_count_above_floor, terminal_top }` — from ONE round trip
+	 * (Ruling S61, Codex round-23 P1 on #88).
+	 *
+	 * THE BUG THIS CLOSES: `sync_computed_state()`'s persisted tuple
+	 * tracked `{ active, seam, door, rewind_top, running, interrupted,
+	 * held }` — none of which a `wp_options` RESTORE that happens to
+	 * preserve the epoch, the door version, and every one of THOSE fields
+	 * would touch. A restore that flips ONE row's own state — seq N
+	 * settled back to `pending`, say, while Aura's own cursor already sits
+	 * at N — passes `sync_computed_state()`'s steady-state fast path
+	 * unnoticed: nothing versions, the restored (STALE) door version
+	 * stands, and Aura's strictly-greater comparison rejects every
+	 * fragment describing the log's real, current shape for as long as
+	 * some UNRELATED mutation does not happen to advance the version on
+	 * its own. Folding this shape into the SAME tuple makes the FIRST
+	 * serve that sees the restored state a real, detected transition,
+	 * versioned through the exact mechanism Rulings S29/S45 already
+	 * established for `rewind_top`/`running`/`interrupted`: the ordinary
+	 * CLOCK-FLOORED bump (Ruling S4), landing above every pre-restore
+	 * value because a restore rolls the STORED counter back but never the
+	 * wall clock.
+	 *
+	 * ONE query, not one per row: the row set matching this door's
+	 * PREFIX, fetched whole and aggregated in PHP — the log is BOUNDED by
+	 * MAX_UNACKED admission (Ruling P82), never an unbounded scan, and
+	 * this is the SAME "fetch bounded rows raw, parse in PHP" shape
+	 * `log_after()`/`full_report_raw()`/`stale_pending()` already use,
+	 * never a fragile SQL-text match against a PHP-serialized blob.
+	 *
+	 * `pending_count`/`terminal_count_above_floor`/`terminal_top` are
+	 * DERIVED from each row's own `result` field (`'pending'` or a
+	 * terminal verdict) — never from `top`/`floor` alone, which a restore
+	 * can hold constant while still flipping what a specific row between
+	 * them says.
+	 *
+	 * @return array{ top: int, floor: int, pending_count: int, terminal_count_above_floor: int, terminal_top: int|null }|null
+	 *         Null when `top`, the floor, or the row read itself could not
+	 *         be proven — check `log_shape_was_unreadable()` immediately
+	 *         after.
+	 */
+	public static function log_shape_raw() {
+		global $wpdb;
+		self::$log_shape_unreadable = false;
+		$top = self::highest_row_seq();
+		if ( null === $top ) {
+			self::$log_shape_unreadable = true;
+			return null;
+		}
+		$floor = self::floor_raw();
+		if ( self::floor_was_unreadable_this_attempt() ) {
+			self::$log_shape_unreadable = true;
+			return null;
+		}
+		$like              = $wpdb->esc_like( self::PREFIX ) . '%';
+		$wpdb->last_error  = '';
+		// LIKE alone, never a second REGEXP clause: the numeric-suffix
+		// filter below (the SAME defensive read count_unacked()/
+		// highest_row_seq() apply to this shared prefix) already excludes
+		// FLOOR/FULL_MARKER/FULL_COUNTER, which share this prefix but
+		// never end in digits — a second SQL-side filter would only
+		// narrow what MySQL itself returns, never what this method
+		// trusts, and this is the exact "names AND values for a prefix"
+		// shape the rest of this codebase's own raw bulk reads already
+		// use.
+		$rows              = $wpdb->get_results( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$like
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $rows ) || '' !== (string) $wpdb->last_error ) {
+			self::$log_shape_unreadable = true;
+			return null;
+		}
+		$pending_count              = 0;
+		$terminal_count_above_floor = 0;
+		$terminal_top               = null;
+		foreach ( $rows as $r ) {
+			// ROW_REGEXP already scoped the SQL match to a purely numeric
+			// suffix, but the trailing digits are still pulled explicitly
+			// (never assumed) — the same defensive read
+			// count_unacked()/highest_row_seq() apply to this shared
+			// prefix.
+			if ( ! preg_match( '/(\d+)$/', (string) $r['option_name'], $m ) ) {
+				continue;
+			}
+			$seq = (int) $m[1];
+			$row = maybe_unserialize( $r['option_value'] );
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+			$result = isset( $row['result'] ) ? (string) $row['result'] : 'pending';
+			if ( 'pending' === $result ) {
+				++$pending_count;
+				continue;
+			}
+			if ( $seq > $floor ) {
+				++$terminal_count_above_floor;
+				$terminal_top = null === $terminal_top ? $seq : max( $terminal_top, $seq );
+			}
+		}
+		return array(
+			'top'                        => $top,
+			'floor'                      => $floor,
+			'pending_count'              => $pending_count,
+			'terminal_count_above_floor' => $terminal_count_above_floor,
+			'terminal_top'               => $terminal_top,
+		);
+	}
+
 	/**
 	 * How many rows Aura has not acknowledged — or NULL when that cannot be
 	 * read (Ruling P53).

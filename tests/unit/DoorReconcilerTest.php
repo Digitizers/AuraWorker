@@ -382,6 +382,41 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S61 (Codex round-23 P1 on #88): a wp_options RESTORE that
+	 * happens to keep the epoch, the door version, and every field
+	 * sync_computed_state()'s tuple already tracked (active/seam/door,
+	 * rewind_top, running/interrupted, held) passes the steady-state fast
+	 * path unnoticed even though it flipped ONE log row's own state --
+	 * seq N settled back to `pending`, exactly the shape a restore to a
+	 * snapshot predating that ack would produce while Aura's own cursor
+	 * still sits at N. The persisted tuple now folds in a log-shape
+	 * identity (top, floor, pending_count, terminal_count_above_floor,
+	 * terminal_top) that this flip provably changes, so the FIRST serve
+	 * that sees it is a real, versioned transition -- the SAME
+	 * clock-floored bump mechanism Rulings S29/S45 already established.
+	 */
+	public function test_a_row_flipped_terminal_to_pending_with_no_bump_still_advances_the_observation(): void {
+		$seq = $this->entry( array(), true, false ); // admitted, NOT backdated -- irrelevant to this test either way
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+
+		$before = $this->fragment();
+		$v1     = $before['observation'];
+		$this->assertIsInt( $v1, 'the fixture assumption this test is built on' );
+
+		// The restore: seq $seq flips back to pending, raw -- no
+		// versioned() unit runs, no bump of any kind.
+		$this->patchOption( Aura_Worker_Door_Log::PREFIX . $seq, array( 'result' => 'pending' ) );
+
+		$after = $this->fragment();
+		$this->assertNotNull( $after['observation'], 'a single retry resolves this -- never "torn twice"' );
+		$this->assertGreaterThan( $v1, $after['observation'], 'the restored row-state is a REAL transition, served under a witness strictly greater than the pre-restore poll' );
+
+		// A second serve of the SAME (now steady) shape does not bump again.
+		$again = $this->fragment();
+		$this->assertSame( $after['observation'], $again['observation'], 'the flip is already recorded -- a repeat serve does not bump again' );
+	}
+
+	/**
 	 * Ruling S46 (Codex round-19, S45 class): the SAME transition-fold as
 	 * `running`, for `interrupted` — a claim crosses into "stale,
 	 * unleased" SOLELY by its own `claimed_at` ageing past CLAIM_STALE_MS,

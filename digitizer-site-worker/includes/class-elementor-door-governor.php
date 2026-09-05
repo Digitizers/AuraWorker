@@ -969,10 +969,20 @@ class Aura_Worker_Elementor_Door {
 			// this fold exists to witness. Null (unreadable) is guarded
 			// below, before this tuple is ever compared or persisted.
 			'held'        => is_array( $held_identity ) ? $held_identity : array(),
+			// Ruling S61 (Codex round-23 P1 on #88): a wp_options RESTORE
+			// that happens to preserve every OTHER field above (the
+			// epoch, the door version, active/seam/door,
+			// running/interrupted/held) but flips ONE row's own state —
+			// seq N settled back to `pending`, say, while Aura's cursor
+			// already sits at N — is invisible to all of them. This
+			// identity is what makes it a detected transition instead:
+			// see Aura_Worker_Door_Log::log_shape_raw()'s own docblock.
+			'log_shape'   => Aura_Worker_Door_Log::log_shape_raw(),
 		);
 		if ( Aura_Worker_Door_Log::closure_read_was_unreadable()
 			|| Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt()
 			|| null === $held_identity
+			|| Aura_Worker_Door_Log::log_shape_was_unreadable()
 		) {
 			// Ruling S39 (Codex round-16 P2 on #88): the door_state() call
 			// just above could not prove the closure marker either way —
@@ -989,6 +999,12 @@ class Aura_Worker_Elementor_Door {
 			// of them compared against a persisted tuple naming a real
 			// claim or hold would look like it LEFT, and persist that
 			// fabrication.
+			//
+			// Ruling S61: an unreadable log-shape read is the SAME
+			// fabrication risk — `$current['log_shape']` is null here,
+			// which would compare as a real (and false) "shape changed
+			// to null" against whatever the persisted tuple's own
+			// log_shape last recorded.
 			//
 			// Either way: neither persist nor bump — exactly like Rulings
 			// S24/S26, return false and let the caller withhold
