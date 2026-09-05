@@ -1619,6 +1619,35 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertNull( $frag['rewind'], 'the floor failure must not be misread as evidence of a rewind' );
 	}
 
+	/**
+	 * Ruling S41 (Codex round-17 P1 on #88): detect_rewind() consumed
+	 * floor_raw()'s fabricated 0 in its own `max($max, floor_raw())`
+	 * BEFORE ever checking whether that floor was proven readable — so a
+	 * perfectly healthy cursor sitting AT the real (merely unreadable)
+	 * floor, with nothing retained above it, looked like it landed above
+	 * a falsely-lowered top: `rewind.detected` served, `after` reset to
+	 * 0, on a log that was never rewound. Withholding `observation`
+	 * afterwards (Ruling S38) does not un-serve an already-served
+	 * `rewind.detected` — the verdict itself must never be manufactured
+	 * from an unreadable floor in the first place.
+	 */
+	public function test_a_failing_floor_read_never_manufactures_a_rewind_verdict(): void {
+		$seq = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $seq, array( 'result' => 'ok' ) );
+		Aura_Worker_Door_Log::ack( Aura_Worker_Door_Log::epoch(), $seq ); // floor moves to $seq; the row is purged
+		$this->assertSame( 0, Aura_Worker_Door_Log::highest_row_seq(), 'the fixture assumption this test is built on — nothing is retained above the floor' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::FLOOR ] = true;
+
+		// A cursor sitting exactly AT the real floor — the ordinary,
+		// healthy case a site with nothing pending answers every poll.
+		$frag = $this->fragment( $seq, Aura_Worker_Door_Log::epoch() );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertNull( $frag['rewind'], 'never a fabricated rewind over an unreadable floor' );
+		$this->assertNull( $frag['observation'], 'withheld for this poll (Ruling S38)' );
+	}
+
 	public function test_get_status_reads_the_cursor_and_the_epoch_from_the_request(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );

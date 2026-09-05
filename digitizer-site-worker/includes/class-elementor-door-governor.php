@@ -898,15 +898,40 @@ class Aura_Worker_Elementor_Door {
 		if ( (string) $epoch !== $site ) {
 			$after = 0;
 		} else {
-			$max = Aura_Worker_Door_Log::highest_row_seq();
+			$max            = Aura_Worker_Door_Log::highest_row_seq();
 			$top_unreadable = ( null === $max );
-			$top = $top_unreadable ? 0 : max( $max, Aura_Worker_Door_Log::floor_raw() );
-			if ( ! $top_unreadable && $after > $top ) {
-				$rewind = array(
-					'detected' => true,
-					'top'      => (int) $top,
-				);
-				$after  = 0;
+			if ( ! $top_unreadable ) {
+				$floor_for_top = Aura_Worker_Door_Log::floor_raw();
+				if ( Aura_Worker_Door_Log::floor_was_unreadable_this_attempt() ) {
+					// Ruling S41 (Codex round-17 P1 on #88): floor_raw()
+					// just fabricated 0 for a floor it could not prove —
+					// consuming that BEFORE this method's own caller ever
+					// gets to check the unreadable flag let a healthy
+					// cursor sitting at or below the REAL (merely
+					// unreadable) floor look like it landed above a
+					// falsely-lowered top: `rewind.detected` served,
+					// `after` reset to 0, on a log that was never rewound
+					// at all. `$top` cannot be established here for the
+					// SAME reason `highest_row_seq()` failing cannot
+					// establish it (Ruling P77) — the verdict is UNKNOWN,
+					// never a detection, and `after` is served exactly as
+					// Aura sent it. `status_fragment()` withholds
+					// `observation` for this poll via this SAME flag
+					// (Ruling S38) — reported here as `log_top_unreadable`,
+					// not a second, narrower flag, because "the top could
+					// not be read" is true whichever of its two inputs
+					// failed to read.
+					$top_unreadable = true;
+				} else {
+					$top = max( $max, $floor_for_top );
+					if ( $after > $top ) {
+						$rewind = array(
+							'detected' => true,
+							'top'      => (int) $top,
+						);
+						$after  = 0;
+					}
+				}
 			}
 		}
 		return array(
