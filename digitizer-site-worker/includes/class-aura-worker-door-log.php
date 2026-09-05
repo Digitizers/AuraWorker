@@ -1852,7 +1852,13 @@ class Aura_Worker_Door_Log {
 		self::$int_size_override_for_tests = $bytes;
 	}
 
-	/** @var bool|null Cached once per request (Ruling S13): is wp_options a transactional (InnoDB) table? */
+	/**
+	 * @var bool|null Cached once per request (Ruling S13), but ONLY once
+	 * the probe has actually answered `true` or `false` (Ruling S47, Codex
+	 * round-19 P1 on #88) - an unreadable probe is never cached, so the
+	 * NEXT read tries again rather than freezing this request's transient
+	 * miss as its permanent answer.
+	 */
 	private static $engine_transactional = null;
 
 	/** @param bool|null $value Test seam: overrides engine_is_transactional()'s answer. Never set by production code. */
@@ -1868,11 +1874,22 @@ class Aura_Worker_Door_Log {
 	 * would fail to undo them without saying so. Checked ONCE per request via
 	 * `SHOW TABLE STATUS` and cached — a real second query every mutation
 	 * would cost more than the whole point of batching state and the version
-	 * bump into one round trip. An UNREADABLE answer counts as
-	 * NON-transactional: a table this method cannot PROVE supports rollback
-	 * is treated as one that does not, the fail-closed direction — assuming
-	 * the opposite is exactly what would silently lose writes on an engine
-	 * that cannot honour them.
+	 * bump into one round trip.
+	 *
+	 * UNREADABLE IS ITS OWN ANSWER, NEVER `false` (Ruling S47, Codex
+	 * round-19 P1 on #88, superseding this ruling's own earlier
+	 * fail-closed-to-false reading). A failed probe used to be cached as
+	 * NON-transactional, on the theory that a table this method cannot
+	 * PROVE supports rollback should be treated as one that does not — but
+	 * `versioned()` reads `false` as "take the autocommit branch: no
+	 * transaction, no rollback, `$writes()` lands the instant it runs" —
+	 * exactly the WRONG branch for a real InnoDB table hit by a transient
+	 * `SHOW TABLE STATUS` failure, letting a concurrent `/status` poll
+	 * certify state a half-finished mutation had not actually made
+	 * durable. This method now returns `null` for an unreadable probe — a
+	 * THIRD state `versioned()` answers retryable for, before `$writes()`
+	 * ever runs — and never caches it, so the next mutation tries the
+	 * probe fresh rather than inheriting this one's miss.
 	 *
 	 * EXACT MATCH, NEVER `LIKE` (Ruling S23, Codex round-9 P2 on #88).
 	 * `SHOW TABLE STATUS LIKE '%s'` treats the pattern as a real MySQL LIKE
@@ -1894,9 +1911,15 @@ class Aura_Worker_Door_Log {
 		}
 		global $wpdb;
 		$wpdb->last_error = '';
-		$row    = $wpdb->get_row( $wpdb->prepare( 'SHOW TABLE STATUS WHERE Name = %s', $wpdb->options ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
-		$engine = ( is_object( $row ) && isset( $row->Engine ) ) ? strtoupper( (string) $row->Engine ) : '';
-		self::$engine_transactional = ( '' === (string) $wpdb->last_error && 'INNODB' === $engine );
+		$row = $wpdb->get_row( $wpdb->prepare( 'SHOW TABLE STATUS WHERE Name = %s', $wpdb->options ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
+		if ( '' !== (string) $wpdb->last_error || ! is_object( $row ) || ! isset( $row->Engine ) ) {
+			// UNREADABLE (Ruling S47): a driver failure, or a row this
+			// server did not return at all — neither is the fact "this
+			// table is not InnoDB", so this answers unknown and caches
+			// NOTHING, leaving the next call free to probe again.
+			return null;
+		}
+		self::$engine_transactional = ( 'INNODB' === strtoupper( (string) $row->Engine ) );
 		return self::$engine_transactional;
 	}
 
@@ -2315,7 +2338,19 @@ class Aura_Worker_Door_Log {
 	public static function versioned( callable $writes ) {
 		global $wpdb;
 		$transactional = self::engine_is_transactional();
-		$tx_nonce      = null;
+		if ( null === $transactional ) {
+			// Ruling S47 (Codex round-19 P1 on #88): UNREADABLE is not the
+			// same fact as "non-transactional" and must not silently take
+			// the autocommit branch below — retryable, and nothing here
+			// has written anything yet, so there is nothing to roll back.
+			// Same shape every other retryable branch in this method
+			// already answers (Ruling S15): `committed: false`, no
+			// `result`.
+			return array(
+				'committed' => false,
+			);
+		}
+		$tx_nonce = null;
 		if ( $transactional ) {
 			$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 			// Ruling S17 (Codex round-7 P1 on #88): a REAL transactional
@@ -2647,8 +2682,15 @@ class Aura_Worker_Door_Log {
 	 * @return string|null 'engine'|'php32'|null
 	 */
 	public static function observation_unsupported_reason() {
-		if ( ! self::engine_is_transactional() ) {
+		$transactional = self::engine_is_transactional();
+		if ( false === $transactional ) {
 			return 'engine';
+		}
+		if ( null === $transactional ) {
+			// Ruling S47: an unreadable probe is a TRANSIENT miss, not the
+			// permanent "upgrade the host" fact this field exists to name
+			// — see this method's own docblock above.
+			return null;
 		}
 		$int_size = null !== self::$int_size_override_for_tests ? self::$int_size_override_for_tests : PHP_INT_SIZE;
 		if ( $int_size < 8 ) {

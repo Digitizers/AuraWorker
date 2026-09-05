@@ -1751,4 +1751,59 @@ final class DoorLogTest extends TestCase {
 
 		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
 	}
+
+	/**
+	 * Ruling S47 (Codex round-19 P1 on #88): a TRANSIENT `SHOW TABLE
+	 * STATUS` failure must never be read as "this table is non-
+	 * transactional" — `versioned()` used to collapse the two, taking the
+	 * autocommit branch (no transaction, no rollback, `$writes()` landing
+	 * the instant it ran) on what may well be a real InnoDB table having a
+	 * bad moment, letting a concurrent `/status` poll certify state a
+	 * half-finished mutation had not actually made durable. An unreadable
+	 * probe now answers retryable, before `$writes()` ever runs — nothing
+	 * written, nothing to roll back — and, critically, is never cached, so
+	 * the very next attempt probes fresh rather than inheriting this one's
+	 * miss.
+	 */
+	public function test_an_unreadable_engine_probe_is_retryable_and_never_caches_the_miss(): void {
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+		$GLOBALS['_db_queries']    = array();
+
+		$out = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertInstanceOf( 'WP_Error', $out, 'an unreadable engine probe must never silently pick a branch to write under' );
+		$data = $out->get_error_data();
+		$this->assertSame( 503, $data['status'] );
+		$this->assertContains( "SHOW TABLE STATUS WHERE Name = 'wp_options'", $GLOBALS['_db_queries'], 'the probe was attempted' );
+		$this->assertNotContains( 'START TRANSACTION', $GLOBALS['_db_queries'], 'never guesses the transactional branch either' );
+		$this->assertNotContains( 'COMMIT', $GLOBALS['_db_queries'], 'never guesses the autocommit branch' );
+		$this->assertSame( array(), $GLOBALS['_options'], 'nothing landed while the engine could not be proven — not even the epoch mint' );
+
+		// The failed probe must not have been cached as "non-transactional":
+		// once the driver recovers, the VERY NEXT call takes the real
+		// transactional path rather than being stuck on the earlier miss.
+		$GLOBALS['_sa_wpdb_error'] = '';
+		$GLOBALS['_db_queries']    = array();
+		$seq                       = Aura_Worker_Door_Log::open_pending( $this->entry() );
+
+		$this->assertIsInt( $seq, 'the very next call succeeds once the probe can actually answer' );
+		$this->assertContains( 'START TRANSACTION', $GLOBALS['_db_queries'], 'the real transactional path — nothing was cached from the earlier failure' );
+		$this->assertContains( 'COMMIT', $GLOBALS['_db_queries'] );
+	}
+
+	/**
+	 * Ruling S47: `observation_unsupported_reason()` names 'engine' only for
+	 * a DEFINITIVE non-transactional answer — a transient probe failure is
+	 * not the permanent "upgrade the host" fact this field exists to
+	 * report, and must answer null (unknown this poll), never 'engine'.
+	 */
+	public function test_observation_unsupported_reason_does_not_confuse_unreadable_with_non_transactional(): void {
+		$GLOBALS['_sa_wpdb_error'] = 'MySQL server has gone away';
+		$this->assertNull( Aura_Worker_Door_Log::observation_unsupported_reason(), 'unreadable is not the same fact as "this engine cannot roll back"' );
+		$GLOBALS['_sa_wpdb_error'] = '';
+
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( false );
+		$this->assertSame( 'engine', Aura_Worker_Door_Log::observation_unsupported_reason(), 'a DEFINITIVE non-transactional answer still reports the permanent reason' );
+		Aura_Worker_Door_Log::set_engine_transactional_for_tests( null );
+	}
 }
