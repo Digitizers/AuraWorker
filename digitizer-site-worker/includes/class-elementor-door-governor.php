@@ -4922,7 +4922,7 @@ class Aura_Worker_Elementor_Door {
 				if ( Aura_Worker_Door_Log::full_report_raw_was_unreadable() ) {
 					self::mark_unreadable( 'full_report' );
 				}
-				return array(
+				$audit = array(
 					'active'              => $active,
 					'epoch'               => '' === $epoch ? null : $epoch,
 					// The current binding generation, read RAW and NEVER
@@ -4969,6 +4969,38 @@ class Aura_Worker_Elementor_Door {
 					'queue_full'          => null === $held ? null : ( $held >= Aura_Worker_Door_Holds::CAP ),
 					'log_full'            => $log_full,
 				);
+				// Ruling S75 (Codex round-30 P2 on #88): this audit never
+				// writes (Ruling S27), so it cannot version a transition
+				// its OWN content just proved happened — an unclaimed
+				// hold expiring between two audit calls (no /status poll
+				// in between) changes held_count/queue_full with nothing
+				// forcing a bump, and the SAME (unchanged) door version
+				// would otherwise be reported alongside genuinely
+				// DIFFERENT content. Comparing this audit's own LIVE
+				// identity (the SAME audit_identity_payload() shape
+				// status_fragment() already previews and persists —
+				// Ruling S74) against what is actually persisted answers
+				// the question this audit CAN answer honestly: is my
+				// content proven to match a version somebody actually
+				// wrote? A mismatch withholds `observation` (the SAME
+				// mark_unreadable() mechanism every other unproven read
+				// here already uses) — never certifying a pairing this
+				// read-only audit has no way to make true. A genuinely
+				// ABSENT persisted identity (no /status poll has EVER
+				// run) is not itself a mismatch: there is nothing yet to
+				// disagree with, so live computation is certified exactly
+				// as it always was before this ruling.
+				$live_audit_identity = self::served_identity(
+					self::audit_identity_payload( $active, $epoch, $binding, $seam, $door, $held, $log_unacked, $log_full )
+				);
+				$persisted_for_audit = get_option( self::COMPUTED, null );
+				if ( is_array( $persisted_for_audit )
+					&& array_key_exists( 'audit_identity', $persisted_for_audit )
+					&& $persisted_for_audit['audit_identity'] !== $live_audit_identity
+				) {
+					self::mark_unreadable( 'audit_identity' );
+				}
+				return $audit;
 			}
 		);
 	}

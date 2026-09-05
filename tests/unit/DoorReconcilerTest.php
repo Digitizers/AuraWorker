@@ -382,6 +382,56 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S75 (Codex round-30 P2 on #88): `governor_block()` never
+	 * writes (Ruling S27), so an unclaimed hold expiring between two
+	 * audit calls — with no `/status` poll in between to detect and
+	 * version the crossing (Rulings S46/S71/S74) — changed `held_count`/
+	 * `queue_full` with NOTHING forcing a bump: the SAME (unchanged) door
+	 * version would otherwise be reported alongside genuinely DIFFERENT
+	 * content. This audit now compares its own LIVE identity against
+	 * what `status_fragment()` last persisted (`audit_identity`, Ruling
+	 * S74) and withholds `observation` on a mismatch — it CANNOT make
+	 * the pairing true, so it must not certify it. The served content
+	 * (`held_count`) is still live and correct either way; only the
+	 * witness is withheld.
+	 */
+	public function test_governor_block_withholds_observation_when_a_hold_expires_with_no_status_poll_in_between(): void {
+		$ref = $this->hold();
+		// A real /status poll first — this is what persists BOTH
+		// fragment_identity and audit_identity (Ruling S74), the
+		// audit_identity this test's own mismatch is judged against.
+		$this->assertSame( array( $ref ), array_column( $this->fragment()['held'], 'ref' ), 'the fixture assumption this test is built on' );
+
+		$first = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertNotNull( $first['observation'], 'the fixture assumption this test is built on' );
+		$this->assertSame( 1, $first['held_count'], 'the fixture assumption this test is built on' );
+
+		// The hold expires — no `/status` poll runs in between, so
+		// nothing ever forces a bump for this crossing: status_fragment()
+		// is the ONLY writer (Ruling S27), and it never runs here.
+		$this->patchOption( Aura_Worker_Door_Holds::HELD . $ref, array( 'expires_at' => gmdate( 'c', time() - 1 ) ) );
+		// held_rows() memoises its read for the WHOLE process (Ruling
+		// P71) — the FIRST governor_block() call above's own memo would
+		// otherwise still answer the pre-expiry snapshot here.
+		Aura_Worker_Door_Holds::forget_held();
+
+		$second = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 0, $second['held_count'], 'the expiry is reflected live — this audit never lies about its OWN content' );
+		$this->assertNull( $second['observation'], 'this audit cannot version the transition it just proved happened, so it must not certify it' );
+
+		// A real `/status` poll now runs, correctly detecting and
+		// persisting the crossing.
+		$this->assertSame( array(), $this->fragment()['held'] );
+
+		// The audit certifies again — the poll just persisted a fresh
+		// audit_identity matching this audit's own (unchanged since the
+		// second call) live content.
+		$third = Aura_Worker_Elementor_Door::governor_block();
+		$this->assertSame( 0, $third['held_count'] );
+		$this->assertNotNull( $third['observation'], 'the /status poll persisted a fresh audit_identity matching this audit\'s own live content' );
+	}
+
+	/**
 	 * Ruling S66 (Codex round-25 P1 on #88): `version_bracketed()` reset
 	 * every builder memo only from attempt 1 onward — never attempt 0. The
 	 * `/status` route calls `reconcile()` BEFORE `status_fragment()`, and
