@@ -2550,46 +2550,111 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
-	 * Ruling S83 (Codex round-34 P1 on #88): `door_observation_seen =
-	 * PHP_INT_MAX - 1` (accepted by the PRE-ruling validator) made
-	 * `restamp_observation_forward()`'s own `$seen + 1` reach exactly
-	 * PHP_INT_MAX -- a value that then floats through a `%d` placeholder
-	 * uncontrolled the moment anything adds to it again. The route's own
-	 * REST arg `validate_callback` now refuses anything at or above
-	 * `Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN` outright, through the
-	 * REAL registered route (`sa_dispatch_route()`, never the handler
-	 * called directly) -- arg validation runs BEFORE the permission
-	 * callback, so this refusal needs no authenticated request at all.
+	 * Ruling S83 (Codex round-34 P1 on #88), SUPERSEDED by Ruling S92
+	 * (Codex round-40 P1 on #88): S83 refused `door_observation_seen`
+	 * values at or above `Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN`
+	 * outright, to stop `restamp_observation_forward()`'s own
+	 * `$seen + 1` from overflowing. Ruling S92 found that ceiling itself
+	 * unsound: honouring a rewind at `MAX - 2` restamps the site's own
+	 * `observation` to `MAX` (see `MAX_OBSERVATION_SEEN`'s own docblock
+	 * for the two increments that land it there), and any later,
+	 * perfectly ordinary mutation bumps it ONCE more, to `MAX + 1` -- a
+	 * value the site can now legitimately report, but S83's own ceiling
+	 * refused FOR EVER once `observation` crossed it, since the witness
+	 * only ever increases. ACCEPT now has no magnitude ceiling of its
+	 * own at all -- overflow safety lives entirely on the HONOUR side
+	 * (`restamp_observation_forward()`'s own, unchanged threshold),
+	 * which never computes with a value this large regardless of how
+	 * large it grows. Proven directly against the registered route's own
+	 * `validate_callback` (`sa_route_endpoint()`, never
+	 * `sa_dispatch_route()` -- reaching the handler needs a configured
+	 * site token this test class does not set up, and accept/honour are
+	 * separable questions the S90-era sibling test below already proves
+	 * through the handler).
 	 */
-	public function test_door_observation_seen_at_php_int_max_minus_one_is_refused_with_400(): void {
-		$this->fragment(); // establishes a real baseline
-		$epoch   = Aura_Worker_Door_Log::epoch();
-		$current = Aura_Worker_Door_Log::door_version_raw();
+	public function test_door_observation_seen_at_php_int_max_minus_one_is_accepted_not_refused(): void {
+		$req_probe = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$endpoint  = sa_route_endpoint( $req_probe );
+		$validate  = $endpoint['args']['door_observation_seen']['validate_callback'];
 
-		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
-		$req->set_param( 'door_epoch', $epoch );
-		$req->set_param( 'door_observation_seen', PHP_INT_MAX - 1 );
-		$resp = sa_dispatch_route( $req );
-
-		$this->assertSame( 400, $resp->get_status() );
-		$this->assertSame( 'aura_invalid_param', $resp->get_data()['code'] );
-		$this->assertSame( $current, Aura_Worker_Door_Log::door_version_raw(), 'refused before the handler -- let alone restamp_observation_forward() -- is ever reached; the version is completely untouched' );
+		$this->assertTrue( $validate( PHP_INT_MAX - 1 ), 'Ruling S92: no magnitude ceiling on ACCEPT -- overflow safety lives on the HONOUR side alone' );
 	}
 
 	/** The other named value, the same ruling: PHP_INT_MAX itself. */
-	public function test_door_observation_seen_at_php_int_max_is_refused_with_400(): void {
+	public function test_door_observation_seen_at_php_int_max_is_accepted_and_not_honoured(): void {
+		$req_probe = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$endpoint  = sa_route_endpoint( $req_probe );
+		$validate  = $endpoint['args']['door_observation_seen']['validate_callback'];
+
+		$this->assertTrue( $validate( PHP_INT_MAX ), 'Ruling S92: PHP_INT_MAX itself is a well-formed, non-negative int -- accepted' );
+
+		// Reached through the direct handler call (no site token needed):
+		// well above the honour threshold, so accepted but not bumped.
 		$this->fragment();
-		$epoch   = Aura_Worker_Door_Log::epoch();
-		$current = Aura_Worker_Door_Log::door_version_raw();
+		$epoch  = Aura_Worker_Door_Log::epoch();
+		$before = Aura_Worker_Door_Log::door_version_raw();
 
 		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
 		$req->set_param( 'door_epoch', $epoch );
 		$req->set_param( 'door_observation_seen', PHP_INT_MAX );
-		$resp = sa_dispatch_route( $req );
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
 
-		$this->assertSame( 400, $resp->get_status() );
-		$this->assertSame( 'aura_invalid_param', $resp->get_data()['code'] );
-		$this->assertSame( $current, Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertSame( $before, $door['observation'], 'accepted but not honoured -- no bump, no error' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/**
+	 * Ruling S92's own named regression case: a value ABOVE the class
+	 * ceiling -- `MAX_OBSERVATION_SEEN + 5`, comfortably realistic once
+	 * the site's own witness has crossed the constant (see
+	 * `MAX_OBSERVATION_SEEN`'s own docblock) -- is accepted (200) and
+	 * silently not honoured, never a 400. This is exactly the value the
+	 * PRE-ruling (S90) validator refused forever once `observation`
+	 * first crossed the constant.
+	 */
+	public function test_door_observation_seen_above_the_class_ceiling_is_accepted_not_refused(): void {
+		$max = Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN;
+
+		$req_probe = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$endpoint  = sa_route_endpoint( $req_probe );
+		$validate  = $endpoint['args']['door_observation_seen']['validate_callback'];
+		$this->assertTrue( $validate( $max + 5 ), 'Ruling S92: no magnitude ceiling on ACCEPT, however far past the class constant' );
+
+		$this->fragment();
+		$epoch  = Aura_Worker_Door_Log::epoch();
+		$before = Aura_Worker_Door_Log::door_version_raw();
+
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', $max + 5 );
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
+
+		$this->assertSame( $before, $door['observation'], 'above the honour threshold -- accepted, not honoured, no bump' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/**
+	 * Ruling S92's own shape check: ACCEPT has NO magnitude ceiling, but
+	 * it is still a SHAPE check -- negative, non-integer (a float, or a
+	 * numeric string PHP itself would only parse as a float), and a
+	 * magnitude beyond PHP_INT_MAX (never castable to a native PHP int
+	 * without undefined behaviour) are each refused with 400, exactly as
+	 * before this ruling.
+	 */
+	public function test_door_observation_seen_rejects_negative_float_and_non_numeric_and_overflowing_values(): void {
+		$req_probe = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$endpoint  = sa_route_endpoint( $req_probe );
+		$validate  = $endpoint['args']['door_observation_seen']['validate_callback'];
+
+		foreach ( array( -1, -100, 12.5, '12abc', PHP_INT_MAX . '000' ) as $bad ) {
+			$result = $validate( $bad );
+			$this->assertInstanceOf( 'WP_Error', $result, 'rejected: ' . var_export( $bad, true ) );
+			$this->assertSame( 'aura_invalid_param', $result->get_error_code() );
+			$this->assertSame( 400, $result->get_error_data()['status'] );
+		}
+
+		// null (the param simply absent) is the one exception -- a no-op.
+		$this->assertTrue( $validate( null ) );
 	}
 
 	/**
@@ -2691,6 +2756,44 @@ final class DoorReconcilerTest extends TestCase {
 		$door3 = (array) $this->api->get_status( $req3 )->get_data()['door'];
 		$this->assertSame( $served, $door3['observation'], 'a no-op -- MAX-2 is no longer greater than the now-served observation' );
 		$this->assertSame( $served, Aura_Worker_Door_Log::door_version_raw() );
+	}
+
+	/**
+	 * Ruling S92 (Codex round-40 P1 on #88), the coordinator's own named
+	 * round trip and the exact scenario that motivated removing ACCEPT's
+	 * magnitude ceiling: honouring `seen = MAX - 2` costs TWO increments
+	 * on the SAME commit (`restamp_observation_forward()`'s own `+1`,
+	 * then `versioned()`'s generic bump) and lands the served
+	 * `observation` at EXACTLY `MAX_OBSERVATION_SEEN` -- see
+	 * `MAX_OBSERVATION_SEEN`'s own docblock for why that arithmetic is
+	 * exact, not merely bounded. Aura's NEXT poll echoes back exactly
+	 * what `/status` just told it (`MAX`) -- accepted (200, never a 400)
+	 * and, since `MAX` is above the honour threshold, a no-op: the
+	 * served value is unchanged and nothing bumps.
+	 */
+	public function test_the_max_minus_two_round_trip_serves_exactly_max_then_echoing_max_is_a_no_op(): void {
+		$this->fragment();
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$max   = Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN;
+
+		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', $max - 2 );
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
+		$this->assertSame( $max, $door['observation'], 'Ruling S92: honouring MAX-2 lands EXACTLY on the class ceiling -- two increments, no more, no less' );
+		$this->assertSame( $max, Aura_Worker_Door_Log::door_version_raw() );
+
+		// Aura echoes MAX straight back -- accepted, not honoured, no
+		// bump. This is the exact value the PRE-ruling (S90) validator
+		// would ALSO have accepted (MAX is not > MAX) -- the regression
+		// this ruling actually fixes is the NEXT ordinary bump past MAX,
+		// covered by the dedicated "above the class ceiling" test above.
+		$req2 = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req2->set_param( 'door_epoch', $epoch );
+		$req2->set_param( 'door_observation_seen', $max );
+		$door2 = (array) $this->api->get_status( $req2 )->get_data()['door'];
+		$this->assertSame( $max, $door2['observation'], 'echoing MAX back is a no-op' );
+		$this->assertSame( $max, Aura_Worker_Door_Log::door_version_raw() );
 	}
 
 	/* ------------------------------------------------------------------ */

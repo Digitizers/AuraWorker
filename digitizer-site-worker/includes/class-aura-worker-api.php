@@ -125,23 +125,45 @@ class Aura_Worker_API {
 				// `rest_invalid_param`) names the actual reason plainly.
 				//
 				// Ruling S88 (Codex round-38 P2 on #88), SUPERSEDED by
-				// Ruling S90 (Codex round-39 P2 on #88): S88 shrank what
-				// this check ACCEPTS to `MAX_OBSERVATION_SEEN - 2`, which
-				// broke a DIFFERENT invariant — a site can legitimately
-				// need to name its own PRESENT ceiling
-				// (`MAX_OBSERVATION_SEEN` itself) back to Aura, and that
-				// value was then refused outright, never even reaching
-				// the handler. ACCEPTING and HONOURING are different
-				// questions (see Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN's
-				// own docblock for the full two-threshold design): this
-				// check accepts every `seen <= MAX_OBSERVATION_SEEN` —
-				// THE INVARIANT — and
-				// Aura_Worker_Door_Log::restamp_observation_forward()'s
-				// own, TIGHTER threshold (`seen <= MAX_OBSERVATION_SEEN - 2`)
-				// is what actually decides whether a value is HONOURED
-				// (bumped) or silently ignored with a plain `200` —
-				// never a `400` for a value this check itself calls
-				// well-formed.
+				// Ruling S90 (Codex round-39 P2 on #88), SUPERSEDED AGAIN
+				// by Ruling S92 (Codex round-40 P1 on #88) — the fourth
+				// time this one constant has ping-ponged between too
+				// tight and too loose. S88 shrank ACCEPT to
+				// `MAX_OBSERVATION_SEEN - 2`; S90 restored it to
+				// `<= MAX_OBSERVATION_SEEN`, reasoning "no legitimate
+				// value the site could ever serve is refused" — but that
+				// was still a ceiling, and `observation` is NOT bounded
+				// by the class constant in practice: honouring a rewind
+				// at `MAX - 2` restamps to `MAX - 1`, and the SAME commit's
+				// own generic version bump (every `versioned()` write
+				// advances the door version once more, on top of
+				// whatever `$writes()` itself did) carries that straight
+				// to `MAX` — a value this site can now legitimately
+				// report. Any LATER, perfectly ordinary mutation bumps it
+				// ONE more time, to `MAX + 1`, and S90's own ceiling then
+				// refused that value FOR EVER: `observation` only ever
+				// increases, so once the site's own witness has crossed
+				// the constant, EVERY later echo of it back — which is
+				// exactly what Aura does every poll — was a 400,
+				// permanently.
+				//
+				// Ruling S92's mechanism: ACCEPT and HONOUR are not just
+				// different THRESHOLDS (S90's own framing) — they are
+				// different QUESTIONS, and only one of them has anything
+				// to do with `MAX_OBSERVATION_SEEN`. ACCEPT must be a
+				// superset of every value the site's OWN witness can ever
+				// reach, and that witness is UNBOUNDED (it only counts
+				// up) — so this check has NO magnitude ceiling of its
+				// own at all; it verifies SHAPE only: a non-negative
+				// integer representable as a native PHP int. Overflow
+				// safety lives ENTIRELY on the HONOUR side —
+				// `Aura_Worker_Door_Log::restamp_observation_forward()`'s
+				// own `seen <= MAX_OBSERVATION_SEEN - 2` guard, unchanged
+				// by this ruling — because that is the ONLY place a
+				// value from here ever feeds an arithmetic `+ 1`; an
+				// accepted-but-not-honoured value is echoed and dropped,
+				// never computed with, so it cannot overflow anything
+				// however large it is.
 				'door_observation_seen' => array(
 					'required'          => false,
 					'type'              => 'integer',
@@ -149,15 +171,23 @@ class Aura_Worker_API {
 						if ( null === $value ) {
 							return true;
 						}
-						if ( ! is_numeric( $value ) || (int) $value != $value || (int) $value < 0 ) { // phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
+						// Ruling S92: magnitude checked BEFORE any cast
+						// to (int) — casting a float outside the
+						// platform int range is undefined behaviour in
+						// PHP, so a value too large to BE a PHP int
+						// (arriving as a float, or as a numeric string
+						// PHP itself would only ever parse as a float)
+						// is refused by comparing it, as a float, to
+						// PHP_INT_MAX first.
+						if ( ! is_numeric( $value ) || (float) $value < 0 || (float) $value > PHP_INT_MAX ) {
 							return new WP_Error( 'aura_invalid_param', 'door_observation_seen must be a non-negative integer.', array( 'status' => 400 ) );
 						}
-						if ( (int) $value > Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN ) {
-							return new WP_Error( 'aura_invalid_param', 'door_observation_seen exceeds the maximum accepted value.', array( 'status' => 400 ) );
+						if ( (int) $value != $value ) { // phpcs:ignore Universal.Operators.StrictComparisons.LooseEqual
+							return new WP_Error( 'aura_invalid_param', 'door_observation_seen must be a non-negative integer.', array( 'status' => 400 ) );
 						}
 						return true;
 					},
-					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — a non-negative integer, ACCEPTED up to Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN itself (no legitimate value the site could ever serve is refused). When it EXCEEDS this site's current door version under that SAME epoch AND is at or below Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2 (the SEPARATE, tighter threshold restamp_observation_forward() actually HONOURS), the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored — 200, never a bump, never an error — when it is not greater than the current version, when `door_epoch` does not name this site's CURRENT epoch, or when it is accepted but above the honour threshold. A value above the class ceiling itself is refused outright with a 400 `aura_invalid_param`.", 'digitizer-site-worker' ),
+					'description'       => __( "Aura's own last-accepted `observation` for the door epoch named by `door_epoch` — accepted whenever it is a non-negative integer representable as a native PHP int, with NO magnitude ceiling of its own (Ruling S92): the site's own witness only ever counts up, so any value it could legitimately echo back must be acceptable, however large. When it EXCEEDS this site's current door version under that SAME epoch AND is at or below Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2 (the SEPARATE, tighter threshold restamp_observation_forward() actually HONOURS — the only place overflow safety is enforced), the site treats it as a rewind of the witness itself (a whole-DB restore that left content unchanged but rewound the version alongside it) and forces its own version strictly past it before serving. Silently ignored — 200, never a bump, never an error — when it is not greater than the current version, when `door_epoch` does not name this site's CURRENT epoch, or when it is accepted but above the honour threshold. Refused outright with a 400 `aura_invalid_param` only for a negative value, a non-integer (a float, or a non-canonical numeric string), or a magnitude beyond PHP_INT_MAX.", 'digitizer-site-worker' ),
 				),
 			),
 		) );
