@@ -172,29 +172,48 @@ class Aura_Worker_Door_Log {
 	 * `door_observation_seen` Aura could ever legitimately send is
 	 * refused by it.
 	 *
-	 * THIS CONSTANT NAMES THE FLOOR OF THE CHECK, NEVER THE CEILING OF
-	 * THE INPUT (Ruling S88, Codex round-38 P2 on #88). One
-	 * `door_observation_seen` request costs TWO increments past
-	 * whatever `$seen` it names — `restamp_observation_forward()`'s own
-	 * `GREATEST( …, $seen + 1, … )` (+1), THEN `versioned()`'s own
-	 * generic version bump on the SAME mutating unit, which runs
-	 * UNCONDITIONALLY after ANY unit that reports `mutated: true`
-	 * (`GREATEST( current + 1, clock )`, and `current` is now what the
-	 * restamp just wrote — a SECOND +1). The `/status` route's own REST
-	 * arg `validate_callback` — the place this arithmetic must be
-	 * documented beside, per this ruling, since it is the ONE caller
-	 * this constant gates — therefore refuses at `MAX_OBSERVATION_SEEN
-	 * - 1`, not at `MAX_OBSERVATION_SEEN` itself: accepting the
-	 * legal-looking `MAX_OBSERVATION_SEEN - 1` let the SAME two
-	 * increments carry the SERVED observation to
-	 * `MAX_OBSERVATION_SEEN + 1` — a value the validator would then
-	 * refuse FOREVER, since `MAX_OBSERVATION_SEEN` is that check's own
-	 * ceiling. Reserving the top TWO integers — the validator accepts
-	 * only `seen <= MAX_OBSERVATION_SEEN - 2` — leaves exactly enough
-	 * headroom that the largest legal input (`MAX_OBSERVATION_SEEN - 2`)
-	 * can absorb BOTH increments (restamp: `MAX_OBSERVATION_SEEN - 1`;
-	 * the bump: `MAX_OBSERVATION_SEEN`) without the served value ever
-	 * exceeding this constant itself.
+	 * TWO THRESHOLDS, NOT ONE (Ruling S90, Codex round-39 P2 on #88,
+	 * SUPERSEDING Ruling S88's own single-ceiling answer). S88 reasoned
+	 * that a legal `door_observation_seen` must never come back out as a
+	 * SERVED value the validator itself would then refuse — true, but
+	 * it tried to hold that invariant by SHRINKING what the validator
+	 * ACCEPTS, and "accepting" is the wrong half of the mechanism to
+	 * shrink: this constant's OWN purpose (this docblock's first half)
+	 * is that NO legitimate `door_observation_seen` is EVER refused —
+	 * accepting less than `MAX_OBSERVATION_SEEN` itself broke that for
+	 * the honest reason the site could ever legitimately need to name
+	 * ITS OWN present ceiling back to Aura.
+	 *
+	 * ACCEPTING and HONOURING are two DIFFERENT questions, so this
+	 * constant now gates two DIFFERENT checks at two DIFFERENT
+	 * thresholds:
+	 *  - ACCEPT (the `/status` route's own REST arg `validate_callback`):
+	 *    every `seen <= MAX_OBSERVATION_SEEN` is a well-formed value —
+	 *    THE INVARIANT this ruling names: every observation the site
+	 *    could ever legitimately SERVE is accepted back, with no
+	 *    exception, ever.
+	 *  - HONOUR (`restamp_observation_forward()`'s own check): only
+	 *    `seen <= MAX_OBSERVATION_SEEN - 2` is actually ACTED on. One
+	 *    honoured request costs TWO increments past whatever `$seen` it
+	 *    names — this method's own `GREATEST( …, $seen + 1, … )` (+1),
+	 *    THEN `versioned()`'s own generic version bump on the SAME
+	 *    mutating unit, which runs UNCONDITIONALLY after any unit
+	 *    reporting `mutated: true` (`GREATEST( current + 1, clock )`,
+	 *    and `current` is now what the restamp just wrote — a SECOND
+	 *    +1) — so the largest value this method ever HONOURS
+	 *    (`MAX_OBSERVATION_SEEN - 2`) is exactly what the two increments
+	 *    can absorb (restamp: `MAX_OBSERVATION_SEEN - 1`; the bump:
+	 *    `MAX_OBSERVATION_SEEN`) without the served observation ever
+	 *    exceeding this constant.
+	 *  - A value ACCEPTED but not HONOURED — anywhere in
+	 *    `(MAX_OBSERVATION_SEEN - 2, MAX_OBSERVATION_SEEN]` — answers
+	 *    `200` and is silently IGNORED: no bump, no error, exactly like
+	 *    an ordinary `seen` that is not strictly greater than the
+	 *    current observation already is (Ruling S82). It is not a
+	 *    REALISTIC value (see this docblock's own clock-vs-cap
+	 *    comparison above) — this range exists only so the validator's
+	 *    OWN invariant holds at the theoretical edge, never because
+	 *    honouring it would do anything useful.
 	 */
 	const MAX_OBSERVATION_SEEN = 4611686018427387904; // 2^62
 
@@ -2575,38 +2594,48 @@ class Aura_Worker_Door_Log {
 	 * which callers already invoke from INSIDE their own open
 	 * transaction and therefore cannot re-wrap.
 	 *
-	 * REFUSES AT OR ABOVE `MAX_OBSERVATION_SEEN` (Ruling S83, Codex
-	 * round-34 P1 on #88), belt-and-braces: the `/status` route's own
-	 * `door_observation_seen` REST arg `validate_callback` already
-	 * refuses anything above that cap with a `400` before this method is
-	 * ever reached in production — but this is a PUBLIC method, and the
-	 * cap is checked HERE too, before `$seen + 1` is ever computed, so no
-	 * caller (present or future) can reach the unchecked arithmetic that
-	 * let `$seen + 1` overflow a 64-bit int into a float and float
-	 * straight through this query's `%d` placeholders uncontrolled.
-	 * Refuses PLAINLY — no write attempted, no `versioned()` unit even
-	 * opened — with the exact same `{ committed: false }` shape a caller
-	 * already treats identically to "nothing happened" on any other
-	 * refusal path.
+	 * HONOURS ONLY `seen <= MAX_OBSERVATION_SEEN - 2` (Ruling S90, Codex
+	 * round-39 P2 on #88, SUPERSEDING Ruling S83's own single-ceiling
+	 * belt-and-braces answer — see `MAX_OBSERVATION_SEEN`'s own docblock
+	 * for the two-threshold design this method is the HONOUR half of).
+	 * ACCEPTING and HONOURING are different questions: the `/status`
+	 * route's own REST arg `validate_callback` accepts every `seen <=
+	 * MAX_OBSERVATION_SEEN` (the invariant — no legitimate value the
+	 * site could ever serve is refused), but a value above THIS
+	 * method's own, tighter threshold is refused HERE instead — silently,
+	 * `{ committed: false }`, never an error, exactly like an ordinary
+	 * `seen` that is not strictly greater than the current observation
+	 * already is (`Aura_Worker_Elementor_Door::maybe_restamp_observation_forward()`'s
+	 * own "steady state" rejection, Ruling S82). This is a PUBLIC
+	 * method, and the threshold is checked HERE, before `$seen + 1` is
+	 * ever computed, so no caller (present or future, REST-validated or
+	 * not) can reach the unchecked arithmetic that let `$seen + 1`
+	 * overflow a 64-bit int into a float and float straight through this
+	 * query's `%d` placeholders uncontrolled (Ruling S83's own original
+	 * finding).
 	 *
 	 * @param int $seen A non-negative observation AURA has already
 	 *                   accepted for the door epoch this call concerns —
-	 *                   validated non-negative (and, since Ruling S83,
-	 *                   capped) by the caller (the REST arg's own
-	 *                   `validate_callback`); clamped to zero here
-	 *                   regardless, defensively.
+	 *                   validated non-negative by the caller (the REST
+	 *                   arg's own `validate_callback`, which accepts up
+	 *                   to `MAX_OBSERVATION_SEEN` itself — a value above
+	 *                   THIS method's own tighter honour threshold is
+	 *                   accepted at the door but silently not honoured
+	 *                   here); clamped to zero here regardless,
+	 *                   defensively.
 	 * @return array{ committed: bool|null } versioned()'s own outcome
 	 *              shape — the caller (`Aura_Worker_Elementor_Door`'s own
 	 *              `maybe_restamp_observation_forward()`) does not act
-	 *              differently on any of the three outcomes: an
-	 *              ambiguous, refused or failed restamp simply means the
-	 *              version this poll serves may still be stale, exactly
-	 *              as if this call had never been made — the NEXT poll
-	 *              carrying the same `$observation_seen` tries again.
+	 *              differently on any of the outcomes: an ambiguous,
+	 *              refused (not honoured) or failed restamp simply means
+	 *              the version this poll serves may still be stale,
+	 *              exactly as if this call had never been made — the
+	 *              NEXT poll carrying the same `$observation_seen` tries
+	 *              again.
 	 */
 	public static function restamp_observation_forward( $seen ) {
 		$seen = max( 0, (int) $seen );
-		if ( $seen >= self::MAX_OBSERVATION_SEEN ) {
+		if ( $seen > self::MAX_OBSERVATION_SEEN - 2 ) {
 			return array( 'committed' => false );
 		}
 		return self::versioned(

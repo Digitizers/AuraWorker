@@ -999,25 +999,37 @@ final class DoorLogTest extends TestCase {
 	 * Ruling S83 (Codex round-34 P1 on #88): a `door_observation_seen` at
 	 * or above `MAX_OBSERVATION_SEEN` made `$seen + 1` overflow a 64-bit
 	 * int into a FLOAT, which then floated straight through this query's
-	 * `%d` placeholders uncontrolled -- the `/status` route's own REST
-	 * arg validator refuses this before the handler is ever reached, but
-	 * this PUBLIC method refuses it too, belt-and-braces, for any caller
-	 * that reaches it directly.
+	 * `%d` placeholders uncontrolled -- this PUBLIC method refuses it,
+	 * belt-and-braces, for any caller that reaches it directly.
+	 *
+	 * Ruling S90 (Codex round-39 P2 on #88) TIGHTENS the threshold this
+	 * method itself honours at, from "anything below `MAX_OBSERVATION_SEEN`
+	 * itself" to "anything at or below `MAX_OBSERVATION_SEEN - 2`" --
+	 * see `MAX_OBSERVATION_SEEN`'s own docblock for the two-threshold
+	 * design (ACCEPT at the REST layer vs HONOUR here) this method is
+	 * the HONOUR half of. `MAX_OBSERVATION_SEEN - 1` -- ACCEPTED by the
+	 * REST arg validator, since it is `<= MAX_OBSERVATION_SEEN` -- is
+	 * now ALSO refused here, silently, the SAME `{ committed: false }`
+	 * shape as the cap itself.
 	 */
-	public function test_restamp_observation_forward_refuses_at_or_above_the_cap(): void {
+	public function test_restamp_observation_forward_honours_only_up_to_the_cap_minus_two(): void {
 		$before = Aura_Worker_Door_Log::bump_door_version();
 
-		$at_cap   = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN );
-		$php_max  = Aura_Worker_Door_Log::restamp_observation_forward( PHP_INT_MAX );
+		$at_cap    = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN );
+		$php_max   = Aura_Worker_Door_Log::restamp_observation_forward( PHP_INT_MAX );
+		$one_below = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 1 );
 
 		$this->assertFalse( $at_cap['committed'], 'refused plainly at the cap itself -- never merely "large"' );
 		$this->assertFalse( $php_max['committed'], 'PHP_INT_MAX refused outright -- never an overflowing $seen + 1' );
-		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'no write attempted -- the version this site holds is completely untouched' );
+		$this->assertFalse( $one_below['committed'], 'Ruling S90: MAX - 1 is ACCEPTED by the REST validator but NOT honoured here -- the tighter threshold this method itself enforces' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw(), 'no write attempted for any of the three -- the version this site holds is completely untouched' );
 
-		// One below the cap is honoured exactly as this method always has.
-		$under_cap = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 1 );
-		$this->assertTrue( $under_cap['committed'] );
-		$this->assertGreaterThan( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 1, Aura_Worker_Door_Log::door_version_raw() );
+		// Two below the cap IS honoured -- the largest value this method
+		// ever acts on.
+		$two_below = Aura_Worker_Door_Log::restamp_observation_forward( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2 );
+		$this->assertTrue( $two_below['committed'] );
+		$this->assertGreaterThan( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN - 2, Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertLessThanOrEqual( Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN, Aura_Worker_Door_Log::door_version_raw(), 'Ruling S90: the served value never exceeds the class ceiling itself' );
 	}
 
 	/**

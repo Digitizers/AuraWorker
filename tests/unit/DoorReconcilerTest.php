@@ -2615,73 +2615,82 @@ final class DoorReconcilerTest extends TestCase {
 	}
 
 	/**
-	 * Ruling S88 (Codex round-38 P2 on #88): S83's own ceiling left NO
-	 * headroom for what honouring a legal value actually costs -- a
-	 * "legal" `door_observation_seen = MAX_OBSERVATION_SEEN - 1` came
-	 * back out the OTHER end as a SERVED observation of
-	 * `MAX_OBSERVATION_SEEN + 1` (restamp_observation_forward()'s own
-	 * `$seen + 1`, THEN versioned()'s own generic version bump on the
-	 * SAME mutating unit -- a SECOND, unconditional increment), which
-	 * this SAME validator then refused FOREVER. The validator now
-	 * refuses at `MAX_OBSERVATION_SEEN - 1` (reserving the top TWO
-	 * integers, not one), so the LARGEST legal input
-	 * (`MAX_OBSERVATION_SEEN - 2`) can absorb both increments without
-	 * the served observation ever exceeding `MAX_OBSERVATION_SEEN`
-	 * itself -- the invariant this ruling names: no value this site
-	 * could ever be made to serve exceeds what this class's own ceiling
-	 * permits.
+	 * Ruling S88 (Codex round-38 P2 on #88), SUPERSEDED by Ruling S90
+	 * (Codex round-39 P2 on #88): S88 tried to hold "no legal value ever
+	 * serves an unrecoverable observation" by SHRINKING what the
+	 * validator ACCEPTS to `MAX_OBSERVATION_SEEN - 2` -- which broke a
+	 * DIFFERENT invariant instead: a site can legitimately need to
+	 * name its own PRESENT ceiling (`MAX_OBSERVATION_SEEN` itself) back
+	 * to Aura, and THAT value was then refused outright, a 400 for a
+	 * perfectly well-formed integer.
+	 *
+	 * ACCEPTING and HONOURING are different questions (see
+	 * `Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN`'s own docblock for
+	 * the full two-threshold design). The validator now accepts every
+	 * `seen <= MAX_OBSERVATION_SEEN` -- THE INVARIANT: no legitimate
+	 * value the site could ever serve is refused -- while
+	 * `restamp_observation_forward()`'s own, TIGHTER threshold
+	 * (`seen <= MAX_OBSERVATION_SEEN - 2`) decides whether it is
+	 * actually HONOURED (bumped). A value accepted but not honoured
+	 * answers 200 and changes nothing.
 	 *
 	 * Pinned at the boundary, per the ruling's own test recipe:
-	 *   seen = MAX-2 -> accepted, served <= MAX;
-	 *   the SAME seen = MAX-2 sent again on a LATER request is STILL
-	 *     accepted (the validator's ceiling is a fixed check on the
-	 *     INPUT alone, never affected by what the site has since
-	 *     served -- "the next request with that value is accepted");
-	 *   seen = MAX-1 -> 400, never honoured.
+	 *   seen = MAX-2 -> HONOURED: served > MAX-2, served <= MAX;
+	 *   seen = MAX -> ACCEPTED (200), NOT honoured: no bump, no error;
+	 *   the SAME seen = MAX-2 echoed back on a LATER request is STILL
+	 *     accepted (200) -- a no-op once it is no longer strictly
+	 *     greater than the now-served observation.
 	 */
-	public function test_door_observation_seen_round_trip_is_pinned_at_the_boundary(): void {
+	public function test_door_observation_seen_accept_and_honour_are_pinned_at_separate_boundaries(): void {
 		$this->fragment(); // establishes a real baseline
 		$epoch = Aura_Worker_Door_Log::epoch();
 		$max   = Aura_Worker_Door_Log::MAX_OBSERVATION_SEEN;
 
-		// seen = MAX-2: accepted, served <= MAX. Direct handler call
-		// (matching this file's own established S82/S83 pattern) -- arg
-		// validation is what this test cares about proving here, and
-		// the LAST assertion below reaches it through the real
-		// registered route instead, where validation genuinely runs
-		// before any handler.
-		$req = new WP_REST_Request( 'GET', '/aura/v1/status' );
-		$req->set_param( 'door_epoch', $epoch );
-		$req->set_param( 'door_observation_seen', $max - 2 );
-		$door = (array) $this->api->get_status( $req )->get_data()['door'];
-		$this->assertIsInt( $door['observation'] );
-		$this->assertGreaterThan( $max - 2, $door['observation'] );
-		$this->assertLessThanOrEqual( $max, $door['observation'], 'Ruling S88: never above the class ceiling itself, even at the boundary' );
-		$served = Aura_Worker_Door_Log::door_version_raw();
-		$this->assertLessThanOrEqual( $max, $served );
+		// seen = MAX: ACCEPTED by the REST arg's own validate_callback
+		// (never a 400 -- it is <= the class ceiling, THE invariant) --
+		// fetched from the REAL registered route (never a copy) so this
+		// proves the actual validator, without needing full REST
+		// dispatch/auth just to reach a 200.
+		$req_probe = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$endpoint  = sa_route_endpoint( $req_probe );
+		$validate  = $endpoint['args']['door_observation_seen']['validate_callback'];
+		$this->assertTrue( $validate( $max ), 'Ruling S90: MAX itself is a well-formed value -- never refused at the door' );
 
-		// The SAME seen = MAX-2, sent again: still accepted (a fixed
-		// input-side check, unaffected by the site's now-higher
-		// observation) -- silently a no-op at the application layer
-		// (Ruling S82: not strictly greater than current), but never a
-		// 400 at the door.
+		// And, reached through the handler, ACCEPTED but NOT honoured --
+		// it exceeds restamp_observation_forward()'s own, tighter
+		// threshold, so nothing bumps.
+		$before = Aura_Worker_Door_Log::door_version_raw();
+		$req    = new WP_REST_Request( 'GET', '/aura/v1/status' );
+		$req->set_param( 'door_epoch', $epoch );
+		$req->set_param( 'door_observation_seen', $max );
+		$door = (array) $this->api->get_status( $req )->get_data()['door'];
+		$this->assertSame( $before, $door['observation'], 'accepted but not honoured -- no bump' );
+		$this->assertSame( $before, Aura_Worker_Door_Log::door_version_raw() );
+
+		// seen = MAX-2: HONOURED. Direct handler call (matching this
+		// file's own established S82/S83 pattern) for the served-value
+		// assertions; the "seen = MAX" case above already proved
+		// acceptance through the REAL registered route.
 		$req2 = new WP_REST_Request( 'GET', '/aura/v1/status' );
 		$req2->set_param( 'door_epoch', $epoch );
 		$req2->set_param( 'door_observation_seen', $max - 2 );
 		$door2 = (array) $this->api->get_status( $req2 )->get_data()['door'];
-		$this->assertSame( $served, $door2['observation'], 'a no-op -- MAX-2 is no longer greater than the now-served observation' );
-		$this->assertSame( $served, Aura_Worker_Door_Log::door_version_raw() );
+		$this->assertIsInt( $door2['observation'] );
+		$this->assertGreaterThan( $max - 2, $door2['observation'] );
+		$this->assertLessThanOrEqual( $max, $door2['observation'], 'Ruling S90: never above the class ceiling itself, even at the honour boundary' );
+		$served = Aura_Worker_Door_Log::door_version_raw();
+		$this->assertLessThanOrEqual( $max, $served );
 
-		// seen = MAX-1: refused outright, 400, never honoured -- through
-		// the REAL registered route, since arg validation runs BEFORE
-		// the permission callback (no auth needed to prove this).
+		// The SAME seen = MAX-2, echoed back on a LATER request: still
+		// accepted (200) -- a no-op at the application layer (Ruling
+		// S82: not strictly greater than the now-served observation),
+		// never a 400.
 		$req3 = new WP_REST_Request( 'GET', '/aura/v1/status' );
 		$req3->set_param( 'door_epoch', $epoch );
-		$req3->set_param( 'door_observation_seen', $max - 1 );
-		$resp3 = sa_dispatch_route( $req3 );
-		$this->assertSame( 400, $resp3->get_status() );
-		$this->assertSame( 'aura_invalid_param', $resp3->get_data()['code'] );
-		$this->assertSame( $served, Aura_Worker_Door_Log::door_version_raw(), 'refused before the handler -- completely untouched' );
+		$req3->set_param( 'door_observation_seen', $max - 2 );
+		$door3 = (array) $this->api->get_status( $req3 )->get_data()['door'];
+		$this->assertSame( $served, $door3['observation'], 'a no-op -- MAX-2 is no longer greater than the now-served observation' );
+		$this->assertSame( $served, Aura_Worker_Door_Log::door_version_raw() );
 	}
 
 	/* ------------------------------------------------------------------ */
