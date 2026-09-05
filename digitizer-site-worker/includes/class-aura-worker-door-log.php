@@ -1790,15 +1790,29 @@ class Aura_Worker_Door_Log {
 		return self::$closure_read_unreadable;
 	}
 
-	/** One owner: the INSERT. */
+	/**
+	 * One owner: the INSERT.
+	 *
+	 * AN UNPROVEN CONFIRMING READ IS NOT "NOT CLOSED" — it is audited here,
+	 * not changed (Ruling S37 sweep, part 2, Codex round-17 on #88).
+	 * `insert_unique()` answers false to two different events — a genuine
+	 * write failure, or losing the race to a concurrent closer whose own
+	 * marker is already there — and this confirming read is what tells
+	 * them apart. When THAT read is itself unproven
+	 * (`raw_option_was_unreadable()`), this still answers `false`, exactly
+	 * as a genuinely-absent marker does: EVERY caller already treats
+	 * `false` as retryable (no `bump_refused()`, no `aura_log_full`, a
+	 * plain `aura_log_failed`/`aura_log_unreadable` 503 instead — see
+	 * their own call sites), never as a proven "still open" that would
+	 * license a write the log might already be closed to. The two cases
+	 * are NOT collapsed into a false definitive answer, only into the
+	 * same SAFE one: a closure nobody can prove either way is retried,
+	 * never assumed either way.
+	 */
 	public static function close() {
 		if ( self::insert_unique( self::FULL_MARKER, gmdate( 'c' ) ) ) {
 			return true;
 		}
-		// A LOST insert is a closure too — somebody else's marker is under that
-		// name — but a FAILED one is not (Ruling P82), and `insert_unique()`
-		// answers false to both. Ask the row: the marker is either there or it
-		// is not, and a closure nobody can prove is not one.
 		return null !== self::raw_option( self::FULL_MARKER );
 	}
 

@@ -99,6 +99,28 @@ final class DoorLogTest extends TestCase {
 	 * An unreadable one cast to 0 and deleted FULL_MARKER over a backlog that
 	 * was still full — the door open again with nothing having been acked.
 	 */
+	/**
+	 * Ruling S37 sweep, part 2 (Codex round-17 on #88): close() answers
+	 * `false` to two different events — a genuine write failure, and
+	 * losing the race to a concurrent closer whose own marker is already
+	 * there — and the confirming raw read is what would normally tell
+	 * them apart. When THAT read cannot be proven either, close() still
+	 * answers `false`: the SAME safe, retryable answer a genuinely absent
+	 * marker gets, never a wrongly-confirmed `true` manufactured from an
+	 * unprovable read, and never (the other direction) a claim that the
+	 * log is still open when it is, in fact, already closed.
+	 */
+	public function test_close_answers_false_when_it_cannot_confirm_a_lost_races_own_marker(): void {
+		$this->assertTrue( Aura_Worker_Door_Log::close(), 'this call wins the race for real' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::FULL_MARKER ] = true;
+		$out = Aura_Worker_Door_Log::close(); // loses the race — the marker is already there
+		$GLOBALS['_sa_option_read_fail'] = array();
+
+		$this->assertFalse( $out, 'the confirming read could not prove the lost race — never wrongly confirmed true' );
+		$this->assertTrue( Aura_Worker_Door_Log::is_closed(), 'the log really is closed regardless — this call just could not prove it itself' );
+	}
+
 	public function test_an_ack_with_an_unreadable_count_keeps_the_closure_marker(): void {
 		$epoch = Aura_Worker_Door_Log::epoch();
 		$seq   = Aura_Worker_Door_Log::open_pending( $this->entry() );

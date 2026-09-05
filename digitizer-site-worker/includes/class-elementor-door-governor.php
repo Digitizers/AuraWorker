@@ -496,8 +496,18 @@ class Aura_Worker_Elementor_Door {
 			// full_report_raw() for the 'log_full' field, and this must be
 			// read before anything else this attempt can call it again.
 			$full_report_unreadable = Aura_Worker_Door_Log::full_report_raw_was_unreadable();
+			// Ruling S37 sweep, part 2 (Codex round-17 on #88): `$rewind_info`
+			// is already in scope from detect_rewind() above — its own
+			// `top_unreadable` is TRUE whenever the verdict it computed
+			// (rewind detected or not) could not actually be established,
+			// whether because highest_row_seq() failed (Ruling P77, the
+			// original case) or because the epoch read did. Either way the
+			// SAME reasoning as the log walk and the floor applies: an
+			// input the fragment's own rewind/cursor decision depends on
+			// was unproven, so this poll must not vouch for it.
+			$rewind_unreadable = (bool) $rewind_info['top_unreadable'];
 			$after_version          = Aura_Worker_Door_Log::door_version_raw();
-			if ( $log_unreadable || $floor_unreadable || $full_report_unreadable ) {
+			if ( $log_unreadable || $floor_unreadable || $full_report_unreadable || $rewind_unreadable ) {
 				// Served immediately, never retried — the same shape as the
 				// `!$synced` branch just below: a retry re-runs the SAME
 				// walk against the SAME transient condition and, whether it
@@ -897,10 +907,28 @@ class Aura_Worker_Elementor_Door {
 		// `epoch`/`rewind` fields, so neither may read an epoch or a top
 		// this request cached before a DIFFERENT request rotated or purged.
 		Aura_Worker_Door_Log::epoch();
-		$site   = Aura_Worker_Door_Log::epoch_raw();
-		$rewind = null;
-		$top_unreadable = false;
-		if ( (string) $epoch !== $site ) {
+		$site            = Aura_Worker_Door_Log::epoch_raw();
+		$epoch_unreadable = Aura_Worker_Door_Log::raw_option_was_unreadable();
+		$rewind          = null;
+		$top_unreadable  = false;
+		if ( $epoch_unreadable ) {
+			// Ruling S37 sweep, part 2 (Codex round-17 on #88): an
+			// unreadable epoch used to collapse to '' — almost always a
+			// mismatch against Aura's own remembered $epoch — which reset
+			// `after` to 0 exactly as a genuine epoch change does. `after`
+			// is served UNCHANGED instead: this call cannot prove the
+			// epoch changed, so it must not act as if it did. `$site`
+			// still reports the same fallback '' the fragment's `epoch`
+			// field has no better source for (matching the fallback
+			// `build_status_fragment_state()`'s own `door` field already
+			// accepts when nothing persisted exists to fall back to,
+			// Ruling S39) — but `$top_unreadable` marks the whole verdict
+			// unproven, which is what makes status_fragment() withhold
+			// `observation` for this poll (it already checks
+			// raw_option_was_unreadable()-driven flags the same way for
+			// the floor, Ruling S38).
+			$top_unreadable = true;
+		} elseif ( (string) $epoch !== $site ) {
 			$after = 0;
 		} else {
 			$max            = Aura_Worker_Door_Log::highest_row_seq();

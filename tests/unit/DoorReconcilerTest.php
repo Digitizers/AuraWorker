@@ -1673,6 +1673,33 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertNull( $frag['observation'], 'withheld for this poll (Ruling S38)' );
 	}
 
+	/**
+	 * Ruling S37 sweep, part 2 (Codex round-17 on #88): an unreadable
+	 * epoch collapsed to '' in epoch_raw(), which detect_rewind() then
+	 * compared against Aura's own remembered epoch — almost always a
+	 * mismatch, resetting `after` to 0 exactly as a genuine epoch change
+	 * does. A perfectly healthy cursor then had the log walk re-serve
+	 * rows Aura had already acknowledged, and the epoch this call could
+	 * not prove was reported as a definite `''`.
+	 */
+	public function test_a_failing_epoch_read_never_resets_the_cursor_or_reports_a_fabricated_epoch(): void {
+		$epoch = Aura_Worker_Door_Log::epoch();
+		$one   = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
+		$two = $this->entry( array(), true, false );
+		Aura_Worker_Door_Log::settle( $two, array( 'result' => 'ok' ) );
+		$this->assertSame( array( $two ), array_column( $this->fragment( $one, $epoch )['log'], 'seq' ), 'the fixture assumption this test is built on — a healthy read never re-serves row 1' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Door_Log::EPOCH ] = true;
+
+		$frag = $this->fragment( $one, $epoch );
+
+		$GLOBALS['_sa_option_read_fail'] = array();
+		$this->assertNull( $frag['rewind'], 'never a fabricated rewind over an unreadable epoch' );
+		$this->assertNull( $frag['observation'], 'withheld for this poll' );
+		$this->assertSame( array( $two ), array_column( $frag['log'], 'seq' ), 'the cursor was served UNCHANGED — never reset to 0 over an epoch this call could not prove had changed' );
+	}
+
 	public function test_get_status_reads_the_cursor_and_the_epoch_from_the_request(): void {
 		$one = $this->entry( array(), true, false );
 		Aura_Worker_Door_Log::settle( $one, array( 'result' => 'ok' ) );
