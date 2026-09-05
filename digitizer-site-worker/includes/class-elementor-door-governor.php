@@ -418,8 +418,9 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return null;
 		}
-		$synced      = false;
-		$rewind_info = array( 'top_unreadable' => false );
+		$synced              = false;
+		$rewind_info         = array( 'top_unreadable' => false );
+		$computed_unreadable = false;
 		return self::version_bracketed(
 			static function () {
 				// Ruling S20 (Codex round-8 P1 on #88): a retry MUST
@@ -429,7 +430,7 @@ class Aura_Worker_Elementor_Door {
 				// closes.
 				self::reset_request_caches();
 			},
-			function () use ( $after, $epoch, &$synced, &$rewind_info ) {
+			function () use ( $after, $epoch, &$synced, &$rewind_info, &$computed_unreadable ) {
 				// Ruling S38 (Codex round-16 P1 on #88): reset
 				// UNCONDITIONALLY, on attempt 0 too — a floor-read failure
 				// belongs to the attempt that hit it, never carried in
@@ -506,10 +507,21 @@ class Aura_Worker_Elementor_Door {
 				// fence or an uncommitted write (Rulings S24/S26) there is
 				// nothing this call may credit itself with, and the
 				// fragment falls back to live computation below.
-				$computed = $synced ? self::persisted_computed_state() : null;
+				$computed           = $synced ? self::persisted_computed_state() : null;
+				// Ruling S48 (Codex round-19 P2 on #88): snapshotted the
+				// INSTANT after the read it describes — before
+				// build_status_fragment_state() runs, which may call
+				// persisted_computed_state() a SECOND time for its own,
+				// unrelated S39 stale-door fallback and overwrite
+				// Aura_Worker_Door_Log's shared flag with THAT read's
+				// outcome instead. `$synced` guards this the same way it
+				// guards $computed itself: sync_computed_state() failing
+				// outright is already `!$synced` below and never reaches
+				// this line.
+				$computed_unreadable = $synced && Aura_Worker_Door_Log::raw_option_was_unreadable();
 				return self::build_status_fragment_state( $rewind_info, $computed, $running_now, $interrupted_now );
 			},
-			function () use ( &$synced, &$rewind_info ) {
+			function () use ( &$synced, &$rewind_info, &$computed_unreadable ) {
 				// Ruling S24 (Codex round-10 P2 on #88): the
 				// computed-state transition ITSELF could not be committed
 				// — see sync_computed_state()'s own docblock for why a
@@ -551,7 +563,16 @@ class Aura_Worker_Elementor_Door {
 					// fields (build_status_fragment_state(), just above),
 					// already nulled out there when this is true — this is
 					// what makes `observation` follow them.
-					|| Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt();
+					|| Aura_Worker_Door_Holds::claimed_queue_was_unreadable_this_attempt()
+					// Ruling S48 (Codex round-19 P2 on #88): the computed
+					// tuple's own read-back could not be proven — see
+					// persisted_computed_state()'s own docblock. `$computed`
+					// is null either way (genuinely absent OR unreadable),
+					// so `build_status_fragment_state()` already fell back
+					// to live active/seam/door values for BOTH; this is
+					// what stops the unreadable half of that pair from
+					// also being served under a witness it never earned.
+					|| $computed_unreadable;
 			}
 		);
 	}
@@ -1012,11 +1033,27 @@ class Aura_Worker_Elementor_Door {
 	 * callers fall back to live computation in that case, since there is
 	 * nothing to read back yet.
 	 *
+	 * PROVEN, never `get_option()` (Ruling S48, Codex round-19 P2 on #88).
+	 * `get_option()` answers its own default for EITHER a genuinely absent
+	 * row or one it failed to read — indistinguishable, and this method's
+	 * callers could not tell "nothing to read back yet" (live computation
+	 * is fine, exactly as documented above) from "something IS persisted
+	 * here but this read could not prove it" (which must never be served
+	 * paired with a witness — the very race this method exists to close,
+	 * reopened one layer down). `Aura_Worker_Door_Log::raw_option_for()`
+	 * is the SAME proven read `epoch_raw()`/`binding_raw()` use; the
+	 * caller reads `Aura_Worker_Door_Log::raw_option_was_unreadable()`
+	 * IMMEDIATELY after this method returns to tell the two apart — this
+	 * method's own return value is unchanged either way (null), so every
+	 * existing caller that only wants "is there something to read back"
+	 * keeps working exactly as before.
+	 *
 	 * @return array{ active: bool, seam: string, door: string }|null
 	 */
 	private static function persisted_computed_state() {
 		wp_cache_delete( self::COMPUTED, 'options' );
-		$persisted = get_option( self::COMPUTED, null );
+		$raw       = Aura_Worker_Door_Log::raw_option_for( self::COMPUTED );
+		$persisted = null === $raw ? null : maybe_unserialize( $raw );
 		return is_array( $persisted ) ? $persisted : null;
 	}
 
@@ -4111,6 +4148,7 @@ class Aura_Worker_Elementor_Door {
 		if ( ! self::present() ) {
 			return array( 'active' => false );
 		}
+		$computed_unreadable = false;
 		// Ruling S43 (Codex round-18 P1 on #88): the SAME version-bracket
 		// discipline status_fragment() already has, through the SAME
 		// shared helper (version_bracketed()'s own docblock) — every
@@ -4133,7 +4171,7 @@ class Aura_Worker_Elementor_Door {
 				// goes through the identical held_rows() memo).
 				self::reset_request_caches();
 			},
-			static function () {
+			static function () use ( &$computed_unreadable ) {
 				// Ruling S28 (Codex round-12 P1 on #88): the PERSISTED
 				// tuple, never this request's own live computation — see
 				// persisted_computed_state()'s own docblock for the race
@@ -4143,6 +4181,15 @@ class Aura_Worker_Elementor_Door {
 				// poll has ever run) falls back to live computation
 				// below, since there is nothing to read back yet.
 				$computed = self::persisted_computed_state();
+				// Ruling S48 (Codex round-19 P2 on #88): snapshotted
+				// immediately — before the S39 fallback just below can
+				// call persisted_computed_state() again for its own,
+				// unrelated read and overwrite this outcome with that
+				// one's instead. This audit never calls
+				// sync_computed_state() (Ruling S27), so there is no
+				// `$synced` guard to fold in here the way status_fragment()
+				// has one.
+				$computed_unreadable = Aura_Worker_Door_Log::raw_option_was_unreadable();
 				$active   = null !== $computed ? (bool) ( $computed['active'] ?? false ) : self::active();
 				$seam     = null !== $computed ? (string) ( $computed['seam'] ?? self::$seam ) : self::$seam;
 				$door     = null !== $computed ? (string) ( $computed['door'] ?? self::door_state() ) : self::door_state();
@@ -4206,7 +4253,7 @@ class Aura_Worker_Elementor_Door {
 					'log_full'            => Aura_Worker_Door_Log::full_report_raw(),
 				);
 			},
-			static function () {
+			static function () use ( &$computed_unreadable ) {
 				// Ruling S43: the closure marker (feeds `door` above,
 				// through door_state()) and the closed-log report (Ruling
 				// S42) are the two raw reads this audit's OWN fields
@@ -4214,8 +4261,17 @@ class Aura_Worker_Elementor_Door {
 				// checks via build_status_fragment_state(). This audit
 				// never calls detect_rewind()/log_after(), so it has no
 				// floor, log-walk or rewind-top signal to join.
+				//
+				// Ruling S48 (Codex round-19 P2 on #88): the computed
+				// tuple's own read-back joins them — see
+				// persisted_computed_state()'s own docblock. `$computed`
+				// is null either way (absent or unreadable), so `$active`/
+				// `$seam`/`$door` already fell back to live values for
+				// BOTH; this is what stops the unreadable half of that
+				// pair from also being served under a witness.
 				return Aura_Worker_Door_Log::closure_read_was_unreadable()
-					|| Aura_Worker_Door_Log::full_report_raw_was_unreadable();
+					|| Aura_Worker_Door_Log::full_report_raw_was_unreadable()
+					|| $computed_unreadable;
 			}
 		);
 	}

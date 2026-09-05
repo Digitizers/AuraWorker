@@ -1735,4 +1735,56 @@ final class ElementorDoorGovernorTest extends TestCase {
 		$this->assertSame( $first['door'], $second['door'] );
 		$this->assertSame( $first['observation'], $second['observation'] );
 	}
+
+	/**
+	 * Ruling S48 (Codex round-19 P2 on #88): `persisted_computed_state()`
+	 * used to read the COMPUTED tuple back through plain `get_option()`,
+	 * which answers the same default for a genuinely absent row and one
+	 * it failed to read -- indistinguishable. A steady poll's
+	 * `sync_computed_state()` never even reaches a write (its own
+	 * `get_option()` read is a DIFFERENT, request-cache-backed call this
+	 * failure never touches), so `$synced` is true and the fragment tried
+	 * to read back a tuple that demonstrably EXISTS -- but this read
+	 * failed. The old code read that failure as "nothing persisted yet",
+	 * fell back to this request's own live active/seam/door (fine, they
+	 * happen to agree with what is actually persisted), and served them
+	 * paired with an `observation` this read never proved anything about
+	 * -- exactly the S28 race, one layer down. The fragment must still be
+	 * served; only `observation` is withheld.
+	 */
+	public function test_a_failed_computed_tuple_read_back_withholds_observation_but_still_serves_a_fragment(): void {
+		$this->registerAll();
+		$first = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $first['observation'], 'the fixture assumption this test is built on' );
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = true;
+		$second = Aura_Worker_Elementor_Door::status_fragment();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = 0;
+
+		$this->assertNull( $second['observation'], 'the read that would have proven this version could not itself be proven' );
+		$this->assertTrue( $second['active'], 'still served -- the same live-computation fallback a genuinely fresh site already gets' );
+		$this->assertSame( 'open', $second['door'] );
+
+		// The miss must not stick: the VERY NEXT poll, once the driver
+		// recovers, is witnessed again.
+		$third = Aura_Worker_Elementor_Door::status_fragment();
+		$this->assertIsInt( $third['observation'], 'a transient read failure is not cached against the next attempt' );
+	}
+
+	/**
+	 * Ruling S48, the SAME fix read from `governor_block()` -- which never
+	 * writes (Ruling S27) and so has no `$synced` guard of its own; the
+	 * read-back failure alone must withhold `observation` here too.
+	 */
+	public function test_governor_block_withholds_observation_on_a_failed_computed_tuple_read_back(): void {
+		$this->registerAll();
+		Aura_Worker_Elementor_Door::status_fragment(); // persist a real tuple first
+
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = true;
+		$block = Aura_Worker_Elementor_Door::governor_block();
+		$GLOBALS['_sa_option_read_fail'][ Aura_Worker_Elementor_Door::COMPUTED ] = 0;
+
+		$this->assertNull( $block['observation'], 'this audit never writes -- it can only fail to prove the read it just took' );
+		$this->assertTrue( $block['active'], 'still served via live computation' );
+	}
 }

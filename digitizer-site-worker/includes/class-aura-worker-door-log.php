@@ -1006,6 +1006,29 @@ class Aura_Worker_Door_Log {
 	}
 
 	/**
+	 * The SAME proven raw read `epoch_raw()`/`binding_raw()` use above,
+	 * exposed generically (Ruling S48, Codex round-19 P2 on #88) for a
+	 * caller OUTSIDE this class that owns its own option name and needs
+	 * the identical present/absent/unreadable tri-state —
+	 * `Aura_Worker_Elementor_Door::persisted_computed_state()`'s own
+	 * COMPUTED tuple, which used to read through plain `get_option()`
+	 * (indistinguishable "absent" vs "unreadable") and so could serve a
+	 * fragment's `active`/`seam`/`door` from this REQUEST's live
+	 * computation — the exact Ruling S28 race — paired with an
+	 * `observation` witness for a version this read never actually
+	 * proved anything about.
+	 *
+	 * @param string $name Option name.
+	 * @return string|null Raw serialised bytes; null for EITHER a
+	 *                      genuinely absent row or an unproven read — call
+	 *                      `raw_option_was_unreadable()` immediately
+	 *                      afterwards to tell them apart.
+	 */
+	public static function raw_option_for( $name ) {
+		return self::raw_option( $name );
+	}
+
+	/**
 	 * Move the binding to a new IDENTITY, minting a generation (Rulings
 	 * P58/P59).
 	 *
