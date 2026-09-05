@@ -1153,6 +1153,81 @@ final class DoorLogTest extends TestCase {
 	}
 
 	/**
+	 * Ruling S30 (Codex round-13 P1 on #88): the session-variable nonce
+	 * (Ruling S16) has a gap of its own — if COMMIT genuinely lands on
+	 * THIS session but the connection then drops and reconnects before
+	 * this method's own `SELECT @aura_door_tx` can run, the session
+	 * variable is gone, indistinguishable from a COMMIT that ran on a
+	 * fresh session that never opened this transaction at all. A plain
+	 * option row survives that same reconnect, because it lives in the
+	 * table the landed COMMIT just made durable — so the SAME nonce,
+	 * written to `aura_worker_door_last_tx` BEFORE the bump, lets this
+	 * call prove the commit really happened even though its own session
+	 * check cannot.
+	 */
+	public function test_a_reconnect_after_a_real_commit_falls_back_to_the_durable_witness(): void {
+		$name = 'aura_worker_door_s30_test';
+
+		$GLOBALS['_sa_reconnect_after_commit'] = true;
+		$outcome                               = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_after_commit'] = false;
+
+		$this->assertTrue( $outcome['committed'], 'the durable witness proves the COMMIT really landed even though the session variable was lost afterwards' );
+		$this->assertTrue( $outcome['result'] );
+		$this->assertArrayHasKey( $name, $GLOBALS['_options'], 'the state really did land' );
+	}
+
+	/**
+	 * The other half of Ruling S30: when the connection drops BEFORE
+	 * COMMIT (Ruling S16's own original window — nothing landed at all,
+	 * this call's own durable-witness write included), the fallback must
+	 * NOT be fooled by whatever an OLDER, already-committed transaction
+	 * left in that same row. Only THIS call's own nonce may prove THIS
+	 * call's own commit.
+	 */
+	public function test_a_reconnect_before_commit_is_not_fooled_by_an_older_durable_witness(): void {
+		$name = 'aura_worker_door_s30_test2';
+
+		// A previous, unrelated transaction's own nonce — still sitting in
+		// the durable witness row from before this call ever started.
+		$GLOBALS['_rows'][ Aura_Worker_Door_Log::LAST_TX ]    = 'an-older-nonce';
+		$GLOBALS['_options'][ Aura_Worker_Door_Log::LAST_TX ] = 'an-older-nonce';
+
+		$GLOBALS['_sa_reconnect_before_commit'] = true;
+		$outcome                                = Aura_Worker_Door_Log::versioned(
+			function () use ( $name ) {
+				$GLOBALS['_options'][ $name ] = array( 'x' => 1 );
+				$GLOBALS['_rows'][ $name ]    = maybe_serialize( array( 'x' => 1 ) );
+				return array(
+					'mutated' => true,
+					'result'  => true,
+					'evict'   => array( $name ),
+				);
+			}
+		);
+		$GLOBALS['_sa_reconnect_before_commit'] = false;
+
+		$this->assertFalse( $outcome['committed'] );
+		$this->assertArrayNotHasKey( 'result', $outcome, 'a rolled-back unit carries no callback result (Ruling S15)' );
+		$this->assertArrayNotHasKey( $name, $GLOBALS['_options'], 'nothing landed — the reconnect unwound this call\'s own durable-witness write too' );
+		$this->assertSame(
+			'an-older-nonce',
+			$GLOBALS['_options'][ Aura_Worker_Door_Log::LAST_TX ],
+			'the durable witness reverted to what a PREVIOUS transaction left — never mistaken for THIS call\'s own nonce'
+		);
+	}
+
+	/**
 	 * Ruling S17 (Codex round-7 P1 on #88): the nonce alone is not proof — a
 	 * reconnect landing WHILE the nonce's own `SET` is issued can be
 	 * transparently retried by `wpdb` on a fresh autocommit session, and

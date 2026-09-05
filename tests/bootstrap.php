@@ -2351,8 +2351,22 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 			// scoped to THIS connection exactly like LAST_INSERT_ID() above —
 			// absent (null) on a fresh session, which is what a reconnect
 			// between the SET and this SELECT models.
+			//
+			// `_sa_reconnect_after_commit` (Ruling S30, 2.16.2) models the
+			// NARROWER, later window: COMMIT itself already landed for
+			// real (the transaction snapshot is NOT unwound, unlike
+			// `_sa_reconnect_before_commit` above, which fires earlier and
+			// discards everything), but the connection then drops and
+			// reconnects before this exact SELECT can run — clearing
+			// session variables same as any reconnect, but leaving every
+			// row COMMIT just made durable (including the S30 witness)
+			// untouched. Fires once.
 			if ( preg_match( '/^SELECT @(\w+)$/', (string) $query, $m ) ) {
 				$GLOBALS['_db_queries'][] = (string) $query;
+				if ( ! empty( $GLOBALS['_sa_reconnect_after_commit'] ) ) {
+					$GLOBALS['_sa_reconnect_after_commit'] = false; // fires once
+					$this->sa_session_vars = array();
+				}
 				return $this->sa_session_vars[ $m[1] ] ?? null;
 			}
 			if ( preg_match( "/^SELECT option_value FROM \S+ WHERE option_name = '([^']+)' LIMIT 1$/", (string) $query, $m ) ) {
@@ -3365,6 +3379,18 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 				$GLOBALS['_options'][ $name ] = $GLOBALS['_rows'][ $name ];
 				return 1;
 			}
+			// Aura_Worker_Door_Log::versioned()'s DURABLE commit witness
+			// (Ruling S30, 2.16.2): an unconditional upsert — every unit
+			// simply OVERWRITES this row with its own nonce, unlike the
+			// atomic counters above — into 'aura_worker_door_last_tx',
+			// written INSIDE the transaction, BEFORE the version bump.
+			if ( preg_match( "/^INSERT INTO \S+ \(option_name, option_value, autoload\) VALUES \('([^']+)', '([^']*)', 'no'\) ON DUPLICATE KEY UPDATE option_value = VALUES\(option_value\)$/", $query, $m ) ) {
+				$name  = stripslashes( $m[1] );
+				$value = stripslashes( $m[2] );
+				$GLOBALS['_rows'][ $name ]    = $value;
+				$GLOBALS['_options'][ $name ] = $value;
+				return 1;
+			}
 			// Aura_Worker_Door_Log::bump_door_version()'s upsert (Rulings S2,
 			// S4 and S6, 2.16.2): the SAME atomic create-or-increment as
 			// above, but CLOCK-FLOORED — GREATEST( current + 1, the caller's
@@ -3485,6 +3511,7 @@ if ( ! class_exists( 'SA_Test_Wpdb' ) ) {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).
@@ -4757,6 +4784,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_door_unacked_error']   = false;   // count_unacked()'s COUNT fails at the driver (Ruling P53).
 	$GLOBALS['_sa_last_insert_id_reconnect'] = false; // bump_door_version()'s SELECT LAST_INSERT_ID() answers 0, a reconnect-onto-a-fresh-session (Ruling S5).
 	$GLOBALS['_sa_reconnect_before_commit']  = false; // versioned()'s COMMIT lands on a reconnected session with no open transaction (Ruling S16).
+	$GLOBALS['_sa_reconnect_after_commit']   = false; // versioned()'s post-COMMIT session read lands on a reconnected session, real writes intact (Ruling S30).
 	$GLOBALS['_sa_reconnect_before_savepoint'] = false; // versioned()'s SAVEPOINT lands on a reconnected session (Ruling S17).
 	$GLOBALS['_sa_reconnect_during_set'] = false; // versioned()'s nonce SET lands on a reconnected session (Ruling S25).
 	$GLOBALS['_sa_named_locks']          = array(); // MySQL named locks currently held (Ruling P52's replay lease).

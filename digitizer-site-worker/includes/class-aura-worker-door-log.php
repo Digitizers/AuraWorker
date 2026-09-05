@@ -63,6 +63,13 @@ class Aura_Worker_Door_Log {
 	 * could not do.
 	 */
 	const OBSERVATION  = 'aura_worker_door_observation';
+	/**
+	 * The DURABLE commit witness `versioned()` writes inside its own
+	 * transaction, before the version bump (Ruling S30, Codex round-13 P1
+	 * on #88) — see that method's own docblock for the reconnect window
+	 * the session-variable nonce (Ruling S16) alone cannot close.
+	 */
+	const LAST_TX      = 'aura_worker_door_last_tx';
 	const MAX_UNACKED  = 2000;
 	const PAGE         = 100;
 	/** How many INSERT collisions to ride through before giving up. */
@@ -1917,6 +1924,25 @@ class Aura_Worker_Door_Log {
 	 * the real transaction is gone, and this method answers `committed:
 	 * false` — accurately: nothing landed.
 	 *
+	 * THE COMMIT WITNESS MUST ALSO BE DURABLE (Ruling S30, Codex round-13
+	 * P1 on #88). Ruling S16's session-variable nonce has a gap of its own:
+	 * if `COMMIT` genuinely lands on THIS session but the connection then
+	 * drops before this method's own `SELECT @aura_door_tx` can run, the
+	 * session variable is gone — indistinguishable from the case Ruling
+	 * S16 exists to catch, where `COMMIT` ran on a fresh session that never
+	 * opened this transaction at all. Both answer NULL or a mismatch, so a
+	 * mutation that fully committed could be reported `committed: false`.
+	 * A plain option row does not have this problem: unlike a session
+	 * variable, it survives the reconnect that follows a landed `COMMIT`,
+	 * because it lives in the very table that `COMMIT` just made durable.
+	 * The SAME nonce is therefore also written to `self::LAST_TX` — inside
+	 * this transaction, BEFORE the version bump — and when the session
+	 * variable cannot confirm the commit, this method falls back to
+	 * reading that row RAW (no option cache, a fresh statement): equal to
+	 * this call's nonce means the COMMIT that wrote it landed for real and
+	 * the session was merely lost afterwards; anything else means it did
+	 * not.
+	 *
 	 * THE SESSION ITSELF IS ESTABLISHED WITH A SAVEPOINT, NOT JUST NAMED
 	 * (Ruling S17, Codex round-7 P1 on #88). Ruling S16's nonce closed the
 	 * gap at the END of the transaction, but a reconnect can also land
@@ -2111,6 +2137,27 @@ class Aura_Worker_Door_Log {
 				'result'    => $result,
 			);
 		}
+		if ( $transactional ) {
+			// Ruling S30 (Codex round-13 P1 on #88): a DURABLE commit
+			// witness, written INSIDE this transaction, BEFORE the version
+			// bump — see the post-COMMIT check below for the reconnect
+			// window this closes that the session-variable nonce (Ruling
+			// S16) cannot: if COMMIT itself lands but the connection then
+			// drops before this method's own SELECT of the session
+			// variable can run, the session variable is unreadable and
+			// looks IDENTICAL to a COMMIT that never happened on this
+			// session at all — a plain option row, unlike a session
+			// variable, survives the reconnect that follows a landed
+			// COMMIT, because it lives in the table the COMMIT itself just
+			// made durable.
+			$wpdb->query( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->prepare(
+					"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no') ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)",
+					self::LAST_TX,
+					$tx_nonce
+				)
+			);
+		}
 		$bump_ok = self::bump_door_version_write();
 		if ( ! $bump_ok && $transactional ) {
 			// Ruling S8: the bump's own WRITE failed, so the mutation must
@@ -2175,12 +2222,36 @@ class Aura_Worker_Door_Log {
 			if ( $commit_ok ) {
 				$session_nonce = $wpdb->get_var( 'SELECT @aura_door_tx' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$commit_ok     = ( is_string( $session_nonce ) && $session_nonce === $tx_nonce );
+				if ( ! $commit_ok ) {
+					// Ruling S30 (Codex round-13 P1 on #88): the session
+					// variable ALONE cannot tell two very different cases
+					// apart — "COMMIT ran on a fresh, reconnected session
+					// that never opened this transaction" (nothing landed)
+					// versus "COMMIT genuinely landed on THIS session, but
+					// the connection then dropped and reconnected before
+					// this SELECT could run" (everything landed; only the
+					// session variable itself was lost). Both answer NULL
+					// or a mismatch here. The DURABLE witness written
+					// BEFORE the bump, inside this same transaction,
+					// resolves it: a plain option row — unlike a session
+					// variable — survives a reconnect, because it lives in
+					// the table the COMMIT that wrote it just made durable.
+					// Read RAW: no option-cache layer, a fresh statement.
+					$durable   = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						$wpdb->prepare(
+							"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+							self::LAST_TX
+						)
+					);
+					$commit_ok = ( is_string( $durable ) && $durable === $tx_nonce );
+				}
 			}
 			if ( ! $commit_ok ) {
 				// Ruling S15: no callback result — see the bump-failure
-				// branch above for why. The mutation this call thought it
-				// just committed was rolled back by MySQL itself the moment
-				// the original session was lost; nothing here landed.
+				// branch above for why. Neither the session variable nor
+				// the durable witness could prove this COMMIT landed on a
+				// session that ever held this transaction; nothing here is
+				// trusted to have happened.
 				self::evict_after_rollback( $evict ); // Ruling S18
 				return array(
 					'committed' => false,
