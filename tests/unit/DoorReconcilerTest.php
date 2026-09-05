@@ -233,6 +233,68 @@ final class DoorReconcilerTest extends TestCase {
 		$this->assertNotNull( Aura_Worker_Door_Holds::get_claimed( $ref ), 'the claim still stands' );
 	}
 
+	/**
+	 * Ruling S45 (Codex round-18 P2 on #88): a claim enters `running`
+	 * SOLELY by its own `claimed_at` crossing CLAIM_STALE_MS — no
+	 * mutation, no version bump of its own — so the fragment used to
+	 * attach the SAME observation it served when the claim was still
+	 * young, and Aura's strictly-greater comparison hid the transition
+	 * entirely. The running set's own IDENTITY is now folded into the
+	 * persisted computed tuple: the FIRST serve that observes the
+	 * crossing persists it through versioned() before the bracket, so
+	 * `running` is served under a witness strictly greater than before.
+	 */
+	public function test_a_claim_crossing_the_stale_bound_with_no_mutation_still_bumps_the_observation(): void {
+		$ref = $this->hold();
+		$this->assertIsArray( Aura_Worker_Door_Holds::claim( $ref ) ); // fresh — NOT backdated
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $ref ) ] = true;
+
+		$young = $this->fragment();
+		$this->assertSame( array(), $young['running'], 'the fixture assumption this test is built on — too young to be running yet' );
+		$v1 = $young['observation'];
+		$this->assertIsInt( $v1 );
+
+		// The clock advances past CLAIM_STALE_MS — nothing else mutates:
+		// no write, no version bump from any OTHER source.
+		$this->patchOption( Aura_Worker_Door_Holds::CLAIMED . $ref, array( 'claimed_at' => $this->longAgo() ) );
+
+		$crossed = $this->fragment();
+		$this->assertSame( array( $ref ), array_column( $crossed['running'], 'ref' ), 'the crossing is now observed' );
+		$this->assertNotNull( $crossed['observation'], 'a single retry (this attempt\'s own persist) resolves this — never "torn twice"' );
+		$this->assertGreaterThan( $v1, $crossed['observation'], 'served under a witness STRICTLY greater than the young claim\'s own poll' );
+
+		// A second serve of the SAME crossing is now a steady state —
+		// nothing about the running set has changed since the last
+		// serve — so nothing bumps again.
+		$again = $this->fragment();
+		$this->assertSame( $crossed['observation'], $again['observation'], 'the crossing is already recorded — a repeat serve does not bump again' );
+		$this->assertSame( array( $ref ), array_column( $again['running'], 'ref' ) );
+	}
+
+	/**
+	 * The other half of Ruling S45: LEAVING `running` (the lease releases,
+	 * or the claim is finally settled) is a transition too.
+	 */
+	public function test_a_claim_leaving_running_also_bumps_the_observation(): void {
+		$ref = $this->hold();
+		$this->claim( $ref ); // backdated past CLAIM_STALE_MS
+		$GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $ref ) ] = true;
+
+		$running_frag = $this->fragment();
+		$this->assertSame( array( $ref ), array_column( $running_frag['running'], 'ref' ), 'the fixture assumption this test is built on' );
+		$v1 = $running_frag['observation'];
+		$this->assertIsInt( $v1 );
+
+		// The lease releases — nothing about the claimed row itself
+		// changes, only whether a live connection still holds its lock.
+		unset( $GLOBALS['_sa_named_locks'][ Aura_Worker_Door_Holds::lease_name( $ref ) ] );
+
+		$left = $this->fragment();
+		$this->assertSame( array(), $left['running'], 'no longer running — it is interrupted now instead' );
+		$this->assertSame( array( $ref ), array_column( $left['interrupted'], 'ref' ) );
+		$this->assertGreaterThan( $v1, $left['observation'], 'leaving running is ALSO a transition — served under a strictly greater witness' );
+	}
+
 	/** An UNLEASED claim past the bound is interrupted, exactly as before. */
 	public function test_an_unleased_claim_past_the_bound_is_still_interrupted(): void {
 		$ref = $this->hold();
