@@ -109,6 +109,38 @@ if ( false === strpos( $stub_body, ARCHIVE_LINK ) ) {
 }
 echo "Stub: `= {$stub_version} and earlier =` is the last entry and links to the archive.\n";
 
+// ── 2b. The release being prepared has its entry BEFORE its tag exists ────
+// Coverage below is derived from tags, and the tag for the release a PR is
+// preparing does not exist yet — so a commit that bumped `Stable tag` and forgot
+// the Changelog entry passed, and lint never runs on the tag/release events that
+// ship to wp.org (Codex round-8 P2). The one thing decidable at PR time: the
+// version `Stable tag` names must be the newest heading in the Changelog. It is
+// also step 3 of the four-place version bump CLAUDE.md records.
+if ( ! preg_match( '/^Stable tag:\s*([0-9]+(?:\.[0-9]+)+)\s*$/m', $readme, $st ) ) {
+	fwrite( STDERR, "\ncheck-readme-limits: no numeric `Stable tag:` line in {$path}\n" );
+	exit( 1 );
+}
+$stable_tag = $st[1];
+$newest     = null;
+foreach ( $headings[1] as $h ) {
+	if ( preg_match( '/^[0-9]+(?:\.[0-9]+)+$/', $h ) ) {
+		$newest = $h;
+		break; // newest first
+	}
+}
+if ( $stable_tag !== $newest ) {
+	fwrite(
+		STDERR,
+		"\ncheck-readme-limits: `Stable tag: {$stable_tag}` but the Changelog's newest entry is "
+		. ( $newest ?? 'none' ) . ".\n"
+		. "A release bumps the header, the constant, `Stable tag` AND writes its Changelog entry\n"
+		. "together — the entry must exist before the tag does, because wp.org deploys on the\n"
+		. "release event and nothing checks the readme after this point.\n"
+	);
+	exit( 1 );
+}
+echo "Stable tag: {$stable_tag} has its Changelog entry.\n";
+
 // ── 3. Every stable release has an entry somewhere ─────────────────────────
 $listed = array();
 foreach ( $headings[1] as $h ) {
