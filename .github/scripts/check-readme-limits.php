@@ -133,7 +133,14 @@ preg_match_all(
  * Every STABLE release, as the repository itself records them. A pre-release
  * (`-beta.N`, `-rc.N`) never reaches wp.org and gets no changelog entry.
  */
-$tag_output = shell_exec( 'git -C ' . escapeshellarg( dirname( $archive ) ) . ' tag 2>/dev/null' );
+// Resolved from THIS SCRIPT's location, never from the file under test: the
+// releases being checked are this repository's, whichever archive path is
+// passed. Deriving it from `$archive` made `git -C /tmp tag` fail for an
+// out-of-tree control file, and the script then reported "no release tags
+// visible" instead of checking the archive it was handed — so a positive
+// control had to be staged inside the repo to work at all (Codex round-3 P2).
+$repo_root  = dirname( __DIR__, 2 );
+$tag_output = shell_exec( 'git -C ' . escapeshellarg( $repo_root ) . ' tag 2>/dev/null' );
 $tags       = array_filter( array_map( 'trim', explode( "\n", (string) $tag_output ) ) );
 $released   = array();
 foreach ( $tags as $tag ) {
