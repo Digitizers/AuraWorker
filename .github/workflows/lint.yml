@@ -56,6 +56,21 @@ jobs:
         if: ${{ always() }}
         run: cs2pr --graceful-warnings ./phpcs-report.xml
 
+  readme-limits:
+    name: Readme limits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # WordPress.org truncates a Changelog over 5,000 words and says so ONLY in
+      # a warning on the plugin page that is visible to committers alone. 2.16.2
+      # shipped at 5,195 words and the older half of the history was published
+      # missing. The budget in the script is deliberately below wp.org's ceiling
+      # so this fails while there is still room to fix it.
+      - name: Check readme.txt section limits
+        run: php .github/scripts/check-readme-limits.php
+
   plugin-check:
     name: Plugin Check
     runs-on: ubuntu-latest

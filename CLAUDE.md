@@ -276,6 +276,17 @@ at 2.13.0 (found by a human, not a check):
    automates any of it: no workflow edits `README.md` — the 2.14.0 badge bump
    was a human commit (`434fdd4`).
 
+**`readme.txt`'s Changelog is capped; `README.md`'s is the full history.**
+WordPress.org truncates a `== Changelog ==` section over 5,000 words and reports
+it only in a warning on the plugin page that is visible to committers alone —
+nothing in the repo, in CI, or in the release output. 2.16.2 shipped at 5,195
+words across 36 entries, and wp.org published the Changelog with the older half
+silently missing. `readme.txt` now keeps the recent releases and ends with a
+`= <version> and earlier =` stub pointing at `README.md#changelog`; when the
+budget is next exceeded, move the OLDEST entries out rather than compressing the
+newest. `.github/scripts/check-readme-limits.php` fails the `Readme limits` lint
+job well below wp.org's ceiling, so it is caught while there is still room.
+
 Publishing a **stable GitHub release** IS the WordPress.org deploy: `release.yml`
 builds and attaches the zip, `deploy.yml` pushes to wp.org SVN.
 
