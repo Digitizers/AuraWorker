@@ -165,4 +165,30 @@ if ( $both ) {
 	exit( 1 );
 }
 
-echo "Every stable release is covered, and nothing is in both files.\n";
+// The stub names the archive's boundary, so it must MOVE with the archive. Parsed
+// but never compared, it let a trim move 2.10.0 into the archive while the stub
+// still read "2.9.1 and earlier" — coverage and duplicate checks both passed, and
+// wp.org's list simply appeared to skip 2.10.0 (Codex round-7 P2).
+$newest_archived = array_reduce(
+	$archived,
+	static fn( $carry, $v ) => ( null === $carry || version_compare( $v, $carry, '>' ) ) ? $v : $carry
+);
+if ( $stub_version !== $newest_archived ) {
+	fwrite(
+		STDERR,
+		"\ncheck-readme-limits: the stub says `{$stub_version} and earlier` but the newest archived\n"
+		. "release is {$newest_archived}. Advance the stub to the newest version moved.\n"
+	);
+	exit( 1 );
+}
+$not_newer = array_values( array_filter( $listed, static fn( $v ) => ! version_compare( $v, $stub_version, '>' ) ) );
+if ( $not_newer ) {
+	fwrite(
+		STDERR,
+		"\ncheck-readme-limits: still listed in readme.txt but not newer than the stub's\n"
+		. "{$stub_version}: " . implode( ', ', $not_newer ) . ". Everything at or below the stub belongs in the archive.\n"
+	);
+	exit( 1 );
+}
+
+echo "Every stable release is covered, nothing is in both files, and the stub sits at the archive boundary ({$stub_version}).\n";
