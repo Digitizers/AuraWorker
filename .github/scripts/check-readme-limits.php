@@ -123,11 +123,49 @@ if ( ! preg_match( '/^##\s*Changelog\s*$/m', $archive_md, $am, PREG_OFFSET_CAPTU
 	fwrite( STDERR, "check-readme-limits: no `## Changelog` section in {$archive}\n" );
 	exit( 1 );
 }
-preg_match_all(
-	'/^###\s*([0-9]+(?:\.[0-9]+)+)/m',
-	substr( $archive_md, $am[0][1] ),
-	$archived
+/**
+ * A HEADING IS NOT AN ENTRY. Collecting `### <version>` alone would let someone
+ * delete a release's notes and keep its label, and the guard would report the
+ * archive complete while the stub still promised that release's history — the
+ * same loss this exists to prevent, one step subtler (Codex round-4 P2). A
+ * version counts as archived only when its section has a line of its own.
+ */
+$archive_body     = substr( $archive_md, $am[0][1] );
+$archive_sections = preg_split(
+	'/^###\s*([0-9]+(?:\.[0-9]+)+)[^\n]*$/m',
+	$archive_body,
+	-1,
+	PREG_SPLIT_DELIM_CAPTURE
 );
+$archived  = array( 1 => array() );
+$headingsl = array();
+// preg_split with DELIM_CAPTURE yields [prologue, version, body, version, body, …].
+for ( $i = 1; $i < count( $archive_sections ); $i += 2 ) {
+	$version = $archive_sections[ $i ];
+	$section = $archive_sections[ $i + 1 ] ?? '';
+	$headingsl[] = $version;
+	// Anything that is not blank and not another heading counts as the notes.
+	$content = preg_replace( '/^#{1,6}\s.*$/m', '', $section );
+	if ( '' !== trim( (string) $content ) ) {
+		$archived[1][] = $version;
+	}
+}
+
+$empty = array_values( array_diff( $headingsl, $archived[1] ) );
+if ( $empty ) {
+	usort( $empty, 'version_compare' );
+	fwrite(
+		STDERR,
+		sprintf(
+			"\ncheck-readme-limits: %s a heading in README.md but no release notes under it:\n  %s\n\n"
+			. "An empty section is not an archived release. Restore the notes, or remove the\n"
+			. "heading so the missing-version check reports it honestly.\n",
+			count( $empty ) === 1 ? '1 version has' : count( $empty ) . ' versions have',
+			implode( ', ', $empty )
+		)
+	);
+	exit( 1 );
+}
 
 /**
  * Every STABLE release, as the repository itself records them. A pre-release
