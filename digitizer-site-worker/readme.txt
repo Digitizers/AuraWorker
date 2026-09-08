@@ -493,8 +493,8 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 = 2.9.1 and earlier =
 
 * WordPress.org truncates a Changelog over 5,000 words, and this plugin's history is longer than that.
-  Entries for 2.9.1 and every release before it are kept in full in the repository:
-  https://github.com/Digitizers/SiteAgent/blob/main/README.md#changelog
+  The entries for 2.9.1 and every release before it were moved out of this file verbatim and are kept in full at:
+  https://github.com/Digitizers/SiteAgent/blob/main/docs/changelog-archive.md
 
 == Upgrade Notice ==
 

@@ -276,29 +276,38 @@ at 2.13.0 (found by a human, not a check):
    automates any of it: no workflow edits `README.md` — the 2.14.0 badge bump
    was a human commit (`434fdd4`).
 
-**`readme.txt`'s Changelog is capped; `README.md`'s is the full history.**
+**`readme.txt`'s Changelog is capped; `docs/changelog-archive.md` holds what left it, verbatim.**
 WordPress.org truncates a `== Changelog ==` section over 5,000 words and reports
 it only in a warning on the plugin page that is visible to committers alone —
 nothing in the repo, in CI, or in the release output. 2.16.2 shipped at 5,195
 words across 36 entries, and wp.org published the Changelog with the older half
 silently missing. `readme.txt` now keeps the recent releases and ends with a
-`= <version> and earlier =` stub pointing at `README.md#changelog`; when the
-budget is next exceeded, move the OLDEST entries out rather than compressing the
-newest. `.github/scripts/check-readme-limits.php` fails the `Readme limits` lint
-job well below wp.org's ceiling, so it is caught while there is still room.
+`= <version> and earlier =` stub pointing at the archive.
 
-That trim is only safe because the same script enforces the other half:
-**`README.md` must hold an entry for every stable release tag**, plus every
-version `readme.txt` still lists. Tags are written by the release process rather
-than by hand, so the reference cannot drift, and an entry stays protected once
-it has been trimmed — checking `README.md` against `readme.txt` alone does not,
-because a trimmed version drops out of that comparison and nothing guards it any
-more. The first attempt at this cap assumed the archive was complete without
-checking (it was missing 2.0.2, 2.0.1 and 1.0.0), and the second guarded only
-what was still listed. Enforcing the tag rule surfaced three more releases that
-had never been written down anywhere — 1.2.0, 1.3.1, 1.3.2 — now recovered from
-their own tagged commits. The same check catches step 4 of the version bump above
-going missing, which is how the GitHub changelog silently stopped at 2.13.0.
+**The trim MOVES, it never deletes or rewrites.** When the budget is next
+exceeded, cut the OLDEST entries from `readme.txt` byte-for-byte into
+`docs/changelog-archive.md` (newest first, directly under its header), advance
+the stub to the newest version moved, and touch nothing else. Do not "compress"
+the newest entries, and do not point the stub at `README.md`: its `## Changelog`
+is an independently written record that says different things about the same
+versions — the first six review rounds of this cap assumed it was the full
+history and kept finding it was not (missing versions, then, with every version
+present, twelve of twenty-four trimmed entries with over a third of their
+wording absent). Moving text needs no judgement; reconciling two prose
+histories does, and that is the call the archive file exists to avoid.
+
+`.github/scripts/check-readme-limits.php` runs as the `Readme limits` lint job
+and checks three decidable things: the word budget (4,000, below wp.org's
+ceiling so it fails while there is still room); that the stub is the LAST
+Changelog heading and links to the archive; and that every stable release tag
+has an entry in `readme.txt` or the archive, and never in both (a copy, not a
+move). It deliberately does not judge what is written under a heading — two
+rounds of trying proved a hand-written file has no edge-free definition of
+content. The job checks out with `fetch-depth: 0` because the tags are the
+reference; without them the script fails rather than passes. Five releases
+(1.2.0, 1.3.1–1.3.4) were tagged but never written into `readme.txt`; the
+archive records them in a separate, sourced section so coverage is complete
+without pretending they were moved.
 
 Publishing a **stable GitHub release** IS the WordPress.org deploy: `release.yml`
 builds and attaches the zip, `deploy.yml` pushes to wp.org SVN.
