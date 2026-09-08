@@ -107,9 +107,10 @@ if ( $words > BUDGET ) {
 printf( "Headroom: %d words.\n", $headroom );
 
 /**
- * Every version readme.txt lists must also be in README.md's changelog, so the
- * archive is always ahead of the trim. README.md may hold MORE (it keeps
- * entries readme.txt has already dropped, which is the whole point).
+ * README.md must hold an entry for every STABLE RELEASE and for every version
+ * readme.txt still lists, so the archive is always ahead of the trim. README.md
+ * may hold MORE (it keeps entries readme.txt has already dropped, which is the
+ * whole point).
  */
 if ( ! is_readable( $archive ) ) {
 	fwrite( STDERR, "check-readme-limits: cannot read {$archive}\n" );
@@ -124,59 +125,39 @@ if ( ! preg_match( '/^##\s*Changelog\s*$/m', $archive_md, $am, PREG_OFFSET_CAPTU
 	exit( 1 );
 }
 /**
- * A HEADING IS NOT AN ENTRY. Collecting `### <version>` alone would let someone
- * delete a release's notes and keep its label, and the guard would report the
- * archive complete while the stub still promised that release's history — the
- * same loss this exists to prevent, one step subtler (Codex round-4 P2). A
- * version counts as archived only when its section has a line of its own.
+ * WHICH VERSIONS THE ARCHIVE COVERS — and deliberately nothing about what is
+ * written under each heading.
+ *
+ * A content check lived here for two review rounds and produced a finding in
+ * each: first it counted headings rather than notes, then, once it read the
+ * section body, the README's trailing footer counted as the final release's
+ * notes because that section runs to end of file. Both were real, and both were
+ * the same question — "what counts as content" — which has no edge-free answer
+ * in a hand-written Markdown file.
+ *
+ * So it is gone, by owner decision, rather than patched a third time. What
+ * remains is decidable: a version is archived when README.md has a heading for
+ * it. That still catches the loss this guard was built for — a release absent
+ * from the archive while the trimmed readme.txt's stub promises it — which is
+ * the failure that actually happened. A heading deliberately emptied of its
+ * notes is a thing a person does on purpose, and review is the place for it.
  */
-$archive_body     = substr( $archive_md, $am[0][1] );
-$archive_sections = preg_split(
-	'/^###\s*([0-9]+(?:\.[0-9]+)+)[^\n]*$/m',
-	$archive_body,
-	-1,
-	PREG_SPLIT_DELIM_CAPTURE
+preg_match_all(
+	'/^###\s*([0-9]+(?:\.[0-9]+)+)/m',
+	substr( $archive_md, $am[0][1] ),
+	$archived
 );
-$archived  = array( 1 => array() );
-$headingsl = array();
-// preg_split with DELIM_CAPTURE yields [prologue, version, body, version, body, …].
-for ( $i = 1; $i < count( $archive_sections ); $i += 2 ) {
-	$version = $archive_sections[ $i ];
-	$section = $archive_sections[ $i + 1 ] ?? '';
-	$headingsl[] = $version;
-	// Anything that is not blank and not another heading counts as the notes.
-	$content = preg_replace( '/^#{1,6}\s.*$/m', '', $section );
-	if ( '' !== trim( (string) $content ) ) {
-		$archived[1][] = $version;
-	}
-}
-
-$empty = array_values( array_diff( $headingsl, $archived[1] ) );
-if ( $empty ) {
-	usort( $empty, 'version_compare' );
-	fwrite(
-		STDERR,
-		sprintf(
-			"\ncheck-readme-limits: %s a heading in README.md but no release notes under it:\n  %s\n\n"
-			. "An empty section is not an archived release. Restore the notes, or remove the\n"
-			. "heading so the missing-version check reports it honestly.\n",
-			count( $empty ) === 1 ? '1 version has' : count( $empty ) . ' versions have',
-			implode( ', ', $empty )
-		)
-	);
-	exit( 1 );
-}
 
 /**
  * Every STABLE release, as the repository itself records them. A pre-release
  * (`-beta.N`, `-rc.N`) never reaches wp.org and gets no changelog entry.
+ *
+ * Resolved from THIS SCRIPT's location, never from the file under test: the
+ * releases being checked are this repository's, whichever archive path is
+ * passed. Deriving it from `$archive` made `git -C /tmp tag` fail for an
+ * out-of-tree control file, and the script then reported "no release tags
+ * visible" instead of checking the archive it was handed (Codex round-3 P2).
  */
-// Resolved from THIS SCRIPT's location, never from the file under test: the
-// releases being checked are this repository's, whichever archive path is
-// passed. Deriving it from `$archive` made `git -C /tmp tag` fail for an
-// out-of-tree control file, and the script then reported "no release tags
-// visible" instead of checking the archive it was handed — so a positive
-// control had to be staged inside the repo to work at all (Codex round-3 P2).
 $repo_root  = dirname( __DIR__, 2 );
 $tag_output = shell_exec( 'git -C ' . escapeshellarg( $repo_root ) . ' tag 2>/dev/null' );
 $tags       = array_filter( array_map( 'trim', explode( "\n", (string) $tag_output ) ) );
