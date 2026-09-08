@@ -62,6 +62,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The archive check compares README.md against the RELEASE TAGS, so the
+          # tags have to be here. The script fails loudly rather than passing when
+          # it cannot see them — a guard that goes quiet is worse than none.
+          fetch-depth: 0
 
       # WordPress.org truncates a Changelog over 5,000 words and says so ONLY in
       # a warning on the plugin page that is visible to committers alone. 2.16.2

@@ -288,12 +288,17 @@ newest. `.github/scripts/check-readme-limits.php` fails the `Readme limits` lint
 job well below wp.org's ceiling, so it is caught while there is still room.
 
 That trim is only safe because the same script enforces the other half:
-**`README.md`'s changelog must be a SUPERSET of `readme.txt`'s** — every entry is
-archived before it can ever be trimmed. The first attempt at this cap assumed the
-archive was complete without checking, and it was missing 2.0.2, 2.0.1 and 1.0.0,
-so the trim would have deleted three releases while the stub told readers they
-were preserved. The same check catches step 4 of the version bump above going
-missing, which is how the GitHub changelog silently stopped at 2.13.0.
+**`README.md` must hold an entry for every stable release tag**, plus every
+version `readme.txt` still lists. Tags are written by the release process rather
+than by hand, so the reference cannot drift, and an entry stays protected once
+it has been trimmed — checking `README.md` against `readme.txt` alone does not,
+because a trimmed version drops out of that comparison and nothing guards it any
+more. The first attempt at this cap assumed the archive was complete without
+checking (it was missing 2.0.2, 2.0.1 and 1.0.0), and the second guarded only
+what was still listed. Enforcing the tag rule surfaced three more releases that
+had never been written down anywhere — 1.2.0, 1.3.1, 1.3.2 — now recovered from
+their own tagged commits. The same check catches step 4 of the version bump above
+going missing, which is how the GitHub changelog silently stopped at 2.13.0.
 
 Publishing a **stable GitHub release** IS the WordPress.org deploy: `release.yml`
 builds and attaches the zip, `deploy.yml` pushes to wp.org SVN.

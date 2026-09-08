@@ -23,13 +23,28 @@
  * and the first version of this change assumed `README.md` was that archive
  * without verifying it — it was missing 2.0.2, 2.0.1 and 1.0.0, so the trim
  * would have deleted three releases outright while the stub told readers they
- * were preserved (Codex round-1 P2). Rather than copy three entries and move
- * on, the invariant is enforced: `README.md`'s changelog must be a SUPERSET of
- * `readme.txt`'s, so every entry is archived BEFORE it can ever be trimmed.
+ * were preserved (Codex round-1 P2).
+ *
+ * COMPARING `README.md` AGAINST `readme.txt` IS NOT ENOUGH, and that was the
+ * round-2 finding: a version already moved behind the `= <version> and earlier =`
+ * stub is no longer listed in readme.txt, so it drops out of that comparison and
+ * nothing guards it any more. Deleting the freshly restored `### 2.0.2` would
+ * have passed CI while the stub still promised the full history — the very loss
+ * this guard exists to prevent, one release later.
+ *
+ * So the archive is checked against the RELEASES THEMSELVES: every stable git
+ * tag must have an entry in `README.md`. Tags are written by the release
+ * process, not by hand, so the reference cannot drift the way a checked-in list
+ * of versions would, and an entry stays protected for ever — trimmed or not.
+ * `readme.txt`'s own listed versions are still required too, which catches a
+ * release being prepared before its tag exists.
  *
  * That check also catches the older mistake CLAUDE.md records — 2.14.0 shipped
  * with `readme.txt` updated and `README.md` forgotten, and the GitHub changelog
- * silently stopped at 2.13.0 until a human noticed.
+ * silently stopped at 2.13.0 until a human noticed. Enforcing it surfaced three
+ * more: 1.2.0, 1.3.1 and 1.3.2 were tagged and released but had never been
+ * written down anywhere. They are archived now, recovered from their own tagged
+ * commits rather than invented.
  *
  * Usage: php .github/scripts/check-readme-limits.php [path/to/readme.txt] [path/to/README.md]
  */
@@ -114,11 +129,39 @@ preg_match_all(
 	$archived
 );
 
-$missing = array_values( array_diff( $shipped[1], $archived[1] ) );
+/**
+ * Every STABLE release, as the repository itself records them. A pre-release
+ * (`-beta.N`, `-rc.N`) never reaches wp.org and gets no changelog entry.
+ */
+$tag_output = shell_exec( 'git -C ' . escapeshellarg( dirname( $archive ) ) . ' tag 2>/dev/null' );
+$tags       = array_filter( array_map( 'trim', explode( "\n", (string) $tag_output ) ) );
+$released   = array();
+foreach ( $tags as $tag ) {
+	if ( preg_match( '/^v?([0-9]+(?:\.[0-9]+)+)$/', $tag, $tm ) ) {
+		$released[] = $tm[1];
+	}
+}
+$released = array_values( array_unique( $released ) );
+
+// A guard that cannot see the tags must say so rather than pass. In CI this
+// means `actions/checkout` needs `fetch-depth: 0`; locally, `git fetch --tags`.
+if ( ! $released ) {
+	fwrite(
+		STDERR,
+		"\ncheck-readme-limits: no release tags visible, so the archive cannot be checked.\n"
+		. "Fetch them (`git fetch --tags`, or `fetch-depth: 0` in CI) and re-run.\n"
+	);
+	exit( 1 );
+}
+
+$must_be_archived = array_values( array_unique( array_merge( $shipped[1], $released ) ) );
+$missing          = array_values( array_diff( $must_be_archived, $archived[1] ) );
+usort( $missing, 'version_compare' );
 
 printf(
-	"Archive: %d versions in readme.txt, %d in README.md.\n",
+	"Archive: %d versions in readme.txt, %d stable release tags, %d entries in README.md.\n",
 	count( $shipped[1] ),
+	count( $released ),
 	count( $archived[1] )
 );
 
@@ -126,10 +169,11 @@ if ( $missing ) {
 	fwrite(
 		STDERR,
 		sprintf(
-			"\ncheck-readme-limits: %s in readme.txt's Changelog but not in README.md's:\n  %s\n\n"
-			. "README.md is the archive the trimmed readme.txt points at, so it must hold every\n"
-			. "version readme.txt lists — otherwise trimming an entry deletes it outright while\n"
-			. "the `and earlier` stub claims it was preserved. Add the entries to README.md.\n",
+			"\ncheck-readme-limits: %s released or listed but missing from README.md's changelog:\n  %s\n\n"
+			. "README.md is the archive the trimmed readme.txt points at, so it must hold an entry\n"
+			. "for every stable release tag AND every version readme.txt still lists — otherwise a\n"
+			. "release can vanish while the `and earlier` stub claims it was preserved. Add the\n"
+			. "entries to README.md.\n",
 			count( $missing ) === 1 ? '1 version is' : count( $missing ) . ' versions are',
 			implode( ', ', $missing )
 		)
@@ -137,4 +181,4 @@ if ( $missing ) {
 	exit( 1 );
 }
 
-echo "Archive complete: README.md covers every version readme.txt lists.\n";
+echo "Archive complete: README.md covers every stable release and every listed version.\n";

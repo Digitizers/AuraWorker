@@ -523,10 +523,22 @@ statement reports it wrote the row.
 - **Official WordPress.org Launch:** Now available in the official plugin repository.
 - GitHub Release: [v1.3.3](https://github.com/Digitizers/SiteAgent/releases/tag/v1.3.3)
 
+### 1.3.2
+
+- Clear the plugin cache after a self-update.
+
+### 1.3.1
+
+- Security: specific capability permission callbacks, per the WordPress.org review.
+
 ### 1.3.0
 
 - Rebranded from "AuraWorker" to "Digitizer Site Worker for Aura"
 - New slug: `digitizer-site-worker`
+
+### 1.2.0
+
+- Renamed from "AuraWP" to "AuraWorker" and changed the text domain from `aurawp` to `aura-worker`, for trademark compliance.
 
 ### 1.0.0
 
