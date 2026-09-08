@@ -121,13 +121,28 @@ if ( ! preg_match( '/^Stable tag:\s*([0-9]+(?:\.[0-9]+)+)\s*$/m', $readme, $st )
 	exit( 1 );
 }
 $stable_tag = $st[1];
-$newest     = null;
-foreach ( $headings[1] as $h ) {
-	if ( preg_match( '/^[0-9]+(?:\.[0-9]+)+$/', $h ) ) {
-		$newest = $h;
-		break; // newest first
+$listed_now = array_values( array_filter( $headings[1], static fn( $h ) => (bool) preg_match( '/^[0-9]+(?:\.[0-9]+)+$/', $h ) ) );
+
+// NEWEST FIRST is a rule, not an assumption. Round 8 read the FIRST heading as
+// the newest, so an entry inserted out of order — 2.17.0 typed in below 2.16.2 —
+// left `Stable tag: 2.16.2` looking correct and wp.org serving the old release
+// (Codex round-9 P2). Enforce the order, then the first heading IS the greatest;
+// compare against the greatest anyway so the message is right even when the
+// order is what failed.
+for ( $i = 1, $n = count( $listed_now ); $i < $n; $i++ ) {
+	if ( ! version_compare( $listed_now[ $i - 1 ], $listed_now[ $i ], '>' ) ) {
+		fwrite(
+			STDERR,
+			"\ncheck-readme-limits: Changelog entries must be newest first, but `= {$listed_now[ $i - 1 ]} =` is\n"
+			. "followed by `= {$listed_now[ $i ]} =`. Move the entry to its place in descending order.\n"
+		);
+		exit( 1 );
 	}
 }
+$newest = array_reduce(
+	$listed_now,
+	static fn( $carry, $v ) => ( null === $carry || version_compare( $v, $carry, '>' ) ) ? $v : $carry
+);
 if ( $stable_tag !== $newest ) {
 	fwrite(
 		STDERR,
