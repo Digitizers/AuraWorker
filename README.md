@@ -491,6 +491,15 @@ statement reports it wrote the row.
 - `check_health` + `backup_plugins` reuse the existing health-check and rollback engines — building blocks for health-gated fleet-wide safe updates.
 - Read tools run on demand; cache/transient/backup tools are mutating and approval-gated.
 
+### 2.0.2
+
+- Removed an arrow character from screenshot caption #1 that WordPress.org wrapped in emoji markup inside the image `alt` attribute, breaking the plugin page's HTML.
+
+### 2.0.1
+
+- Readme rewritten for the 2.0 feature set (safe batch updates, rollback, magic-link, MCP), corrected security description, and added the v2/MCP endpoint reference.
+- Corrected the admin menu location — the settings page lives under **Settings → SiteAgent**.
+
 ### 2.0.0 *(stable — live on WordPress.org)*
 
 - **v2 Update Engine:** health checks, per-plugin rollback, chunked batch updates, auto-rollback on failure.
@@ -518,6 +527,14 @@ statement reports it wrote the row.
 
 - Rebranded from "AuraWorker" to "Digitizer Site Worker for Aura"
 - New slug: `digitizer-site-worker`
+
+### 1.0.0
+
+- Initial release.
+- REST API endpoints for site health, available updates, and core/plugin/theme/translation/database updates.
+- Auto-generated Site Token.
+- Admin page under Tools → SiteAgent.
+- Zero frontend performance impact.
 
 ---
 

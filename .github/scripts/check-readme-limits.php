@@ -18,14 +18,28 @@
  * move the OLDEST ones out. `README.md#changelog` holds the full history, and
  * readme.txt keeps a `= <version> and earlier =` stub pointing at it.
  *
- * Usage: php .github/scripts/check-readme-limits.php [path/to/readme.txt]
+ * The second check is why the first one is SAFE. Trimming readme.txt only stops
+ * losing history if the entries being removed are already archived somewhere,
+ * and the first version of this change assumed `README.md` was that archive
+ * without verifying it — it was missing 2.0.2, 2.0.1 and 1.0.0, so the trim
+ * would have deleted three releases outright while the stub told readers they
+ * were preserved (Codex round-1 P2). Rather than copy three entries and move
+ * on, the invariant is enforced: `README.md`'s changelog must be a SUPERSET of
+ * `readme.txt`'s, so every entry is archived BEFORE it can ever be trimmed.
+ *
+ * That check also catches the older mistake CLAUDE.md records — 2.14.0 shipped
+ * with `readme.txt` updated and `README.md` forgotten, and the GitHub changelog
+ * silently stopped at 2.13.0 until a human noticed.
+ *
+ * Usage: php .github/scripts/check-readme-limits.php [path/to/readme.txt] [path/to/README.md]
  */
 
 const WP_ORG_CHANGELOG_WORD_LIMIT = 5000;
 /** Headroom for roughly seven more releases at this plugin's typical entry size. */
 const BUDGET = 4000;
 
-$path = $argv[1] ?? __DIR__ . '/../../digitizer-site-worker/readme.txt';
+$path    = $argv[1] ?? __DIR__ . '/../../digitizer-site-worker/readme.txt';
+$archive = $argv[2] ?? __DIR__ . '/../../README.md';
 
 if ( ! is_readable( $path ) ) {
 	fwrite( STDERR, "check-readme-limits: cannot read {$path}\n" );
@@ -76,3 +90,51 @@ if ( $words > BUDGET ) {
 }
 
 printf( "Headroom: %d words.\n", $headroom );
+
+/**
+ * Every version readme.txt lists must also be in README.md's changelog, so the
+ * archive is always ahead of the trim. README.md may hold MORE (it keeps
+ * entries readme.txt has already dropped, which is the whole point).
+ */
+if ( ! is_readable( $archive ) ) {
+	fwrite( STDERR, "check-readme-limits: cannot read {$archive}\n" );
+	exit( 1 );
+}
+
+preg_match_all( '/^=\s*([0-9]+(?:\.[0-9]+)+)\s*=\s*$/m', $body, $shipped );
+
+$archive_md = file_get_contents( $archive );
+if ( ! preg_match( '/^##\s*Changelog\s*$/m', $archive_md, $am, PREG_OFFSET_CAPTURE ) ) {
+	fwrite( STDERR, "check-readme-limits: no `## Changelog` section in {$archive}\n" );
+	exit( 1 );
+}
+preg_match_all(
+	'/^###\s*([0-9]+(?:\.[0-9]+)+)/m',
+	substr( $archive_md, $am[0][1] ),
+	$archived
+);
+
+$missing = array_values( array_diff( $shipped[1], $archived[1] ) );
+
+printf(
+	"Archive: %d versions in readme.txt, %d in README.md.\n",
+	count( $shipped[1] ),
+	count( $archived[1] )
+);
+
+if ( $missing ) {
+	fwrite(
+		STDERR,
+		sprintf(
+			"\ncheck-readme-limits: %s in readme.txt's Changelog but not in README.md's:\n  %s\n\n"
+			. "README.md is the archive the trimmed readme.txt points at, so it must hold every\n"
+			. "version readme.txt lists — otherwise trimming an entry deletes it outright while\n"
+			. "the `and earlier` stub claims it was preserved. Add the entries to README.md.\n",
+			count( $missing ) === 1 ? '1 version is' : count( $missing ) . ' versions are',
+			implode( ', ', $missing )
+		)
+	);
+	exit( 1 );
+}
+
+echo "Archive complete: README.md covers every version readme.txt lists.\n";
