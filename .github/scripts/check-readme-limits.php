@@ -90,7 +90,9 @@ printf( "Headroom: %d words.\n", $headroom );
 
 // ── 2. The stub: present, last, and pointing at the archive ────────────────
 // Every `= … =` heading in order, numeric or not, so the stub's position is known.
-preg_match_all( '/^=\s*([^=\n]+?)\s*=\s*$/m', $body, $headings );
+preg_match_all( '/^=\s*([^=\n]+?)\s*=\s*$/m', $body, $headings, PREG_OFFSET_CAPTURE );
+$last_match   = end( $headings[0] );   // [matched text, byte offset] of the last heading
+$headings[1]  = array_map( static fn( $h ) => $h[0], $headings[1] );
 $last_heading = end( $headings[1] );
 if ( ! preg_match( STUB_PATTERN, "= {$last_heading} =", $stub ) ) {
 	fwrite(
@@ -102,7 +104,12 @@ if ( ! preg_match( STUB_PATTERN, "= {$last_heading} =", $stub ) ) {
 	exit( 1 );
 }
 $stub_version = $stub[1];
-$stub_body    = substr( $body, strrpos( $body, "= {$last_heading} =" ) );
+// Slice from the heading's MATCHED offset, never from a reconstructed string:
+// a stub with extra spacing (`=   2.9.1 and earlier   =`) is accepted by the
+// pattern but was absent from the rebuilt "= … =", so strrpos() returned false,
+// substr() read that as offset 0, and the archive link was accepted anywhere in
+// the Changelog (Codex round-10 P2).
+$stub_body    = substr( $body, $last_match[1] );
 if ( false === strpos( $stub_body, ARCHIVE_LINK ) ) {
 	fwrite( STDERR, "\ncheck-readme-limits: the stub does not link to " . ARCHIVE_LINK . "\n" );
 	exit( 1 );
