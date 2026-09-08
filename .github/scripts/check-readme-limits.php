@@ -173,6 +173,17 @@ foreach ( $headings[1] as $h ) {
 preg_match_all( '/^=\s*([0-9]+(?:\.[0-9]+)+)\s*=\s*$/m', file_get_contents( $archive ), $arch );
 $archived = $arch[1];
 
+// Once each, inside the archive too. `$both` catches a version copied between
+// the two files; a version pasted into the archive TWICE was deduplicated by
+// coverage and never noticed — two sections, possibly with different notes,
+// that will drift the moment either is edited (Codex round-11 P2).
+$dupes = array_keys( array_filter( array_count_values( $archived ), static fn( $n ) => $n > 1 ) );
+if ( $dupes ) {
+	usort( $dupes, 'version_compare' );
+	fwrite( STDERR, "\ncheck-readme-limits: archived more than once in docs/changelog-archive.md: " . implode( ', ', $dupes ) . "\n" );
+	exit( 1 );
+}
+
 $tag_output = shell_exec( 'git -C ' . escapeshellarg( $repo_root ) . ' tag 2>/dev/null' );
 $released   = array();
 foreach ( array_filter( array_map( 'trim', explode( "\n", (string) $tag_output ) ) ) as $tag ) {
